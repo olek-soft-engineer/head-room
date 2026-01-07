@@ -4,7 +4,6 @@ from datetime import date
 
 from .registry import ModelPricing, PricingRegistry
 
-
 # Last verified date for pricing information
 LAST_UPDATED = date(2025, 1, 6)
 

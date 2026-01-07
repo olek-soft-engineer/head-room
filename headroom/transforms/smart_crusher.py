@@ -34,11 +34,10 @@ import statistics
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ..config import RelevanceScorerConfig, TransformResult
-from ..relevance import BM25Scorer, RelevanceScorer, create_scorer
-
+from ..relevance import RelevanceScorer, create_scorer
 
 # Legacy patterns for backwards compatibility (extract_query_anchors)
 _UUID_PATTERN = re.compile(

@@ -57,15 +57,6 @@ from .config import (
     WasteSignals,
 )
 from .providers import AnthropicProvider, OpenAIProvider, Provider, TokenCounter
-from .reporting import generate_report
-from .tokenizer import Tokenizer, count_tokens_messages, count_tokens_text
-from .transforms import (
-    CacheAligner,
-    RollingWindow,
-    SmartCrusher,
-    ToolCrusher,
-    TransformPipeline,
-)
 from .relevance import (
     BM25Scorer,
     EmbeddingScorer,
@@ -74,6 +65,15 @@ from .relevance import (
     RelevanceScorer,
     create_scorer,
     embedding_available,
+)
+from .reporting import generate_report
+from .tokenizer import Tokenizer, count_tokens_messages, count_tokens_text
+from .transforms import (
+    CacheAligner,
+    RollingWindow,
+    SmartCrusher,
+    ToolCrusher,
+    TransformPipeline,
 )
 
 __version__ = "0.2.0"

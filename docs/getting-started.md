@@ -1,0 +1,109 @@
+# Getting Started with Headroom
+
+This guide will help you get up and running with Headroom in under 5 minutes.
+
+## Installation
+
+```bash
+# Core package (minimal dependencies)
+pip install headroom
+
+# With proxy server
+pip install headroom[proxy]
+
+# With semantic relevance (for smarter compression)
+pip install headroom[relevance]
+
+# Everything
+pip install headroom[all]
+```
+
+## Quick Start: Proxy Mode (Recommended)
+
+The easiest way to use Headroom is as a proxy server:
+
+```bash
+# Start the proxy
+headroom proxy --port 8787
+```
+
+Then point your LLM client at it:
+
+```bash
+# Claude Code
+ANTHROPIC_BASE_URL=http://localhost:8787 claude
+
+# OpenAI-compatible clients
+OPENAI_BASE_URL=http://localhost:8787/v1 your-app
+```
+
+That's it! All your requests now go through Headroom and get optimized automatically.
+
+## Quick Start: Python SDK
+
+If you want programmatic control:
+
+```python
+from headroom import HeadroomClient
+from openai import OpenAI
+
+# Create a wrapped client
+client = HeadroomClient(
+    original_client=OpenAI(),
+    default_mode="optimize",
+)
+
+# Use exactly like the original
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello!"},
+    ],
+)
+```
+
+## Modes
+
+### Audit Mode
+
+Observe without modifying:
+
+```python
+client = HeadroomClient(
+    original_client=OpenAI(),
+    default_mode="audit",
+)
+# Logs metrics but doesn't change requests
+```
+
+### Optimize Mode
+
+Apply transforms to reduce tokens:
+
+```python
+client = HeadroomClient(
+    original_client=OpenAI(),
+    default_mode="optimize",
+)
+# Compresses tool outputs, aligns cache prefixes, etc.
+```
+
+### Simulate Mode
+
+Preview what optimizations would do:
+
+```python
+plan = client.chat.completions.simulate(
+    model="gpt-4o",
+    messages=[...],
+)
+print(f"Would save {plan.tokens_saved} tokens")
+print(f"Transforms: {plan.transforms_applied}")
+```
+
+## Next Steps
+
+- [Proxy Server Documentation](proxy.md) - Configure the proxy
+- [Transforms Reference](transforms.md) - Understand each transform
+- [API Reference](api.md) - Full API documentation

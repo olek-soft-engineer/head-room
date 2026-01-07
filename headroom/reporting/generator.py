@@ -11,7 +11,6 @@ from jinja2 import Template
 from ..storage import create_storage
 from ..utils import estimate_cost, format_cost
 
-
 # HTML template embedded as string
 REPORT_TEMPLATE = """
 <!DOCTYPE html>

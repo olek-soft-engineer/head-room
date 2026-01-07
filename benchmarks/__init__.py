@@ -21,7 +21,7 @@ Performance Targets:
     - HybridScorer: < 50ms for 100 items (with embeddings)
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .scenarios.tool_outputs import (
     generate_api_responses,

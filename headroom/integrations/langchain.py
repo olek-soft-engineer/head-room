@@ -29,9 +29,10 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterator, List, Optional, Sequence, Union
+from typing import Any
 from uuid import uuid4
 
 # LangChain imports - these are optional dependencies
@@ -378,7 +379,7 @@ class HeadroomChatModel(BaseChatModel):
             **kwargs,
         )
 
-    def bind_tools(self, tools: Sequence[Any], **kwargs) -> "HeadroomChatModel":
+    def bind_tools(self, tools: Sequence[Any], **kwargs) -> HeadroomChatModel:
         """Bind tools to the wrapped model."""
         new_wrapped = self.wrapped_model.bind_tools(tools, **kwargs)
         return HeadroomChatModel(

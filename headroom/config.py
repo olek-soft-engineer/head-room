@@ -301,8 +301,8 @@ class TransformResult:
     transforms_applied: list[str]
     markers_inserted: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    diff_artifact: "DiffArtifact | None" = None  # Populated if generate_diff_artifact=True
-    cache_metrics: "CachePrefixMetrics | None" = None  # Populated by CacheAligner
+    diff_artifact: DiffArtifact | None = None  # Populated if generate_diff_artifact=True
+    cache_metrics: CachePrefixMetrics | None = None  # Populated by CacheAligner
 
 
 @dataclass

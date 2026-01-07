@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -15,11 +14,11 @@ class ModelPricing:
     provider: str
     input_per_1m: float
     output_per_1m: float
-    cached_input_per_1m: Optional[float] = None
-    batch_input_per_1m: Optional[float] = None
-    batch_output_per_1m: Optional[float] = None
-    context_window: Optional[int] = None
-    notes: Optional[str] = None
+    cached_input_per_1m: float | None = None
+    batch_input_per_1m: float | None = None
+    batch_output_per_1m: float | None = None
+    context_window: int | None = None
+    notes: str | None = None
 
 
 @dataclass
@@ -27,9 +26,9 @@ class CostEstimate:
     """Result of a cost estimation calculation."""
     cost_usd: float
     breakdown: dict = field(default_factory=dict)
-    pricing_date: Optional[date] = None
+    pricing_date: date | None = None
     is_stale: bool = False
-    warning: Optional[str] = None
+    warning: str | None = None
 
 
 class PricingRegistry:
@@ -41,8 +40,8 @@ class PricingRegistry:
     def __init__(
         self,
         last_updated: date,
-        source_url: Optional[str] = None,
-        prices: Optional[dict[str, ModelPricing]] = None,
+        source_url: str | None = None,
+        prices: dict[str, ModelPricing] | None = None,
     ):
         """Initialize the pricing registry.
 
@@ -55,7 +54,7 @@ class PricingRegistry:
         self.source_url = source_url
         self.prices: dict[str, ModelPricing] = prices or {}
 
-    def get_price(self, model: str) -> Optional[ModelPricing]:
+    def get_price(self, model: str) -> ModelPricing | None:
         """Get pricing for a specific model.
 
         Args:
@@ -75,7 +74,7 @@ class PricingRegistry:
         age = date.today() - self.last_updated
         return age > timedelta(days=self.STALENESS_THRESHOLD_DAYS)
 
-    def staleness_warning(self) -> Optional[str]:
+    def staleness_warning(self) -> str | None:
         """Get a warning message if pricing is stale.
 
         Returns:

@@ -20,7 +20,7 @@ Limitations:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -71,7 +71,7 @@ class EmbeddingScorer(RelevanceScorer):
         Requires sentence-transformers: pip install headroom[relevance]
     """
 
-    _model_cache: dict[str, "SentenceTransformer"] = {}
+    _model_cache: dict[str, SentenceTransformer] = {}
 
     def __init__(
         self,
@@ -93,7 +93,7 @@ class EmbeddingScorer(RelevanceScorer):
         self.model_name = model_name
         self.device = device
         self.cache_model = cache_model
-        self._model: "SentenceTransformer | None" = None
+        self._model: SentenceTransformer | None = None
         self._available: bool | None = None
 
     @classmethod
@@ -110,7 +110,7 @@ class EmbeddingScorer(RelevanceScorer):
         except ImportError:
             return False
 
-    def _get_model(self) -> "SentenceTransformer":
+    def _get_model(self) -> SentenceTransformer:
         """Get or load the sentence transformer model.
 
         Returns:

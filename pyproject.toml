@@ -4,39 +4,67 @@ build-backend = "hatchling.build"
 
 [project]
 name = "headroom"
-version = "0.1.0"
-description = "A safe, deterministic Context Budget Controller for LLM APIs"
+version = "0.2.0"
+description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
-    { name = "Headroom Team" }
+    { name = "Headroom Contributors" }
+]
+maintainers = [
+    { name = "Headroom Contributors" }
 ]
 keywords = [
     "llm",
     "openai",
+    "anthropic",
+    "claude",
+    "gpt",
     "context",
     "token",
     "optimization",
+    "compression",
     "caching",
+    "proxy",
+    "ai",
+    "machine-learning",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 dependencies = [
     "tiktoken>=0.5.0",
     "pydantic>=2.0.0",
-    "jinja2>=3.0.0",
 ]
 
 [project.optional-dependencies]
+# Semantic relevance scoring with embeddings
+relevance = [
+    "sentence-transformers>=2.2.0",
+    "numpy>=1.24.0",
+]
+# Proxy server
+proxy = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "httpx>=0.24.0",
+]
+# Report generation
+reports = [
+    "jinja2>=3.0.0",
+]
+# Development dependencies
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -44,15 +72,35 @@ dev = [
     "ruff>=0.1.0",
     "mypy>=1.0.0",
     "openai>=1.0.0",
+    "anthropic>=0.18.0",
 ]
+# All optional dependencies
+all = [
+    "headroom[relevance,proxy,reports]",
+]
+
+[project.scripts]
+headroom = "headroom.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/headroom-sdk/headroom"
-Documentation = "https://github.com/headroom-sdk/headroom#readme"
+Documentation = "https://headroom.dev/docs"
 Repository = "https://github.com/headroom-sdk/headroom"
+Issues = "https://github.com/headroom-sdk/headroom/issues"
+Changelog = "https://github.com/headroom-sdk/headroom/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["headroom"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/headroom",
+    "/tests",
+    "/LICENSE",
+    "/NOTICE",
+    "/README.md",
+    "/CHANGELOG.md",
+]
 
 [tool.ruff]
 target-version = "py310"
@@ -71,19 +119,43 @@ select = [
 ignore = [
     "E501",  # line too long (handled by formatter)
     "B008",  # do not perform function calls in argument defaults
+    "B905",  # zip without strict parameter
 ]
 
 [tool.ruff.lint.isort]
 known-first-party = ["headroom"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
 
 [tool.mypy]
 python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["headroom"]
+branch = true
+omit = [
+    "headroom/cli.py",
+    "*/tests/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]

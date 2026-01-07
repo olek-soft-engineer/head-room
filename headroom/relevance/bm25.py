@@ -20,9 +20,8 @@ from __future__ import annotations
 import math
 import re
 from collections import Counter
-from typing import Any
 
-from .base import RelevanceScore, RelevanceScorer, default_batch_score
+from .base import RelevanceScore, RelevanceScorer
 
 
 class BM25Scorer(RelevanceScorer):
