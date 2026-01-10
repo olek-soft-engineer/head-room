@@ -53,7 +53,7 @@ try:
     HTTPX_AVAILABLE = True
 except ImportError:
     HTTPX_AVAILABLE = False
-    httpx = None
+    httpx = None  # type: ignore[assignment]
 
 from .tool_injection import CCR_TOOL_NAME
 

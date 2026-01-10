@@ -55,8 +55,8 @@ except ImportError:
     LANGCHAIN_AVAILABLE = False
     BaseChatModel = object
     BaseCallbackHandler = object
-    Field = lambda **kwargs: None  # noqa: E731
-    PrivateAttr = lambda **kwargs: None  # noqa: E731
+    Field = lambda **kwargs: None  # type: ignore[assignment]  # noqa: E731
+    PrivateAttr = lambda **kwargs: None  # type: ignore[assignment]  # noqa: E731
 
 from headroom import HeadroomConfig, HeadroomMode
 from headroom.providers import OpenAIProvider
