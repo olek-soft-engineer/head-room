@@ -328,9 +328,8 @@ class SearchCompressor:
 
             store = get_compression_store()
             return store.store(
-                original_content=original,
-                compressed_content=compressed,
-                content_type="search_results",
+                original,
+                compressed,
                 original_item_count=original_count,
             )
         except ImportError:

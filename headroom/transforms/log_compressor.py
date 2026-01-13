@@ -494,9 +494,8 @@ class LogCompressor:
 
             store = get_compression_store()
             return store.store(
-                original_content=original,
-                compressed_content=compressed,
-                content_type="build_output",
+                original,
+                compressed,
                 original_item_count=original_count,
             )
         except ImportError:
