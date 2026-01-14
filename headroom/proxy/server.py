@@ -59,7 +59,17 @@ from headroom.config import CacheAlignerConfig, RollingWindowConfig, SmartCrushe
 from headroom.providers import AnthropicProvider, OpenAIProvider
 from headroom.telemetry import get_telemetry_collector
 from headroom.tokenizers import get_tokenizer
-from headroom.transforms import CacheAligner, RollingWindow, SmartCrusher, TransformPipeline
+from headroom.transforms import (
+    _LLMLINGUA_AVAILABLE,
+    CacheAligner,
+    RollingWindow,
+    SmartCrusher,
+    TransformPipeline,
+)
+
+# Conditionally import LLMLingua if available
+if _LLMLINGUA_AVAILABLE:
+    from headroom.transforms import LLMLinguaCompressor, LLMLinguaConfig
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -144,6 +154,11 @@ class ProxyConfig:
     # CCR Tool Injection
     ccr_inject_tool: bool = True  # Inject headroom_retrieve tool when compression occurs
     ccr_inject_system_instructions: bool = False  # Add instructions to system message
+
+    # LLMLingua ML-based compression (opt-in)
+    llmlingua_enabled: bool = False  # Enable LLMLingua-2 for ML-based compression
+    llmlingua_device: str = "auto"  # Device: 'auto', 'cuda', 'cpu', 'mps'
+    llmlingua_target_rate: float = 0.3  # Target compression rate (0.3 = keep 30%)
 
     # Caching
     cache_enabled: bool = True
@@ -656,6 +671,9 @@ class HeadroomProxy:
             ),
         ]
 
+        # Add LLMLingua if enabled and available
+        self._llmlingua_status = self._setup_llmlingua(config, transforms)
+
         self.anthropic_pipeline = TransformPipeline(
             transforms=transforms,
             provider=self.anthropic_provider,
@@ -722,6 +740,38 @@ class HeadroomProxy:
             inject_system_instructions=config.ccr_inject_system_instructions,
         )
 
+    def _setup_llmlingua(self, config: ProxyConfig, transforms: list) -> str:
+        """Set up LLMLingua compression if enabled.
+
+        Args:
+            config: Proxy configuration
+            transforms: Transform list to append to
+
+        Returns:
+            Status string for logging: 'enabled', 'disabled', 'available', 'unavailable'
+        """
+        if config.llmlingua_enabled:
+            if _LLMLINGUA_AVAILABLE:
+                llmlingua_config = LLMLinguaConfig(
+                    device=config.llmlingua_device,
+                    target_compression_rate=config.llmlingua_target_rate,
+                    enable_ccr=config.ccr_inject_tool,  # Link to CCR
+                )
+                # Insert before RollingWindow (which should be last)
+                # LLMLingua works best on individual tool outputs before windowing
+                transforms.insert(-1, LLMLinguaCompressor(llmlingua_config))
+                return "enabled"
+            else:
+                logger.warning(
+                    "LLMLingua requested but not installed. "
+                    "Install with: pip install headroom-ai[llmlingua]"
+                )
+                return "unavailable"
+        else:
+            if _LLMLINGUA_AVAILABLE:
+                return "available"  # Available but not enabled - hint to user
+            return "disabled"
+
     async def startup(self):
         """Initialize async resources."""
         self.http_client = httpx.AsyncClient(
@@ -736,6 +786,18 @@ class HeadroomProxy:
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
         logger.info(f"Caching: {'ENABLED' if self.config.cache_enabled else 'DISABLED'}")
         logger.info(f"Rate Limiting: {'ENABLED' if self.config.rate_limit_enabled else 'DISABLED'}")
+
+        # LLMLingua status with helpful hint
+        if self._llmlingua_status == "enabled":
+            logger.info(
+                f"LLMLingua: ENABLED (device={self.config.llmlingua_device}, "
+                f"rate={self.config.llmlingua_target_rate})"
+            )
+        elif self._llmlingua_status == "available":
+            logger.info(
+                "LLMLingua: available but not enabled. "
+                "Enable with --llmlingua for ML-based compression (3-5x better on text/logs)"
+            )
 
     async def shutdown(self):
         """Cleanup async resources."""
@@ -1818,6 +1880,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     return app
 
 
+def _get_llmlingua_banner_status(config: ProxyConfig) -> str:
+    """Get LLMLingua status line for banner."""
+    if config.llmlingua_enabled:
+        if _LLMLINGUA_AVAILABLE:
+            return (
+                f"ENABLED  (device={config.llmlingua_device}, rate={config.llmlingua_target_rate})"
+            )
+        else:
+            return "REQUESTED but not installed (pip install headroom-ai[llmlingua])"
+    else:
+        if _LLMLINGUA_AVAILABLE:
+            return "available (enable with --llmlingua for ML compression)"
+        return "DISABLED"
+
+
 def run_server(config: ProxyConfig | None = None):
     """Run the proxy server."""
     if not FASTAPI_AVAILABLE:
@@ -1826,6 +1903,8 @@ def run_server(config: ProxyConfig | None = None):
 
     config = config or ProxyConfig()
     app = create_app(config)
+
+    llmlingua_status = _get_llmlingua_banner_status(config)
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════════════╗
@@ -1840,6 +1919,7 @@ def run_server(config: ProxyConfig | None = None):
 ║    Rate Limiting:   {"ENABLED " if config.rate_limit_enabled else "DISABLED"}   ({config.rate_limit_requests_per_minute} req/min, {config.rate_limit_tokens_per_minute:,} tok/min)       ║
 ║    Retry:           {"ENABLED " if config.retry_enabled else "DISABLED"}   (max {config.retry_max_attempts} attempts)                       ║
 ║    Cost Tracking:   {"ENABLED " if config.cost_tracking_enabled else "DISABLED"}   (budget: {"$" + str(config.budget_limit_usd) + "/" + config.budget_period if config.budget_limit_usd else "unlimited"})          ║
+║    LLMLingua:       {llmlingua_status:<52}║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║  USAGE:                                                              ║
 ║    Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude     ║
@@ -1893,6 +1973,25 @@ if __name__ == "__main__":
     parser.add_argument("--log-file", help="Log file path")
     parser.add_argument("--log-messages", action="store_true", help="Log full messages")
 
+    # LLMLingua ML-based compression
+    parser.add_argument(
+        "--llmlingua",
+        action="store_true",
+        help="Enable LLMLingua-2 ML-based compression (requires: pip install headroom-ai[llmlingua])",
+    )
+    parser.add_argument(
+        "--llmlingua-device",
+        choices=["auto", "cuda", "cpu", "mps"],
+        default="auto",
+        help="Device for LLMLingua model (default: auto)",
+    )
+    parser.add_argument(
+        "--llmlingua-rate",
+        type=float,
+        default=0.3,
+        help="LLMLingua target compression rate, 0.0-1.0 (default: 0.3 = keep 30%%)",
+    )
+
     args = parser.parse_args()
 
     config = ProxyConfig(
@@ -1910,6 +2009,9 @@ if __name__ == "__main__":
         budget_period=args.budget_period,
         log_file=args.log_file,
         log_full_messages=args.log_messages,
+        llmlingua_enabled=args.llmlingua,
+        llmlingua_device=args.llmlingua_device,
+        llmlingua_target_rate=args.llmlingua_rate,
     )
 
     run_server(config)

@@ -21,6 +21,8 @@ headroom proxy \
 
 ## Command Line Options
 
+### Core Options
+
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--host` | `127.0.0.1` | Host to bind to |
@@ -30,6 +32,27 @@ headroom proxy \
 | `--no-rate-limit` | `false` | Disable rate limiting |
 | `--log-file` | None | Path to JSONL log file |
 | `--budget` | None | Daily budget limit in USD |
+
+### LLMLingua Options (ML Compression)
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--llmlingua` | `false` | Enable LLMLingua-2 ML-based compression |
+| `--llmlingua-device` | `auto` | Device for model: `auto`, `cuda`, `cpu`, `mps` |
+| `--llmlingua-rate` | `0.3` | Target compression rate (0.3 = keep 30% of tokens) |
+
+**Note:** LLMLingua requires additional dependencies: `pip install headroom-ai[llmlingua]`
+
+```bash
+# Enable LLMLingua with GPU acceleration
+headroom proxy --llmlingua --llmlingua-device cuda
+
+# More aggressive compression (keep only 20%)
+headroom proxy --llmlingua --llmlingua-rate 0.2
+
+# Conservative compression for code (keep 50%)
+headroom proxy --llmlingua --llmlingua-rate 0.5
+```
 
 ## API Endpoints
 
@@ -103,6 +126,42 @@ client = OpenAI(
 ```
 
 ## Features
+
+### LLMLingua ML Compression (Opt-In)
+
+When enabled, the proxy uses Microsoft's LLMLingua-2 model for ML-based token compression:
+
+```bash
+headroom proxy --llmlingua
+```
+
+**How it works:**
+- LLMLinguaCompressor is added to the transform pipeline (before RollingWindow)
+- Automatically detects content type (JSON, code, text) and adjusts compression
+- Stores original content in CCR for retrieval if needed
+
+**Startup feedback:**
+
+```
+# When enabled and available:
+LLMLingua: ENABLED  (device=cuda, rate=0.3)
+
+# When installed but not enabled (helpful hint):
+LLMLingua: available (enable with --llmlingua for ML compression)
+
+# When enabled but not installed:
+WARNING: LLMLingua requested but not installed. Install with: pip install headroom-ai[llmlingua]
+```
+
+**Why opt-in?**
+| Concern | Default Proxy | With LLMLingua |
+|---------|---------------|----------------|
+| Dependencies | ~50MB | +2GB (torch, transformers) |
+| Cold start | <1s | 10-30s (model load) |
+| Memory | ~100MB | +1GB (model in RAM) |
+| Overhead | <5ms | 50-200ms per request |
+
+Enable LLMLingua when maximum compression justifies the resource cost.
 
 ### Semantic Caching
 

@@ -64,6 +64,12 @@ proxy = [
 reports = [
     "jinja2>=3.0.0",
 ]
+# ML-based compression (LLMLingua-2)
+llmlingua = [
+    "llmlingua>=0.2.0",
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+]
 # Development dependencies
 dev = [
     "pytest>=7.0.0",
@@ -76,7 +82,7 @@ dev = [
 ]
 # All optional dependencies
 all = [
-    "headroom-ai[relevance,proxy,reports]",
+    "headroom-ai[relevance,proxy,reports,llmlingua]",
 ]
 
 [project.scripts]

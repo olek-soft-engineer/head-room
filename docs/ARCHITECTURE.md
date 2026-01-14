@@ -193,7 +193,36 @@ analysis = {
 
 ---
 
-#### Transform 4: Rolling Window
+#### Transform 4: LLMLingua Compressor (Optional)
+
+**When to use:** Maximum compression needed and latency is acceptable.
+
+```python
+# Opt-in ML-based compression using Microsoft's LLMLingua-2
+# BERT-based token classifier trained via GPT-4 distillation
+
+# Before: Long tool output text
+"The function processUserData takes a user object and validates all fields..."
+
+# After: Compressed while preserving semantic meaning
+"function processUserData validates user fields..."
+```
+
+**Key characteristics:**
+- Uses `microsoft/llmlingua-2-xlm-roberta-large-meetingbank` model
+- Auto-detects content type (code, JSON, text) for optimal compression rates
+- Stores original in CCR for retrieval if needed
+- Adds 50-200ms latency per request
+- Requires ~1GB RAM when loaded
+
+**Proxy integration (opt-in):**
+```bash
+headroom proxy --llmlingua --llmlingua-device cuda
+```
+
+---
+
+#### Transform 5: Rolling Window
 
 **Problem:** Even after compression, you might exceed the model's context limit.
 
@@ -282,7 +311,12 @@ def apply(self, messages, ...):
     # - Compresses to 17 points (preserving spike)
     # - Factors out constant "host" field
 
-    # Transform 3: Rolling Window
+    # Transform 3: LLMLingua (if enabled via --llmlingua)
+    # - ML-based compression on remaining long text
+    # - Auto-detects content type for optimal rate
+    # - Stores original in CCR for retrieval
+
+    # Transform 4: Rolling Window
     # - Checks if we're under limit (we are)
     # - No drops needed
 
@@ -670,12 +704,13 @@ headroom/
 │   └── anthropic.py     # Anthropic-specific
 │
 ├── transforms/
-│   ├── base.py          # Transform protocol
-│   ├── pipeline.py      # Orchestrates all transforms
-│   ├── cache_aligner.py # Date extraction for caching
-│   ├── tool_crusher.py  # Naive compression (disabled)
-│   ├── smart_crusher.py # Statistical compression (default)
-│   └── rolling_window.py # Token limit enforcement
+│   ├── base.py              # Transform protocol
+│   ├── pipeline.py          # Orchestrates all transforms
+│   ├── cache_aligner.py     # Date extraction for caching
+│   ├── tool_crusher.py      # Naive compression (disabled)
+│   ├── smart_crusher.py     # Statistical compression (default)
+│   ├── rolling_window.py    # Token limit enforcement
+│   └── llmlingua_compressor.py  # ML-based compression (opt-in)
 │
 ├── cache/               # CCR Architecture
 │   ├── compression_store.py    # Phase 1: Store original content

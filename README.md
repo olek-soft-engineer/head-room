@@ -483,6 +483,143 @@ def compress_tool_output(content: str, context: str = "") -> str:
 
 ---
 
+## ML-Based Compression with LLMLingua-2 (Optional)
+
+For even more aggressive compression, Headroom integrates with **LLMLingua-2**, Microsoft's BERT-based token classifier trained via GPT-4 distillation. It achieves **up to 20x compression** while preserving semantic meaning.
+
+### When to Use LLMLingua-2
+
+| Approach | Best For | Compression | Speed |
+|----------|----------|-------------|-------|
+| **SmartCrusher** | JSON tool outputs | 70-90% | ~1ms |
+| **Text Utilities** | Search/logs | 50-90% | ~1ms |
+| **LLMLingua-2** | Any text, max compression | 80-95% | ~50-200ms |
+
+LLMLingua-2 is ideal when you need maximum compression and can tolerate slightly higher latency (e.g., compressing large tool outputs before storage, offline processing).
+
+### Installation
+
+```bash
+# Adds ~2GB of model weights
+pip install "headroom-ai[llmlingua]"
+```
+
+### Basic Usage
+
+```python
+from headroom.transforms import LLMLinguaCompressor
+
+# Create compressor (model loaded lazily on first use)
+compressor = LLMLinguaCompressor()
+
+# Compress any text
+long_output = "The function processUserData takes a user object and validates..."
+result = compressor.compress(long_output)
+
+print(f"Before: {result.original_tokens} tokens")
+print(f"After: {result.compressed_tokens} tokens")
+print(f"Saved: {result.savings_percentage:.1f}%")
+print(result.compressed)
+```
+
+### Content-Aware Compression
+
+LLMLingua-2 automatically adjusts compression based on content type:
+
+```python
+from headroom.transforms import LLMLinguaCompressor, LLMLinguaConfig
+
+# Conservative for code (keep 40% of tokens)
+config = LLMLinguaConfig(
+    code_compression_rate=0.4,    # More conservative
+    json_compression_rate=0.35,   # Moderate
+    text_compression_rate=0.25,   # Aggressive
+)
+
+compressor = LLMLinguaCompressor(config)
+
+# Auto-detects content type
+code_result = compressor.compress("def calculate(x): return x * 2")
+text_result = compressor.compress("This is a verbose explanation...")
+```
+
+### Memory Management
+
+The model uses ~1GB RAM. Unload it when done:
+
+```python
+from headroom.transforms import (
+    LLMLinguaCompressor,
+    unload_llmlingua_model,
+    is_llmlingua_model_loaded,
+)
+
+compressor = LLMLinguaCompressor()
+result = compressor.compress(content)  # Model loaded here
+
+# Check if loaded
+print(is_llmlingua_model_loaded())  # True
+
+# Free memory when done
+unload_llmlingua_model()  # Frees ~1GB
+print(is_llmlingua_model_loaded())  # False
+
+# Next compression will reload automatically
+```
+
+### Use in Pipeline
+
+```python
+from headroom.transforms import TransformPipeline, LLMLinguaCompressor, SmartCrusher
+
+# Combine with other transforms
+pipeline = TransformPipeline([
+    SmartCrusher(),        # First: compress JSON
+    LLMLinguaCompressor(), # Then: ML compression on remaining text
+])
+
+result = pipeline.apply(messages, tokenizer)
+```
+
+### Device Configuration
+
+```python
+from headroom.transforms import LLMLinguaConfig, LLMLinguaCompressor
+
+# Force CPU (slower but works everywhere)
+config = LLMLinguaConfig(device="cpu")
+
+# Force GPU (faster but needs CUDA)
+config = LLMLinguaConfig(device="cuda")
+
+# Auto-detect (default): uses CUDA > MPS > CPU
+config = LLMLinguaConfig(device="auto")
+
+compressor = LLMLinguaCompressor(config)
+```
+
+### Proxy Integration (Opt-In)
+
+Enable LLMLingua in the proxy server for automatic ML compression of all requests:
+
+```bash
+# Enable LLMLingua in proxy (requires: pip install headroom-ai[llmlingua,proxy])
+headroom proxy --llmlingua
+
+# With custom settings
+headroom proxy --llmlingua --llmlingua-device cuda --llmlingua-rate 0.4
+
+# The proxy shows LLMLingua status at startup:
+#   LLMLingua: ENABLED  (device=cuda, rate=0.4)
+#
+# If llmlingua is installed but not enabled, you'll see a helpful hint:
+#   LLMLingua: available (enable with --llmlingua for ML compression)
+```
+
+**Why opt-in?** LLMLingua adds ~2GB dependencies and 10-30s cold start. The default proxy is lightweight (~50MB) with <5ms overhead. Enable LLMLingua when you need maximum compression and can accept the tradeoffs.
+
+---
+
 ## Metrics & Monitoring
 
 ### Prometheus Metrics (Proxy)

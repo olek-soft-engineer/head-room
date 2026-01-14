@@ -162,6 +162,76 @@ config = RollingWindowConfig(
 
 ---
 
+## LLMLinguaCompressor (Optional)
+
+ML-based compression using Microsoft's LLMLingua-2 model.
+
+### When to Use
+
+| Transform | Best For | Speed | Compression |
+|-----------|----------|-------|-------------|
+| SmartCrusher | JSON arrays | ~1ms | 70-90% |
+| Text Utilities | Search/logs | ~1ms | 50-90% |
+| **LLMLinguaCompressor** | Any text, max compression | 50-200ms | 80-95% |
+
+### Installation
+
+```bash
+pip install "headroom-ai[llmlingua]"  # Adds ~2GB
+```
+
+### Configuration
+
+```python
+from headroom.transforms import LLMLinguaCompressor, LLMLinguaConfig
+
+config = LLMLinguaConfig(
+    device="auto",                    # auto, cuda, cpu, mps
+    target_compression_rate=0.3,      # Keep 30% of tokens
+    min_tokens_for_compression=100,   # Skip small content
+    code_compression_rate=0.4,        # Conservative for code
+    json_compression_rate=0.35,       # Moderate for JSON
+    text_compression_rate=0.25,       # Aggressive for text
+    enable_ccr=True,                  # Store original for retrieval
+)
+
+compressor = LLMLinguaCompressor(config)
+```
+
+### Content-Aware Rates
+
+LLMLinguaCompressor auto-detects content type:
+
+| Content Type | Default Rate | Behavior |
+|--------------|--------------|----------|
+| Code | 0.4 | Conservative - preserves syntax |
+| JSON | 0.35 | Moderate - keeps structure |
+| Text | 0.3 | Aggressive - maximum compression |
+
+### Memory Management
+
+```python
+from headroom.transforms import (
+    is_llmlingua_model_loaded,
+    unload_llmlingua_model,
+)
+
+# Check if model is loaded
+print(is_llmlingua_model_loaded())  # True/False
+
+# Free ~1GB RAM when done
+unload_llmlingua_model()
+```
+
+### Proxy Integration
+
+```bash
+# Enable in proxy
+headroom proxy --llmlingua --llmlingua-device cuda --llmlingua-rate 0.3
+```
+
+---
+
 ## TransformPipeline
 
 Combine transforms for optimal results.
@@ -179,11 +249,36 @@ result = pipeline.transform(messages)
 print(f"Saved {result.tokens_saved} tokens")
 ```
 
+### With LLMLingua (Optional)
+
+```python
+from headroom.transforms import (
+    TransformPipeline, SmartCrusher, CacheAligner,
+    RollingWindow, LLMLinguaCompressor
+)
+
+pipeline = TransformPipeline([
+    CacheAligner(),         # 1. Stabilize prefix
+    SmartCrusher(),         # 2. Compress JSON arrays
+    LLMLinguaCompressor(),  # 3. ML compression on remaining text
+    RollingWindow(),        # 4. Final size constraint (always last)
+])
+```
+
 ### Recommended Order
 
-1. **SmartCrusher** - Reduce individual messages
-2. **CacheAligner** - Optimize for caching
-3. **RollingWindow** - Final size constraint
+| Order | Transform | Purpose |
+|-------|-----------|---------|
+| 1 | CacheAligner | Stabilize prefix for caching |
+| 2 | SmartCrusher | Compress JSON tool outputs |
+| 3 | LLMLinguaCompressor | ML compression (optional) |
+| 4 | RollingWindow | Enforce token limits (always last) |
+
+**Why this order?**
+- CacheAligner first to maximize prefix stability
+- SmartCrusher handles JSON arrays efficiently
+- LLMLingua compresses remaining long text
+- RollingWindow truncates only if still over limit
 
 ---
 

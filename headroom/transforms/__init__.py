@@ -15,6 +15,21 @@ from .smart_crusher import SmartCrusher, SmartCrusherConfig
 from .text_compressor import TextCompressionResult, TextCompressor, TextCompressorConfig
 from .tool_crusher import ToolCrusher
 
+# ML-based compression (optional dependency)
+try:
+    from .llmlingua_compressor import (  # noqa: F401
+        LLMLinguaCompressor,
+        LLMLinguaConfig,
+        LLMLinguaResult,
+        compress_with_llmlingua,
+        is_llmlingua_model_loaded,
+        unload_llmlingua_model,
+    )
+
+    _LLMLINGUA_AVAILABLE = True
+except ImportError:
+    _LLMLINGUA_AVAILABLE = False
+
 __all__ = [
     # Base
     "Transform",
@@ -39,4 +54,19 @@ __all__ = [
     # Other transforms
     "CacheAligner",
     "RollingWindow",
+    # ML-based compression (optional)
+    "_LLMLINGUA_AVAILABLE",
 ]
+
+# Conditionally add LLMLingua exports
+if _LLMLINGUA_AVAILABLE:
+    __all__.extend(
+        [
+            "LLMLinguaCompressor",
+            "LLMLinguaConfig",
+            "LLMLinguaResult",
+            "compress_with_llmlingua",
+            "is_llmlingua_model_loaded",
+            "unload_llmlingua_model",
+        ]
+    )

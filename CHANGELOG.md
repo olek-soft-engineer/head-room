@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Production-ready proxy server with caching, rate limiting, and metrics
 - CLI command `headroom proxy` to start the proxy server
+- **LLMLingua-2 Integration** (opt-in ML-based compression)
+  - `LLMLinguaCompressor` transform using Microsoft's LLMLingua-2 model
+  - Content-aware compression rates (code: 0.4, JSON: 0.35, text: 0.3)
+  - Memory management utilities: `unload_llmlingua_model()`, `is_llmlingua_model_loaded()`
+  - Proxy integration via `--llmlingua` flag
+  - Device selection: `--llmlingua-device` (auto/cuda/cpu/mps)
+  - Custom compression rate: `--llmlingua-rate`
+  - Helpful startup hints when llmlingua is available but not enabled
+  - Install with: `pip install headroom-ai[llmlingua]`
 
 ## [0.2.0] - 2025-01-07
 
