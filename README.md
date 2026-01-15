@@ -106,6 +106,7 @@ See the full [LangChain Integration Guide](docs/langchain.md) for memory, retrie
 | Feature | Description | Docs |
 |---------|-------------|------|
 | **Memory** | Persistent memory across conversations (zero-latency inline extraction) | [Memory](docs/memory.md) |
+| **Universal Compression** | ML-based content detection + structure-preserving compression | [Compression](docs/compression.md) |
 | **SmartCrusher** | Compresses JSON tool outputs statistically | [Transforms](docs/transforms.md) |
 | **CacheAligner** | Stabilizes prefixes for provider caching | [Transforms](docs/transforms.md) |
 | **RollingWindow** | Manages context limits without breaking tools | [Transforms](docs/transforms.md) |
@@ -173,6 +174,7 @@ pip install "headroom-ai[all]"       # Everything
 | Guide | Description |
 |-------|-------------|
 | [Memory Guide](docs/memory.md) | Persistent memory for LLMs |
+| [Compression Guide](docs/compression.md) | Universal compression with ML detection |
 | [LangChain Integration](docs/langchain.md) | Full LangChain support |
 | [SDK Guide](docs/sdk.md) | Fine-grained control |
 | [Proxy Guide](docs/proxy.md) | Production deployment |

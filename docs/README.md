@@ -21,6 +21,7 @@ Welcome to the Headroom documentation.
 
 | Topic | Description |
 |-------|-------------|
+| [Universal Compression](compression.md) | ML-based content detection + structure preservation |
 | [Transforms](transforms.md) | How compression works |
 | [CCR](ccr.md) | Reversible compression architecture |
 | [Configuration](configuration.md) | All configuration options |
@@ -48,10 +49,11 @@ Headroom is the Context Optimization Layer for LLM applications. It reduces your
 
 ### How It Works
 
-1. **SmartCrusher** — Compresses JSON tool outputs, keeping errors, anomalies, and relevant items
-2. **CacheAligner** — Stabilizes message prefixes so provider caching works
-3. **RollingWindow** — Manages context limits without breaking tool call pairs
-4. **CCR** — Caches original data so compression is reversible
+1. **Universal Compression** — ML-based content detection with structure-preserving compression
+2. **SmartCrusher** — Compresses JSON tool outputs, keeping errors, anomalies, and relevant items
+3. **CacheAligner** — Stabilizes message prefixes so provider caching works
+4. **RollingWindow** — Manages context limits without breaking tool call pairs
+5. **CCR** — Caches original data so compression is reversible
 
 ### Safety Guarantees
 
