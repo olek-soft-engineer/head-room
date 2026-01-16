@@ -2201,10 +2201,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def openai_chat(request: Request):
         return await proxy.handle_openai_chat(request)
 
-    # Passthrough
+    # Passthrough - route to correct backend based on headers
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
     async def passthrough(request: Request, path: str):
-        if "anthropic" in request.headers.get("user-agent", "").lower():
+        # Anthropic SDK always sends anthropic-version header and uses x-api-key for auth
+        # OpenAI SDK uses Authorization: Bearer for auth
+        if request.headers.get("anthropic-version") or request.headers.get("x-api-key"):
             base_url = proxy.ANTHROPIC_API_URL
         else:
             base_url = proxy.OPENAI_API_URL
