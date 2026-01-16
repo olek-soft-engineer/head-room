@@ -358,9 +358,9 @@ class LLMLinguaCompressor(Transform):
         # Perform compression
         try:
             result = compressor.compress_prompt(
-                original_prompt=content,
+                context=[content],  # LLMLingua expects a list of context strings
                 rate=compression_rate,
-                force_tokens=force_tokens if force_tokens else None,
+                force_tokens=force_tokens if force_tokens else [],
                 drop_consecutive=self.config.drop_consecutive,
             )
 
