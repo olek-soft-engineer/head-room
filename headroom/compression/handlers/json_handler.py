@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 from headroom.compression.handlers.base import BaseStructureHandler, HandlerResult
 from headroom.compression.masks import EntropyScore, StructureMask
@@ -370,7 +370,7 @@ class JSONStructureHandler(BaseStructureHandler):
         return tokens
 
 
-def extract_json_schema(content: str) -> dict[str, Any]:
+def extract_json_schema(content: str) -> dict[str, Any] | list[Any]:
     """Extract the schema (keys only) from JSON content.
 
     Useful for understanding the structure without the values.
@@ -408,6 +408,11 @@ def extract_json_schema(content: str) -> dict[str, Any]:
 
     try:
         parsed = json.loads(content)
-        return _extract(parsed)
+        result = _extract(parsed)
+        if isinstance(result, dict):
+            return cast(dict[str, Any], result)
+        elif isinstance(result, list):
+            return cast(list[Any], result)
+        return {}
     except (json.JSONDecodeError, ValueError):
         return {}

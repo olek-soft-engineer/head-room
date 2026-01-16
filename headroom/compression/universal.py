@@ -187,11 +187,10 @@ class UniversalCompressor:
         try:
             from headroom.transforms.llmlingua_compressor import compress_with_llmlingua
 
-            result = compress_with_llmlingua(
+            return compress_with_llmlingua(
                 text,
-                target_ratio=self.config.compression_ratio_target,
+                compression_rate=self.config.compression_ratio_target,
             )
-            return result.compressed
         except ImportError:
             return self._simple_compress(text)
         except Exception as e:
@@ -371,8 +370,8 @@ class UniversalCompressor:
                 self._ccr_store = CompressionStore()
 
             key = self._ccr_store.store(
-                original_content=original,
-                compressed_content=compressed,
+                original,
+                compressed,
                 original_tokens=self._estimate_tokens(original),
                 compressed_tokens=self._estimate_tokens(compressed),
             )
