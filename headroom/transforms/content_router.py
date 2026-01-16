@@ -172,6 +172,9 @@ class ContentRouterConfig:
         mixed_content_threshold: Min distinct types to consider "mixed".
         min_section_tokens: Minimum tokens for a section to compress.
         fallback_strategy: Strategy when no compressor matches.
+        skip_user_messages: Never compress user messages (they're the subject).
+        skip_recent_messages: Don't compress last N messages (likely the subject).
+        protect_analysis_context: Detect "analyze/review" intent, skip compression.
     """
 
     # Enable/disable specific compressors
@@ -188,6 +191,15 @@ class ContentRouterConfig:
 
     # Fallback
     fallback_strategy: CompressionStrategy = CompressionStrategy.PASSTHROUGH
+
+    # Protection: Don't compress content that's likely the subject of analysis
+    skip_user_messages: bool = True  # User messages contain what they want analyzed
+    protect_recent_code: int = 4  # Don't compress CODE in last N messages (0 = disabled)
+    protect_analysis_context: bool = True  # Detect "analyze/review" intent, protect code
+
+    # CCR (Compress-Cache-Retrieve) settings for SmartCrusher
+    ccr_enabled: bool = True  # Enable CCR marker injection for reversible compression
+    ccr_inject_marker: bool = True  # Add retrieval markers to compressed content
 
 
 # Patterns for detecting mixed content
@@ -805,12 +817,18 @@ class ContentRouter(Transform):
         return self._code_compressor
 
     def _get_smart_crusher(self) -> Any:
-        """Get SmartCrusher (lazy load)."""
+        """Get SmartCrusher (lazy load) with CCR config."""
         if self._smart_crusher is None:
             try:
+                from ..config import CCRConfig
                 from .smart_crusher import SmartCrusher
 
-                self._smart_crusher = SmartCrusher()
+                # Pass CCR config for marker injection
+                ccr_config = CCRConfig(
+                    enabled=self.config.ccr_enabled,
+                    inject_retrieval_marker=self.config.ccr_inject_marker,
+                )
+                self._smart_crusher = SmartCrusher(ccr_config=ccr_config)
             except ImportError:
                 logger.debug("SmartCrusher not available")
         return self._smart_crusher
@@ -889,8 +907,35 @@ class ContentRouter(Transform):
         transforms_applied = []
         warnings: list[str] = []
 
+        # Check for analysis intent in the most recent user message
+        analysis_intent = False
+        if self.config.protect_analysis_context:
+            analysis_intent = self._detect_analysis_intent(messages)
+
+        num_messages = len(messages)
+
         for i, message in enumerate(messages):
+            role = message.get("role", "")
             content = message.get("content", "")
+
+            # Handle list content (Anthropic format with content blocks)
+            if isinstance(content, list):
+                transformed_message = self._process_content_blocks(
+                    message, content, context, transforms_applied
+                )
+                transformed_messages.append(transformed_message)
+                continue
+
+            # Skip non-string content (other types)
+            if not isinstance(content, str):
+                transformed_messages.append(message)
+                continue
+
+            # Protection 1: Never compress user messages
+            if self.config.skip_user_messages and role == "user":
+                transformed_messages.append(message)
+                transforms_applied.append("router:protected:user_message")
+                continue
 
             if not content or len(content.split()) < 50:
                 # Skip small content
@@ -899,6 +944,27 @@ class ContentRouter(Transform):
 
             # Get source hint if available
             source_hint = source_hints.get(i) or source_hints.get(str(i))
+
+            # Detect content type for protection decisions
+            detection = detect_content_type(content)
+            is_code = detection.content_type == ContentType.SOURCE_CODE
+
+            # Protection 2: Don't compress recent CODE
+            messages_from_end = num_messages - i
+            if (
+                self.config.protect_recent_code > 0
+                and messages_from_end <= self.config.protect_recent_code
+                and is_code
+            ):
+                transformed_messages.append(message)
+                transforms_applied.append("router:protected:recent_code")
+                continue
+
+            # Protection 3: Don't compress CODE when analysis intent detected
+            if analysis_intent and is_code:
+                transformed_messages.append(message)
+                transforms_applied.append("router:protected:analysis_context")
+                continue
 
             # Route and compress
             result = self.compress(content, source_hint=source_hint, context=context)
@@ -922,6 +988,139 @@ class ContentRouter(Transform):
             transforms_applied=transforms_applied if transforms_applied else ["router:noop"],
             warnings=warnings,
         )
+
+    def _process_content_blocks(
+        self,
+        message: dict[str, Any],
+        content_blocks: list[Any],
+        context: str,
+        transforms_applied: list[str],
+    ) -> dict[str, Any]:
+        """Process content blocks (Anthropic format) for tool_result compression.
+
+        Handles tool_result blocks by compressing their string content using
+        the appropriate strategy (typically SmartCrusher for JSON arrays).
+
+        Args:
+            message: The original message.
+            content_blocks: List of content blocks.
+            context: Context for compression.
+            transforms_applied: List to append transform names to.
+
+        Returns:
+            Transformed message with compressed content blocks.
+        """
+        import json
+
+        new_blocks = []
+        any_compressed = False
+
+        for block in content_blocks:
+            if not isinstance(block, dict):
+                new_blocks.append(block)
+                continue
+
+            block_type = block.get("type")
+
+            # Handle tool_result blocks
+            if block_type == "tool_result":
+                tool_content = block.get("content", "")
+
+                # Only process string content
+                if isinstance(tool_content, str) and len(tool_content) > 500:
+                    # Try to detect if it's JSON array data (SmartCrusher target)
+                    try:
+                        parsed = json.loads(tool_content)
+                        if isinstance(parsed, list) and len(parsed) > 10:
+                            # Route to SmartCrusher for arrays
+                            result = self.compress(
+                                tool_content,
+                                source_hint="json_array",
+                                context=context,
+                            )
+                            if result.compression_ratio < 0.9:
+                                new_blocks.append(
+                                    {
+                                        **block,
+                                        "content": result.compressed,
+                                    }
+                                )
+                                transforms_applied.append(
+                                    f"router:tool_result:{result.strategy_used.value}"
+                                )
+                                any_compressed = True
+                                continue
+                    except (json.JSONDecodeError, TypeError):
+                        # Not JSON, try general compression
+                        pass
+
+                    # Try general compression for large non-JSON content
+                    result = self.compress(tool_content, context=context)
+                    if result.compression_ratio < 0.9:
+                        new_blocks.append({**block, "content": result.compressed})
+                        transforms_applied.append(
+                            f"router:tool_result:{result.strategy_used.value}"
+                        )
+                        any_compressed = True
+                        continue
+
+            # Keep block unchanged
+            new_blocks.append(block)
+
+        if any_compressed:
+            return {**message, "content": new_blocks}
+        return message
+
+    def _detect_analysis_intent(self, messages: list[dict[str, Any]]) -> bool:
+        """Detect if user wants to analyze/review code.
+
+        Looks at the most recent user message for analysis keywords.
+
+        Args:
+            messages: Conversation messages.
+
+        Returns:
+            True if analysis intent detected.
+        """
+        # Analysis keywords that suggest user wants full code details
+        analysis_keywords = {
+            "analyze",
+            "analyse",
+            "review",
+            "audit",
+            "inspect",
+            "security",
+            "vulnerability",
+            "bug",
+            "issue",
+            "problem",
+            "explain",
+            "understand",
+            "how does",
+            "what does",
+            "debug",
+            "fix",
+            "error",
+            "wrong",
+            "broken",
+            "refactor",
+            "improve",
+            "optimize",
+            "clean up",
+        }
+
+        # Find most recent user message
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                content = message.get("content", "")
+                if isinstance(content, str):
+                    content_lower = content.lower()
+                    for keyword in analysis_keywords:
+                        if keyword in content_lower:
+                            return True
+                break
+
+        return False
 
     def should_apply(
         self,

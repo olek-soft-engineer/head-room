@@ -386,9 +386,8 @@ class LLMLinguaCompressor(Transform):
         if self.config.enable_ccr and ratio < 0.8:
             cache_key = self._store_in_ccr(content, compressed, original_tokens)
             if cache_key:
-                compressed += (
-                    f"\n[LLMLingua: {original_tokens}→{compressed_tokens} tokens. hash={cache_key}]"
-                )
+                # Use standard CCR marker format for CCRToolInjector detection
+                compressed += f"\n[{original_tokens} items compressed to {compressed_tokens}. Retrieve more: hash={cache_key}]"
 
         return LLMLinguaResult(
             compressed=compressed,

@@ -558,6 +558,12 @@ class CodeAwareCompressor(Transform):
             cache_key = None
             if self.config.enable_ccr and ratio < 0.8:
                 cache_key = self._store_in_ccr(code, compressed, original_tokens)
+                if cache_key:
+                    # Add standard CCR marker format for CCRToolInjector detection
+                    compressed += (
+                        f"\n# [{original_tokens} items compressed to {compressed_tokens}. "
+                        f"Retrieve more: hash={cache_key}]"
+                    )
 
             return CodeCompressionResult(
                 compressed=compressed,
@@ -785,7 +791,8 @@ class CodeAwareCompressor(Transform):
 
         if total_body > keep_lines:
             omitted = total_body - keep_lines
-            result_parts.append(f"{indent}# ... ({omitted} lines compressed)")
+            # Simple, honest marker - no retrieval hints (causes hallucination)
+            result_parts.append(f"{indent}# [{omitted} lines omitted]")
             result_parts.append(f"{indent}pass")
 
         return "\n".join(result_parts)

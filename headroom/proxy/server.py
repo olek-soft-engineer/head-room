@@ -28,6 +28,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import random
 import sys
 import time
@@ -63,7 +64,7 @@ from headroom.ccr import (
     ResponseHandlerConfig,
     parse_tool_call,
 )
-from headroom.config import CacheAlignerConfig, RollingWindowConfig, SmartCrusherConfig
+from headroom.config import CacheAlignerConfig, CCRConfig, RollingWindowConfig, SmartCrusherConfig
 from headroom.providers import AnthropicProvider, OpenAIProvider
 from headroom.telemetry import get_telemetry_collector
 from headroom.tokenizers import get_tokenizer
@@ -72,6 +73,8 @@ from headroom.transforms import (
     CacheAligner,
     CodeAwareCompressor,
     CodeCompressorConfig,
+    ContentRouter,
+    ContentRouterConfig,
     RollingWindow,
     SmartCrusher,
     TransformPipeline,
@@ -182,6 +185,9 @@ class ProxyConfig:
 
     # Code-aware compression (ON by default if installed)
     code_aware_enabled: bool = True  # Enable AST-based code compression
+
+    # Smart content routing (routes each message to optimal compressor)
+    smart_routing: bool = True  # Use ContentRouter for intelligent compression
 
     # Caching
     cache_enabled: bool = True
@@ -675,30 +681,54 @@ class HeadroomProxy:
         self.anthropic_provider = AnthropicProvider()
         self.openai_provider = OpenAIProvider()
 
-        # Initialize transforms
-        transforms = [
-            CacheAligner(CacheAlignerConfig(enabled=True)),
-            SmartCrusher(
-                SmartCrusherConfig(  # type: ignore[arg-type]
-                    enabled=True,
-                    min_tokens_to_crush=config.min_tokens_to_crush,
-                    max_items_after_crush=config.max_items_after_crush,
-                )
-            ),
-            RollingWindow(
-                RollingWindowConfig(
-                    enabled=True,
-                    keep_system=True,
-                    keep_last_turns=config.keep_last_turns,
-                )
-            ),
-        ]
-
-        # Add LLMLingua if enabled and available
-        self._llmlingua_status = self._setup_llmlingua(config, transforms)
-
-        # Add CodeAware if enabled and available
-        self._code_aware_status = self._setup_code_aware(config, transforms)
+        # Initialize transforms based on routing mode
+        if config.smart_routing:
+            # Smart routing: ContentRouter handles all content types intelligently
+            # It lazy-loads compressors (including LLMLingua) only when needed
+            router_config = ContentRouterConfig(
+                enable_llmlingua=config.llmlingua_enabled,
+                enable_code_aware=config.code_aware_enabled,
+            )
+            transforms = [
+                CacheAligner(CacheAlignerConfig(enabled=True)),
+                ContentRouter(router_config),
+                RollingWindow(
+                    RollingWindowConfig(
+                        enabled=True,
+                        keep_system=True,
+                        keep_last_turns=config.keep_last_turns,
+                    )
+                ),
+            ]
+            self._llmlingua_status = "lazy" if config.llmlingua_enabled else "disabled"
+            self._code_aware_status = "lazy" if config.code_aware_enabled else "disabled"
+        else:
+            # Legacy mode: sequential pipeline
+            transforms = [
+                CacheAligner(CacheAlignerConfig(enabled=True)),
+                SmartCrusher(
+                    SmartCrusherConfig(  # type: ignore[arg-type]
+                        enabled=True,
+                        min_tokens_to_crush=config.min_tokens_to_crush,
+                        max_items_after_crush=config.max_items_after_crush,
+                    ),
+                    ccr_config=CCRConfig(
+                        enabled=config.ccr_inject_tool,
+                        inject_retrieval_marker=config.ccr_inject_tool,  # Add CCR markers
+                    ),
+                ),
+                RollingWindow(
+                    RollingWindowConfig(
+                        enabled=True,
+                        keep_system=True,
+                        keep_last_turns=config.keep_last_turns,
+                    )
+                ),
+            ]
+            # Add LLMLingua if enabled and available
+            self._llmlingua_status = self._setup_llmlingua(config, transforms)
+            # Add CodeAware if enabled and available
+            self._code_aware_status = self._setup_code_aware(config, transforms)
 
         self.anthropic_pipeline = TransformPipeline(
             transforms=transforms,
@@ -873,24 +903,38 @@ class HeadroomProxy:
         logger.info(f"Caching: {'ENABLED' if self.config.cache_enabled else 'DISABLED'}")
         logger.info(f"Rate Limiting: {'ENABLED' if self.config.rate_limit_enabled else 'DISABLED'}")
 
+        # Smart routing status
+        if self.config.smart_routing:
+            logger.info("Smart Routing: ENABLED (intelligent content detection)")
+        else:
+            logger.info("Smart Routing: DISABLED (legacy sequential mode)")
+
         # LLMLingua status with helpful hint
         if self._llmlingua_status == "enabled":
             logger.info(
                 f"LLMLingua: ENABLED (device={self.config.llmlingua_device}, "
                 f"rate={self.config.llmlingua_target_rate})"
             )
+        elif self._llmlingua_status == "lazy":
+            logger.info("LLMLingua: LAZY (will load when prose content detected)")
         elif self._llmlingua_status == "available":
-            logger.info("LLMLingua: available but disabled (use without --no-llmlingua)")
+            logger.info("LLMLingua: available but disabled (use --llmlingua)")
         elif self._llmlingua_status == "unavailable":
             logger.info("LLMLingua: not installed (pip install headroom-ai[llmlingua])")
+        elif self._llmlingua_status == "disabled":
+            logger.info("LLMLingua: DISABLED")
 
         # Code-aware status
         if self._code_aware_status == "enabled":
             logger.info("Code-Aware: ENABLED (AST-based compression)")
+        elif self._code_aware_status == "lazy":
+            logger.info("Code-Aware: LAZY (will load when code content detected)")
         elif self._code_aware_status == "available":
-            logger.info("Code-Aware: available but disabled (use without --no-code-aware)")
+            logger.info("Code-Aware: available but disabled (use --code-aware)")
         elif self._code_aware_status == "unavailable":
             logger.info("Code-Aware: not installed (pip install headroom-ai[code])")
+        elif self._code_aware_status == "disabled":
+            logger.info("Code-Aware: DISABLED")
 
         # CCR status
         ccr_features = []
@@ -1233,6 +1277,7 @@ class HeadroomProxy:
                     logger.info(f"[{request_id}] CCR: Detected retrieval tool call, handling...")
 
                     # Create API call function for continuation
+                    # Use a fresh client to avoid potential decompression state issues
                     async def api_call_fn(
                         msgs: list[dict], tls: list[dict] | None
                     ) -> dict[str, Any]:
@@ -1242,11 +1287,44 @@ class HeadroomProxy:
                         }
                         if tls is not None:
                             continuation_body["tools"] = tls
-                        cont_response = await self._retry_request(
-                            "POST", url, headers, continuation_body
-                        )
-                        result: dict[str, Any] = cont_response.json()
-                        return result
+
+                        # Use clean headers for continuation
+                        continuation_headers = {
+                            k: v
+                            for k, v in headers.items()
+                            if k.lower()
+                            not in (
+                                "content-encoding",
+                                "transfer-encoding",
+                                "accept-encoding",
+                                "content-length",
+                            )
+                        }
+
+                        # Use a fresh client for CCR continuations
+                        logger.info(f"CCR: Making continuation request with {len(msgs)} messages")
+                        async with httpx.AsyncClient(
+                            timeout=httpx.Timeout(120.0),
+                        ) as ccr_client:
+                            try:
+                                cont_response = await ccr_client.post(
+                                    url,
+                                    json=continuation_body,
+                                    headers=continuation_headers,
+                                )
+                                logger.info(
+                                    f"CCR: Got response status={cont_response.status_code}, "
+                                    f"content-encoding={cont_response.headers.get('content-encoding')}"
+                                )
+                                result: dict[str, Any] = cont_response.json()
+                                logger.info("CCR: Parsed JSON successfully")
+                                return result
+                            except Exception as e:
+                                logger.error(
+                                    f"CCR: API call failed: {e}, "
+                                    f"response headers: {dict(cont_response.headers) if 'cont_response' in dir() else 'N/A'}"
+                                )
+                                raise
 
                     # Handle CCR tool calls
                     try:
@@ -1259,14 +1337,25 @@ class HeadroomProxy:
                         )
                         # Update response content with final response
                         resp_json = final_resp_json
+                        # Remove encoding headers since content is now uncompressed JSON
+                        ccr_response_headers = {
+                            k: v
+                            for k, v in response.headers.items()
+                            if k.lower() not in ("content-encoding", "content-length")
+                        }
                         response = httpx.Response(
                             status_code=200,
                             content=json.dumps(final_resp_json).encode(),
-                            headers=dict(response.headers),
+                            headers=ccr_response_headers,
                         )
                         logger.info(f"[{request_id}] CCR: Retrieval handled successfully")
                     except Exception as e:
-                        logger.warning(f"[{request_id}] CCR: Response handling failed: {e}")
+                        import traceback
+
+                        logger.warning(
+                            f"[{request_id}] CCR: Response handling failed: {e}\n"
+                            f"Traceback: {traceback.format_exc()}"
+                        )
                         # Continue with original response
 
                 total_latency = (time.time() - start_time) * 1000
@@ -2203,6 +2292,41 @@ def run_server(config: ProxyConfig | None = None):
     uvicorn.run(app, host=config.host, port=config.port, log_level="warning")
 
 
+def _get_env_bool(name: str, default: bool) -> bool:
+    """Get boolean from environment variable."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.lower() in ("true", "1", "yes", "on")
+
+
+def _get_env_int(name: str, default: int) -> int:
+    """Get integer from environment variable."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+def _get_env_float(name: str, default: float) -> float:
+    """Get float from environment variable."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        return default
+
+
+def _get_env_str(name: str, default: str) -> str:
+    """Get string from environment variable."""
+    return os.environ.get(name, default)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Headroom Proxy Server")
 
@@ -2232,11 +2356,23 @@ if __name__ == "__main__":
     parser.add_argument("--log-file", help="Log file path")
     parser.add_argument("--log-messages", action="store_true", help="Log full messages")
 
+    # Smart routing (content-aware compression)
+    parser.add_argument(
+        "--no-smart-routing",
+        action="store_true",
+        help="Disable smart routing (use legacy sequential pipeline)",
+    )
+
     # LLMLingua ML-based compression
     parser.add_argument(
         "--llmlingua",
         action="store_true",
         help="Enable LLMLingua-2 ML-based compression (requires: pip install headroom-ai[llmlingua])",
+    )
+    parser.add_argument(
+        "--no-llmlingua",
+        action="store_true",
+        help="Disable LLMLingua compression",
     )
     parser.add_argument(
         "--llmlingua-device",
@@ -2251,26 +2387,68 @@ if __name__ == "__main__":
         help="LLMLingua target compression rate, 0.0-1.0 (default: 0.3 = keep 30%%)",
     )
 
+    # Code-aware compression
+    parser.add_argument(
+        "--code-aware",
+        action="store_true",
+        help="Enable AST-based code compression (requires: pip install headroom-ai[code])",
+    )
+    parser.add_argument(
+        "--no-code-aware",
+        action="store_true",
+        help="Disable code-aware compression",
+    )
+
     args = parser.parse_args()
 
+    # Environment variable defaults (HEADROOM_* prefix)
+    # CLI args override env vars, env vars override ProxyConfig defaults
+    env_smart_routing = _get_env_bool("HEADROOM_SMART_ROUTING", True)
+    env_llmlingua = _get_env_bool("HEADROOM_LLMLINGUA_ENABLED", True)
+    env_code_aware = _get_env_bool("HEADROOM_CODE_AWARE_ENABLED", True)
+    env_optimize = _get_env_bool("HEADROOM_OPTIMIZE", True)
+    env_cache = _get_env_bool("HEADROOM_CACHE_ENABLED", True)
+    env_rate_limit = _get_env_bool("HEADROOM_RATE_LIMIT_ENABLED", True)
+
+    # Determine settings: CLI flags override env vars
+    # --no-X explicitly disables, --X explicitly enables, neither uses env var
+    smart_routing = env_smart_routing if not args.no_smart_routing else False
+    llmlingua_enabled = (
+        env_llmlingua
+        if not (args.llmlingua or args.no_llmlingua)
+        else (args.llmlingua or not args.no_llmlingua)
+    )
+    code_aware_enabled = (
+        env_code_aware
+        if not (args.code_aware or args.no_code_aware)
+        else (args.code_aware or not args.no_code_aware)
+    )
+    optimize = env_optimize if not args.no_optimize else False
+    cache_enabled = env_cache if not args.no_cache else False
+    rate_limit_enabled = env_rate_limit if not args.no_rate_limit else False
+
     config = ProxyConfig(
-        host=args.host,
-        port=args.port,
-        optimize=not args.no_optimize,
-        min_tokens_to_crush=args.min_tokens,
-        max_items_after_crush=args.max_items,
-        cache_enabled=not args.no_cache,
-        cache_ttl_seconds=args.cache_ttl,
-        rate_limit_enabled=not args.no_rate_limit,
-        rate_limit_requests_per_minute=args.rpm,
-        rate_limit_tokens_per_minute=args.tpm,
+        host=_get_env_str("HEADROOM_HOST", args.host),
+        port=_get_env_int("HEADROOM_PORT", args.port),
+        optimize=optimize,
+        min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", args.min_tokens),
+        max_items_after_crush=_get_env_int("HEADROOM_MAX_ITEMS", args.max_items),
+        cache_enabled=cache_enabled,
+        cache_ttl_seconds=_get_env_int("HEADROOM_CACHE_TTL", args.cache_ttl),
+        rate_limit_enabled=rate_limit_enabled,
+        rate_limit_requests_per_minute=_get_env_int("HEADROOM_RPM", args.rpm),
+        rate_limit_tokens_per_minute=_get_env_int("HEADROOM_TPM", args.tpm),
         budget_limit_usd=args.budget,
         budget_period=args.budget_period,
-        log_file=args.log_file,
-        log_full_messages=args.log_messages,
-        llmlingua_enabled=args.llmlingua,
-        llmlingua_device=args.llmlingua_device,
-        llmlingua_target_rate=args.llmlingua_rate,
+        log_file=_get_env_str("HEADROOM_LOG_FILE", args.log_file)
+        if args.log_file
+        else os.environ.get("HEADROOM_LOG_FILE"),
+        log_full_messages=args.log_messages or _get_env_bool("HEADROOM_LOG_MESSAGES", False),
+        smart_routing=smart_routing,
+        llmlingua_enabled=llmlingua_enabled,
+        llmlingua_device=_get_env_str("HEADROOM_LLMLINGUA_DEVICE", args.llmlingua_device),
+        llmlingua_target_rate=_get_env_float("HEADROOM_LLMLINGUA_RATE", args.llmlingua_rate),
+        code_aware_enabled=code_aware_enabled,
     )
 
     run_server(config)

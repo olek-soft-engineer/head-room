@@ -698,6 +698,19 @@ class CompressionPlan:
 
 
 @dataclass
+class CrushResult:
+    """Result from SmartCrusher.crush() method.
+
+    Used by ContentRouter when routing JSON arrays to SmartCrusher.
+    """
+
+    compressed: str
+    original: str
+    was_modified: bool
+    strategy: str = "passthrough"
+
+
+@dataclass
 class SmartCrusherConfig:
     """Configuration for smart crusher.
 
@@ -1324,6 +1337,29 @@ class SmartCrusher(Transform):
 
         # NOTE: Error detection now uses structural outlier detection (_detect_structural_outliers)
         # instead of hardcoded keywords. This scales to any data domain.
+
+    def crush(self, content: str, query: str = "") -> CrushResult:
+        """Crush content string directly (for use by ContentRouter).
+
+        This is a simplified interface for compressing a single content string,
+        used by ContentRouter when routing JSON arrays to SmartCrusher.
+
+        Args:
+            content: JSON string content to compress.
+            query: Query context for relevance-based compression.
+
+        Returns:
+            CrushResult with compressed content and metadata.
+        """
+        compressed, was_modified, analysis_info = self._smart_crush_content(
+            content, query_context=query
+        )
+        return CrushResult(
+            compressed=compressed,
+            original=content,
+            was_modified=was_modified,
+            strategy=analysis_info or "passthrough",
+        )
 
     def _get_compression_store(self) -> CompressionStore:
         """Get the compression store for CCR (lazy initialization).
