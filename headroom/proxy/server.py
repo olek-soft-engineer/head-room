@@ -2567,7 +2567,9 @@ if __name__ == "__main__":
     # Server
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
-    parser.add_argument("--openai-api-url", help=f"Custom OpenAI API URL (default: {HeadroomProxy.OPENAI_API_URL})")
+    parser.add_argument(
+        "--openai-api-url", help=f"Custom OpenAI API URL (default: {HeadroomProxy.OPENAI_API_URL})"
+    )
 
     # Optimization
     parser.add_argument("--no-optimize", action="store_true", help="Disable optimization")

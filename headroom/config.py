@@ -384,6 +384,12 @@ class HeadroomConfig:
     cache_optimizer: CacheOptimizerConfig = field(default_factory=CacheOptimizerConfig)
     ccr: CCRConfig = field(default_factory=CCRConfig)  # Compress-Cache-Retrieve
 
+    # Intelligent context management (Phase 2.5)
+    # When enabled, replaces RollingWindow with semantic-aware context management
+    intelligent_context: IntelligentContextConfig = field(
+        default_factory=lambda: IntelligentContextConfig(enabled=False)
+    )
+
     # Debugging - opt-in diff artifact generation
     generate_diff_artifact: bool = False  # Enable to get detailed transform diffs
 

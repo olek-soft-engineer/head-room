@@ -9,6 +9,7 @@ from ..config import (
     CacheAlignerConfig,
     DiffArtifact,
     HeadroomConfig,
+    IntelligentContextConfig,
     RollingWindowConfig,
     ToolCrusherConfig,
     TransformDiff,
@@ -18,6 +19,7 @@ from ..tokenizer import Tokenizer
 from ..utils import deep_copy_messages
 from .base import Transform
 from .cache_aligner import CacheAligner
+from .intelligent_context import IntelligentContextManager
 from .rolling_window import RollingWindow
 from .smart_crusher import SmartCrusher
 from .tool_crusher import ToolCrusher
@@ -93,8 +95,17 @@ class TransformPipeline:
             # Fallback to fixed-rule crushing
             transforms.append(ToolCrusher(self.config.tool_crusher))
 
-        # 3. Rolling Window (enforce limits last)
-        if self.config.rolling_window.enabled:
+        # 3. Context Management (enforce limits last)
+        # IntelligentContextManager takes precedence over RollingWindow when enabled
+        if self.config.intelligent_context.enabled:
+            # Use semantic-aware context management with scoring
+            transforms.append(IntelligentContextManager(self.config.intelligent_context))
+            logger.info(
+                "Pipeline using IntelligentContextManager with strategies: "
+                "COMPRESS_FIRST -> SUMMARIZE -> DROP_BY_SCORE"
+            )
+        elif self.config.rolling_window.enabled:
+            # Fallback to position-based rolling window
             transforms.append(RollingWindow(self.config.rolling_window))
 
         return transforms
@@ -273,6 +284,7 @@ def create_pipeline(
     tool_crusher_config: ToolCrusherConfig | None = None,
     cache_aligner_config: CacheAlignerConfig | None = None,
     rolling_window_config: RollingWindowConfig | None = None,
+    intelligent_context_config: IntelligentContextConfig | None = None,
 ) -> TransformPipeline:
     """
     Create a pipeline with specific configurations.
@@ -281,6 +293,9 @@ def create_pipeline(
         tool_crusher_config: Tool crusher configuration.
         cache_aligner_config: Cache aligner configuration.
         rolling_window_config: Rolling window configuration.
+        intelligent_context_config: Intelligent context configuration.
+            When provided with enabled=True, replaces RollingWindow with
+            semantic-aware context management.
 
     Returns:
         Configured TransformPipeline.
@@ -293,5 +308,7 @@ def create_pipeline(
         config.cache_aligner = cache_aligner_config
     if rolling_window_config is not None:
         config.rolling_window = rolling_window_config
+    if intelligent_context_config is not None:
+        config.intelligent_context = intelligent_context_config
 
     return TransformPipeline(config)

@@ -266,6 +266,7 @@ class HeadroomClient:
         cache_optimizer: BaseCacheOptimizer | None = None,
         enable_cache_optimizer: bool = True,
         enable_semantic_cache: bool = False,
+        config: HeadroomConfig | None = None,
     ):
         """
         Initialize HeadroomClient.
@@ -280,6 +281,9 @@ class HeadroomClient:
                 enable_cache_optimizer=True, auto-detects from provider.
             enable_cache_optimizer: Enable provider-specific cache optimization.
             enable_semantic_cache: Enable query-level semantic caching.
+            config: Optional HeadroomConfig for full control over all settings
+                including intelligent_context. When provided, takes precedence
+                over individual settings like store_url, default_mode, etc.
         """
         self._original = original_client
         self._provider = provider
@@ -295,12 +299,22 @@ class HeadroomClient:
         self._store_url = store_url
         self._default_mode = HeadroomMode(default_mode)
 
-        # Build config
-        self._config = HeadroomConfig()
-        self._config.store_url = store_url
-        self._config.default_mode = self._default_mode
-        self._config.cache_optimizer.enabled = enable_cache_optimizer
-        self._config.cache_optimizer.enable_semantic_cache = enable_semantic_cache
+        # Use provided config or build from individual parameters
+        if config is not None:
+            self._config = config
+            # Override store_url and mode if explicitly provided in config
+            if config.store_url:
+                self._store_url = config.store_url
+            else:
+                self._config.store_url = store_url
+            self._default_mode = config.default_mode
+        else:
+            # Build config from individual parameters
+            self._config = HeadroomConfig()
+            self._config.store_url = store_url
+            self._config.default_mode = self._default_mode
+            self._config.cache_optimizer.enabled = enable_cache_optimizer
+            self._config.cache_optimizer.enable_semantic_cache = enable_semantic_cache
 
         if model_context_limits:
             self._config.model_context_limits.update(model_context_limits)
