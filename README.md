@@ -122,14 +122,61 @@ Run it yourself: `python examples/multi_tool_agent_test.py`
 
 ## How It Works
 
-Headroom doesn't summarize or truncate blindly. It uses **statistical analysis**:
+> Headroom optimizes LLM context *before* it hits the provider —
+> without changing your agent logic or tools.
 
-1. **Detects redundancy** - Repeated fields like `"language": "typescript"` across 100 items
-2. **Keeps what matters** - First items, last items, query-relevant matches, anomalies
-3. **Preserves errors** - Never drops items containing "error", "exception", "failed"
-4. **Maintains schema** - Output JSON structure stays identical
+```mermaid
+flowchart LR
+  User["Your App"]
+  Entry["Headroom"]
+  Transform["Context<br/>Optimization"]
+  LLM["LLM Provider"]
+  Response["Response"]
 
-The compression is **reversible** via CCR (Compress-Cache-Retrieve). If the LLM needs more data, it can request the original.
+  User --> Entry --> Transform --> LLM --> Response
+```
+
+### Inside Headroom
+
+```mermaid
+flowchart TB
+
+subgraph Pipeline["Transform Pipeline"]
+  CA["Cache Aligner<br/><i>Stabilizes dynamic tokens</i>"]
+  SC["Smart Crusher<br/><i>Removes redundant tool output</i>"]
+  CM["Context Manager<br/><i>Fits token budget</i>"]
+  CA --> SC --> CM
+end
+
+subgraph CCR["CCR: Compress-Cache-Retrieve"]
+  Store[("Compressed<br/>Store")]
+  Tool["Retrieve Tool"]
+  Tool <--> Store
+end
+
+LLM["LLM Provider"]
+
+CM --> LLM
+SC -. "Stores originals" .-> Store
+LLM -. "Requests full context<br/>if needed" .-> Tool
+```
+
+> Headroom never throws data away.
+> It compresses aggressively and retrieves precisely.
+
+### What actually happens
+
+1. **Headroom intercepts context** — Tool outputs, logs, search results, and intermediate agent steps.
+
+2. **Dynamic content is stabilized** — Timestamps, UUIDs, request IDs are normalized so prompts cache cleanly.
+
+3. **Low-signal content is removed** — Repetitive or redundant data is crushed, not truncated.
+
+4. **Original data is preserved** — Full content is stored separately and retrieved *only if the LLM asks*.
+
+5. **Provider caches finally work** — Headroom aligns prompts so OpenAI, Anthropic, and Google caches actually hit.
+
+For deep technical details, see [Architecture Documentation](docs/ARCHITECTURE.md).
 
 ---
 

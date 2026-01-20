@@ -1,5 +1,51 @@
 # Headroom SDK: A Complete Explanation
 
+## Architecture Overview
+
+```mermaid
+flowchart TB
+    subgraph Entry["Entry Points"]
+        Proxy["Proxy Mode<br/><i>Zero code changes</i>"]
+        SDK["SDK Mode<br/><i>HeadroomClient</i>"]
+        Integrations["Integrations<br/><i>LangChain / Agno</i>"]
+    end
+
+    subgraph Pipeline["Transform Pipeline"]
+        direction TB
+
+        CA["Cache Aligner<br/>━━━━━━━━━━━━━━━<br/>Extracts dynamic content<br/>(dates, UUIDs, tokens)<br/>Stable prefix for caching"]
+
+        SC["Smart Crusher<br/>━━━━━━━━━━━━━━━<br/>Analyzes tool outputs<br/>Keeps: first, last, errors, outliers<br/>70-95% reduction"]
+
+        CM["Context Manager<br/>━━━━━━━━━━━━━━━<br/>Enforces token limits<br/>Scores by recency and relevance<br/>Fits context window"]
+
+        CA --> SC --> CM
+    end
+
+    subgraph Cache["Provider Cache Optimization"]
+        direction LR
+        Anthropic["Anthropic<br/><i>cache_control blocks</i><br/>90% savings"]
+        OpenAI["OpenAI<br/><i>Prefix alignment</i><br/>50% savings"]
+        Google["Google<br/><i>CachedContent API</i><br/>75% savings"]
+    end
+
+    subgraph CCR["CCR: Compress-Cache-Retrieve"]
+        Store[("Compression<br/>Store")]
+        Tool["Retrieve Tool<br/><i>LLM requests original</i>"]
+        Store <--> Tool
+    end
+
+    LLM["LLM API<br/><i>OpenAI / Anthropic / Google</i>"]
+
+    Entry --> Pipeline
+    Pipeline --> Cache
+    Cache --> LLM
+    SC -.->|"Stores original"| Store
+    LLM -.->|"If needed"| Tool
+```
+
+---
+
 ## What Problem Does Headroom Solve?
 
 When you use AI models like GPT-4 or Claude, you pay for **tokens** - the pieces of text you send (input) and receive (output). The problem is:
