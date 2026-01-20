@@ -18,6 +18,9 @@
   <a href="https://pypi.org/project/headroom-ai/">
     <img src="https://img.shields.io/pypi/pyversions/headroom-ai.svg" alt="Python">
   </a>
+  <a href="https://pypistats.org/packages/headroom-ai">
+    <img src="https://img.shields.io/pypi/dm/headroom-ai.svg" alt="Downloads">
+  </a>
   <a href="https://github.com/chopratejas/headroom/blob/main/LICENSE">
     <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License">
   </a>
