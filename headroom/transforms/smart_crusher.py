@@ -54,7 +54,7 @@ from typing import Any
 
 from ..cache.compression_feedback import CompressionFeedback, get_compression_feedback
 from ..cache.compression_store import CompressionStore, get_compression_store
-from ..config import CCRConfig, RelevanceScorerConfig, TransformResult
+from ..config import AnchorConfig, CCRConfig, RelevanceScorerConfig, TransformResult
 from ..relevance import RelevanceScorer, create_scorer
 from ..telemetry import TelemetryCollector, ToolSignature, get_telemetry_collector
 from ..telemetry.models import FieldSemantics
@@ -67,6 +67,8 @@ from ..utils import (
     safe_json_dumps,
     safe_json_loads,
 )
+from .anchor_selector import AnchorSelector
+from .anchor_selector import DataPattern as AnchorDataPattern
 from .base import Transform
 
 logger = logging.getLogger(__name__)
@@ -813,6 +815,9 @@ class SmartCrusherConfig:
     # Minimum confidence required to apply TOIN recommendations
     toin_confidence_threshold: float = 0.5
 
+    # Content deduplication - prevents wasting slots on identical items
+    dedup_identical_items: bool = True
+
 
 class SmartAnalyzer:
     """Analyzes JSON arrays to determine optimal compression strategy."""
@@ -1412,8 +1417,28 @@ class SmartCrusher(Transform):
         rel_cfg = relevance_config or RelevanceScorerConfig()
         self._relevance_threshold = rel_cfg.relevance_threshold
 
+        # Initialize AnchorSelector for dynamic position-based preservation
+        anchor_config = self.config.anchor if hasattr(self.config, 'anchor') else AnchorConfig()
+        self._anchor_selector = AnchorSelector(anchor_config)
+
         # NOTE: Error detection now uses structural outlier detection (_detect_structural_outliers)
         # instead of hardcoded keywords. This scales to any data domain.
+
+    def _map_to_anchor_pattern(self, strategy: CompressionStrategy) -> AnchorDataPattern:
+        """Map SmartCrusher compression strategy to AnchorSelector data pattern.
+
+        Args:
+            strategy: The detected compression strategy.
+
+        Returns:
+            Corresponding AnchorDataPattern for anchor selection.
+        """
+        return {
+            CompressionStrategy.TIME_SERIES: AnchorDataPattern.TIME_SERIES,
+            CompressionStrategy.TOP_N: AnchorDataPattern.SEARCH_RESULTS,
+            CompressionStrategy.CLUSTER_SAMPLE: AnchorDataPattern.LOGS,
+            CompressionStrategy.SMART_SAMPLE: AnchorDataPattern.GENERIC,
+        }.get(strategy, AnchorDataPattern.GENERIC)
 
     def crush(self, content: str, query: str = "") -> CrushResult:
         """Crush content string directly (for use by ContentRouter).
@@ -1554,6 +1579,178 @@ class SmartCrusher(Transform):
             # Telemetry should never break compression
             pass
 
+    def _deduplicate_indices_by_content(
+        self,
+        keep_indices: set[int],
+        items: list[dict],
+    ) -> set[int]:
+        """Deduplicate indices by content hash, preferring lower indices.
+
+        When multiple indices contain identical content, only the lowest index
+        is kept. This maximizes information density in the compressed output.
+
+        Enterprise considerations:
+        - Thread-safe: No shared state modified
+        - Performance: O(n) single pass with hash map
+        - Memory: O(n) for hash storage (16-char hashes)
+        - Fault-tolerant: Serialization errors preserve the item
+
+        Args:
+            keep_indices: Set of indices to deduplicate.
+            items: The items array for content lookup.
+
+        Returns:
+            Deduplicated set of indices (may be smaller than input).
+        """
+        if not keep_indices:
+            return keep_indices
+
+        # Track first occurrence of each content hash
+        # Using dict[hash -> lowest_index] for O(1) lookup
+        seen_hashes: dict[str, int] = {}
+        duplicates_removed = 0
+
+        # Process in sorted order to ensure deterministic "lowest index wins"
+        for idx in sorted(keep_indices):
+            # Bounds check
+            if idx < 0 or idx >= len(items):
+                continue
+
+            item = items[idx]
+
+            # Compute content hash
+            try:
+                if isinstance(item, dict):
+                    # Canonical JSON serialization for consistent hashing
+                    content = json.dumps(item, sort_keys=True, default=str)
+                else:
+                    # Non-dict items: use string representation
+                    content = str(item)
+                item_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+            except (TypeError, ValueError, RecursionError) as e:
+                # Serialization failed - keep the item (fail-safe)
+                logger.debug(
+                    "Dedup hash failed for item at index %d: %s. Keeping item.", idx, e
+                )
+                # Use index as unique "hash" to ensure item is kept
+                item_hash = f"__idx_{idx}__"
+
+            # First occurrence wins
+            if item_hash not in seen_hashes:
+                seen_hashes[item_hash] = idx
+            else:
+                duplicates_removed += 1
+
+        # Log deduplication stats for observability
+        if duplicates_removed > 0:
+            logger.debug(
+                "Content deduplication removed %d duplicate items from %d candidates "
+                "(%.1f%% reduction). Unique items: %d",
+                duplicates_removed,
+                len(keep_indices),
+                100 * duplicates_removed / len(keep_indices),
+                len(seen_hashes),
+            )
+
+        return set(seen_hashes.values())
+
+    def _fill_remaining_slots(
+        self,
+        keep_indices: set[int],
+        items: list[dict],
+        n: int,
+        effective_max: int,
+    ) -> set[int]:
+        """Fill remaining slots with unique items when under budget.
+
+        When deduplication reduces keep_indices below effective_max, this method
+        fills the remaining slots with diverse items from the array. It:
+        1. Computes content hashes for already-kept items
+        2. Scans array for items with unique content not yet kept
+        3. Distributes new items evenly across the array for coverage
+
+        Enterprise considerations:
+        - Thread-safe: No shared state modified
+        - Performance: O(n) for hash computation, O(n) for filling
+        - Memory: O(k) where k = len(keep_indices) for hash storage
+        - Deterministic: Same input always produces same output
+
+        Args:
+            keep_indices: Current set of indices to keep (already deduplicated).
+            items: The full items array.
+            n: Total number of items.
+            effective_max: Target maximum items.
+
+        Returns:
+            Updated set of indices, filled up to effective_max with unique items.
+        """
+        remaining_slots = effective_max - len(keep_indices)
+        if remaining_slots <= 0:
+            return keep_indices
+
+        # Build set of content hashes for items we're already keeping
+        seen_hashes: set[str] = set()
+        for idx in keep_indices:
+            if 0 <= idx < n:
+                item = items[idx]
+                try:
+                    if isinstance(item, dict):
+                        content = json.dumps(item, sort_keys=True, default=str)
+                    else:
+                        content = str(item)
+                    seen_hashes.add(hashlib.sha256(content.encode()).hexdigest()[:16])
+                except (TypeError, ValueError, RecursionError):
+                    pass  # Skip hash computation failures
+
+        # Find candidate indices not in keep_indices
+        candidates = [i for i in range(n) if i not in keep_indices]
+        if not candidates:
+            return keep_indices
+
+        # Distribute selection evenly across the array for coverage
+        # Use stride-based sampling to avoid clustering
+        result = keep_indices.copy()
+        added = 0
+
+        # Calculate step size for even distribution
+        step = max(1, len(candidates) // (remaining_slots + 1))
+
+        # First pass: evenly distributed unique items
+        for start_offset in range(step):
+            if added >= remaining_slots:
+                break
+            for i in range(start_offset, len(candidates), step):
+                if added >= remaining_slots:
+                    break
+                idx = candidates[i]
+                item = items[idx]
+
+                # Check if this item's content is unique
+                try:
+                    if isinstance(item, dict):
+                        content = json.dumps(item, sort_keys=True, default=str)
+                    else:
+                        content = str(item)
+                    item_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+                except (TypeError, ValueError, RecursionError):
+                    # Hash failure - use index as unique hash (fail-safe)
+                    item_hash = f"__idx_{idx}__"
+
+                if item_hash not in seen_hashes:
+                    result.add(idx)
+                    seen_hashes.add(item_hash)
+                    added += 1
+
+        if added > 0:
+            logger.debug(
+                "Filled %d remaining slots (from %d to %d items) after deduplication",
+                added,
+                len(keep_indices),
+                len(result),
+            )
+
+        return result
+
     def _prioritize_indices(
         self,
         keep_indices: set[int],
@@ -1595,6 +1792,31 @@ class SmartCrusher(Transform):
         """
         # Use provided max_items or fall back to config
         effective_max = max_items if max_items is not None else self.config.max_items_after_crush
+
+        # === ENTERPRISE FIX: Content-based deduplication ===
+        # Multiple preservation mechanisms (anchors, anomalies, outliers, etc.) can add
+        # the same item multiple times by index. More critically, different INDICES can
+        # contain IDENTICAL content (e.g., 10 identical status messages at indices 0-9).
+        # Without deduplication, we waste slots on redundant information.
+        #
+        # This deduplication runs FIRST, before any other logic, to ensure:
+        # 1. Budget calculations work with unique items only
+        # 2. Critical item detection doesn't double-count
+        # 3. Final output maximizes information density
+        #
+        # Performance: O(n) where n = len(keep_indices), single pass with hash map
+        # Memory: O(n) for hash storage, hashes are 16 chars each
+        if self.config.dedup_identical_items:
+            keep_indices = self._deduplicate_indices_by_content(keep_indices, items)
+
+        # === ENTERPRISE FIX: Fill up to max_items when under budget ===
+        # After deduplication, we may have fewer unique items than max_items.
+        # Instead of returning a sparse result, fill remaining slots with
+        # diverse items from the array. This maximizes information density.
+        if len(keep_indices) < effective_max and len(keep_indices) < n:
+            keep_indices = self._fill_remaining_slots(
+                keep_indices, items, n, effective_max
+            )
 
         if len(keep_indices) <= effective_max:
             return keep_indices
@@ -2270,15 +2492,17 @@ class SmartCrusher(Transform):
         n = len(items)
         keep_indices = set()
 
-        # 1. First 3 items
-        for i in range(min(3, n)):
-            keep_indices.add(i)
+        # 1. Dynamic anchor selection (replaces static first 3 + last 2)
+        anchor_pattern = self._map_to_anchor_pattern(CompressionStrategy.TIME_SERIES)
+        anchor_indices = self._anchor_selector.select_anchors(
+            items=items,
+            max_items=effective_max,
+            pattern=anchor_pattern,
+            query=query_context or None,
+        )
+        keep_indices.update(anchor_indices)
 
-        # 2. Last 2 items
-        for i in range(max(0, n - 2), n):
-            keep_indices.add(i)
-
-        # 3. Items around change points from numeric fields
+        # 2. Items around change points from numeric fields
         for stats in analysis.field_stats.values():
             if stats.change_points:
                 for cp in stats.change_points:
@@ -2288,16 +2512,16 @@ class SmartCrusher(Transform):
                         if 0 <= idx < n:
                             keep_indices.add(idx)
 
-        # 4. Structural outlier items (STATISTICAL detection - no hardcoded keywords)
+        # 3. Structural outlier items (STATISTICAL detection - no hardcoded keywords)
         outlier_indices = _detect_structural_outliers(items)
         keep_indices.update(outlier_indices)
 
-        # 4b. Error items via KEYWORD detection (PRESERVATION GUARANTEE)
+        # 3b. Error items via KEYWORD detection (PRESERVATION GUARANTEE)
         # This is critical - errors must ALWAYS be preserved regardless of structure
         error_indices = _detect_error_items_for_preservation(items)
         keep_indices.update(error_indices)
 
-        # 5. Items matching query anchors (DETERMINISTIC exact match)
+        # 4. Items matching query anchors (DETERMINISTIC exact match)
         # Anchors provide reliable preservation for specific entity lookups (UUIDs, IDs, names)
         if query_context:
             anchors = extract_query_anchors(query_context)
@@ -2305,7 +2529,7 @@ class SmartCrusher(Transform):
                 if item_matches_anchors(item, anchors):
                     keep_indices.add(i)
 
-        # 6. Items with high relevance to query context (PROBABILISTIC semantic match)
+        # 5. Items with high relevance to query context (PROBABILISTIC semantic match)
         if query_context:
             item_strs = [json.dumps(item, default=str) for item in items]
             scores = self._scorer.score_batch(item_strs, query_context)
@@ -2313,7 +2537,7 @@ class SmartCrusher(Transform):
                 if score.score >= self._relevance_threshold:
                     keep_indices.add(i)
 
-        # 6b. TOIN preserve_fields: boost items where query matches these fields
+        # 5b. TOIN preserve_fields: boost items where query matches these fields
         # Note: preserve_fields are SHA256[:8] hashes, use helper to match
         if preserve_fields and query_context:
             for i, item in enumerate(items):
@@ -2350,24 +2574,26 @@ class SmartCrusher(Transform):
         n = len(items)
         keep_indices = set()
 
-        # 1. First 3 items
-        for i in range(min(3, n)):
-            keep_indices.add(i)
+        # 1. Dynamic anchor selection (replaces static first 3 + last 2)
+        anchor_pattern = self._map_to_anchor_pattern(CompressionStrategy.CLUSTER_SAMPLE)
+        anchor_indices = self._anchor_selector.select_anchors(
+            items=items,
+            max_items=effective_max,
+            pattern=anchor_pattern,
+            query=query_context or None,
+        )
+        keep_indices.update(anchor_indices)
 
-        # 2. Last 2 items
-        for i in range(max(0, n - 2), n):
-            keep_indices.add(i)
-
-        # 3. Structural outlier items (STATISTICAL detection - no hardcoded keywords)
+        # 2. Structural outlier items (STATISTICAL detection - no hardcoded keywords)
         outlier_indices = _detect_structural_outliers(items)
         keep_indices.update(outlier_indices)
 
-        # 3b. Error items via KEYWORD detection (PRESERVATION GUARANTEE)
+        # 2b. Error items via KEYWORD detection (PRESERVATION GUARANTEE)
         # This is critical - errors must ALWAYS be preserved regardless of structure
         error_indices = _detect_error_items_for_preservation(items)
         keep_indices.update(error_indices)
 
-        # 4. Cluster by message-like field and keep representatives
+        # 3. Cluster by message-like field and keep representatives
         # Find a high-cardinality string field (likely message field)
         message_field = None
         max_uniqueness = 0.0
@@ -2395,7 +2621,7 @@ class SmartCrusher(Transform):
                 for idx in indices[:2]:
                     keep_indices.add(idx)
 
-        # 5. Items matching query anchors (DETERMINISTIC exact match)
+        # 4. Items matching query anchors (DETERMINISTIC exact match)
         # Anchors provide reliable preservation for specific entity lookups (UUIDs, IDs, names)
         if query_context:
             anchors = extract_query_anchors(query_context)
@@ -2403,7 +2629,7 @@ class SmartCrusher(Transform):
                 if item_matches_anchors(item, anchors):
                     keep_indices.add(i)
 
-        # 6. Items with high relevance to query context (PROBABILISTIC semantic match)
+        # 5. Items with high relevance to query context (PROBABILISTIC semantic match)
         if query_context:
             item_strs = [json.dumps(item, default=str) for item in items]
             scores = self._scorer.score_batch(item_strs, query_context)
@@ -2411,7 +2637,7 @@ class SmartCrusher(Transform):
                 if score.score >= self._relevance_threshold:
                     keep_indices.add(i)
 
-        # 6b. TOIN preserve_fields: boost items where query matches these fields
+        # 5b. TOIN preserve_fields: boost items where query matches these fields
         # Note: preserve_fields are SHA256[:8] hashes, use helper to match
         if preserve_fields and query_context:
             for i, item in enumerate(items):
@@ -2538,8 +2764,7 @@ class SmartCrusher(Transform):
         """Plan smart statistical sampling using STATISTICAL detection.
 
         Always keeps:
-        - First K items (default 3)
-        - Last K items (default 2)
+        - Dynamic anchor positions (based on data pattern and query context)
         - Structural outliers (items with rare fields or rare status values)
         - Anomalous numeric items (> 2 std from mean)
         - Items around change points
@@ -2558,24 +2783,26 @@ class SmartCrusher(Transform):
         n = len(items)
         keep_indices = set()
 
-        # 1. First K items (default 3)
-        for i in range(min(3, n)):
-            keep_indices.add(i)
+        # 1. Dynamic anchor selection (replaces static first 3 + last 2)
+        anchor_pattern = self._map_to_anchor_pattern(CompressionStrategy.SMART_SAMPLE)
+        anchor_indices = self._anchor_selector.select_anchors(
+            items=items,
+            max_items=effective_max,
+            pattern=anchor_pattern,
+            query=query_context or None,
+        )
+        keep_indices.update(anchor_indices)
 
-        # 2. Last K items (default 2)
-        for i in range(max(0, n - 2), n):
-            keep_indices.add(i)
-
-        # 3. Structural outlier items (STATISTICAL detection - no hardcoded keywords)
+        # 2. Structural outlier items (STATISTICAL detection - no hardcoded keywords)
         outlier_indices = _detect_structural_outliers(items)
         keep_indices.update(outlier_indices)
 
-        # 3b. Error items via KEYWORD detection (PRESERVATION GUARANTEE)
+        # 2b. Error items via KEYWORD detection (PRESERVATION GUARANTEE)
         # This is critical - errors must ALWAYS be preserved regardless of structure
         error_indices = _detect_error_items_for_preservation(items)
         keep_indices.update(error_indices)
 
-        # 4. Anomalous numeric items (> 2 std from mean)
+        # 3. Anomalous numeric items (> 2 std from mean)
         for name, stats in analysis.field_stats.items():
             if stats.field_type == "numeric" and stats.mean_val is not None and stats.variance:
                 std = stats.variance**0.5
@@ -2587,7 +2814,7 @@ class SmartCrusher(Transform):
                             if abs(val - stats.mean_val) > threshold:
                                 keep_indices.add(i)
 
-        # 5. Items around change points (if detected)
+        # 4. Items around change points (if detected)
         if self.config.preserve_change_points:
             for stats in analysis.field_stats.values():
                 if stats.change_points:
@@ -2598,7 +2825,7 @@ class SmartCrusher(Transform):
                             if 0 <= idx < n:
                                 keep_indices.add(idx)
 
-        # 6. Items matching query anchors (DETERMINISTIC exact match)
+        # 5. Items matching query anchors (DETERMINISTIC exact match)
         # Anchors provide reliable preservation for specific entity lookups (UUIDs, IDs, names)
         if query_context:
             anchors = extract_query_anchors(query_context)
@@ -2606,7 +2833,7 @@ class SmartCrusher(Transform):
                 if item_matches_anchors(item, anchors):
                     keep_indices.add(i)
 
-        # 7. Items with high relevance to query context (PROBABILISTIC semantic match)
+        # 6. Items with high relevance to query context (PROBABILISTIC semantic match)
         if query_context:
             item_strs = [json.dumps(item, default=str) for item in items]
             scores = self._scorer.score_batch(item_strs, query_context)
@@ -2614,7 +2841,7 @@ class SmartCrusher(Transform):
                 if score.score >= self._relevance_threshold:
                     keep_indices.add(i)
 
-        # 7b. TOIN preserve_fields: boost items where query matches these fields
+        # 6b. TOIN preserve_fields: boost items where query matches these fields
         # Note: preserve_fields are SHA256[:8] hashes, use helper to match
         if preserve_fields and query_context:
             for i, item in enumerate(items):

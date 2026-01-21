@@ -1,5 +1,13 @@
 """Transform modules for Headroom SDK."""
 
+from .anchor_selector import (
+    AnchorSelector,
+    AnchorStrategy,
+    AnchorWeights,
+    DataPattern,
+    calculate_information_score,
+    compute_item_hash,
+)
 from .base import Transform
 from .cache_aligner import CacheAligner
 from .content_detector import ContentType, DetectionResult, detect_content_type
@@ -56,6 +64,13 @@ __all__ = [
     # Base
     "Transform",
     "TransformPipeline",
+    # Anchor selection
+    "AnchorSelector",
+    "AnchorStrategy",
+    "AnchorWeights",
+    "DataPattern",
+    "calculate_information_score",
+    "compute_item_hash",
     # JSON compression
     "ToolCrusher",
     "SmartCrusher",

@@ -289,6 +289,63 @@ class RelevanceScorerConfig:
 
 
 @dataclass
+class AnchorConfig:
+    """Configuration for dynamic anchor allocation in SmartCrusher.
+
+    Anchor selection determines which array positions are preserved during
+    compression. Different data patterns benefit from different anchor strategies:
+    - Search results: Front-heavy (top results are most relevant)
+    - Logs: Back-heavy (recent entries matter most)
+    - Time series: Balanced (need both ends to show trends)
+    - Generic: Distributed (no assumption about order importance)
+
+    The anchor budget is a percentage of max_items allocated to position-based
+    anchors. The remaining budget goes to relevance-scored items.
+    """
+
+    # Base anchor budget as percentage of max_items
+    anchor_budget_pct: float = 0.25  # 25% of slots for position anchors
+
+    # Minimum and maximum anchor slots
+    min_anchor_slots: int = 3
+    max_anchor_slots: int = 12
+
+    # Default distribution weights (sum to 1.0)
+    default_front_weight: float = 0.5
+    default_back_weight: float = 0.4
+    default_middle_weight: float = 0.1
+
+    # Pattern-specific overrides
+    search_front_weight: float = 0.75  # Search results: front-heavy
+    search_back_weight: float = 0.15
+    logs_front_weight: float = 0.15  # Logs: back-heavy (recent)
+    logs_back_weight: float = 0.75
+
+    # Query keyword detection for dynamic adjustment
+    recency_keywords: tuple[str, ...] = (
+        "latest",
+        "recent",
+        "last",
+        "newest",
+        "current",
+        "now",
+    )
+    historical_keywords: tuple[str, ...] = (
+        "first",
+        "oldest",
+        "earliest",
+        "original",
+        "initial",
+        "beginning",
+    )
+
+    # Information density selection
+    use_information_density: bool = True
+    candidate_multiplier: int = 3  # Consider 3x candidates per slot
+    dedup_identical_items: bool = True  # Don't waste slots on identical items
+
+
+@dataclass
 class SmartCrusherConfig:
     """Configuration for smart statistical crusher (DEFAULT).
 
@@ -337,6 +394,15 @@ class SmartCrusherConfig:
 
     # Relevance scoring configuration
     relevance: RelevanceScorerConfig = field(default_factory=RelevanceScorerConfig)
+
+    # Anchor selection configuration (dynamic position-based preservation)
+    anchor: AnchorConfig = field(default_factory=AnchorConfig)
+
+    # Content deduplication - prevents wasting slots on identical items
+    # When multiple preservation mechanisms (anchors, anomalies, outliers) add
+    # the same item, only one copy is kept. This is critical for arrays where
+    # many items have identical content (e.g., repeated status messages).
+    dedup_identical_items: bool = True
 
 
 @dataclass
