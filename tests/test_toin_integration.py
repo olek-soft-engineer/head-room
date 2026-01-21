@@ -84,7 +84,7 @@ class TestTOINIntegration:
 
         # Get the entry and verify it has tool_signature_hash
         # We need to find the hash key from the store
-        entries = list(fresh_store._store.values())
+        entries = [entry for _, entry in fresh_store._backend.items()]
         assert len(entries) >= 1, "Should have at least one entry"
 
         entry = entries[0]
@@ -162,7 +162,7 @@ class TestTOINIntegration:
 
         # Step 3: Simulate retrievals (indicating compression was too aggressive)
         # Find the stored entry hash
-        entries = list(fresh_store._store.values())
+        entries = [entry for _, entry in fresh_store._backend.items()]
         assert len(entries) > 0, "Should have cached entries"
 
         # Retrieve multiple times to trigger learning
@@ -361,7 +361,7 @@ class TestStoreToTOINHash:
         assert was_modified, f"Content should be modified by compression: {info}"
 
         # Get the stored hash
-        entries = list(fresh_store._store.values())
+        entries = [entry for _, entry in fresh_store._backend.items()]
         assert len(entries) >= 1, (
             f"Should have stored entry. Modified: {was_modified}, Info: {info}"
         )

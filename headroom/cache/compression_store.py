@@ -41,9 +41,12 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..relevance.bm25 import BM25Scorer
+
+if TYPE_CHECKING:
+    from .backends import CompressionStoreBackend
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +127,7 @@ class CompressionStore:
         max_entries: int = 1000,
         default_ttl: int = 300,
         enable_feedback: bool = True,
+        backend: CompressionStoreBackend | None = None,
     ):
         """Initialize the compression store.
 
@@ -131,8 +135,13 @@ class CompressionStore:
             max_entries: Maximum number of entries to store.
             default_ttl: Default TTL in seconds (5 minutes).
             enable_feedback: Whether to track retrieval events.
+            backend: Storage backend to use. Defaults to InMemoryBackend.
+                     Custom backends can be passed for persistence (MongoDB, Redis).
         """
-        self._store: dict[str, CompressionEntry] = {}
+        # Import here to avoid circular imports
+        from .backends import InMemoryBackend
+
+        self._backend: CompressionStoreBackend = backend or InMemoryBackend()
         self._lock = threading.Lock()
         self._max_entries = max_entries
         self._default_ttl = default_ttl
@@ -224,7 +233,7 @@ class CompressionStore:
             # CRITICAL FIX: Hash collision detection
             # If hash already exists with DIFFERENT content, log a warning.
             # This indicates either a hash collision or duplicate store calls.
-            existing = self._store.get(hash_key)
+            existing = self._backend.get(hash_key)
             if existing is not None:
                 if existing.original_content != original:
                     # True hash collision - different content, same hash
@@ -245,7 +254,7 @@ class CompressionStore:
                 # Mark old heap entry as stale since we're replacing
                 self._stale_heap_entries += 1
 
-            self._store[hash_key] = entry
+            self._backend.set(hash_key, entry)
             # MEDIUM FIX #16: Add to eviction heap for O(log n) eviction
             heapq.heappush(self._eviction_heap, (entry.created_at, hash_key))
 
@@ -266,19 +275,21 @@ class CompressionStore:
             CompressionEntry if found and not expired, None otherwise.
         """
         with self._lock:
-            entry = self._store.get(hash_key)
+            entry = self._backend.get(hash_key)
 
             if entry is None:
                 return None
 
             if entry.is_expired():
-                del self._store[hash_key]
+                self._backend.delete(hash_key)
                 # CRITICAL FIX: Track stale heap entry
                 self._stale_heap_entries += 1
                 return None
 
             # Track access for feedback
             entry.record_access(query)
+            # Update the backend with the modified entry
+            self._backend.set(hash_key, entry)
 
             # Log retrieval event
             if self._enable_feedback:
@@ -319,13 +330,13 @@ class CompressionStore:
             Dict with metadata if found and not expired, None otherwise.
         """
         with self._lock:
-            entry = self._store.get(hash_key)
+            entry = self._backend.get(hash_key)
 
             if entry is None:
                 return None
 
             if entry.is_expired():
-                del self._store[hash_key]
+                self._backend.delete(hash_key)
                 self._stale_heap_entries += 1
                 return None
 
@@ -423,19 +434,21 @@ class CompressionStore:
             CompressionEntry copy if found and not expired, None otherwise.
         """
         with self._lock:
-            entry = self._store.get(hash_key)
+            entry = self._backend.get(hash_key)
 
             if entry is None:
                 return None
 
             if entry.is_expired():
-                del self._store[hash_key]
+                self._backend.delete(hash_key)
                 # CRITICAL FIX: Track stale heap entry
                 self._stale_heap_entries += 1
                 return None
 
             # Track access but don't log retrieval event (search will log separately)
             entry.record_access(query)
+            # Update the backend with the modified entry
+            self._backend.set(hash_key, entry)
 
             # CRITICAL FIX #4: Return a copy to prevent race conditions
             # The entry contains mutable fields (search_queries list) that could be
@@ -454,14 +467,14 @@ class CompressionStore:
             True if the entry exists and is not expired.
         """
         with self._lock:
-            entry = self._store.get(hash_key)
+            entry = self._backend.get(hash_key)
             if entry is None:
                 return False
             if entry.is_expired():
                 # LOW FIX #20: Only delete if explicitly requested
                 # This makes exists() a pure check by default
                 if clean_expired:
-                    del self._store[hash_key]
+                    self._backend.delete(hash_key)
                     # CRITICAL FIX: Track stale heap entry
                     self._stale_heap_entries += 1
                 return False
@@ -473,17 +486,23 @@ class CompressionStore:
             # Clean expired entries
             self._clean_expired()
 
-            total_original_tokens = sum(e.original_tokens for e in self._store.values())
-            total_compressed_tokens = sum(e.compressed_tokens for e in self._store.values())
-            total_retrievals = sum(e.retrieval_count for e in self._store.values())
+            # Get all entries for statistics
+            entries = [entry for _, entry in self._backend.items()]
+            total_original_tokens = sum(e.original_tokens for e in entries)
+            total_compressed_tokens = sum(e.compressed_tokens for e in entries)
+            total_retrievals = sum(e.retrieval_count for e in entries)
+
+            # Include backend stats
+            backend_stats = self._backend.get_stats()
 
             return {
-                "entry_count": len(self._store),
+                "entry_count": self._backend.count(),
                 "max_entries": self._max_entries,
                 "total_original_tokens": total_original_tokens,
                 "total_compressed_tokens": total_compressed_tokens,
                 "total_retrievals": total_retrievals,
                 "event_count": len(self._retrieval_events),
+                "backend": backend_stats,
             }
 
     def get_retrieval_events(
@@ -514,7 +533,7 @@ class CompressionStore:
     def clear(self) -> None:
         """Clear all entries. Mainly for testing."""
         with self._lock:
-            self._store.clear()
+            self._backend.clear()
             self._retrieval_events.clear()
             self._pending_feedback_events.clear()
             self._eviction_heap.clear()  # MEDIUM FIX #16: Clear heap too
@@ -538,13 +557,13 @@ class CompressionStore:
                 self._rebuild_heap()
 
         # If still at capacity, remove oldest entries using heap
-        while len(self._store) >= self._max_entries and self._eviction_heap:
+        while self._backend.count() >= self._max_entries and self._eviction_heap:
             # Pop oldest from heap (O(log n))
             created_at, hash_key = heapq.heappop(self._eviction_heap)
 
             # Check if entry still exists and matches timestamp
             # (entry might have been deleted or replaced)
-            entry = self._store.get(hash_key)
+            entry = self._backend.get(hash_key)
             if entry is not None and entry.created_at == created_at:
                 # HIGH FIX: Track eviction as "successful compression" if never retrieved
                 # This prevents state divergence between store and feedback loop
@@ -552,7 +571,7 @@ class CompressionStore:
                     # Entry was never retrieved = compression was successful
                     # Notify feedback system so it knows this strategy worked
                     self._record_eviction_success(entry)
-                del self._store[hash_key]
+                self._backend.delete(hash_key)
             else:
                 # CRITICAL FIX: This was a stale entry, decrement counter
                 # (we already popped it, so the stale entry is now gone)
@@ -564,9 +583,9 @@ class CompressionStore:
 
         CRITICAL FIX: Track stale heap entries when deleting to prevent memory leak.
         """
-        expired_keys = [key for key, entry in self._store.items() if entry.is_expired()]
+        expired_keys = [key for key, entry in self._backend.items() if entry.is_expired()]
         for key in expired_keys:
-            del self._store[key]
+            self._backend.delete(key)
             # CRITICAL FIX: Increment stale counter - the heap still has an entry
             # for this key that will be stale when we try to evict
             self._stale_heap_entries += 1
@@ -579,7 +598,7 @@ class CompressionStore:
         """
         # Build new heap from current store entries only
         self._eviction_heap = [
-            (entry.created_at, hash_key) for hash_key, entry in self._store.items()
+            (entry.created_at, hash_key) for hash_key, entry in self._backend.items()
         ]
         heapq.heapify(self._eviction_heap)
         # Reset stale counter - heap is now clean
@@ -689,7 +708,7 @@ class CompressionStore:
                 tuple[RetrievalEvent, str | None, str | None, str | None, str | None]
             ] = []
             for event in events:
-                entry = self._store.get(event.hash)
+                entry = self._backend.get(event.hash)
                 if entry:
                     # Use the ACTUAL tool_signature_hash stored during compression
                     # This MUST match the hash used by SmartCrusher
@@ -778,6 +797,7 @@ _store_lock = threading.Lock()
 def get_compression_store(
     max_entries: int = 1000,
     default_ttl: int = 300,
+    backend: CompressionStoreBackend | None = None,
 ) -> CompressionStore:
     """Get the global compression store instance.
 
@@ -786,6 +806,8 @@ def get_compression_store(
     Args:
         max_entries: Maximum entries (only used on first call).
         default_ttl: Default TTL (only used on first call).
+        backend: Custom storage backend (only used on first call).
+                 Defaults to InMemoryBackend if not provided.
 
     Returns:
         Global CompressionStore instance.
@@ -799,6 +821,7 @@ def get_compression_store(
                 _compression_store = CompressionStore(
                     max_entries=max_entries,
                     default_ttl=default_ttl,
+                    backend=backend,
                 )
 
     return _compression_store

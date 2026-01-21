@@ -893,9 +893,11 @@ class TestCompressionStoreHighPriorityFixes:
         # Manually expire entries (simulating TTL)
         with store._lock:
             for h in hashes[:5]:
-                if h in store._store:
-                    store._store[h].created_at = 0  # Make it look old
-                    store._store[h].ttl = 0  # Make it expired
+                entry = store._backend.get(h)
+                if entry:
+                    entry.created_at = 0  # Make it look old
+                    entry.ttl = 0  # Make it expired
+                    store._backend.set(h, entry)
 
         # Store more entries - should handle stale heap entries gracefully
         for i in range(20, 30):
@@ -943,7 +945,7 @@ class TestCompressionStoreHighPriorityFixes:
             store.search(hash_key, f"unique_query_{i}")
 
         with store._lock:
-            entry = store._store.get(hash_key)
+            entry = store._backend.get(hash_key)
             if entry:
                 assert len(entry.search_queries) <= 10
 
@@ -1196,12 +1198,12 @@ class TestLowPriorityFixes:
 
         # Entry should still be in internal store (not deleted)
         with store._lock:
-            assert hash_key in store._store
+            assert store._backend.exists(hash_key)
 
         # Now with clean_expired=True, it should delete
         assert store.exists(hash_key, clean_expired=True) is False
         with store._lock:
-            assert hash_key not in store._store
+            assert not store._backend.exists(hash_key)
 
     def test_toin_confidence_threshold_configurable(self):
         """LOW FIX #21: TOIN confidence threshold should be configurable."""
