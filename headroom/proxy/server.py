@@ -1616,6 +1616,21 @@ class HeadroomProxy:
                 # Estimate output tokens from total bytes (rough estimate: ~4 bytes per token)
                 output_tokens = total_bytes // 4
 
+                # Calculate cost
+                cost_usd = None
+                savings_usd = None
+                if self.cost_tracker:
+                    cost_usd = self.cost_tracker.estimate_cost(
+                        model, optimized_tokens, output_tokens
+                    )
+                    original_cost = self.cost_tracker.estimate_cost(
+                        model, original_tokens, output_tokens
+                    )
+                    if cost_usd and original_cost:
+                        savings_usd = original_cost - cost_usd
+                        self.cost_tracker.record_cost(cost_usd)
+                        self.cost_tracker.record_savings(savings_usd)
+
                 await self.metrics.record_request(
                     provider=provider,
                     model=model,
@@ -1623,6 +1638,8 @@ class HeadroomProxy:
                     output_tokens=output_tokens,
                     tokens_saved=tokens_saved,
                     latency_ms=total_latency,
+                    cost_usd=cost_usd or 0,
+                    savings_usd=savings_usd or 0,
                 )
 
                 if tokens_saved > 0:
