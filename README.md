@@ -31,7 +31,9 @@
 
 ## Demo
 
-**[Watch Headroom in action](https://github.com/chopratejas/headroom/releases/download/v0.2.15/Headroom.-.Optimized.mp4)** - Analyzing its own codebase with Claude Code while demonstrating real-time token savings with multi-tool agents.
+<p align="center">
+  <img src="Headroom-2.gif" alt="Headroom Demo" width="800">
+</p>
 
 ---
 
