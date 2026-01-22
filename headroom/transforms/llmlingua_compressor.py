@@ -215,9 +215,9 @@ class LLMLinguaConfig:
     ccr_ttl: int = 300  # 5 minutes
 
     # Content type specific settings
-    code_compression_rate: float = 0.4  # More conservative for code
-    json_compression_rate: float = 0.35  # Slightly conservative for JSON
-    text_compression_rate: float = 0.25  # More aggressive for plain text
+    code_compression_rate: float = 0.5  # Conservative for code
+    json_compression_rate: float = 0.4  # Somewhat conservative for JSON
+    text_compression_rate: float = 0.5  # Balanced for plain text (higher = more accurate)
 
 
 @dataclass

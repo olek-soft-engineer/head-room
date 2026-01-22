@@ -740,10 +740,9 @@ class ContentRouter(Transform):
                 return self._try_llmlingua(content, context)
 
             elif strategy == CompressionStrategy.TEXT:
-                compressor = self._get_text_compressor()
-                if compressor:
-                    result = compressor.compress(content, context=context)
-                    return result.compressed, result.compressed_line_count
+                # Prefer LLMLingua for text if available (ML-based, better compression)
+                # Falls back to heuristic TextCompressor if LLMLingua unavailable
+                return self._try_llmlingua(content, context)
 
         except Exception as e:
             logger.warning("Compression with %s failed: %s", strategy.value, e)

@@ -168,11 +168,11 @@ class TestLLMLinguaConfig:
         """Different content types have appropriate compression rates."""
         config = LLMLinguaConfig()
 
-        # Code should be more conservative
-        assert config.code_compression_rate > config.text_compression_rate
-        # JSON should be between code and text
-        assert config.json_compression_rate > config.text_compression_rate
-        assert config.json_compression_rate < config.code_compression_rate
+        # Code and text are equally conservative for accuracy
+        assert config.code_compression_rate >= config.text_compression_rate
+        # JSON can be slightly more aggressive since structure is preserved
+        assert config.json_compression_rate <= config.code_compression_rate
+        assert config.json_compression_rate <= config.text_compression_rate
 
 
 # =============================================================================

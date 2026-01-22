@@ -283,6 +283,63 @@ See the full [Agno Integration Guide](docs/agno.md) for hooks, multi-provider su
 | **Text Utilities** | Opt-in compression for search/logs | [Text Compression](docs/text-compression.md) |
 | **LLMLingua-2** | ML-based 20x compression (opt-in) | [LLMLingua](docs/llmlingua.md) |
 | **Code-Aware** | AST-based code compression (tree-sitter) | [Transforms](docs/transforms.md) |
+| **Evals Framework** | Prove compression preserves accuracy (12+ datasets) | [Evals](headroom/evals/README.md) |
+
+---
+
+## Evaluation Framework: Prove It Works
+
+Skeptical? Good. We built a comprehensive evaluation framework to **prove** compression preserves accuracy.
+
+```bash
+# Install evals
+pip install "headroom-ai[evals]"
+
+# Quick sanity check (5 samples)
+python -m headroom.evals quick
+
+# Run on real datasets
+python -m headroom.evals benchmark --dataset hotpotqa -n 100
+```
+
+### How Evals Work
+
+```
+Original Context ───► LLM ───► Response A
+                                   │
+Compressed Context ─► LLM ───► Response B
+                                   │
+                    Compare A vs B │
+                    ─────────────────
+                    F1 Score: 0.95
+                    Semantic Similarity: 0.97
+                    Ground Truth Match: ✓
+                    ─────────────────
+                    PASS: Accuracy preserved
+```
+
+### Available Datasets (12+)
+
+| Category | Datasets |
+|----------|----------|
+| **RAG** | HotpotQA, Natural Questions, TriviaQA, MS MARCO, SQuAD |
+| **Long Context** | LongBench (4K-128K tokens), NarrativeQA |
+| **Tool Use** | BFCL (function calling), ToolBench, Built-in samples |
+| **Code** | CodeSearchNet, HumanEval |
+
+### CI Integration
+
+```yaml
+# GitHub Actions
+- name: Run Compression Evals
+  run: python -m headroom.evals quick -n 20
+  env:
+    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+Exit code 0 if accuracy ≥ 90%, 1 otherwise.
+
+See the full [Evals Documentation](headroom/evals/README.md) for datasets, metrics, and programmatic API.
 
 ---
 
@@ -334,6 +391,7 @@ pip install headroom-ai              # SDK only
 pip install "headroom-ai[proxy]"     # Proxy server
 pip install "headroom-ai[langchain]" # LangChain integration
 pip install "headroom-ai[agno]"      # Agno agent framework
+pip install "headroom-ai[evals]"     # Evaluation framework
 pip install "headroom-ai[code]"      # AST-based code compression
 pip install "headroom-ai[llmlingua]" # ML-based compression
 pip install "headroom-ai[all]"       # Everything
@@ -349,6 +407,7 @@ pip install "headroom-ai[all]"       # Everything
 |-------|-------------|
 | [Memory Guide](docs/memory.md) | Persistent memory for LLMs |
 | [Compression Guide](docs/compression.md) | Universal compression with ML detection |
+| [Evals Framework](headroom/evals/README.md) | Prove compression preserves accuracy |
 | [LangChain Integration](docs/langchain.md) | Full LangChain support |
 | [Agno Integration](docs/agno.md) | Full Agno agent framework support |
 | [SDK Guide](docs/sdk.md) | Fine-grained control |
