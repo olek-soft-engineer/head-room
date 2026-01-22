@@ -67,6 +67,7 @@ from headroom.ccr import (
 from headroom.config import CacheAlignerConfig, CCRConfig, RollingWindowConfig, SmartCrusherConfig
 from headroom.providers import AnthropicProvider, OpenAIProvider
 from headroom.telemetry import get_telemetry_collector
+from headroom.telemetry.toin import get_toin
 from headroom.tokenizers import get_tokenizer
 from headroom.transforms import (
     _LLMLINGUA_AVAILABLE,
@@ -1911,6 +1912,33 @@ class HeadroomProxy:
 # =============================================================================
 
 
+async def _log_toin_stats_periodically(interval_seconds: int = 300) -> None:
+    """Background task that logs TOIN stats periodically.
+
+    Args:
+        interval_seconds: How often to log stats (default: 5 minutes).
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            toin = get_toin()
+            stats = toin.get_stats()
+            total_compressions = stats.get("total_compressions", 0)
+            if total_compressions > 0:
+                patterns = stats.get("patterns_tracked", 0)
+                retrievals = stats.get("total_retrievals", 0)
+                retrieval_rate = stats.get("global_retrieval_rate", 0.0)
+                logger.info(
+                    "TOIN: %d patterns, %d compressions, %d retrievals, %.1f%% retrieval rate",
+                    patterns,
+                    total_compressions,
+                    retrievals,
+                    retrieval_rate * 100,
+                )
+        except Exception as e:
+            logger.debug("Failed to log TOIN stats: %s", e)
+
+
 def create_app(config: ProxyConfig | None = None) -> FastAPI:
     """Create FastAPI application."""
     if not FASTAPI_AVAILABLE:
@@ -1938,6 +1966,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.on_event("startup")
     async def startup():
         await proxy.startup()
+        # Start background task for periodic TOIN stats logging
+        asyncio.create_task(_log_toin_stats_periodically())
 
     @app.on_event("shutdown")
     async def shutdown():
@@ -2041,6 +2071,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     if p.get("retrieval_rate", 0) > 0.3
                 ),
             },
+            "toin": get_toin().get_stats(),
             "cache": await proxy.cache.stats() if proxy.cache else None,
             "rate_limiter": await proxy.rate_limiter.stats() if proxy.rate_limiter else None,
             "recent_requests": proxy.logger.get_recent(10) if proxy.logger else [],
@@ -2294,6 +2325,105 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "recommendations": recommendations,
         }
 
+    # TOIN (Tool Output Intelligence Network) endpoints
+    @app.get("/v1/toin/stats")
+    async def toin_stats():
+        """Get overall TOIN statistics.
+
+        Returns aggregated statistics from the Tool Output Intelligence Network,
+        which learns optimal compression strategies across all tool types.
+
+        Response includes:
+        - enabled: Whether TOIN is enabled
+        - patterns_tracked: Number of unique tool patterns being tracked
+        - total_compressions: Total compression events recorded
+        - total_retrievals: Total retrieval events recorded
+        - global_retrieval_rate: Overall retrieval rate (high = compression too aggressive)
+        - patterns_with_recommendations: Patterns with enough data for recommendations
+        """
+        toin = get_toin()
+        return toin.get_stats()
+
+    @app.get("/v1/toin/patterns")
+    async def toin_patterns(limit: int = 20):
+        """List TOIN patterns with most samples.
+
+        Returns patterns sorted by sample_size descending. Use this to see
+        which tool types have the most data and their learned behaviors.
+
+        Query params:
+            limit: Maximum number of patterns to return (default 20)
+
+        Response includes for each pattern:
+        - hash: Truncated tool signature hash (12 chars)
+        - compressions: Total compression events
+        - retrievals: Total retrieval events
+        - retrieval_rate: Percentage of compressions that triggered retrieval
+        - confidence: Confidence level in recommendations (0.0-1.0)
+        - skip_recommended: Whether TOIN recommends skipping compression
+        - optimal_max_items: Learned optimal max_items setting
+        """
+        toin = get_toin()
+        exported = toin.export_patterns()
+        patterns_data = exported.get("patterns", {})
+
+        # Convert to list and sort by sample_size
+        patterns_list = []
+        for sig_hash, pattern_dict in patterns_data.items():
+            sample_size = pattern_dict.get("sample_size", 0)
+            total_compressions = pattern_dict.get("total_compressions", 0)
+            total_retrievals = pattern_dict.get("total_retrievals", 0)
+            retrieval_rate = (
+                total_retrievals / total_compressions if total_compressions > 0 else 0.0
+            )
+
+            patterns_list.append(
+                {
+                    "hash": sig_hash[:12],
+                    "compressions": total_compressions,
+                    "retrievals": total_retrievals,
+                    "retrieval_rate": f"{retrieval_rate:.1%}",
+                    "confidence": round(pattern_dict.get("confidence", 0.0), 3),
+                    "skip_recommended": pattern_dict.get("skip_compression_recommended", False),
+                    "optimal_max_items": pattern_dict.get("optimal_max_items", 20),
+                    "sample_size": sample_size,
+                }
+            )
+
+        # Sort by sample_size descending
+        patterns_list.sort(key=lambda p: p["sample_size"], reverse=True)
+
+        # Remove sample_size from output (used only for sorting)
+        for p in patterns_list:
+            del p["sample_size"]
+
+        return patterns_list[:limit]
+
+    @app.get("/v1/toin/pattern/{hash_prefix}")
+    async def toin_pattern_detail(hash_prefix: str):
+        """Get detailed TOIN pattern info by hash prefix.
+
+        Searches for a pattern where the tool signature hash starts with
+        the provided prefix. Returns full pattern details if found.
+
+        Path params:
+            hash_prefix: Beginning of the tool signature hash (min 4 chars recommended)
+
+        Response: Full pattern.to_dict() with all learned statistics and recommendations.
+        """
+        toin = get_toin()
+        exported = toin.export_patterns()
+        patterns_data = exported.get("patterns", {})
+
+        # Search for pattern with matching hash prefix
+        for sig_hash, pattern_dict in patterns_data.items():
+            if sig_hash.startswith(hash_prefix):
+                return pattern_dict
+
+        raise HTTPException(
+            status_code=404, detail=f"No TOIN pattern found with hash starting with: {hash_prefix}"
+        )
+
     @app.get("/v1/retrieve/{hash_key}")
     async def ccr_retrieve_get(hash_key: str, query: str | None = None):
         """GET version of CCR retrieve for easier testing."""
@@ -2526,6 +2656,9 @@ def run_server(config: ProxyConfig | None = None):
 ║    /v1/telemetry            Data flywheel: Telemetry stats           ║
 ║    /v1/telemetry/export     Data flywheel: Export for aggregation    ║
 ║    /v1/telemetry/tools      Data flywheel: Per-tool stats            ║
+║    /v1/toin/stats           TOIN: Overall intelligence stats         ║
+║    /v1/toin/patterns        TOIN: List learned patterns              ║
+║    /v1/toin/pattern/{{hash}} TOIN: Pattern details by hash            ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """)
 

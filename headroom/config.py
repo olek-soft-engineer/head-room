@@ -390,7 +390,7 @@ class SmartCrusherConfig:
 
     # LOW FIX #21: Make TOIN confidence threshold configurable
     # Minimum confidence required to apply TOIN recommendations
-    toin_confidence_threshold: float = 0.5
+    toin_confidence_threshold: float = 0.3
 
     # Relevance scoring configuration
     relevance: RelevanceScorerConfig = field(default_factory=RelevanceScorerConfig)

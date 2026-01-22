@@ -559,6 +559,10 @@ class ContentRouter(Transform):
             if tool in ("git-diff", "diff"):
                 return CompressionStrategy.DIFF
 
+        # Direct strategy hints (used by _process_content_blocks for tool_result)
+        if hint_lower == "json_array":
+            return CompressionStrategy.SMART_CRUSHER
+
         return None
 
     def _strategy_from_detection(self, detection: Any) -> CompressionStrategy:

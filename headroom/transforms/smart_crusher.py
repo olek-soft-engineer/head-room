@@ -2220,6 +2220,15 @@ class SmartCrusher(Transform):
         toin = self._get_toin()
         toin_hint = toin.get_recommendation(tool_signature, query_context)
 
+        # Log TOIN hint details
+        logger.debug(
+            "TOIN hint: source=%s, confidence=%.2f, skip=%s, max_items=%d",
+            toin_hint.source,
+            toin_hint.confidence,
+            toin_hint.skip_compression,
+            toin_hint.max_items,
+        )
+
         if toin_hint.skip_compression:
             return items, f"skip:toin({toin_hint.reason})", None
 
@@ -2241,6 +2250,20 @@ class SmartCrusher(Transform):
                 toin_recommended_strategy = toin_hint.recommended_strategy
             if toin_hint.compression_level != "moderate":
                 toin_compression_level = toin_hint.compression_level
+            # Log that TOIN hint was applied
+            logger.debug(
+                "TOIN hint applied: max_items=%d, strategy=%s, compression_level=%s",
+                effective_max_items,
+                toin_recommended_strategy or "default",
+                toin_compression_level or "moderate",
+            )
+        elif toin_hint.source in ("network", "local"):
+            # Hint available but confidence too low
+            logger.debug(
+                "TOIN hint not applied: confidence %.2f < threshold %.2f",
+                toin_hint.confidence,
+                self.config.toin_confidence_threshold,
+            )
 
         # === TOIN Evolution: Extract field semantics for signal detection ===
         # Store temporarily on instance for use in _prioritize_indices

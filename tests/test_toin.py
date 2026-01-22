@@ -178,10 +178,14 @@ class TestTOINConfig:
 
     def test_default_values(self):
         """Default config values."""
+        from pathlib import Path
+
         config = TOINConfig()
 
         assert config.enabled is True
-        assert config.storage_path is None
+        # Default storage path is ~/.headroom/toin.json
+        expected_path = str(Path.home() / ".headroom" / "toin.json")
+        assert config.storage_path == expected_path
         assert config.auto_save_interval == 600
         assert config.min_samples_for_recommendation == 10
         assert config.min_users_for_network_effect == 3

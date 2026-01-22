@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -55,6 +56,33 @@ from typing import Any, Literal
 from .models import FieldSemantics, ToolSignature
 
 logger = logging.getLogger(__name__)
+
+# Environment variable for custom TOIN storage path
+TOIN_PATH_ENV_VAR = "HEADROOM_TOIN_PATH"
+
+# Default TOIN storage directory and file
+DEFAULT_TOIN_DIR = ".headroom"
+DEFAULT_TOIN_FILE = "toin.json"
+
+
+def get_default_toin_storage_path() -> str:
+    """Get the default TOIN storage path.
+
+    Checks for the HEADROOM_TOIN_PATH environment variable first.
+    Falls back to ~/.headroom/toin.json if not set or empty.
+
+    Returns:
+        The path string for TOIN storage.
+    """
+    # Check environment variable first
+    env_path = os.environ.get(TOIN_PATH_ENV_VAR, "").strip()
+    if env_path:
+        return env_path
+
+    # Fall back to default path in user's home directory
+    home = Path.home()
+    return str(home / DEFAULT_TOIN_DIR / DEFAULT_TOIN_FILE)
+
 
 # LOW FIX #22: Define callback types for metrics/monitoring hooks
 # These allow users to plug in their own metrics collection (Prometheus, StatsD, etc.)
@@ -285,7 +313,8 @@ class TOINConfig:
     enabled: bool = True
 
     # Storage
-    storage_path: str | None = None  # Path to store TOIN data
+    # Default path is ~/.headroom/toin.json (or HEADROOM_TOIN_PATH env var)
+    storage_path: str = field(default_factory=get_default_toin_storage_path)
     auto_save_interval: int = 600  # Auto-save every 10 minutes
 
     # Network learning thresholds
