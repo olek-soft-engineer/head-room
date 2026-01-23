@@ -18,6 +18,12 @@ from headroom.memory.adapters.cache import LRUMemoryCache
 from headroom.memory.adapters.fts5 import FTS5TextIndex
 from headroom.memory.adapters.sqlite import SQLiteMemoryStore
 
+# Check for optional dependencies availability
+try:
+    from headroom.memory.adapters.hnsw import HNSW_AVAILABLE
+except ImportError:
+    HNSW_AVAILABLE = False
+
 # Lazy imports for optional adapters
 _HNSWVectorIndex = None
 _LocalEmbedder = None
@@ -70,4 +76,6 @@ __all__ = [
     "LocalEmbedder",
     "OllamaEmbedder",
     "OpenAIEmbedder",
+    # Availability flags
+    "HNSW_AVAILABLE",
 ]

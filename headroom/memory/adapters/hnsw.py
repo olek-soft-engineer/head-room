@@ -3,6 +3,12 @@
 Provides fast approximate nearest neighbor search with cosine similarity
 for semantic memory retrieval. Supports filtering by user_id, session_id,
 agent_id, category, and entity references.
+
+Note: hnswlib is an optional dependency. Install with:
+    pip install hnswlib
+
+Or via headroom extras:
+    pip install "headroom-ai[memory]"
 """
 
 from __future__ import annotations
@@ -14,8 +20,16 @@ from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
-import hnswlib
 import numpy as np
+
+# hnswlib is optional - may not compile on all platforms
+try:
+    import hnswlib
+
+    HNSW_AVAILABLE = True
+except ImportError:
+    hnswlib = None  # type: ignore[assignment]
+    HNSW_AVAILABLE = False
 
 from ..models import Memory, MemoryCategory, ScopeLevel
 from ..ports import VectorFilter, VectorSearchResult
@@ -176,7 +190,16 @@ class HNSWVectorIndex:
 
         Raises:
             ValueError: If auto_save is True but save_path is not provided.
+            ImportError: If hnswlib is not installed.
         """
+        if not HNSW_AVAILABLE:
+            raise ImportError(
+                "hnswlib is required for HNSWVectorIndex. "
+                "Install with: pip install hnswlib\n"
+                "Note: hnswlib requires C++ compilation and may not be "
+                "available on all platforms."
+            )
+
         if auto_save and save_path is None:
             raise ValueError("save_path must be provided when auto_save is True")
 

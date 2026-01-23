@@ -615,7 +615,14 @@ class TestIntegration:
 # HNSW Vector Index Tests
 # =============================================================================
 
+# Check if hnswlib is available
+try:
+    from headroom.memory.adapters.hnsw import HNSW_AVAILABLE
+except ImportError:
+    HNSW_AVAILABLE = False
 
+
+@pytest.mark.skipif(not HNSW_AVAILABLE, reason="hnswlib not installed")
 class TestHNSWVectorIndex:
     """Tests for HNSWVectorIndex."""
 
