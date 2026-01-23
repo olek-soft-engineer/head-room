@@ -4,7 +4,6 @@ Comprehensive tests covering:
 - ContentRouterConfig: Configuration validation and defaults
 - ContentRouter: Core routing functionality
 - Strategy detection: Code, JSON, search, logs, text
-- Source hint parsing: File paths, tool names
 - Mixed content handling: Split, route, reassemble
 - Transform interface: apply(), should_apply() methods
 """
@@ -18,7 +17,6 @@ from headroom.transforms.content_router import (
     ContentRouterConfig,
     RouterCompressionResult,
     RoutingDecision,
-    generate_source_hint,
 )
 
 # =============================================================================
@@ -280,51 +278,6 @@ class TestRouterCompressionResult:
 
 
 # =============================================================================
-# TestSourceHintGeneration
-# =============================================================================
-
-
-class TestSourceHintGeneration:
-    """Tests for generate_source_hint function."""
-
-    def test_file_path_hint_with_file_path(self):
-        """File path generates file: hint."""
-        hint = generate_source_hint("Read", {"file_path": "/src/auth.py"})
-        assert hint == "file:/src/auth.py"
-
-    def test_file_path_hint_with_path(self):
-        """File path with 'path' key also works."""
-        hint = generate_source_hint("read_file", {"path": "/src/auth.py"})
-        assert hint == "file:/src/auth.py"
-
-    def test_grep_tool_hint(self):
-        """Grep tool generates tool:grep hint."""
-        hint = generate_source_hint("Grep", {"pattern": "def.*"})
-        assert hint == "tool:grep"
-
-    def test_glob_tool_hint(self):
-        """Glob tool generates tool:glob hint."""
-        hint = generate_source_hint("Glob", {"pattern": "*.py"})
-        assert hint == "tool:glob"
-
-    def test_bash_test_command(self):
-        """Bash with test command generates tool:pytest hint."""
-        hint = generate_source_hint("Bash", {"command": "pytest tests/"})
-        assert hint == "tool:pytest"
-
-    def test_bash_build_command(self):
-        """Bash with build command generates tool:build hint."""
-        hint = generate_source_hint("Bash", {"command": "npm run build"})
-        assert "tool:" in hint
-
-    def test_unknown_tool(self):
-        """Unknown tool returns generic tool hint."""
-        hint = generate_source_hint("CustomTool", {"arg": "value"})
-        # Should return some hint, not crash
-        assert hint is not None
-
-
-# =============================================================================
 # TestStrategyDetection
 # =============================================================================
 
@@ -335,54 +288,32 @@ class TestStrategyDetection:
     def test_detect_python_code(self, router):
         """Python code is detected."""
         code = generate_python_code(5)
-        strategy = router._determine_strategy(code, None)
+        strategy = router._determine_strategy(code)
         # Should be either CODE_AWARE or fallback
         assert strategy in CompressionStrategy
 
     def test_detect_json_content(self, router):
         """JSON content is detected."""
         json_data = generate_json_data(20)
-        strategy = router._determine_strategy(json_data, None)
+        strategy = router._determine_strategy(json_data)
         assert strategy in CompressionStrategy
 
     def test_detect_search_results(self, router):
         """Search/grep results are detected."""
         search_results = generate_search_results(10)
-        strategy = router._determine_strategy(search_results, None)
+        strategy = router._determine_strategy(search_results)
         assert strategy in CompressionStrategy
 
     def test_detect_log_output(self, router):
         """Build/test logs are detected."""
         logs = generate_log_output(30)
-        strategy = router._determine_strategy(logs, None)
+        strategy = router._determine_strategy(logs)
         assert strategy in CompressionStrategy
 
     def test_detect_plain_text(self, router):
         """Plain text detection."""
         text = "This is just plain text without any special formatting."
-        strategy = router._determine_strategy(text, None)
-        assert strategy in CompressionStrategy
-
-
-# =============================================================================
-# TestSourceHintRouting
-# =============================================================================
-
-
-class TestSourceHintRouting:
-    """Tests for source hint-based routing."""
-
-    def test_file_hint_routes_appropriately(self, router):
-        """file:*.py hint influences routing."""
-        content = generate_python_code(3)
-        strategy = router._determine_strategy(content, "file:/src/auth.py")
-        # Should return a valid strategy
-        assert strategy in CompressionStrategy
-
-    def test_grep_hint_routes_appropriately(self, router):
-        """tool:grep hint influences routing."""
-        content = generate_search_results(5)
-        strategy = router._determine_strategy(content, "tool:grep")
+        strategy = router._determine_strategy(text)
         assert strategy in CompressionStrategy
 
 
@@ -429,14 +360,6 @@ class TestContentRouter:
         assert isinstance(result, RouterCompressionResult)
         assert result.original == content
         assert result.strategy_used is not None
-
-    def test_compress_with_source_hint(self, router):
-        """Source hint influences routing decision."""
-        content = generate_python_code(5)
-        result = router.compress(content, source_hint="file:/src/auth.py")
-
-        # Should return a valid result
-        assert isinstance(result, RouterCompressionResult)
 
     def test_name_property(self, router):
         """Router has correct name."""
@@ -515,7 +438,7 @@ class TestCompressorDisabling:
         code = generate_python_code(10)
 
         # Should not crash
-        result = router.compress(code, source_hint="file:/src/auth.py")
+        result = router.compress(code)
         assert result is not None
 
     def test_config_accepts_disable_search_compression(self):
@@ -528,7 +451,7 @@ class TestCompressorDisabling:
         search_results = generate_search_results(10)
 
         # Should not crash
-        result = router.compress(search_results, source_hint="tool:grep")
+        result = router.compress(search_results)
         assert result is not None
 
     def test_config_accepts_disable_log_compression(self):
@@ -541,7 +464,7 @@ class TestCompressorDisabling:
         logs = generate_log_output(30)
 
         # Should not crash
-        result = router.compress(logs, source_hint="tool:pytest")
+        result = router.compress(logs)
         assert result is not None
 
 
@@ -568,18 +491,6 @@ class TestEdgeCases:
         """Very long content is handled."""
         content = generate_python_code(100)
         result = router.compress(content)
-        assert result is not None
-
-    def test_null_source_hint(self, router):
-        """Null source hint doesn't crash."""
-        content = generate_python_code(5)
-        result = router.compress(content, source_hint=None)
-        assert result is not None
-
-    def test_empty_source_hint(self, router):
-        """Empty source hint doesn't crash."""
-        content = generate_python_code(5)
-        result = router.compress(content, source_hint="")
         assert result is not None
 
 

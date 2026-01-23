@@ -1017,49 +1017,6 @@ class TestCompressFirstStrategy:
         router2 = manager._get_content_router()
         assert router is router2
 
-    def test_source_hint_extraction(self):
-        """Source hints should be extracted from tool calls."""
-        manager = IntelligentContextManager()
-
-        messages = [
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "function": {
-                            "name": "Read",
-                            "arguments": '{"file_path": "/src/main.py"}',
-                        },
-                    }
-                ],
-            },
-            {
-                "role": "assistant",
-                "tool_calls": [
-                    {
-                        "id": "call_2",
-                        "function": {
-                            "name": "Grep",
-                            "arguments": '{"pattern": "def"}',
-                        },
-                    }
-                ],
-            },
-        ]
-
-        # Test file read hint
-        hint1 = manager._get_tool_source_hint(messages, "call_1")
-        assert "file:" in hint1 or hint1 == ""  # May not have content_router import
-
-        # Test grep hint
-        hint2 = manager._get_tool_source_hint(messages, "call_2")
-        assert "grep" in hint2.lower() or hint2 == ""
-
-        # Test unknown tool call
-        hint3 = manager._get_tool_source_hint(messages, "unknown")
-        assert hint3 == ""
-
 
 class TestCompressFirstWithContentBlocks:
     """Tests for COMPRESS_FIRST with Anthropic-style content blocks."""

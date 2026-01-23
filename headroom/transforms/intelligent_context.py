@@ -444,16 +444,8 @@ class IntelligentContextManager(Transform):
             # Focus on tool messages (highest compression potential)
             if role == "tool" and isinstance(content, str) and len(content) > 100:
                 try:
-                    # Get source hint from tool call context
-                    tool_call_id = msg.get("tool_call_id", "")
-                    source_hint = self._get_tool_source_hint(messages, tool_call_id)
-
-                    # Compress using ContentRouter
-                    result = router.compress(
-                        content,
-                        source_hint=source_hint,
-                        context="",  # No specific context in compress-first mode
-                    )
+                    # Compress using ContentRouter (auto-detects content type)
+                    result = router.compress(content)
 
                     # Check if compression was effective
                     if result.compression_ratio < 0.9:  # At least 10% savings
@@ -499,46 +491,6 @@ class IntelligentContextManager(Transform):
             )
 
         return compressed_messages, transforms_applied, total_tokens_saved
-
-    def _get_tool_source_hint(self, messages: list[dict[str, Any]], tool_call_id: str) -> str:
-        """Extract source hint from the tool call that produced this result.
-
-        Args:
-            messages: List of all messages.
-            tool_call_id: The ID of the tool call to find.
-
-        Returns:
-            Source hint string (e.g., "tool:grep", "file:main.py").
-        """
-        if not tool_call_id:
-            return ""
-
-        # Find the assistant message with this tool call
-        for msg in messages:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tc in msg.get("tool_calls", []):
-                    if tc.get("id") == tool_call_id:
-                        func = tc.get("function", {})
-                        tool_name = func.get("name", "")
-
-                        # Import here to avoid circular imports
-                        try:
-                            import json
-
-                            from .content_router import generate_source_hint
-
-                            args_str = func.get("arguments", "{}")
-                            try:
-                                args = (
-                                    json.loads(args_str) if isinstance(args_str, str) else args_str
-                                )
-                            except json.JSONDecodeError:
-                                args = {}
-
-                            return generate_source_hint(tool_name, args)
-                        except ImportError:
-                            return f"tool:{tool_name}" if tool_name else ""
-        return ""
 
     def _compress_content_blocks(
         self,

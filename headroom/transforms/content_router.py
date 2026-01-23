@@ -360,51 +360,6 @@ def _extract_json_block(lines: list[str], start: int) -> tuple[str | None, int]:
     return None, start
 
 
-def generate_source_hint(tool_name: str, tool_input: dict[str, Any]) -> str:
-    """Generate a source hint from tool metadata.
-
-    This enables higher-confidence routing decisions.
-
-    Args:
-        tool_name: Name of the tool that produced the output.
-        tool_input: Input parameters to the tool.
-
-    Returns:
-        Source hint string (e.g., "file:auth.py", "tool:grep").
-    """
-    # File read operations
-    if tool_name in ("Read", "read_file", "cat", "ReadFile"):
-        file_path = tool_input.get("file_path", tool_input.get("path", ""))
-        if file_path:
-            return f"file:{file_path}"
-
-    # Search operations
-    if tool_name in ("Grep", "grep", "ripgrep", "rg", "search", "Search"):
-        return "tool:grep"
-
-    # Glob operations
-    if tool_name in ("Glob", "glob", "find"):
-        return "tool:glob"
-
-    # Build/test operations
-    if tool_name == "Bash":
-        command = str(tool_input.get("command", ""))
-        if any(cmd in command for cmd in ["pytest", "npm test", "cargo test", "go test"]):
-            return "tool:pytest"
-        if any(cmd in command for cmd in ["npm run build", "cargo build", "make"]):
-            return "tool:build"
-        if "git diff" in command:
-            return "tool:git-diff"
-        if "git log" in command:
-            return "tool:git-log"
-
-    # Web fetch
-    if tool_name in ("WebFetch", "fetch", "curl", "WebSearch"):
-        return "tool:web"
-
-    return ""
-
-
 class ContentRouter(Transform):
     """Intelligent router that selects optimal compression strategy.
 
@@ -462,15 +417,12 @@ class ContentRouter(Transform):
     def compress(
         self,
         content: str,
-        source_hint: str | None = None,
         context: str = "",
     ) -> RouterCompressionResult:
-        """Compress content using optimal strategy.
+        """Compress content using optimal strategy based on content detection.
 
         Args:
             content: Content to compress.
-            source_hint: Optional hint about content source.
-                Examples: "file:auth.py", "tool:grep", "tool:pytest"
             context: Optional context for relevance-aware compression.
 
         Returns:
@@ -484,86 +436,30 @@ class ContentRouter(Transform):
                 routing_log=[],
             )
 
-        # Determine strategy
-        strategy = self._determine_strategy(content, source_hint)
+        # Determine strategy from content analysis
+        strategy = self._determine_strategy(content)
 
         if strategy == CompressionStrategy.MIXED:
             return self._compress_mixed(content, context)
         else:
             return self._compress_pure(content, strategy, context)
 
-    def _determine_strategy(
-        self,
-        content: str,
-        source_hint: str | None,
-    ) -> CompressionStrategy:
-        """Determine the compression strategy.
+    def _determine_strategy(self, content: str) -> CompressionStrategy:
+        """Determine the compression strategy from content analysis.
 
         Args:
             content: Content to analyze.
-            source_hint: Optional source hint.
 
         Returns:
             Selected compression strategy.
         """
-        # 1. Source hint takes priority
-        if source_hint:
-            strategy = self._strategy_from_hint(source_hint)
-            if strategy:
-                return strategy
-
-        # 2. Check for mixed content
+        # 1. Check for mixed content
         if is_mixed_content(content):
             return CompressionStrategy.MIXED
 
-        # 3. Detect content type
+        # 2. Detect content type from content itself
         detection = detect_content_type(content)
         return self._strategy_from_detection(detection)
-
-    def _strategy_from_hint(self, hint: str) -> CompressionStrategy | None:
-        """Get strategy from source hint.
-
-        Args:
-            hint: Source hint string.
-
-        Returns:
-            Strategy if determinable, None otherwise.
-        """
-        hint_lower = hint.lower()
-
-        # File hints
-        if hint_lower.startswith("file:"):
-            file_path = hint_lower[5:]
-            if file_path.endswith((".py", ".pyw")):
-                return CompressionStrategy.CODE_AWARE
-            if file_path.endswith((".js", ".jsx", ".ts", ".tsx", ".mjs")):
-                return CompressionStrategy.CODE_AWARE
-            if file_path.endswith((".go", ".rs", ".java", ".c", ".cpp", ".h", ".hpp")):
-                return CompressionStrategy.CODE_AWARE
-            if file_path.endswith(".json"):
-                return CompressionStrategy.SMART_CRUSHER
-            if file_path.endswith((".md", ".txt", ".rst")):
-                return CompressionStrategy.TEXT
-            if file_path.endswith((".log", ".out")):
-                return CompressionStrategy.LOG
-
-        # Tool hints
-        if hint_lower.startswith("tool:"):
-            tool = hint_lower[5:]
-            if tool in ("grep", "rg", "ripgrep", "ag", "search"):
-                return CompressionStrategy.SEARCH
-            if tool in ("pytest", "jest", "cargo-test", "go-test", "npm-test"):
-                return CompressionStrategy.LOG
-            if tool in ("build", "make", "cargo-build", "npm-build"):
-                return CompressionStrategy.LOG
-            if tool in ("git-diff", "diff"):
-                return CompressionStrategy.DIFF
-
-        # Direct strategy hints (used by _process_content_blocks for tool_result)
-        if hint_lower == "json_array":
-            return CompressionStrategy.SMART_CRUSHER
-
-        return None
 
     def _strategy_from_detection(self, detection: Any) -> CompressionStrategy:
         """Get strategy from content detection result.
@@ -897,14 +793,13 @@ class ContentRouter(Transform):
         Args:
             messages: Messages to transform.
             tokenizer: Tokenizer for counting.
-            **kwargs: Additional arguments (context, source_hints).
+            **kwargs: Additional arguments (context).
 
         Returns:
             TransformResult with routed and compressed messages.
         """
         tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
         context = kwargs.get("context", "")
-        source_hints = kwargs.get("source_hints", {})  # message_id -> hint
 
         transformed_messages: list[dict[str, Any]] = []
         transforms_applied: list[str] = []
@@ -945,9 +840,6 @@ class ContentRouter(Transform):
                 transformed_messages.append(message)
                 continue
 
-            # Get source hint if available
-            source_hint = source_hints.get(i) or source_hints.get(str(i))
-
             # Detect content type for protection decisions
             detection = detect_content_type(content)
             is_code = detection.content_type == ContentType.SOURCE_CODE
@@ -969,8 +861,8 @@ class ContentRouter(Transform):
                 transforms_applied.append("router:protected:analysis_context")
                 continue
 
-            # Route and compress
-            result = self.compress(content, source_hint=source_hint, context=context)
+            # Route and compress based on content detection
+            result = self.compress(content, context=context)
 
             if result.compression_ratio < 0.9:
                 transformed_messages.append({**message, "content": result.compressed})
@@ -1013,8 +905,6 @@ class ContentRouter(Transform):
         Returns:
             Transformed message with compressed content blocks.
         """
-        import json
-
         new_blocks = []
         any_compressed = False
 
@@ -1031,33 +921,7 @@ class ContentRouter(Transform):
 
                 # Only process string content
                 if isinstance(tool_content, str) and len(tool_content) > 500:
-                    # Try to detect if it's JSON array data (SmartCrusher target)
-                    try:
-                        parsed = json.loads(tool_content)
-                        if isinstance(parsed, list) and len(parsed) > 10:
-                            # Route to SmartCrusher for arrays
-                            result = self.compress(
-                                tool_content,
-                                source_hint="json_array",
-                                context=context,
-                            )
-                            if result.compression_ratio < 0.9:
-                                new_blocks.append(
-                                    {
-                                        **block,
-                                        "content": result.compressed,
-                                    }
-                                )
-                                transforms_applied.append(
-                                    f"router:tool_result:{result.strategy_used.value}"
-                                )
-                                any_compressed = True
-                                continue
-                    except (json.JSONDecodeError, TypeError):
-                        # Not JSON, try general compression
-                        pass
-
-                    # Try general compression for large non-JSON content
+                    # Compress using content detection (will auto-detect JSON arrays, etc.)
                     result = self.compress(tool_content, context=context)
                     if result.compression_ratio < 0.9:
                         new_blocks.append({**block, "content": result.compressed})
@@ -1140,15 +1004,13 @@ class ContentRouter(Transform):
 
 def route_and_compress(
     content: str,
-    source_hint: str | None = None,
     context: str = "",
 ) -> str:
     """Convenience function for one-off routing and compression.
 
     Args:
         content: Content to compress.
-        source_hint: Optional source hint.
-        context: Optional context.
+        context: Optional context for relevance-aware compression.
 
     Returns:
         Compressed content.
@@ -1157,5 +1019,5 @@ def route_and_compress(
         >>> compressed = route_and_compress(mixed_content)
     """
     router = ContentRouter()
-    result = router.compress(content, source_hint=source_hint, context=context)
+    result = router.compress(content, context=context)
     return result.compressed

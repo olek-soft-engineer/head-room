@@ -57,7 +57,6 @@ from .content_router import (
     ContentRouter,
     ContentRouterConfig,
     RouterCompressionResult,
-    generate_source_hint,
 )
 
 __all__ = [
@@ -101,7 +100,6 @@ __all__ = [
     "ContentRouterConfig",
     "RouterCompressionResult",
     "CompressionStrategy",
-    "generate_source_hint",
     # Other transforms
     "CacheAligner",
     "RollingWindow",

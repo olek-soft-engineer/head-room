@@ -516,15 +516,14 @@ router = ContentRouter(config)
 ### Example
 
 ```python
-from headroom.transforms import ContentRouter, generate_source_hint
+from headroom.transforms import ContentRouter
 
 router = ContentRouter()
 
-# With source hint for high-confidence routing
-hint = generate_source_hint(tool_name="grep", file_path="src/auth.py")
-result = router.compress(content, source_hint=hint)
+# Router auto-detects content type and routes to optimal compressor
+result = router.compress(content)
 
-print(result.strategy)  # CompressionStrategy.SEARCH or CODE_AWARE
+print(result.strategy_used)  # CompressionStrategy.CODE_AWARE, SMART_CRUSHER, etc.
 print(result.routing_log)  # List of routing decisions
 ```
 
@@ -540,22 +539,17 @@ print(result.routing_log)  # List of routing decisions
 | LLMLINGUA | Any (max compression) | LLMLinguaCompressor |
 | PASSTHROUGH | Small content | None |
 
-### Source Hints
+### Content Detection
 
-Use source hints for accurate routing:
+The router automatically detects content types by analyzing the content itself:
 
-```python
-from headroom.transforms import generate_source_hint
+- **Source code**: Detected by syntax patterns, indentation, keywords
+- **JSON arrays**: Detected by JSON structure with array elements
+- **Search results**: Detected by `file:line:` patterns
+- **Log output**: Detected by timestamp and log level patterns
+- **Plain text**: Fallback for prose content
 
-# From tool invocation
-hint = generate_source_hint(tool_name="Read", file_path="main.py")
-
-# From file extension
-hint = generate_source_hint(file_path="components/Button.tsx")
-
-# From explicit tool
-hint = generate_source_hint(tool_name="Grep")  # Routes to SEARCH
-```
+No manual hints required - the router inspects content directly.
 
 ---
 
