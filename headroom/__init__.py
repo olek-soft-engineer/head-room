@@ -113,8 +113,16 @@ from .exceptions import (
     ValidationError,
 )
 
-# Memory module - simple, LLM-driven memory
-from .memory import Memory, SQLiteMemoryStore, with_memory
+# Memory module - hierarchical memory system
+from .memory import (
+    EmbedderBackend,
+    HierarchicalMemory,
+    Memory,
+    MemoryCategory,
+    MemoryConfig,
+    ScopeLevel,
+    with_memory,
+)
 from .providers import AnthropicProvider, OpenAIProvider, Provider, TokenCounter
 from .relevance import (
     BM25Scorer,
@@ -135,7 +143,7 @@ from .transforms import (
     TransformPipeline,
 )
 
-__version__ = "0.2.15"
+__version__ = "0.3.0"
 
 __all__ = [
     # Main client
@@ -205,8 +213,12 @@ __all__ = [
     "count_tokens_text",
     "count_tokens_messages",
     "generate_report",
-    # Memory - simple, LLM-driven memory
-    "with_memory",
+    # Memory - hierarchical memory system
+    "with_memory",  # Main user-facing API
     "Memory",
-    "SQLiteMemoryStore",
+    "MemoryCategory",
+    "ScopeLevel",
+    "HierarchicalMemory",
+    "MemoryConfig",
+    "EmbedderBackend",
 ]

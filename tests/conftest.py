@@ -1,5 +1,11 @@
 """Shared pytest fixtures for Headroom tests."""
 
+# CRITICAL: Must be set before ANY imports that could trigger sentence_transformers
+# The Rust tokenizers use parallelism that deadlocks with pytest-asyncio
+import os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import json
 import tempfile
 from datetime import datetime

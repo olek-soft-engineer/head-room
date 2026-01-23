@@ -1,32 +1,47 @@
 """Memory wrapper - the main API for Headroom Memory.
 
-One-line integration:
+One-line integration with zero-latency inline extraction:
     from headroom import with_memory
     client = with_memory(OpenAI(), user_id="alice")
+
+This uses the Letta/MemGPT approach - memories are extracted inline
+as part of the LLM response, not in a separate API call.
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import logging
 from pathlib import Path
 from typing import Any
 
-from headroom.memory.extractor import MemoryExtractor
-from headroom.memory.store import Memory, SQLiteMemoryStore
-from headroom.memory.worker import ExtractionWorker
+from headroom.memory.config import EmbedderBackend, MemoryConfig
+from headroom.memory.core import HierarchicalMemory
+from headroom.memory.inline_extractor import (
+    inject_memory_instruction,
+    parse_response_with_memory,
+)
+from headroom.memory.models import Memory, MemoryCategory
+
+logger = logging.getLogger(__name__)
 
 
 class MemoryWrapper:
-    """Wraps an LLM client to add automatic memory.
+    """Wraps an LLM client to add automatic memory with zero extra latency.
+
+    Uses inline extraction (Letta-style) - memories are extracted as part
+    of the LLM response, not in a separate API call.
 
     Intercepts chat completions to:
-    1. BEFORE: Inject relevant memories into user message
-    2. AFTER: Queue conversation for background memory extraction
+    1. BEFORE: Inject relevant memories into user message (semantic search)
+    2. DURING: Memory instruction in system prompt
+    3. AFTER: Parse response to extract and store memories
 
-    The system prompt is left unchanged to preserve prompt caching.
+    The original system prompt is preserved for caching.
 
     Usage:
-        client = MemoryWrapper(OpenAI(), user_id="alice")
+        client = with_memory(OpenAI(), user_id="alice")
         response = client.chat.completions.create(...)
     """
 
@@ -35,10 +50,12 @@ class MemoryWrapper:
         client: Any,
         user_id: str,
         db_path: str | Path = "headroom_memory.db",
-        extraction_model: str | None = None,
         top_k: int = 5,
-        _extractor: Any = None,  # For testing - inject mock
-        _store: SQLiteMemoryStore | None = None,  # For testing
+        session_id: str | None = None,
+        agent_id: str | None = None,
+        embedder_backend: EmbedderBackend = EmbedderBackend.LOCAL,
+        openai_api_key: str | None = None,
+        _memory: HierarchicalMemory | None = None,  # For testing
     ):
         """Initialize the memory wrapper.
 
@@ -46,53 +63,61 @@ class MemoryWrapper:
             client: LLM client (OpenAI, Anthropic, etc.)
             user_id: User identifier for memory isolation
             db_path: Path to SQLite database
-            extraction_model: Override extraction model (auto-detect if None)
             top_k: Number of memories to inject
-            _extractor: Override extractor (for testing)
-            _store: Override store (for testing)
+            session_id: Optional session ID for session-scoped memories
+            agent_id: Optional agent ID for agent-scoped memories
+            embedder_backend: Which embedder to use (LOCAL or OPENAI)
+            openai_api_key: API key if using OpenAI embeddings
+            _memory: Override memory system (for testing)
         """
         self._client = client
         self._user_id = user_id
+        self._session_id = session_id
+        self._agent_id = agent_id
         self._top_k = top_k
+        self._db_path = Path(db_path)
 
-        # Initialize store
-        self._store = _store or SQLiteMemoryStore(db_path)
-
-        # Initialize extractor
-        self._extractor = _extractor or MemoryExtractor(client, model=extraction_model)
-
-        # Initialize background worker with shorter wait for responsiveness
-        self._worker = ExtractionWorker(
-            store=self._store,
-            extractor=self._extractor,
-            max_wait_seconds=5.0,  # Process partial batches after 5s
+        # Initialize memory system (async, so we defer)
+        self._memory = _memory
+        self._memory_config = MemoryConfig(
+            db_path=self._db_path,
+            embedder_backend=embedder_backend,
+            openai_api_key=openai_api_key,
         )
-        self._worker.start()
+        self._initialized = _memory is not None
 
         # Create wrapped chat interface
         self.chat = _WrappedChat(self)
 
-    def flush_extractions(self, timeout: float = 60.0) -> bool:
-        """Force immediate processing of all queued extractions.
-
-        Useful for testing or when you need to ensure memories are saved.
-
-        Args:
-            timeout: Max time to wait in seconds
-
-        Returns:
-            True if all extractions completed, False if timed out
-        """
-        return self._worker.flush(timeout=timeout)
+    def _ensure_initialized(self) -> None:
+        """Ensure memory system is initialized (sync wrapper for async init)."""
+        if not self._initialized:
+            # Run async initialization in sync context
+            loop = asyncio.new_event_loop()
+            try:
+                self._memory = loop.run_until_complete(
+                    HierarchicalMemory.create(self._memory_config)
+                )
+                self._initialized = True
+            finally:
+                loop.close()
 
     @property
     def memory(self) -> _MemoryAPI:
         """Direct access to memory operations."""
-        return _MemoryAPI(self._store, self._user_id)
+        self._ensure_initialized()
+        assert self._memory is not None
+        return _MemoryAPI(
+            self._memory,
+            self._user_id,
+            self._session_id,
+            self._agent_id,
+        )
 
     def _inject_memories(self, messages: list[dict]) -> list[dict]:
         """Inject relevant memories into messages.
 
+        Uses semantic search to find relevant memories.
         Memories are prepended to the FIRST user message to preserve
         system prompt caching.
 
@@ -102,7 +127,10 @@ class MemoryWrapper:
         Returns:
             New messages list with memories injected
         """
-        # Find the last user message
+        self._ensure_initialized()
+        assert self._memory is not None
+
+        # Find the last user message for search context
         user_content = None
         for msg in reversed(messages):
             if msg.get("role") == "user":
@@ -112,20 +140,27 @@ class MemoryWrapper:
         if not user_content:
             return messages
 
-        # Search for relevant memories
-        memories = self._store.search(
-            self._user_id,
-            str(user_content),
-            top_k=self._top_k,
-        )
+        # Search for relevant memories (async -> sync)
+        loop = asyncio.new_event_loop()
+        try:
+            memories = loop.run_until_complete(
+                self._memory.search(
+                    query=str(user_content),
+                    user_id=self._user_id,
+                    session_id=self._session_id,
+                    top_k=self._top_k,
+                )
+            )
+        finally:
+            loop.close()
 
         if not memories:
             return messages
 
-        # Build context block
+        # Build context block (search returns VectorSearchResult with .memory attr)
         context_lines = ["<context>"]
-        for mem in memories:
-            context_lines.append(f"- {mem.content}")
+        for result in memories:
+            context_lines.append(f"- {result.memory.content}")
         context_lines.append("</context>")
         context_block = "\n".join(context_lines)
 
@@ -139,14 +174,42 @@ class MemoryWrapper:
 
         return new_messages
 
-    def _queue_extraction(self, query: str, response: str) -> None:
-        """Queue conversation for background memory extraction.
+    def _store_memories(self, memories: list[dict[str, Any]]) -> None:
+        """Store extracted memories.
 
         Args:
-            query: User's message
-            response: Assistant's response
+            memories: List of memory dicts from inline extraction
         """
-        self._worker.schedule(self._user_id, query, response)
+        self._ensure_initialized()
+        assert self._memory is not None
+
+        loop = asyncio.new_event_loop()
+        try:
+            for mem in memories:
+                content = mem.get("content", "")
+                category_str = mem.get("category", "fact")
+
+                # Map string category to enum
+                category_map = {
+                    "preference": MemoryCategory.PREFERENCE,
+                    "fact": MemoryCategory.FACT,
+                    "context": MemoryCategory.CONTEXT,
+                }
+                category = category_map.get(category_str, MemoryCategory.FACT)
+
+                if content:
+                    loop.run_until_complete(
+                        self._memory.add(
+                            content=content,
+                            user_id=self._user_id,
+                            session_id=self._session_id,
+                            agent_id=self._agent_id,
+                            category=category,
+                            importance=0.7,  # Default importance for extracted memories
+                        )
+                    )
+        finally:
+            loop.close()
 
 
 class _WrappedChat:
@@ -158,66 +221,77 @@ class _WrappedChat:
 
 
 class _WrappedCompletions:
-    """Wrapped completions that add memory to requests."""
+    """Wrapped completions with inline memory extraction."""
 
     def __init__(self, wrapper: MemoryWrapper):
         self._wrapper = wrapper
 
     def create(self, **kwargs: Any) -> Any:
-        """Create a chat completion with memory injection.
+        """Create a chat completion with memory injection and inline extraction.
 
-        This intercepts the request to:
-        1. Inject relevant memories into user message
-        2. Forward to the real client
-        3. Queue response for background extraction
+        Flow:
+        1. Search for relevant memories (semantic)
+        2. Inject memories into user message
+        3. Add memory extraction instruction to system prompt
+        4. Forward to LLM
+        5. Parse response to extract memories
+        6. Store extracted memories
+        7. Return clean response (without memory block)
 
         All kwargs are passed through to the underlying client.
         """
         messages = kwargs.get("messages", [])
 
-        # 1. Inject memories into user message
+        # 1. Inject relevant memories into user message
         enhanced_messages = self._wrapper._inject_memories(messages)
+
+        # 2. Add memory extraction instruction to system prompt
+        enhanced_messages = inject_memory_instruction(enhanced_messages, short=True)
         kwargs["messages"] = enhanced_messages
 
-        # 2. Forward to real client
+        # 3. Forward to LLM
         response = self._wrapper._client.chat.completions.create(**kwargs)
 
-        # 3. Queue for extraction (non-blocking)
-        self._extract_and_queue(messages, response)
+        # 4. Parse response and extract memories
+        raw_content = response.choices[0].message.content
+        parsed = parse_response_with_memory(raw_content)
+
+        # 5. Store extracted memories
+        if parsed.memories:
+            self._wrapper._store_memories(parsed.memories)
+            logger.debug(f"Extracted and stored {len(parsed.memories)} memories")
+
+        # 6. Return clean response (modify in place)
+        response.choices[0].message.content = parsed.content
 
         return response
-
-    def _extract_and_queue(self, original_messages: list[dict], response: Any) -> None:
-        """Extract query and response, queue for extraction."""
-        # Get the last user message (without context injection)
-        user_query = None
-        for msg in reversed(original_messages):
-            if msg.get("role") == "user":
-                user_query = msg.get("content", "")
-                break
-
-        if not user_query:
-            return
-
-        # Get assistant response
-        try:
-            assistant_response = response.choices[0].message.content
-        except (AttributeError, IndexError):
-            return
-
-        if assistant_response:
-            self._wrapper._queue_extraction(user_query, assistant_response)
 
 
 class _MemoryAPI:
     """Direct API for memory operations."""
 
-    def __init__(self, store: SQLiteMemoryStore, user_id: str):
-        self._store = store
+    def __init__(
+        self,
+        memory: HierarchicalMemory,
+        user_id: str,
+        session_id: str | None = None,
+        agent_id: str | None = None,
+    ):
+        self._memory = memory
         self._user_id = user_id
+        self._session_id = session_id
+        self._agent_id = agent_id
+
+    def _run_async(self, coro: Any) -> Any:
+        """Run async coroutine in sync context."""
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
 
     def search(self, query: str, top_k: int = 5) -> list[Memory]:
-        """Search memories.
+        """Semantic search for memories.
 
         Args:
             query: Search query
@@ -226,67 +300,113 @@ class _MemoryAPI:
         Returns:
             Matching memories
         """
-        return self._store.search(self._user_id, query, top_k)
+        results = self._run_async(
+            self._memory.search(
+                query=query,
+                user_id=self._user_id,
+                session_id=self._session_id,
+                top_k=top_k,
+            )
+        )
+        # Extract Memory objects from VectorSearchResult
+        return [r.memory for r in results]
 
     def add(
         self,
         content: str,
-        category: str = "fact",
+        category: str | MemoryCategory = "fact",
         importance: float = 0.5,
     ) -> Memory:
         """Manually add a memory.
 
         Args:
             content: Memory content
-            category: preference, fact, or context
+            category: preference, fact, or context (or MemoryCategory enum)
             importance: 0.0-1.0
 
         Returns:
             The created memory
         """
-        memory = Memory(
-            content=content,
-            category=category,  # type: ignore
-            importance=importance,
+        # Map string category to enum
+        cat_enum: MemoryCategory
+        if isinstance(category, str):
+            category_map: dict[str, MemoryCategory] = {
+                "preference": MemoryCategory.PREFERENCE,
+                "fact": MemoryCategory.FACT,
+                "context": MemoryCategory.CONTEXT,
+                "episodic": MemoryCategory.CONTEXT,
+                "entity": MemoryCategory.ENTITY,
+                "decision": MemoryCategory.DECISION,
+                "insight": MemoryCategory.INSIGHT,
+            }
+            cat_enum = category_map.get(category, MemoryCategory.FACT)
+        else:
+            cat_enum = category
+
+        result: Memory = self._run_async(
+            self._memory.add(
+                content=content,
+                user_id=self._user_id,
+                session_id=self._session_id,
+                agent_id=self._agent_id,
+                category=cat_enum,
+                importance=importance,
+            )
         )
-        self._store.save(self._user_id, memory)
-        return memory
+        return result
 
     def get_all(self) -> list[Memory]:
         """Get all memories for this user."""
-        return self._store.get_all(self._user_id)
+        from headroom.memory.ports import MemoryFilter
 
-    def delete(self, memory_id: str) -> bool:
-        """Delete a specific memory."""
-        return self._store.delete(self._user_id, memory_id)
+        filter = MemoryFilter(user_id=self._user_id)
+        memories: list[Memory] = self._run_async(self._memory.query(filter))
+        return memories
 
     def clear(self) -> int:
         """Clear all memories for this user."""
-        return self._store.clear(self._user_id)
+        count: int = self._run_async(self._memory.clear_scope(user_id=self._user_id))
+        return count
 
     def stats(self) -> dict:
         """Get memory statistics."""
-        return self._store.stats(self._user_id)
+        memories = self.get_all()
+        categories: dict[str, int] = {}
+        for mem in memories:
+            cat = mem.category.value if hasattr(mem.category, "value") else str(mem.category)
+            categories[cat] = categories.get(cat, 0) + 1
+
+        return {
+            "total": len(memories),
+            "categories": categories,
+        }
 
 
 def with_memory(
     client: Any,
     user_id: str,
     db_path: str | Path = "headroom_memory.db",
-    extraction_model: str | None = None,
     top_k: int = 5,
+    session_id: str | None = None,
+    agent_id: str | None = None,
+    embedder_backend: EmbedderBackend = EmbedderBackend.LOCAL,
+    openai_api_key: str | None = None,
     **kwargs: Any,
 ) -> MemoryWrapper:
-    """Wrap an LLM client to add automatic memory.
+    """Wrap an LLM client to add automatic memory with zero extra latency.
 
-    One-line integration for adding persistent memory to any LLM client.
+    Uses inline extraction (Letta-style) - memories are extracted as part
+    of the LLM response, not in a separate API call.
 
     Args:
         client: LLM client (OpenAI, Anthropic, Mistral, Groq, etc.)
         user_id: User identifier for memory isolation
         db_path: Path to SQLite database (default: headroom_memory.db)
-        extraction_model: Override extraction model (auto-detects by default)
         top_k: Number of memories to inject per request (default: 5)
+        session_id: Optional session ID for session-scoped memories
+        agent_id: Optional agent ID for agent-scoped memories
+        embedder_backend: Which embedder to use (LOCAL or OPENAI)
+        openai_api_key: API key if using OpenAI embeddings
         **kwargs: Additional arguments passed to MemoryWrapper
 
     Returns:
@@ -302,7 +422,7 @@ def with_memory(
             model="gpt-4o",
             messages=[{"role": "user", "content": "I prefer Python"}]
         )
-        # Memory automatically extracted in background
+        # Memory automatically extracted INLINE (zero extra latency!)
 
         # Later...
         response = client.chat.completions.create(
@@ -315,7 +435,10 @@ def with_memory(
         client=client,
         user_id=user_id,
         db_path=db_path,
-        extraction_model=extraction_model,
         top_k=top_k,
+        session_id=session_id,
+        agent_id=agent_id,
+        embedder_backend=embedder_backend,
+        openai_api_key=openai_api_key,
         **kwargs,
     )
