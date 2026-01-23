@@ -90,6 +90,10 @@ evals = [
     "anthropic>=0.18.0",          # Anthropic API for evals
     "openai>=1.0.0",              # OpenAI API for evals
 ]
+# Memory system extras (hierarchical memory with vector search)
+memory = [
+    "hnswlib>=0.8.0",  # HNSW vector index for semantic search
+]
 # Development dependencies
 dev = [
     "pytest>=7.0.0",
@@ -102,10 +106,11 @@ dev = [
     "anthropic>=0.18.0",
     "ollama>=0.4.0",  # For Ollama integration tests (local LLM, no API key needed)
     "langchain-ollama>=0.2.0",  # For LangChain+Ollama integration tests
+    "hnswlib>=0.8.0",  # For memory system tests
 ]
 # All optional dependencies
 all = [
-    "headroom-ai[relevance,proxy,reports,llmlingua,code,evals]",
+    "headroom-ai[relevance,proxy,reports,llmlingua,code,evals,memory]",
 ]
 
 [project.scripts]
