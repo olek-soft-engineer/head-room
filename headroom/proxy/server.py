@@ -2116,7 +2116,18 @@ class HeadroomProxy:
 
             # Convert Google format to messages for compression
             system_instruction = req_content.get("systemInstruction")
-            messages = self._gemini_contents_to_messages(contents, system_instruction)
+            messages, preserved_indices = self._gemini_contents_to_messages(
+                contents, system_instruction
+            )
+
+            # Store original content entries that have non-text parts before compression
+            preserved_contents = {idx: contents[idx] for idx in preserved_indices}
+
+            # Early exit if ALL content has non-text parts (nothing to compress)
+            if len(preserved_indices) == len(contents):
+                # All content has non-text parts, skip compression
+                compressed_requests.append(batch_req)
+                continue
 
             # Count original tokens
             tokenizer = get_tokenizer(model)
@@ -2172,6 +2183,11 @@ class HeadroomProxy:
                 optimized_contents, optimized_sys_inst = self._messages_to_gemini_contents(
                     optimized_messages
                 )
+
+                # Restore preserved content entries that had non-text parts
+                for orig_idx, original_content in preserved_contents.items():
+                    if orig_idx < len(optimized_contents):
+                        optimized_contents[orig_idx] = original_content
 
                 # Create compressed batch request
                 compressed_req_content = {**req_content, "contents": optimized_contents}
@@ -2424,7 +2440,7 @@ class HeadroomProxy:
             system_instruction = req_content.get("systemInstruction")
 
             # Convert contents to messages format for CCR handler
-            messages = self._gemini_contents_to_messages(contents, system_instruction)
+            messages, _ = self._gemini_contents_to_messages(contents, system_instruction)
 
             # Extract system instruction text if present
             sys_text = None
@@ -3318,9 +3334,33 @@ class HeadroomProxy:
         """Handle POST /v1/batches/{batch_id}/cancel - Cancel batch (passthrough)."""
         return await self.handle_passthrough(request, self.OPENAI_API_URL)
 
+    def _has_non_text_parts(self, content: dict) -> bool:
+        """Check if a Gemini content entry has non-text parts.
+
+        Non-text parts include:
+        - inlineData: Base64-encoded images/media
+        - fileData: File references (URI + MIME type)
+        - functionCall: Function calls from model
+        - functionResponse: Responses to function calls
+
+        Args:
+            content: A single Gemini content entry with 'parts' list.
+
+        Returns:
+            True if any part contains non-text data.
+        """
+        parts = content.get("parts", [])
+        for part in parts:
+            if any(
+                key in part
+                for key in ("inlineData", "fileData", "functionCall", "functionResponse")
+            ):
+                return True
+        return False
+
     def _gemini_contents_to_messages(
         self, contents: list[dict], system_instruction: dict | None = None
-    ) -> list[dict]:
+    ) -> tuple[list[dict], set[int]]:
         """Convert Gemini contents[] format to OpenAI messages[] format for optimization.
 
         Gemini format:
@@ -3329,8 +3369,14 @@ class HeadroomProxy:
 
         OpenAI format:
             messages: [{"role": "user", "content": "..."}]
+
+        Returns:
+            Tuple of (messages, preserved_indices) where preserved_indices contains
+            the indices of content entries that have non-text parts (images, function
+            calls, etc.) and should not be compressed.
         """
         messages = []
+        preserved_indices: set[int] = set()
 
         # Add system instruction as system message
         if system_instruction:
@@ -3340,7 +3386,11 @@ class HeadroomProxy:
                 messages.append({"role": "system", "content": "\n".join(text_parts)})
 
         # Convert contents to messages
-        for content in contents:
+        for idx, content in enumerate(contents):
+            # Track content entries with non-text parts
+            if self._has_non_text_parts(content):
+                preserved_indices.add(idx)
+
             role = content.get("role", "user")
             # Map Gemini roles to OpenAI roles
             if role == "model":
@@ -3352,7 +3402,7 @@ class HeadroomProxy:
             if text_parts:
                 messages.append({"role": role, "content": "\n".join(text_parts)})
 
-        return messages
+        return messages, preserved_indices
 
     def _messages_to_gemini_contents(self, messages: list[dict]) -> tuple[list[dict], dict | None]:
         """Convert OpenAI messages[] format back to Gemini contents[] format.
@@ -3607,7 +3657,53 @@ class HeadroomProxy:
 
         # Convert Gemini format to messages for optimization
         system_instruction = body.get("systemInstruction")
-        messages = self._gemini_contents_to_messages(contents, system_instruction)
+        messages, preserved_indices = self._gemini_contents_to_messages(
+            contents, system_instruction
+        )
+
+        # Store original content entries that have non-text parts before compression
+        preserved_contents = {idx: contents[idx] for idx in preserved_indices}
+
+        # Early exit if ALL content has non-text parts (nothing to compress)
+        if len(preserved_indices) == len(contents):
+            # All content has non-text parts, skip compression entirely
+            # Just forward the request as-is
+            url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:generateContent"
+            query_params = dict(request.query_params)
+            is_streaming = query_params.get("alt") == "sse"
+            if "key" in query_params:
+                url += f"?key={query_params['key']}"
+
+            if is_streaming:
+                stream_url = (
+                    f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?alt=sse"
+                )
+                if "key" in query_params:
+                    stream_url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?key={query_params['key']}&alt=sse"
+                return await self._stream_response(
+                    stream_url,
+                    headers,
+                    body,
+                    "gemini",
+                    model,
+                    request_id,
+                    0,
+                    0,
+                    0,
+                    [],
+                    tags,
+                    0,
+                )
+            else:
+                response = await self._retry_request("POST", url, headers, body)
+                response_headers = dict(response.headers)
+                response_headers.pop("content-encoding", None)
+                response_headers.pop("content-length", None)
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    headers=response_headers,
+                )
 
         # Token counting
         tokenizer = get_tokenizer(model)
@@ -3644,6 +3740,12 @@ class HeadroomProxy:
             optimized_contents, optimized_system = self._messages_to_gemini_contents(
                 optimized_messages
             )
+
+            # Restore preserved content entries that had non-text parts
+            for orig_idx, original_content in preserved_contents.items():
+                if orig_idx < len(optimized_contents):
+                    optimized_contents[orig_idx] = original_content
+
             body["contents"] = optimized_contents
             if optimized_system:
                 body["systemInstruction"] = optimized_system
@@ -3853,7 +3955,31 @@ class HeadroomProxy:
 
         # Convert Gemini format to messages for optimization
         system_instruction = body.get("systemInstruction")
-        messages = self._gemini_contents_to_messages(contents, system_instruction)
+        messages, preserved_indices = self._gemini_contents_to_messages(
+            contents, system_instruction
+        )
+
+        # Store original content entries that have non-text parts before compression
+        preserved_contents = {idx: contents[idx] for idx in preserved_indices}
+
+        # Early exit if ALL content has non-text parts (nothing to compress)
+        if len(preserved_indices) == len(contents):
+            # All content has non-text parts, skip compression entirely
+            # Just forward the countTokens request as-is
+            url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:countTokens"
+            query_params = dict(request.query_params)
+            if "key" in query_params:
+                url += f"?key={query_params['key']}"
+
+            response = await self._retry_request("POST", url, headers, body)
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
 
         # Token counting (original)
         tokenizer = get_tokenizer(model)
@@ -3882,6 +4008,12 @@ class HeadroomProxy:
             optimized_contents, optimized_system = self._messages_to_gemini_contents(
                 optimized_messages
             )
+
+            # Restore preserved content entries that had non-text parts
+            for orig_idx, original_content in preserved_contents.items():
+                if orig_idx < len(optimized_contents):
+                    optimized_contents[orig_idx] = original_content
+
             body["contents"] = optimized_contents
             if optimized_system:
                 body["systemInstruction"] = optimized_system
