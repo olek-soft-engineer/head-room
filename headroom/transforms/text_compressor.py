@@ -101,7 +101,8 @@ class TextCompressor:
         if self.config.enable_ccr and len(lines) >= self.config.min_lines_for_ccr and ratio < 0.7:
             cache_key = self._store_in_ccr(content, compressed, len(lines))
             if cache_key:
-                compressed += f"\n[{len(lines)} lines compressed. hash={cache_key}]"
+                # Use consistent CCR marker format for CCRToolInjector detection
+                compressed += f"\n[{len(lines)} lines compressed to {len(selected)}. Retrieve more: hash={cache_key}]"
 
         return TextCompressionResult(
             compressed=compressed,

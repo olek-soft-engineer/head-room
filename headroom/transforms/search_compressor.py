@@ -156,7 +156,8 @@ class SearchCompressor:
         ):
             cache_key = self._store_in_ccr(content, compressed, original_count)
             if cache_key:
-                compressed += f"\n[{original_count} matches compressed. hash={cache_key}]"
+                # Use consistent CCR marker format for CCRToolInjector detection
+                compressed += f"\n[{original_count} matches compressed to {compressed_count}. Retrieve more: hash={cache_key}]"
 
         return SearchCompressionResult(
             compressed=compressed,

@@ -5,12 +5,18 @@ Prove that compression doesn't impact LLM accuracy through:
 2. Ground truth benchmarks (HotpotQA, BFCL, SQuAD, etc.)
 3. Information retrieval probes
 4. Statistical significance testing
+5. Batch API compression accuracy testing
 
 Install with: pip install headroom-ai[evals]
 
 Quick start:
     from headroom.evals import run_quick_eval
     results = run_quick_eval(n_samples=5)
+    print(results.summary())
+
+Batch compression eval:
+    from headroom.evals import run_batch_compression_eval
+    results = run_batch_compression_eval(provider="anthropic", n_samples=10)
     print(results.summary())
 
 Available datasets:
@@ -20,6 +26,19 @@ Available datasets:
     - Code: codesearchnet, humaneval
 """
 
+from headroom.evals.batch_compression_eval import (
+    BatchCompressionEvaluator,
+    BatchEvalResult,
+    BatchEvalSuiteResult,
+    BatchRequest,
+    BatchTestCase,
+    TestCategory,
+    TokenCountAccuracyResult,
+    evaluate_token_counting_accuracy,
+    get_all_test_cases,
+    run_batch_compression_eval,
+    run_quick_batch_eval,
+)
 from headroom.evals.core import (
     CompressionEvaluator,
     EvalCase,
@@ -74,6 +93,18 @@ __all__ = [
     "LLMConfig",
     "ContentRouterConfig",
     "run_quick_eval",
+    # Batch compression eval
+    "BatchCompressionEvaluator",
+    "BatchEvalResult",
+    "BatchEvalSuiteResult",
+    "BatchRequest",
+    "BatchTestCase",
+    "TestCategory",
+    "TokenCountAccuracyResult",
+    "evaluate_token_counting_accuracy",
+    "get_all_test_cases",
+    "run_batch_compression_eval",
+    "run_quick_batch_eval",
     # Metrics
     "compute_f1",
     "compute_exact_match",
