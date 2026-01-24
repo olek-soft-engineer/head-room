@@ -57,11 +57,16 @@ from headroom.cache.compression_feedback import get_compression_feedback
 from headroom.cache.compression_store import get_compression_store
 from headroom.ccr import (
     CCR_TOOL_NAME,
+    # Batch processing
+    BatchContext,
+    BatchRequestContext,
+    BatchResultProcessor,
     CCRResponseHandler,
     CCRToolInjector,
     ContextTracker,
     ContextTrackerConfig,
     ResponseHandlerConfig,
+    get_batch_context_store,
     parse_tool_call,
 )
 from headroom.config import CacheAlignerConfig, CCRConfig, RollingWindowConfig, SmartCrusherConfig
@@ -171,6 +176,7 @@ class ProxyConfig:
     host: str = "127.0.0.1"
     port: int = 8787
     openai_api_url: str | None = None  # Custom OpenAI API URL override
+    gemini_api_url: str | None = None  # Custom Gemini API URL override
 
     # Optimization
     optimize: bool = True
@@ -747,6 +753,7 @@ class HeadroomProxy:
 
     ANTHROPIC_API_URL = "https://api.anthropic.com"
     OPENAI_API_URL = "https://api.openai.com"
+    GEMINI_API_URL = "https://generativelanguage.googleapis.com"
 
     def __init__(self, config: ProxyConfig):
         self.config = config
@@ -754,6 +761,10 @@ class HeadroomProxy:
         # Override OPENAI_API_URL with config if set
         if config.openai_api_url:
             HeadroomProxy.OPENAI_API_URL = config.openai_api_url
+
+        # Override GEMINI_API_URL with config if set
+        if config.gemini_api_url:
+            HeadroomProxy.GEMINI_API_URL = config.gemini_api_url
 
         # Initialize providers
         self.anthropic_provider = AnthropicProvider()
@@ -1579,6 +1590,994 @@ class HeadroomProxy:
                 },
             )
 
+    async def handle_anthropic_batch_create(
+        self,
+        request: Request,
+    ) -> Response:
+        """Handle Anthropic POST /v1/messages/batches endpoint with compression.
+
+        Anthropic batch format:
+        {
+            "requests": [
+                {
+                    "custom_id": "req-1",
+                    "params": {
+                        "model": "claude-sonnet-4-20250514",
+                        "max_tokens": 1024,
+                        "messages": [{"role": "user", "content": "Hello"}]
+                    }
+                },
+                ...
+            ]
+        }
+
+        This method applies compression to each request's messages before forwarding.
+        """
+        start_time = time.time()
+        request_id = await self._next_request_id()
+
+        # Check request body size
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "request_too_large",
+                        "message": f"Request body too large. Maximum size is {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB",
+                    },
+                },
+            )
+
+        # Parse request
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": f"Invalid JSON in request body: {e!s}",
+                    },
+                },
+            )
+
+        requests_list = body.get("requests", [])
+        if not requests_list:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": "Missing or empty 'requests' field in batch request",
+                    },
+                },
+            )
+
+        # Extract headers
+        headers = dict(request.headers.items())
+        headers.pop("host", None)
+        headers.pop("content-length", None)
+
+        # Track compression stats across all batch requests
+        total_original_tokens = 0
+        total_optimized_tokens = 0
+        total_tokens_saved = 0
+        compressed_requests = []
+
+        # Apply compression to each request in the batch
+        for batch_req in requests_list:
+            custom_id = batch_req.get("custom_id", "")
+            params = batch_req.get("params", {})
+            messages = params.get("messages", [])
+            model = params.get("model", "unknown")
+
+            if not messages or not self.config.optimize:
+                # No messages or optimization disabled - pass through unchanged
+                compressed_requests.append(batch_req)
+                continue
+
+            # Count original tokens
+            tokenizer = get_tokenizer(model)
+            original_tokens = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
+            total_original_tokens += original_tokens
+
+            # Apply optimization
+            try:
+                context_limit = self.anthropic_provider.get_context_limit(model)
+                result = self.anthropic_pipeline.apply(
+                    messages=messages,
+                    model=model,
+                    model_limit=context_limit,
+                )
+
+                optimized_messages = result.messages
+                optimized_tokens = sum(
+                    tokenizer.count_text(str(m.get("content", ""))) for m in optimized_messages
+                )
+                total_optimized_tokens += optimized_tokens
+                tokens_saved = original_tokens - optimized_tokens
+                total_tokens_saved += tokens_saved
+
+                # CCR Tool Injection: Inject retrieval tool if compression occurred
+                tools = params.get("tools")
+                if self.config.ccr_inject_tool and tokens_saved > 0:
+                    injector = CCRToolInjector(
+                        provider="anthropic",
+                        inject_tool=True,
+                        inject_system_instructions=self.config.ccr_inject_system_instructions,
+                    )
+                    optimized_messages, tools, was_injected = injector.process_request(
+                        optimized_messages, tools
+                    )
+                    if was_injected:
+                        logger.debug(
+                            f"[{request_id}] CCR: Injected retrieval tool for batch request '{custom_id}'"
+                        )
+
+                # Create compressed batch request
+                compressed_params = {**params, "messages": optimized_messages}
+                if tools is not None:
+                    compressed_params["tools"] = tools
+                compressed_requests.append(
+                    {
+                        "custom_id": custom_id,
+                        "params": compressed_params,
+                    }
+                )
+
+                if tokens_saved > 0:
+                    logger.debug(
+                        f"[{request_id}] Batch request '{custom_id}': "
+                        f"{original_tokens:,} -> {optimized_tokens:,} tokens "
+                        f"(saved {tokens_saved:,})"
+                    )
+
+            except Exception as e:
+                logger.warning(
+                    f"[{request_id}] Optimization failed for batch request '{custom_id}': {e}"
+                )
+                # Pass through unchanged on failure
+                compressed_requests.append(batch_req)
+                total_optimized_tokens += original_tokens
+
+        # Update body with compressed requests
+        body["requests"] = compressed_requests
+
+        optimization_latency = (time.time() - start_time) * 1000
+
+        # Forward request to Anthropic
+        url = f"{self.ANTHROPIC_API_URL}/v1/messages/batches"
+
+        try:
+            response = await self._retry_request("POST", url, headers, body)
+
+            # Record metrics
+            await self.metrics.record_request(
+                provider="anthropic",
+                model="batch",
+                input_tokens=total_optimized_tokens,
+                output_tokens=0,
+                tokens_saved=total_tokens_saved,
+                latency_ms=optimization_latency,
+            )
+
+            # Log compression stats
+            if total_tokens_saved > 0:
+                savings_percent = (
+                    (total_tokens_saved / total_original_tokens * 100)
+                    if total_original_tokens > 0
+                    else 0
+                )
+                logger.info(
+                    f"[{request_id}] Batch ({len(compressed_requests)} requests): "
+                    f"{total_original_tokens:,} -> {total_optimized_tokens:,} tokens "
+                    f"(saved {total_tokens_saved:,}, {savings_percent:.1f}%)"
+                )
+
+            # Store batch context for CCR result processing
+            if response.status_code == 200 and self.config.ccr_inject_tool:
+                try:
+                    response_data = response.json()
+                    batch_id = response_data.get("id")
+                    if batch_id:
+                        await self._store_anthropic_batch_context(
+                            batch_id,
+                            requests_list,
+                            headers.get("x-api-key"),
+                        )
+                except Exception as e:
+                    logger.warning(f"[{request_id}] Failed to store batch context: {e}")
+
+            # Remove compression headers
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+
+        except Exception as e:
+            await self.metrics.record_failed()
+            logger.error(f"[{request_id}] Batch request failed: {type(e).__name__}: {e}")
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "An error occurred while processing your batch request. Please try again.",
+                    },
+                },
+            )
+
+    async def handle_anthropic_batch_passthrough(
+        self,
+        request: Request,
+        batch_id: str | None = None,
+    ) -> Response:
+        """Handle Anthropic batch passthrough endpoints.
+
+        Used for:
+        - GET /v1/messages/batches - List batches
+        - GET /v1/messages/batches/{batch_id} - Get batch
+        - GET /v1/messages/batches/{batch_id}/results - Get batch results
+        - POST /v1/messages/batches/{batch_id}/cancel - Cancel batch
+        """
+        start_time = time.time()
+        path = request.url.path
+        url = f"{self.ANTHROPIC_API_URL}{path}"
+
+        # Preserve query string parameters (e.g., limit, after_id for list endpoint)
+        if request.url.query:
+            url = f"{url}?{request.url.query}"
+
+        headers = dict(request.headers.items())
+        headers.pop("host", None)
+
+        body = await request.body()
+
+        response = await self.http_client.request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            content=body,
+        )
+
+        # Track metrics
+        latency_ms = (time.time() - start_time) * 1000
+        await self.metrics.record_request(
+            provider="anthropic",
+            model="passthrough:batches",
+            input_tokens=0,
+            output_tokens=0,
+            tokens_saved=0,
+            latency_ms=latency_ms,
+        )
+
+        # Remove compression headers
+        response_headers = dict(response.headers)
+        response_headers.pop("content-encoding", None)
+        response_headers.pop("content-length", None)
+
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=response_headers,
+        )
+
+    async def _store_anthropic_batch_context(
+        self,
+        batch_id: str,
+        requests_list: list[dict[str, Any]],
+        api_key: str | None,
+    ) -> None:
+        """Store batch context for CCR result processing.
+
+        Args:
+            batch_id: The batch ID from the API response.
+            requests_list: The original batch requests.
+            api_key: The API key for continuation calls.
+        """
+        store = get_batch_context_store()
+        context = BatchContext(
+            batch_id=batch_id,
+            provider="anthropic",
+            api_key=api_key,
+            api_base_url=self.ANTHROPIC_API_URL,
+        )
+
+        for batch_req in requests_list:
+            custom_id = batch_req.get("custom_id", "")
+            params = batch_req.get("params", {})
+            context.add_request(
+                BatchRequestContext(
+                    custom_id=custom_id,
+                    messages=params.get("messages", []),
+                    tools=params.get("tools"),
+                    model=params.get("model", ""),
+                    extras={
+                        "max_tokens": params.get("max_tokens", 4096),
+                        "system": params.get("system"),
+                    },
+                )
+            )
+
+        await store.store(context)
+        logger.debug(f"Stored batch context for {batch_id} with {len(requests_list)} requests")
+
+    async def handle_anthropic_batch_results(
+        self,
+        request: Request,
+        batch_id: str,
+    ) -> Response:
+        """Handle Anthropic batch results with CCR post-processing.
+
+        This endpoint:
+        1. Fetches raw results from Anthropic
+        2. Detects CCR tool calls in each result
+        3. Executes retrieval and makes continuation calls
+        4. Returns processed results with complete responses
+        """
+        start_time = time.time()
+
+        # Forward request to get raw results
+        url = f"{self.ANTHROPIC_API_URL}/v1/messages/batches/{batch_id}/results"
+
+        if request.url.query:
+            url = f"{url}?{request.url.query}"
+
+        headers = dict(request.headers.items())
+        headers.pop("host", None)
+
+        response = await self.http_client.get(url, headers=headers)
+
+        if response.status_code != 200:
+            # Error - pass through
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+
+        # Parse results - Anthropic batch results are JSONL format
+        raw_content = response.content.decode("utf-8")
+        results = []
+        for line in raw_content.strip().split("\n"):
+            if line.strip():
+                try:
+                    results.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+        if not results:
+            # No results to process
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+
+        # Check if we have context and CCR processing is enabled
+        store = get_batch_context_store()
+        batch_context = await store.get(batch_id)
+
+        if batch_context is None or not self.config.ccr_inject_tool:
+            # No context or CCR disabled - pass through
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+
+        # Process results with CCR handler
+        processor = BatchResultProcessor(self.http_client)
+        processed = await processor.process_results(batch_id, results, "anthropic")
+
+        # Convert back to JSONL format
+        processed_lines = []
+        for p in processed:
+            processed_lines.append(json.dumps(p.result))
+            if p.was_processed:
+                logger.info(
+                    f"CCR: Processed batch result {p.custom_id} "
+                    f"({p.continuation_rounds} continuation rounds)"
+                )
+
+        processed_content = "\n".join(processed_lines)
+
+        # Track metrics
+        latency_ms = (time.time() - start_time) * 1000
+        await self.metrics.record_request(
+            provider="anthropic",
+            model="batch:ccr-processed",
+            input_tokens=0,
+            output_tokens=0,
+            tokens_saved=0,
+            latency_ms=latency_ms,
+        )
+
+        return Response(
+            content=processed_content.encode("utf-8"),
+            status_code=200,
+            media_type="application/jsonl",
+        )
+
+    # =========================================================================
+    # Google/Gemini Batch API Handlers
+    # =========================================================================
+
+    async def handle_google_batch_create(
+        self,
+        request: Request,
+        model: str,
+    ) -> Response:
+        """Handle Google POST /v1beta/models/{model}:batchGenerateContent endpoint.
+
+        Google batch format:
+        {
+            "batch": {
+                "display_name": "my-batch",
+                "input_config": {
+                    "requests": {
+                        "requests": [
+                            {
+                                "request": {"contents": [{"parts": [{"text": "..."}]}]},
+                                "metadata": {"key": "request-1"}
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+
+        This method applies compression to each request's contents before forwarding.
+        """
+        start_time = time.time()
+        request_id = await self._next_request_id()
+
+        # Check request body size
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "error": {
+                        "code": 413,
+                        "message": f"Request body too large. Maximum size is {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB",
+                        "status": "INVALID_ARGUMENT",
+                    }
+                },
+            )
+
+        # Parse request
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "code": 400,
+                        "message": f"Invalid JSON in request body: {e!s}",
+                        "status": "INVALID_ARGUMENT",
+                    }
+                },
+            )
+
+        # Extract batch config
+        batch_config = body.get("batch", {})
+        input_config = batch_config.get("input_config", {})
+        requests_wrapper = input_config.get("requests", {})
+        requests_list = requests_wrapper.get("requests", [])
+
+        if not requests_list:
+            # No inline requests - might be using file input, pass through
+            logger.debug(f"[{request_id}] Google batch: No inline requests, passing through")
+            return await self._google_batch_passthrough(request, model, body)
+
+        # Extract headers
+        headers = dict(request.headers.items())
+        headers.pop("host", None)
+        headers.pop("content-length", None)
+
+        # Track compression stats
+        total_original_tokens = 0
+        total_optimized_tokens = 0
+        total_tokens_saved = 0
+        compressed_requests = []
+
+        # Apply compression to each request in the batch
+        for idx, batch_req in enumerate(requests_list):
+            req_content = batch_req.get("request", {})
+            metadata = batch_req.get("metadata", {})
+            contents = req_content.get("contents", [])
+
+            if not contents or not self.config.optimize:
+                # No contents or optimization disabled - pass through unchanged
+                compressed_requests.append(batch_req)
+                continue
+
+            # Convert Google format to messages for compression
+            system_instruction = req_content.get("systemInstruction")
+            messages = self._gemini_contents_to_messages(contents, system_instruction)
+
+            # Count original tokens
+            tokenizer = get_tokenizer(model)
+            original_tokens = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
+            total_original_tokens += original_tokens
+
+            # Apply optimization
+            try:
+                # Default context limit for most models
+                context_limit = 128000
+
+                # Use OpenAI pipeline (similar message format after conversion)
+                result = self.openai_pipeline.apply(
+                    messages=messages,
+                    model=model,
+                    model_limit=context_limit,
+                )
+
+                optimized_messages = result.messages
+                optimized_tokens = sum(
+                    tokenizer.count_text(str(m.get("content", ""))) for m in optimized_messages
+                )
+                total_optimized_tokens += optimized_tokens
+                tokens_saved = original_tokens - optimized_tokens
+                total_tokens_saved += tokens_saved
+
+                # CCR Tool Injection: Inject retrieval tool if compression occurred
+                tools = req_content.get("tools")
+                # Extract existing function declarations if present
+                existing_funcs = None
+                if tools:
+                    for tool in tools:
+                        if "functionDeclarations" in tool:
+                            existing_funcs = tool["functionDeclarations"]
+                            break
+
+                if self.config.ccr_inject_tool and tokens_saved > 0:
+                    injector = CCRToolInjector(
+                        provider="google",
+                        inject_tool=True,
+                        inject_system_instructions=self.config.ccr_inject_system_instructions,
+                    )
+                    optimized_messages, injected_funcs, was_injected = injector.process_request(
+                        optimized_messages, existing_funcs
+                    )
+                    if was_injected:
+                        logger.debug(
+                            f"[{request_id}] CCR: Injected retrieval tool for Google batch request {idx}"
+                        )
+                        existing_funcs = injected_funcs
+
+                # Convert back to Google contents format
+                optimized_contents, optimized_sys_inst = self._messages_to_gemini_contents(
+                    optimized_messages
+                )
+
+                # Create compressed batch request
+                compressed_req_content = {**req_content, "contents": optimized_contents}
+                if optimized_sys_inst:
+                    compressed_req_content["systemInstruction"] = optimized_sys_inst
+                if existing_funcs is not None:
+                    compressed_req_content["tools"] = [{"functionDeclarations": existing_funcs}]
+
+                compressed_req = {
+                    "request": compressed_req_content,
+                    "metadata": metadata,
+                }
+
+                compressed_requests.append(compressed_req)
+
+                if tokens_saved > 0:
+                    logger.debug(
+                        f"[{request_id}] Google batch request {idx}: "
+                        f"{original_tokens:,} -> {optimized_tokens:,} tokens "
+                        f"(saved {tokens_saved:,})"
+                    )
+
+            except Exception as e:
+                logger.warning(
+                    f"[{request_id}] Optimization failed for Google batch request {idx}: {e}"
+                )
+                # Pass through unchanged on failure
+                compressed_requests.append(batch_req)
+                total_optimized_tokens += original_tokens
+
+        # Update body with compressed requests
+        body["batch"]["input_config"]["requests"]["requests"] = compressed_requests
+
+        optimization_latency = (time.time() - start_time) * 1000
+
+        # Forward request to Google
+        url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:batchGenerateContent"
+
+        # Add API key to URL if present in headers
+        api_key = headers.pop("x-goog-api-key", None)
+        if api_key:
+            url = f"{url}?key={api_key}"
+
+        try:
+            response = await self._retry_request("POST", url, headers, body)
+
+            # Record metrics
+            await self.metrics.record_request(
+                provider="google",
+                model=f"batch:{model}",
+                input_tokens=total_optimized_tokens,
+                output_tokens=0,
+                tokens_saved=total_tokens_saved,
+                latency_ms=optimization_latency,
+            )
+
+            # Log compression stats
+            if total_tokens_saved > 0:
+                savings_percent = (
+                    (total_tokens_saved / total_original_tokens * 100)
+                    if total_original_tokens > 0
+                    else 0
+                )
+                logger.info(
+                    f"[{request_id}] Google batch compression: "
+                    f"{total_original_tokens:,} -> {total_optimized_tokens:,} tokens "
+                    f"({savings_percent:.1f}% saved across {len(requests_list)} requests)"
+                )
+
+            # Store batch context for CCR result processing
+            if response.status_code == 200 and self.config.ccr_inject_tool:
+                try:
+                    response_data = response.json()
+                    batch_name = response_data.get("name")
+                    if batch_name:
+                        await self._store_google_batch_context(
+                            batch_name,
+                            requests_list,
+                            model,
+                            api_key,
+                        )
+                except Exception as e:
+                    logger.warning(f"[{request_id}] Failed to store Google batch context: {e}")
+
+            # Remove compression headers
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+
+        except Exception as e:
+            logger.error(f"[{request_id}] Google batch request failed: {e}")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "code": 500,
+                        "message": f"Failed to forward batch request: {e!s}",
+                        "status": "INTERNAL",
+                    }
+                },
+            )
+
+    async def _google_batch_passthrough(
+        self,
+        request: Request,
+        model: str,
+        body: dict | None = None,
+    ) -> Response:
+        """Pass through Google batch request without modification."""
+        start_time = time.time()
+
+        headers = dict(request.headers.items())
+        headers.pop("host", None)
+        headers.pop("content-length", None)
+
+        url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:batchGenerateContent"
+
+        # Add API key to URL if present in headers
+        api_key = headers.pop("x-goog-api-key", None)
+        if api_key:
+            url = f"{url}?key={api_key}"
+
+        if body is None:
+            body_content = await request.body()
+        else:
+            body_content = json.dumps(body).encode()
+
+        response = await self.http_client.post(
+            url,
+            headers=headers,
+            content=body_content,
+        )
+
+        # Track metrics
+        latency_ms = (time.time() - start_time) * 1000
+        await self.metrics.record_request(
+            provider="google",
+            model=f"passthrough:batch:{model}",
+            input_tokens=0,
+            output_tokens=0,
+            tokens_saved=0,
+            latency_ms=latency_ms,
+        )
+
+        response_headers = dict(response.headers)
+        response_headers.pop("content-encoding", None)
+        response_headers.pop("content-length", None)
+
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=response_headers,
+        )
+
+    async def handle_google_batch_passthrough(
+        self,
+        request: Request,
+        batch_name: str | None = None,
+    ) -> Response:
+        """Handle Google batch passthrough endpoints.
+
+        Used for:
+        - GET /v1beta/batches/{batch_name} - Get batch status
+        - POST /v1beta/batches/{batch_name}:cancel - Cancel batch
+        - DELETE /v1beta/batches/{batch_name} - Delete batch
+        """
+        start_time = time.time()
+        path = request.url.path
+        url = f"{self.GEMINI_API_URL}{path}"
+
+        # Preserve query string parameters
+        if request.url.query:
+            url = f"{url}?{request.url.query}"
+
+        headers = dict(request.headers.items())
+        headers.pop("host", None)
+
+        # Handle API key
+        api_key = headers.pop("x-goog-api-key", None)
+        if api_key:
+            if "?" in url:
+                url = f"{url}&key={api_key}"
+            else:
+                url = f"{url}?key={api_key}"
+
+        body = await request.body()
+
+        response = await self.http_client.request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            content=body,
+        )
+
+        # Track metrics
+        latency_ms = (time.time() - start_time) * 1000
+        await self.metrics.record_request(
+            provider="google",
+            model="passthrough:batches",
+            input_tokens=0,
+            output_tokens=0,
+            tokens_saved=0,
+            latency_ms=latency_ms,
+        )
+
+        response_headers = dict(response.headers)
+        response_headers.pop("content-encoding", None)
+        response_headers.pop("content-length", None)
+
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=response_headers,
+        )
+
+    async def _store_google_batch_context(
+        self,
+        batch_name: str,
+        requests_list: list[dict[str, Any]],
+        model: str,
+        api_key: str | None,
+    ) -> None:
+        """Store Google batch context for CCR result processing.
+
+        Args:
+            batch_name: The batch name from the API response.
+            requests_list: The original batch requests.
+            model: The model used for the batch.
+            api_key: The API key for continuation calls.
+        """
+        store = get_batch_context_store()
+        context = BatchContext(
+            batch_id=batch_name,
+            provider="google",
+            api_key=api_key,
+            api_base_url=self.GEMINI_API_URL,
+        )
+
+        for batch_req in requests_list:
+            metadata = batch_req.get("metadata", {})
+            custom_id = metadata.get("key", "")
+            req_content = batch_req.get("request", {})
+            contents = req_content.get("contents", [])
+            system_instruction = req_content.get("systemInstruction")
+
+            # Convert contents to messages format for CCR handler
+            messages = self._gemini_contents_to_messages(contents, system_instruction)
+
+            # Extract system instruction text if present
+            sys_text = None
+            if system_instruction:
+                parts = system_instruction.get("parts", [])
+                if parts and isinstance(parts[0], dict):
+                    sys_text = parts[0].get("text")
+
+            context.add_request(
+                BatchRequestContext(
+                    custom_id=custom_id,
+                    messages=messages,
+                    tools=req_content.get("tools"),
+                    model=model,
+                    system_instruction=sys_text,
+                )
+            )
+
+        await store.store(context)
+        logger.debug(
+            f"Stored Google batch context for {batch_name} with {len(requests_list)} requests"
+        )
+
+    async def handle_google_batch_results(
+        self,
+        request: Request,
+        batch_name: str,
+    ) -> Response:
+        """Handle Google batch results with CCR post-processing.
+
+        Google batch results endpoint returns the batch operation status.
+        When status is SUCCEEDED, results are embedded in the response.
+        This handler processes CCR tool calls in those results.
+        """
+        start_time = time.time()
+
+        # Forward request to get batch status/results
+        url = f"{self.GEMINI_API_URL}/v1beta/{batch_name}"
+
+        if request.url.query:
+            url = f"{url}?{request.url.query}"
+
+        headers = dict(request.headers.items())
+        headers.pop("host", None)
+
+        # Handle API key
+        api_key = headers.pop("x-goog-api-key", None)
+        if api_key:
+            if "?" in url:
+                url = f"{url}&key={api_key}"
+            else:
+                url = f"{url}?key={api_key}"
+
+        response = await self.http_client.get(url, headers=headers)
+
+        if response.status_code != 200:
+            # Error - pass through
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+
+        # Parse response
+        try:
+            response_data = response.json()
+        except json.JSONDecodeError:
+            # Not JSON - pass through
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+
+        # Check if batch has results (state must be SUCCEEDED)
+        metadata = response_data.get("metadata", {})
+        state = metadata.get("state")
+
+        if state != "SUCCEEDED":
+            # Batch not complete - pass through
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+
+        # Extract results from response
+        # Google embeds results in the batch response
+        results = response_data.get("response", {}).get("responses", [])
+
+        if not results:
+            # No results to process
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+
+        # Check if we have context and CCR processing is enabled
+        store = get_batch_context_store()
+        batch_context = await store.get(batch_name)
+
+        if batch_context is None or not self.config.ccr_inject_tool:
+            # No context or CCR disabled - pass through
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+
+        # Process results with CCR handler
+        processor = BatchResultProcessor(self.http_client)
+        processed = await processor.process_results(batch_name, results, "google")
+
+        # Update response with processed results
+        processed_results = [p.result for p in processed]
+        response_data["response"]["responses"] = processed_results
+
+        for p in processed:
+            if p.was_processed:
+                logger.info(
+                    f"CCR: Processed Google batch result {p.custom_id} "
+                    f"({p.continuation_rounds} continuation rounds)"
+                )
+
+        # Track metrics
+        latency_ms = (time.time() - start_time) * 1000
+        await self.metrics.record_request(
+            provider="google",
+            model="batch:ccr-processed",
+            input_tokens=0,
+            output_tokens=0,
+            tokens_saved=0,
+            latency_ms=latency_ms,
+        )
+
+        return JSONResponse(content=response_data, status_code=200)
+
     async def _stream_response(
         self,
         url: str,
@@ -1878,10 +2877,28 @@ class HeadroomProxy:
                 },
             )
 
-    async def handle_passthrough(self, request: Request, base_url: str) -> Response:
-        """Pass through request unchanged."""
+    async def handle_passthrough(
+        self,
+        request: Request,
+        base_url: str,
+        endpoint_name: str | None = None,
+        provider: str | None = None,
+    ) -> Response:
+        """Pass through request unchanged.
+
+        Args:
+            request: The incoming request
+            base_url: The upstream API base URL
+            endpoint_name: Optional name for stats tracking (e.g., "models", "embeddings")
+            provider: Optional provider name for stats (e.g., "openai", "anthropic", "gemini")
+        """
+        start_time = time.time()
         path = request.url.path
         url = f"{base_url}{path}"
+
+        # Preserve query string parameters
+        if request.url.query:
+            url = f"{url}?{request.url.query}"
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
@@ -1900,11 +2917,1042 @@ class HeadroomProxy:
         response_headers.pop("content-encoding", None)
         response_headers.pop("content-length", None)  # Length changed after decompression
 
+        # Track stats for passthrough requests
+        if endpoint_name and provider:
+            latency_ms = (time.time() - start_time) * 1000
+            await self.metrics.record_request(
+                provider=provider,
+                model=f"passthrough:{endpoint_name}",
+                input_tokens=0,
+                output_tokens=0,
+                tokens_saved=0,
+                latency_ms=latency_ms,
+                cached=False,
+                cost_usd=0,
+                savings_usd=0,
+            )
+
         return Response(
             content=response.content,
             status_code=response.status_code,
             headers=response_headers,
         )
+
+    # =========================================================================
+    # OpenAI Batch API with Compression
+    # =========================================================================
+
+    async def handle_batch_create(self, request: Request) -> Response:
+        """Handle POST /v1/batches - Create a batch with compression.
+
+        Flow:
+        1. Parse request to get input_file_id
+        2. Download the JSONL file content from OpenAI
+        3. Parse each line and compress the messages
+        4. Create a new compressed JSONL file
+        5. Upload compressed file to OpenAI
+        6. Create batch with the new compressed file_id
+        7. Return batch object with compression stats in metadata
+        """
+        start_time = time.time()
+        request_id = await self._next_request_id()
+
+        # Parse request
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Invalid JSON in request body: {e!s}",
+                        "type": "invalid_request_error",
+                        "code": "invalid_json",
+                    }
+                },
+            )
+
+        input_file_id = body.get("input_file_id")
+        endpoint = body.get("endpoint")
+        completion_window = body.get("completion_window", "24h")
+        metadata = body.get("metadata", {})
+
+        if not input_file_id:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "input_file_id is required",
+                        "type": "invalid_request_error",
+                        "code": "missing_parameter",
+                    }
+                },
+            )
+
+        if not endpoint:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": "endpoint is required",
+                        "type": "invalid_request_error",
+                        "code": "missing_parameter",
+                    }
+                },
+            )
+
+        # Only compress chat completions endpoint
+        if endpoint != "/v1/chat/completions":
+            # Pass through for other endpoints
+            return await self._batch_passthrough(request, body)
+
+        headers = dict(request.headers.items())
+        headers.pop("host", None)
+        headers.pop("content-length", None)
+
+        try:
+            # Step 1: Download the input file from OpenAI
+            logger.info(f"[{request_id}] Batch: Downloading input file {input_file_id}")
+            file_content = await self._download_openai_file(input_file_id, headers)
+
+            if file_content is None:
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "error": {
+                            "message": f"Failed to download file {input_file_id}",
+                            "type": "invalid_request_error",
+                            "code": "file_not_found",
+                        }
+                    },
+                )
+
+            # Step 2: Parse and compress each line
+            logger.info(f"[{request_id}] Batch: Compressing JSONL content")
+            compressed_lines, stats = await self._compress_batch_jsonl(file_content, request_id)
+
+            if stats["total_requests"] == 0:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": "No valid requests found in input file",
+                            "type": "invalid_request_error",
+                            "code": "empty_file",
+                        }
+                    },
+                )
+
+            # Step 3: Create compressed JSONL content
+            compressed_content = "\n".join(compressed_lines)
+
+            # Step 4: Upload compressed file to OpenAI
+            logger.info(f"[{request_id}] Batch: Uploading compressed file")
+            new_file_id = await self._upload_openai_file(
+                compressed_content, f"compressed_{input_file_id}.jsonl", headers
+            )
+
+            if new_file_id is None:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "error": {
+                            "message": "Failed to upload compressed file",
+                            "type": "server_error",
+                            "code": "upload_failed",
+                        }
+                    },
+                )
+
+            # Step 5: Create batch with compressed file
+            logger.info(f"[{request_id}] Batch: Creating batch with compressed file {new_file_id}")
+
+            # Add compression stats to metadata
+            compression_metadata = {
+                **metadata,
+                "headroom_compressed": "true",
+                "headroom_original_file_id": input_file_id,
+                "headroom_total_requests": str(stats["total_requests"]),
+                "headroom_tokens_saved": str(stats["total_tokens_saved"]),
+                "headroom_original_tokens": str(stats["total_original_tokens"]),
+                "headroom_compressed_tokens": str(stats["total_compressed_tokens"]),
+                "headroom_savings_percent": f"{stats['savings_percent']:.1f}",
+            }
+
+            batch_body = {
+                "input_file_id": new_file_id,
+                "endpoint": endpoint,
+                "completion_window": completion_window,
+                "metadata": compression_metadata,
+            }
+
+            url = f"{self.OPENAI_API_URL}/v1/batches"
+            response = await self.http_client.post(url, json=batch_body, headers=headers)  # type: ignore[union-attr]
+
+            total_latency = (time.time() - start_time) * 1000
+
+            # Log compression stats
+            logger.info(
+                f"[{request_id}] Batch created: {stats['total_requests']} requests, "
+                f"{stats['total_original_tokens']:,} -> {stats['total_compressed_tokens']:,} tokens "
+                f"(saved {stats['total_tokens_saved']:,} tokens, {stats['savings_percent']:.1f}%) "
+                f"in {total_latency:.0f}ms"
+            )
+
+            # Record metrics
+            await self.metrics.record_request(
+                provider="openai",
+                model="batch",
+                input_tokens=stats["total_compressed_tokens"],
+                output_tokens=0,
+                tokens_saved=stats["total_tokens_saved"],
+                latency_ms=total_latency,
+            )
+
+            # Return response with compression info in headers
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+            response_headers["x-headroom-tokens-saved"] = str(stats["total_tokens_saved"])
+            response_headers["x-headroom-savings-percent"] = f"{stats['savings_percent']:.1f}"
+
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+
+        except Exception as e:
+            logger.error(f"[{request_id}] Batch creation failed: {type(e).__name__}: {e}")
+            await self.metrics.record_failed()
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "message": "An error occurred while processing the batch request",
+                        "type": "server_error",
+                        "code": "batch_processing_error",
+                    }
+                },
+            )
+
+    async def _download_openai_file(self, file_id: str, headers: dict) -> str | None:
+        """Download file content from OpenAI."""
+        url = f"{self.OPENAI_API_URL}/v1/files/{file_id}/content"
+        try:
+            response = await self.http_client.get(url, headers=headers)  # type: ignore[union-attr]
+            if response.status_code == 200:
+                return response.text
+            logger.error(f"Failed to download file {file_id}: {response.status_code}")
+            return None
+        except Exception as e:
+            logger.error(f"Error downloading file {file_id}: {e}")
+            return None
+
+    async def _upload_openai_file(self, content: str, filename: str, headers: dict) -> str | None:
+        """Upload a file to OpenAI for batch processing."""
+        url = f"{self.OPENAI_API_URL}/v1/files"
+
+        # Prepare multipart form data
+        # We need to use httpx's files parameter for multipart upload
+        files = {
+            "file": (filename, content.encode("utf-8"), "application/jsonl"),
+        }
+        data = {
+            "purpose": "batch",
+        }
+
+        # Remove content-type from headers (httpx will set it for multipart)
+        upload_headers = {k: v for k, v in headers.items() if k.lower() != "content-type"}
+
+        try:
+            response = await self.http_client.post(  # type: ignore[union-attr]
+                url, files=files, data=data, headers=upload_headers
+            )
+            if response.status_code == 200:
+                result = response.json()
+                return result.get("id")
+            logger.error(f"Failed to upload file: {response.status_code} - {response.text}")
+            return None
+        except Exception as e:
+            logger.error(f"Error uploading file: {e}")
+            return None
+
+    async def _compress_batch_jsonl(self, content: str, request_id: str) -> tuple[list[str], dict]:
+        """Compress messages in each line of a batch JSONL file.
+
+        Returns:
+            Tuple of (compressed_lines, stats_dict)
+        """
+        lines = content.strip().split("\n")
+        compressed_lines = []
+        total_original_tokens = 0
+        total_compressed_tokens = 0
+        total_requests = 0
+        errors = 0
+
+        tokenizer = get_tokenizer("gpt-4")  # Use gpt-4 tokenizer for batch
+
+        for i, line in enumerate(lines):
+            if not line.strip():
+                continue
+
+            try:
+                request_obj = json.loads(line)
+                body = request_obj.get("body", {})
+                messages = body.get("messages", [])
+                model = body.get("model", "gpt-4")
+
+                if not messages:
+                    # No messages to compress, pass through
+                    compressed_lines.append(line)
+                    total_requests += 1
+                    continue
+
+                # Count original tokens
+                original_tokens = sum(
+                    tokenizer.count_text(str(m.get("content", ""))) for m in messages
+                )
+                total_original_tokens += original_tokens
+
+                # Compress messages using the OpenAI pipeline
+                if self.config.optimize:
+                    try:
+                        context_limit = self.openai_provider.get_context_limit(model)
+                        result = self.openai_pipeline.apply(
+                            messages=messages,
+                            model=model,
+                            model_limit=context_limit,
+                        )
+                        compressed_messages = result.messages
+                    except Exception as e:
+                        logger.warning(f"[{request_id}] Compression failed for line {i}: {e}")
+                        compressed_messages = messages
+                else:
+                    compressed_messages = messages
+
+                # Count compressed tokens
+                compressed_tokens = sum(
+                    tokenizer.count_text(str(m.get("content", ""))) for m in compressed_messages
+                )
+                total_compressed_tokens += compressed_tokens
+                tokens_saved = original_tokens - compressed_tokens
+
+                # CCR Tool Injection: Inject retrieval tool if compression occurred
+                tools = body.get("tools")
+                if self.config.ccr_inject_tool and tokens_saved > 0:
+                    injector = CCRToolInjector(
+                        provider="openai",
+                        inject_tool=True,
+                        inject_system_instructions=self.config.ccr_inject_system_instructions,
+                    )
+                    compressed_messages, tools, was_injected = injector.process_request(
+                        compressed_messages, tools
+                    )
+                    if was_injected:
+                        logger.debug(
+                            f"[{request_id}] CCR: Injected retrieval tool for batch line {i}"
+                        )
+
+                # Update body with compressed messages
+                body["messages"] = compressed_messages
+                if tools is not None:
+                    body["tools"] = tools
+                request_obj["body"] = body
+
+                compressed_lines.append(json.dumps(request_obj))
+                total_requests += 1
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"[{request_id}] Invalid JSON on line {i}: {e}")
+                errors += 1
+                # Keep original line on error
+                compressed_lines.append(line)
+                total_requests += 1
+
+        total_tokens_saved = total_original_tokens - total_compressed_tokens
+        savings_percent = (
+            (total_tokens_saved / total_original_tokens * 100) if total_original_tokens > 0 else 0
+        )
+
+        stats = {
+            "total_requests": total_requests,
+            "total_original_tokens": total_original_tokens,
+            "total_compressed_tokens": total_compressed_tokens,
+            "total_tokens_saved": total_tokens_saved,
+            "savings_percent": savings_percent,
+            "errors": errors,
+        }
+
+        return compressed_lines, stats
+
+    async def _batch_passthrough(self, request: Request, body: dict) -> Response:
+        """Pass through batch request to OpenAI without compression."""
+        headers = dict(request.headers.items())
+        headers.pop("host", None)
+        headers.pop("content-length", None)
+
+        url = f"{self.OPENAI_API_URL}/v1/batches"
+        response = await self.http_client.post(url, json=body, headers=headers)  # type: ignore[union-attr]
+
+        response_headers = dict(response.headers)
+        response_headers.pop("content-encoding", None)
+        response_headers.pop("content-length", None)
+
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=response_headers,
+        )
+
+    async def handle_batch_list(self, request: Request) -> Response:
+        """Handle GET /v1/batches - List batches (passthrough)."""
+        return await self.handle_passthrough(request, self.OPENAI_API_URL)
+
+    async def handle_batch_get(self, request: Request, batch_id: str) -> Response:
+        """Handle GET /v1/batches/{batch_id} - Get batch (passthrough)."""
+        return await self.handle_passthrough(request, self.OPENAI_API_URL)
+
+    async def handle_batch_cancel(self, request: Request, batch_id: str) -> Response:
+        """Handle POST /v1/batches/{batch_id}/cancel - Cancel batch (passthrough)."""
+        return await self.handle_passthrough(request, self.OPENAI_API_URL)
+
+    def _gemini_contents_to_messages(
+        self, contents: list[dict], system_instruction: dict | None = None
+    ) -> list[dict]:
+        """Convert Gemini contents[] format to OpenAI messages[] format for optimization.
+
+        Gemini format:
+            contents: [{"role": "user", "parts": [{"text": "..."}]}]
+            systemInstruction: {"parts": [{"text": "..."}]}
+
+        OpenAI format:
+            messages: [{"role": "user", "content": "..."}]
+        """
+        messages = []
+
+        # Add system instruction as system message
+        if system_instruction:
+            parts = system_instruction.get("parts", [])
+            text_parts = [p.get("text", "") for p in parts if "text" in p]
+            if text_parts:
+                messages.append({"role": "system", "content": "\n".join(text_parts)})
+
+        # Convert contents to messages
+        for content in contents:
+            role = content.get("role", "user")
+            # Map Gemini roles to OpenAI roles
+            if role == "model":
+                role = "assistant"
+
+            parts = content.get("parts", [])
+            text_parts = [p.get("text", "") for p in parts if "text" in p]
+
+            if text_parts:
+                messages.append({"role": role, "content": "\n".join(text_parts)})
+
+        return messages
+
+    def _messages_to_gemini_contents(self, messages: list[dict]) -> tuple[list[dict], dict | None]:
+        """Convert OpenAI messages[] format back to Gemini contents[] format.
+
+        Returns:
+            (contents, system_instruction) tuple
+        """
+        contents = []
+        system_instruction = None
+
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if role == "system":
+                # Extract as systemInstruction
+                system_instruction = {"parts": [{"text": content}]}
+            else:
+                # Map OpenAI roles to Gemini roles
+                gemini_role = "model" if role == "assistant" else "user"
+                contents.append({"role": gemini_role, "parts": [{"text": content}]})
+
+        return contents, system_instruction
+
+    async def handle_openai_responses(
+        self,
+        request: Request,
+    ) -> Response | StreamingResponse:
+        """Handle OpenAI /v1/responses endpoint (new Responses API).
+
+        The Responses API differs from /v1/chat/completions:
+        - Input: `input` (string or array) instead of `messages`
+        - System: `instructions` instead of system message
+        - Output: `output[]` array instead of `choices[].message`
+        - State: `previous_response_id` for multi-turn
+        - Built-in tools: web_search, file_search, code_interpreter
+        """
+        start_time = time.time()
+        request_id = await self._next_request_id()
+
+        # Check request body size
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "error": {
+                        "message": f"Request body too large. Maximum size is {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB",
+                        "type": "invalid_request_error",
+                        "code": "request_too_large",
+                    }
+                },
+            )
+
+        # Parse request
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Invalid JSON in request body: {e!s}",
+                        "type": "invalid_request_error",
+                        "code": "invalid_json",
+                    }
+                },
+            )
+
+        model = body.get("model", "unknown")
+        stream = body.get("stream", False)
+
+        # Convert Responses API input to messages format for optimization
+        # The Responses API accepts either a string or array of messages
+        input_data = body.get("input", "")
+        instructions = body.get("instructions")
+
+        messages = []
+        if instructions:
+            messages.append({"role": "system", "content": instructions})
+
+        if isinstance(input_data, str):
+            messages.append({"role": "user", "content": input_data})
+        elif isinstance(input_data, list):
+            # Input is already an array of message objects
+            messages.extend(input_data)
+
+        headers = dict(request.headers.items())
+        headers.pop("host", None)
+        headers.pop("content-length", None)
+        tags = self._extract_tags(headers)
+
+        # Rate limiting
+        if self.rate_limiter:
+            rate_key = headers.get("authorization", "default")[:20]
+            allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
+            if not allowed:
+                await self.metrics.record_rate_limited()
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
+                )
+
+        # Token counting on converted messages
+        tokenizer = get_tokenizer(model)
+        original_tokens = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
+
+        # Note: We pass through to OpenAI without optimization for now
+        # The Responses API has different semantics that may not work well with compression
+        tokens_saved = 0
+        transforms_applied: list[str] = []
+        optimization_latency = (time.time() - start_time) * 1000
+
+        url = f"{self.OPENAI_API_URL}/v1/responses"
+
+        try:
+            if stream:
+                # Streaming for Responses API uses semantic events
+                return await self._stream_response(
+                    url,
+                    headers,
+                    body,
+                    "openai",
+                    model,
+                    request_id,
+                    original_tokens,
+                    original_tokens,
+                    tokens_saved,
+                    transforms_applied,
+                    tags,
+                    optimization_latency,
+                )
+            else:
+                response = await self._retry_request("POST", url, headers, body)
+                total_latency = (time.time() - start_time) * 1000
+
+                output_tokens = 0
+                try:
+                    resp_json = response.json()
+                    usage = resp_json.get("usage", {})
+                    output_tokens = usage.get("output_tokens", 0)
+                except Exception:
+                    pass
+
+                # Cost tracking
+                cost_usd = savings_usd = None
+                if self.cost_tracker:
+                    cost_usd = self.cost_tracker.estimate_cost(
+                        model, original_tokens, output_tokens
+                    )
+                    if cost_usd:
+                        self.cost_tracker.record_cost(cost_usd)
+
+                # Metrics
+                await self.metrics.record_request(
+                    provider="openai",
+                    model=model,
+                    input_tokens=original_tokens,
+                    output_tokens=output_tokens,
+                    tokens_saved=tokens_saved,
+                    latency_ms=total_latency,
+                    cost_usd=cost_usd or 0,
+                    savings_usd=savings_usd or 0,
+                )
+
+                logger.info(f"[{request_id}] /v1/responses {model}: {original_tokens:,} tokens")
+
+                # Remove compression headers
+                response_headers = dict(response.headers)
+                response_headers.pop("content-encoding", None)
+                response_headers.pop("content-length", None)
+
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    headers=response_headers,
+                )
+        except Exception as e:
+            await self.metrics.record_failed()
+            logger.error(f"[{request_id}] OpenAI responses request failed: {type(e).__name__}: {e}")
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": {
+                        "message": "An error occurred while processing your request. Please try again.",
+                        "type": "server_error",
+                        "code": "proxy_error",
+                    }
+                },
+            )
+
+    async def handle_gemini_generate_content(
+        self,
+        request: Request,
+        model: str,
+    ) -> Response | StreamingResponse:
+        """Handle Gemini native /v1beta/models/{model}:generateContent endpoint.
+
+        Gemini's native API differs from OpenAI:
+        - Input: `contents[]` with `parts[]` instead of `messages`
+        - System: `systemInstruction` instead of system message
+        - Auth: `x-goog-api-key` header instead of `Authorization: Bearer`
+        - Output: `candidates[].content.parts[].text`
+        """
+        start_time = time.time()
+        request_id = await self._next_request_id()
+
+        # Check request body size
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > MAX_REQUEST_BODY_SIZE:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "error": {
+                        "message": f"Request body too large. Maximum size is {MAX_REQUEST_BODY_SIZE // (1024 * 1024)}MB",
+                        "code": 413,
+                    }
+                },
+            )
+
+        # Parse request
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Invalid JSON in request body: {e!s}",
+                        "code": 400,
+                    }
+                },
+            )
+
+        contents = body.get("contents", [])
+
+        headers = dict(request.headers.items())
+        headers.pop("host", None)
+        headers.pop("content-length", None)
+        tags = self._extract_tags(headers)
+
+        # Rate limiting (use Gemini API key)
+        if self.rate_limiter:
+            rate_key = headers.get("x-goog-api-key", "default")[:20]
+            allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
+            if not allowed:
+                await self.metrics.record_rate_limited()
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
+                )
+
+        # Convert Gemini format to messages for optimization
+        system_instruction = body.get("systemInstruction")
+        messages = self._gemini_contents_to_messages(contents, system_instruction)
+
+        # Token counting
+        tokenizer = get_tokenizer(model)
+        original_tokens = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
+
+        # Optimization
+        transforms_applied: list[str] = []
+        optimized_messages = messages
+        optimized_tokens = original_tokens
+
+        if self.config.optimize and messages:
+            try:
+                # Use OpenAI pipeline (similar message format)
+                context_limit = self.openai_provider.get_context_limit(model)
+                result = self.openai_pipeline.apply(
+                    messages=messages,
+                    model=model,
+                    model_limit=context_limit,
+                )
+                if result.messages != messages:
+                    optimized_messages = result.messages
+                    transforms_applied = result.transforms_applied
+                    optimized_tokens = sum(
+                        tokenizer.count_text(str(m.get("content", ""))) for m in optimized_messages
+                    )
+            except Exception as e:
+                logger.warning(f"[{request_id}] Gemini optimization failed: {e}")
+
+        tokens_saved = original_tokens - optimized_tokens
+        optimization_latency = (time.time() - start_time) * 1000
+
+        # Convert back to Gemini format if optimized
+        if optimized_messages != messages:
+            optimized_contents, optimized_system = self._messages_to_gemini_contents(
+                optimized_messages
+            )
+            body["contents"] = optimized_contents
+            if optimized_system:
+                body["systemInstruction"] = optimized_system
+            elif "systemInstruction" in body:
+                del body["systemInstruction"]
+
+        # Build URL - model is extracted from path
+        url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:generateContent"
+
+        # Check if streaming requested via query param
+        query_params = dict(request.query_params)
+        is_streaming = query_params.get("alt") == "sse"
+
+        # Preserve API key in query params if present
+        if "key" in query_params:
+            url += f"?key={query_params['key']}"
+
+        try:
+            if is_streaming:
+                # For streaming, use streamGenerateContent endpoint
+                stream_url = (
+                    f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?alt=sse"
+                )
+                if "key" in query_params:
+                    stream_url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?key={query_params['key']}&alt=sse"
+
+                return await self._stream_response(
+                    stream_url,
+                    headers,
+                    body,
+                    "gemini",
+                    model,
+                    request_id,
+                    original_tokens,
+                    optimized_tokens,
+                    tokens_saved,
+                    transforms_applied,
+                    tags,
+                    optimization_latency,
+                )
+            else:
+                response = await self._retry_request("POST", url, headers, body)
+                total_latency = (time.time() - start_time) * 1000
+
+                output_tokens = 0
+                try:
+                    resp_json = response.json()
+                    usage = resp_json.get("usageMetadata", {})
+                    output_tokens = usage.get("candidatesTokenCount", 0)
+                except Exception:
+                    pass
+
+                # Cost tracking
+                cost_usd = savings_usd = None
+                if self.cost_tracker:
+                    cost_usd = self.cost_tracker.estimate_cost(
+                        model, optimized_tokens, output_tokens
+                    )
+                    original_cost = self.cost_tracker.estimate_cost(
+                        model, original_tokens, output_tokens
+                    )
+                    if cost_usd and original_cost:
+                        savings_usd = original_cost - cost_usd
+                        self.cost_tracker.record_cost(cost_usd)
+                        self.cost_tracker.record_savings(savings_usd)
+
+                # Metrics
+                await self.metrics.record_request(
+                    provider="gemini",
+                    model=model,
+                    input_tokens=optimized_tokens,
+                    output_tokens=output_tokens,
+                    tokens_saved=tokens_saved,
+                    latency_ms=total_latency,
+                    cost_usd=cost_usd or 0,
+                    savings_usd=savings_usd or 0,
+                )
+
+                if tokens_saved > 0:
+                    logger.info(
+                        f"[{request_id}] Gemini {model}: {original_tokens:,} → {optimized_tokens:,} "
+                        f"(saved {tokens_saved:,} tokens)"
+                    )
+                else:
+                    logger.info(f"[{request_id}] Gemini {model}: {original_tokens:,} tokens")
+
+                # Remove compression headers
+                response_headers = dict(response.headers)
+                response_headers.pop("content-encoding", None)
+                response_headers.pop("content-length", None)
+
+                return Response(
+                    content=response.content,
+                    status_code=response.status_code,
+                    headers=response_headers,
+                )
+        except Exception as e:
+            await self.metrics.record_failed()
+            logger.error(f"[{request_id}] Gemini request failed: {type(e).__name__}: {e}")
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": {
+                        "message": "An error occurred while processing your request. Please try again.",
+                        "code": 502,
+                    }
+                },
+            )
+
+    async def handle_gemini_stream_generate_content(
+        self,
+        request: Request,
+        model: str,
+    ) -> StreamingResponse:
+        """Handle Gemini streaming endpoint /v1beta/models/{model}:streamGenerateContent."""
+        start_time = time.time()
+        request_id = await self._next_request_id()
+
+        # Parse request
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Invalid JSON in request body: {e!s}",
+                        "code": 400,
+                    }
+                },
+            )
+
+        contents = body.get("contents", [])
+
+        headers = dict(request.headers.items())
+        headers.pop("host", None)
+        headers.pop("content-length", None)
+        tags = self._extract_tags(headers)
+
+        # Token counting
+        tokenizer = get_tokenizer(model)
+        original_tokens = 0
+        for content in contents:
+            parts = content.get("parts", [])
+            for part in parts:
+                if "text" in part:
+                    original_tokens += tokenizer.count_text(part["text"])
+
+        optimization_latency = (time.time() - start_time) * 1000
+
+        # Build URL with SSE param
+        query_params = dict(request.query_params)
+        url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?alt=sse"
+        if "key" in query_params:
+            url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:streamGenerateContent?key={query_params['key']}&alt=sse"
+
+        return await self._stream_response(
+            url,
+            headers,
+            body,
+            "gemini",
+            model,
+            request_id,
+            original_tokens,
+            original_tokens,
+            0,  # tokens_saved
+            [],  # transforms_applied
+            tags,
+            optimization_latency,
+        )
+
+    async def handle_gemini_count_tokens(
+        self,
+        request: Request,
+        model: str,
+    ) -> Response:
+        """Handle Gemini /v1beta/models/{model}:countTokens endpoint with compression.
+
+        This endpoint counts tokens AFTER applying compression, so users can see
+        how many tokens they'll actually use after optimization.
+
+        The request format is the same as generateContent:
+            {"contents": [...], "systemInstruction": {...}}
+        """
+        start_time = time.time()
+        request_id = await self._next_request_id()
+
+        # Parse request
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as e:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "message": f"Invalid JSON in request body: {e!s}",
+                        "code": 400,
+                    }
+                },
+            )
+
+        contents = body.get("contents", [])
+
+        headers = dict(request.headers.items())
+        headers.pop("host", None)
+        headers.pop("content-length", None)
+
+        # Convert Gemini format to messages for optimization
+        system_instruction = body.get("systemInstruction")
+        messages = self._gemini_contents_to_messages(contents, system_instruction)
+
+        # Token counting (original)
+        tokenizer = get_tokenizer(model)
+        original_tokens = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
+
+        # Apply compression using the same pipeline as generateContent
+        transforms_applied: list[str] = []
+        optimized_messages = messages
+
+        if self.config.optimize and messages:
+            try:
+                context_limit = self.openai_provider.get_context_limit(model)
+                result = self.openai_pipeline.apply(
+                    messages=messages,
+                    model=model,
+                    model_limit=context_limit,
+                )
+                if result.messages != messages:
+                    optimized_messages = result.messages
+                    transforms_applied = result.transforms_applied
+            except Exception as e:
+                logger.warning(f"[{request_id}] Gemini countTokens optimization failed: {e}")
+
+        # Convert back to Gemini format for the API call
+        if optimized_messages != messages:
+            optimized_contents, optimized_system = self._messages_to_gemini_contents(
+                optimized_messages
+            )
+            body["contents"] = optimized_contents
+            if optimized_system:
+                body["systemInstruction"] = optimized_system
+            elif "systemInstruction" in body:
+                del body["systemInstruction"]
+
+        # Build URL
+        url = f"{self.GEMINI_API_URL}/v1beta/models/{model}:countTokens"
+
+        # Preserve API key in query params if present
+        query_params = dict(request.query_params)
+        if "key" in query_params:
+            url += f"?key={query_params['key']}"
+
+        try:
+            response = await self._retry_request("POST", url, headers, body)
+            total_latency = (time.time() - start_time) * 1000
+
+            # Parse response to get token count
+            compressed_tokens = 0
+            try:
+                resp_json = response.json()
+                compressed_tokens = resp_json.get("totalTokens", 0)
+            except Exception:
+                pass
+
+            # Track stats
+            tokens_saved = original_tokens - compressed_tokens if compressed_tokens > 0 else 0
+
+            await self.metrics.record_request(
+                provider="gemini",
+                model=model,
+                input_tokens=compressed_tokens,
+                output_tokens=0,
+                tokens_saved=tokens_saved,
+                latency_ms=total_latency,
+                cost_usd=0,
+                savings_usd=0,
+            )
+
+            if tokens_saved > 0:
+                logger.info(
+                    f"[{request_id}] Gemini countTokens {model}: {original_tokens:,} → {compressed_tokens:,} "
+                    f"(saved {tokens_saved:,} tokens, transforms: {transforms_applied})"
+                )
+            else:
+                logger.info(
+                    f"[{request_id}] Gemini countTokens {model}: {compressed_tokens:,} tokens"
+                )
+
+            # Remove compression headers
+            response_headers = dict(response.headers)
+            response_headers.pop("content-encoding", None)
+            response_headers.pop("content-length", None)
+
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=response_headers,
+            )
+        except Exception as e:
+            await self.metrics.record_failed()
+            logger.error(f"[{request_id}] Gemini countTokens failed: {type(e).__name__}: {e}")
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": {
+                        "message": "An error occurred while processing your request. Please try again.",
+                        "code": 502,
+                    }
+                },
+            )
 
 
 # =============================================================================
@@ -2562,12 +4610,230 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.post("/v1/messages/count_tokens")
     async def anthropic_count_tokens(request: Request):
-        return await proxy.handle_passthrough(request, proxy.ANTHROPIC_API_URL)
+        return await proxy.handle_passthrough(
+            request, proxy.ANTHROPIC_API_URL, "count_tokens", "anthropic"
+        )
+
+    # Anthropic Message Batches API endpoints
+    @app.post("/v1/messages/batches")
+    async def anthropic_batch_create(request: Request):
+        """Create a message batch with compression applied to all requests."""
+        return await proxy.handle_anthropic_batch_create(request)
+
+    @app.get("/v1/messages/batches")
+    async def anthropic_batch_list(request: Request):
+        """List message batches (passthrough)."""
+        return await proxy.handle_anthropic_batch_passthrough(request)
+
+    @app.get("/v1/messages/batches/{batch_id}")
+    async def anthropic_batch_get(request: Request, batch_id: str):
+        """Get a specific message batch (passthrough)."""
+        return await proxy.handle_anthropic_batch_passthrough(request, batch_id)
+
+    @app.get("/v1/messages/batches/{batch_id}/results")
+    async def anthropic_batch_results(request: Request, batch_id: str):
+        """Get results for a message batch with CCR post-processing."""
+        return await proxy.handle_anthropic_batch_results(request, batch_id)
+
+    @app.post("/v1/messages/batches/{batch_id}/cancel")
+    async def anthropic_batch_cancel(request: Request, batch_id: str):
+        """Cancel a message batch (passthrough)."""
+        return await proxy.handle_anthropic_batch_passthrough(request, batch_id)
 
     # OpenAI endpoints
     @app.post("/v1/chat/completions")
     async def openai_chat(request: Request):
         return await proxy.handle_openai_chat(request)
+
+    @app.post("/v1/responses")
+    async def openai_responses(request: Request):
+        """OpenAI Responses API (new API introduced March 2025)."""
+        return await proxy.handle_openai_responses(request)
+
+    # OpenAI Batch API endpoints (with compression!)
+    @app.post("/v1/batches")
+    async def create_batch(request: Request):
+        """Create a batch with automatic compression of messages."""
+        return await proxy.handle_batch_create(request)
+
+    @app.get("/v1/batches")
+    async def list_batches(request: Request):
+        """List batches (passthrough to OpenAI)."""
+        return await proxy.handle_batch_list(request)
+
+    @app.get("/v1/batches/{batch_id}")
+    async def get_batch(request: Request, batch_id: str):
+        """Get batch details (passthrough to OpenAI)."""
+        return await proxy.handle_batch_get(request, batch_id)
+
+    @app.post("/v1/batches/{batch_id}/cancel")
+    async def cancel_batch(request: Request, batch_id: str):
+        """Cancel a batch (passthrough to OpenAI)."""
+        return await proxy.handle_batch_cancel(request, batch_id)
+
+    # Gemini native endpoints
+    @app.post("/v1beta/models/{model}:generateContent")
+    async def gemini_generate_content(request: Request, model: str):
+        """Gemini native generateContent API."""
+        return await proxy.handle_gemini_generate_content(request, model)
+
+    @app.post("/v1beta/models/{model}:streamGenerateContent")
+    async def gemini_stream_generate_content(request: Request, model: str):
+        """Gemini native streaming generateContent API."""
+        return await proxy.handle_gemini_stream_generate_content(request, model)
+
+    @app.post("/v1beta/models/{model}:countTokens")
+    async def gemini_count_tokens(request: Request, model: str):
+        """Gemini countTokens API with compression applied."""
+        return await proxy.handle_gemini_count_tokens(request, model)
+
+    # =========================================================================
+    # Passthrough Endpoints (no compression needed)
+    # =========================================================================
+
+    # --- OpenAI Passthrough Endpoints ---
+
+    @app.get("/v1/models")
+    async def list_models(request: Request):
+        """List models - route based on auth header.
+
+        - x-api-key header present -> Anthropic
+        - Authorization: Bearer header -> OpenAI
+        """
+        if request.headers.get("x-api-key"):
+            return await proxy.handle_passthrough(
+                request, proxy.ANTHROPIC_API_URL, "models", "anthropic"
+            )
+        return await proxy.handle_passthrough(request, proxy.OPENAI_API_URL, "models", "openai")
+
+    @app.get("/v1/models/{model_id}")
+    async def get_model(request: Request, model_id: str):
+        """Get model details - route based on auth header.
+
+        - x-api-key header present -> Anthropic
+        - Authorization: Bearer header -> OpenAI
+        """
+        if request.headers.get("x-api-key"):
+            return await proxy.handle_passthrough(
+                request, proxy.ANTHROPIC_API_URL, "models", "anthropic"
+            )
+        return await proxy.handle_passthrough(request, proxy.OPENAI_API_URL, "models", "openai")
+
+    @app.post("/v1/embeddings")
+    async def openai_embeddings(request: Request):
+        """OpenAI embeddings API - passthrough."""
+        return await proxy.handle_passthrough(request, proxy.OPENAI_API_URL, "embeddings", "openai")
+
+    @app.post("/v1/moderations")
+    async def openai_moderations(request: Request):
+        """OpenAI moderations API - passthrough."""
+        return await proxy.handle_passthrough(
+            request, proxy.OPENAI_API_URL, "moderations", "openai"
+        )
+
+    @app.post("/v1/images/generations")
+    async def openai_images_generations(request: Request):
+        """OpenAI image generation API - passthrough."""
+        return await proxy.handle_passthrough(
+            request, proxy.OPENAI_API_URL, "images/generations", "openai"
+        )
+
+    @app.post("/v1/audio/transcriptions")
+    async def openai_audio_transcriptions(request: Request):
+        """OpenAI audio transcription API (multipart/form-data) - passthrough."""
+        return await proxy.handle_passthrough(
+            request, proxy.OPENAI_API_URL, "audio/transcriptions", "openai"
+        )
+
+    @app.post("/v1/audio/speech")
+    async def openai_audio_speech(request: Request):
+        """OpenAI text-to-speech API - passthrough."""
+        return await proxy.handle_passthrough(
+            request, proxy.OPENAI_API_URL, "audio/speech", "openai"
+        )
+
+    # --- Gemini Passthrough Endpoints ---
+
+    @app.get("/v1beta/models")
+    async def gemini_list_models(request: Request):
+        """Gemini list models API - passthrough."""
+        return await proxy.handle_passthrough(request, proxy.GEMINI_API_URL, "models", "gemini")
+
+    @app.get("/v1beta/models/{model_name}")
+    async def gemini_get_model(request: Request, model_name: str):
+        """Gemini get model API - passthrough.
+
+        Note: This handles GET /v1beta/models/{model_name} but NOT :countTokens
+        which is handled by a separate POST route above.
+        """
+        return await proxy.handle_passthrough(request, proxy.GEMINI_API_URL, "models", "gemini")
+
+    @app.post("/v1beta/models/{model}:embedContent")
+    async def gemini_embed_content(request: Request, model: str):
+        """Gemini embedding API - passthrough."""
+        return await proxy.handle_passthrough(
+            request, proxy.GEMINI_API_URL, "embedContent", "gemini"
+        )
+
+    @app.post("/v1beta/models/{model}:batchEmbedContents")
+    async def gemini_batch_embed_contents(request: Request, model: str):
+        """Gemini batch embeddings API - passthrough."""
+        return await proxy.handle_passthrough(
+            request, proxy.GEMINI_API_URL, "batchEmbedContents", "gemini"
+        )
+
+    # Google/Gemini Batch API endpoints (with compression!)
+    @app.post("/v1beta/models/{model}:batchGenerateContent")
+    async def gemini_batch_create(request: Request, model: str):
+        """Create a Gemini batch with compression applied to all requests."""
+        return await proxy.handle_google_batch_create(request, model)
+
+    @app.get("/v1beta/batches/{batch_name}")
+    async def gemini_batch_get(request: Request, batch_name: str):
+        """Get a specific Gemini batch with CCR post-processing."""
+        return await proxy.handle_google_batch_results(request, batch_name)
+
+    @app.post("/v1beta/batches/{batch_name}:cancel")
+    async def gemini_batch_cancel(request: Request, batch_name: str):
+        """Cancel a Gemini batch (passthrough)."""
+        return await proxy.handle_google_batch_passthrough(request, batch_name)
+
+    @app.delete("/v1beta/batches/{batch_name}")
+    async def gemini_batch_delete(request: Request, batch_name: str):
+        """Delete a Gemini batch (passthrough)."""
+        return await proxy.handle_google_batch_passthrough(request, batch_name)
+
+    @app.post("/v1beta/cachedContents")
+    async def gemini_create_cached_content(request: Request):
+        """Gemini create cached content API - passthrough."""
+        return await proxy.handle_passthrough(
+            request, proxy.GEMINI_API_URL, "cachedContents", "gemini"
+        )
+
+    @app.get("/v1beta/cachedContents")
+    async def gemini_list_cached_contents(request: Request):
+        """Gemini list cached contents API - passthrough."""
+        return await proxy.handle_passthrough(
+            request, proxy.GEMINI_API_URL, "cachedContents", "gemini"
+        )
+
+    @app.get("/v1beta/cachedContents/{cache_id}")
+    async def gemini_get_cached_content(request: Request, cache_id: str):
+        """Gemini get cached content API - passthrough."""
+        return await proxy.handle_passthrough(
+            request, proxy.GEMINI_API_URL, "cachedContents", "gemini"
+        )
+
+    @app.delete("/v1beta/cachedContents/{cache_id}")
+    async def gemini_delete_cached_content(request: Request, cache_id: str):
+        """Gemini delete cached content API - passthrough."""
+        return await proxy.handle_passthrough(
+            request, proxy.GEMINI_API_URL, "cachedContents", "gemini"
+        )
+
+    # =========================================================================
+    # Catch-all Passthrough
+    # =========================================================================
 
     # Passthrough - route to correct backend based on headers
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])

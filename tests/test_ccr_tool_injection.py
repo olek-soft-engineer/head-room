@@ -344,3 +344,87 @@ class TestSystemInstructions:
         assert "hash0" in instructions
         assert "hash4" in instructions
         assert "..." in instructions
+
+
+class TestAlternativeMarkerFormats:
+    """Test CCR marker detection for different compressor formats.
+
+    Different compressors use slightly different marker formats:
+    - SmartCrusher: [N items compressed to M. Retrieve more: hash=xxx]
+    - TextCompressor: [N lines compressed to M. Retrieve more: hash=xxx]
+    - LogCompressor: [N lines compressed to M. Retrieve more: hash=xxx]
+    - SearchCompressor: [N matches compressed to M. Retrieve more: hash=xxx]
+    - LLMLingua: [N items compressed to M. Retrieve more: hash=xxx]
+
+    The CCRToolInjector should detect all these formats.
+    """
+
+    def test_textcompressor_format(self):
+        """Detects TextCompressor marker format (lines)."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Build output:\n[500 lines compressed to 50. Retrieve more: hash=aabbccddeeff00112233]",
+            },
+        ]
+
+        injector = CCRToolInjector()
+        hashes = injector.scan_for_markers(messages)
+
+        assert len(hashes) == 1
+        assert "aabbccddeeff00112233" in hashes
+
+    def test_searchcompressor_format(self):
+        """Detects SearchCompressor marker format (matches)."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Search results:\n[100 matches compressed to 10. Retrieve more: hash=1122334455667788]",
+            },
+        ]
+
+        injector = CCRToolInjector()
+        hashes = injector.scan_for_markers(messages)
+
+        assert len(hashes) == 1
+        assert "1122334455667788" in hashes
+
+    def test_mixed_compressor_formats(self):
+        """Detects multiple marker formats in same conversation."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Search results:\n[50 matches compressed to 5. Retrieve more: hash=aaaa11111111]",
+            },
+            {
+                "role": "assistant",
+                "content": "Build logs:\n[200 lines compressed to 20. Retrieve more: hash=bbbb22222222]",
+            },
+            {
+                "role": "assistant",
+                "content": "Database:\n[1000 items compressed to 100. Retrieve more: hash=cccc33333333]",
+            },
+        ]
+
+        injector = CCRToolInjector()
+        hashes = injector.scan_for_markers(messages)
+
+        assert len(hashes) == 3
+        assert "aaaa11111111" in hashes
+        assert "bbbb22222222" in hashes
+        assert "cccc33333333" in hashes
+
+    def test_generic_compressed_marker(self):
+        """Detects generic compression markers via fallback pattern."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Data:\n[Content compressed for efficiency. hash=fedcba9876543210fedcba98]",
+            },
+        ]
+
+        injector = CCRToolInjector()
+        hashes = injector.scan_for_markers(messages)
+
+        assert len(hashes) == 1
+        assert "fedcba9876543210fedcba98" in hashes

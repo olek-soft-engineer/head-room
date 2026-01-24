@@ -113,7 +113,9 @@ class CCRResponseHandler:
         """
         tool_calls = self._extract_tool_calls(response, provider)
         return any(
-            tc.get("name") == CCR_TOOL_NAME or tc.get("function", {}).get("name") == CCR_TOOL_NAME
+            tc.get("name") == CCR_TOOL_NAME
+            or tc.get("function", {}).get("name") == CCR_TOOL_NAME
+            or tc.get("functionCall", {}).get("name") == CCR_TOOL_NAME  # Google format
             for tc in tool_calls
         )
 
@@ -136,6 +138,15 @@ class CCRResponseHandler:
             tool_calls = message.get("tool_calls", [])
             return list(tool_calls) if tool_calls else []
 
+        elif provider == "google":
+            # Google/Gemini format: candidates[0].content.parts contains functionCall objects
+            # Each part with a functionCall has: {"functionCall": {"name": "...", "args": {...}}}
+            candidates = response.get("candidates", [])
+            if not candidates:
+                return []
+            parts = candidates[0].get("content", {}).get("parts", [])
+            return [part for part in parts if "functionCall" in part]
+
         return []
 
     def _parse_ccr_tool_calls(
@@ -157,8 +168,14 @@ class CCRResponseHandler:
             hash_key, query = parse_tool_call(tc, provider)
 
             if hash_key is not None:
-                # This is a CCR tool call
-                tool_call_id = tc.get("id", "")
+                # This is a CCR tool call - extract tool_call_id based on provider
+                if provider == "google":
+                    # Google uses function name as identifier for matching responses
+                    # The functionResponse.name must match the functionCall.name
+                    tool_call_id = tc.get("functionCall", {}).get("name", CCR_TOOL_NAME)
+                else:
+                    # Anthropic and OpenAI use explicit IDs
+                    tool_call_id = tc.get("id", "")
                 ccr_calls.append(
                     CCRToolCall(
                         tool_call_id=tool_call_id,
@@ -295,6 +312,29 @@ class CCRResponseHandler:
                 ]
             }
 
+        elif provider == "google":
+            # Google/Gemini: user message with functionResponse parts
+            # Format: {"role": "user", "parts": [{"functionResponse": {"name": "...", "response": {...}}}]}
+            parts = []
+            for result in results:
+                # Parse the content JSON to include as response object
+                try:
+                    response_data = json.loads(result.content)
+                except json.JSONDecodeError:
+                    response_data = {"content": result.content}
+                parts.append(
+                    {
+                        "functionResponse": {
+                            "name": result.tool_call_id,  # tool_call_id contains the function name for Google
+                            "response": response_data,
+                        }
+                    }
+                )
+            return {
+                "role": "user",
+                "parts": parts,
+            }
+
         else:
             # Generic format
             return {
@@ -329,6 +369,17 @@ class CCRResponseHandler:
                 "role": "assistant",
                 "content": message.get("content"),
                 "tool_calls": message.get("tool_calls"),
+            }
+        elif provider == "google":
+            # Google/Gemini format: role is "model", content is in candidates[0].content.parts
+            candidates = response.get("candidates", [])
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+            else:
+                parts = []
+            return {
+                "role": "model",
+                "parts": parts,
             }
         else:
             return {

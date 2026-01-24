@@ -194,10 +194,23 @@ class CCRToolInjector:
 
     # Detected compression markers
     _detected_hashes: list[str] = field(default_factory=list)
-    _marker_pattern: re.Pattern = field(
-        default_factory=lambda: re.compile(
-            r"\[(\d+) items compressed to (\d+)\. Retrieve more: hash=([a-f0-9]+)\]"
-        )
+    # Multiple marker patterns to match different compressors:
+    # - SmartCrusher: [100 items compressed to 10. Retrieve more: hash=abc123]
+    # - LLMLingua: [1000 items compressed to 300. Retrieve more: hash=abc123]
+    # - TextCompressor: [100 lines compressed to 10. Retrieve more: hash=abc123]
+    # - LogCompressor: [200 lines compressed to 20. Retrieve more: hash=abc123]
+    # - SearchCompressor: [50 matches compressed to 5. Retrieve more: hash=abc123]
+    # - Generic: any [... compressed ... hash=xxx] pattern
+    _marker_patterns: list[re.Pattern] = field(
+        default_factory=lambda: [
+            # Standard format: [N <type> compressed to M. Retrieve more: hash=xxx]
+            # Matches items, lines, matches, or any other type
+            re.compile(r"\[(\d+) \w+ compressed to (\d+)\. Retrieve more: hash=([a-f0-9]+)\]"),
+            # Legacy format without "to M" or "Retrieve more:" (old TextCompressor)
+            re.compile(r"\[(\d+) \w+ compressed\. hash=([a-f0-9]+)\]"),
+            # Generic fallback: any compression marker with hash (8+ chars)
+            re.compile(r"\[.*?compressed.*?hash=([a-f0-9]{8,})\]", re.IGNORECASE),
+        ]
     )
 
     def __post_init__(self) -> None:
@@ -249,14 +262,39 @@ class CCRToolInjector:
                                     if isinstance(item, dict) and item.get("type") == "text":
                                         self._scan_text(item.get("text", ""))
 
+            # Handle Google/Gemini format with parts
+            parts = message.get("parts", [])
+            if isinstance(parts, list):
+                for part in parts:
+                    if isinstance(part, dict):
+                        # Text parts
+                        if "text" in part:
+                            self._scan_text(part.get("text", ""))
+                        # Function response parts (tool results)
+                        elif "functionResponse" in part:
+                            response = part.get("functionResponse", {}).get("response", {})
+                            if isinstance(response, str):
+                                self._scan_text(response)
+                            elif isinstance(response, dict):
+                                # Scan string values in response
+                                for value in response.values():
+                                    if isinstance(value, str):
+                                        self._scan_text(value)
+
         return self._detected_hashes
 
     def _scan_text(self, text: str) -> None:
-        """Scan text for compression markers."""
-        matches = self._marker_pattern.findall(text)
-        for _original, _compressed, hash_key in matches:
-            if hash_key not in self._detected_hashes:
-                self._detected_hashes.append(hash_key)
+        """Scan text for compression markers from any compressor."""
+        for pattern in self._marker_patterns:
+            matches = pattern.findall(text)
+            for match in matches:
+                # Extract hash_key from match (last group is always the hash)
+                if isinstance(match, tuple):
+                    hash_key = match[-1]  # Last capture group is the hash
+                else:
+                    hash_key = match  # Single capture group (generic pattern)
+                if hash_key and hash_key not in self._detected_hashes:
+                    self._detected_hashes.append(hash_key)
 
     def inject_tool_definition(
         self,
@@ -389,7 +427,7 @@ def parse_tool_call(
     Returns:
         Tuple of (hash, query) or (None, None) if not a CCR tool call.
     """
-    # Get tool name
+    # Get tool name and input data based on provider format
     if provider == "anthropic":
         name = tool_call.get("name")
         input_data = tool_call.get("input", {})
@@ -402,7 +440,13 @@ def parse_tool_call(
             input_data = json.loads(args_str)
         except json.JSONDecodeError:
             input_data = {}
+    elif provider == "google":
+        # Google/Gemini format: {"functionCall": {"name": "...", "args": {...}}}
+        function_call = tool_call.get("functionCall", {})
+        name = function_call.get("name")
+        input_data = function_call.get("args", {})
     else:
+        # Generic fallback
         name = tool_call.get("name")
         input_data = tool_call.get("input", tool_call.get("args", {}))
 
