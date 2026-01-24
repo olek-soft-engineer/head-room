@@ -199,13 +199,14 @@ class BatchResultProcessor:
     def _get_custom_id(self, result: dict[str, Any], provider: str) -> str:
         """Extract the custom ID from a result."""
         if provider == "anthropic":
-            return result.get("custom_id", "")
+            return str(result.get("custom_id", ""))
         elif provider == "openai":
-            return result.get("custom_id", "")
+            return str(result.get("custom_id", ""))
         elif provider == "google":
             # Google uses metadata.key
-            return result.get("metadata", {}).get("key", "")
-        return result.get("custom_id", result.get("id", ""))
+            metadata = result.get("metadata", {})
+            return str(metadata.get("key", "") if isinstance(metadata, dict) else "")
+        return str(result.get("custom_id", result.get("id", "")))
 
     def _extract_response(
         self,
@@ -213,16 +214,21 @@ class BatchResultProcessor:
         provider: str,
     ) -> dict[str, Any] | None:
         """Extract the actual response from a batch result."""
+        response: Any
         if provider == "anthropic":
             # Anthropic: result.result.message
-            return result.get("result", {}).get("message")
+            inner = result.get("result", {})
+            response = inner.get("message") if isinstance(inner, dict) else None
         elif provider == "openai":
             # OpenAI: response.body (the full chat completion)
-            return result.get("response", {}).get("body")
+            inner = result.get("response", {})
+            response = inner.get("body") if isinstance(inner, dict) else None
         elif provider == "google":
             # Google: response (the generateContent response)
-            return result.get("response")
-        return result.get("response")
+            response = result.get("response")
+        else:
+            response = result.get("response")
+        return response if isinstance(response, dict) else None
 
     async def _process_single_result(
         self,
@@ -345,7 +351,8 @@ class BatchResultProcessor:
             timeout=self.config.continuation_timeout,
         )
         response.raise_for_status()
-        return response.json()
+        result: dict[str, Any] = response.json()
+        return result
 
     async def _openai_continuation(
         self,
@@ -377,7 +384,8 @@ class BatchResultProcessor:
             timeout=self.config.continuation_timeout,
         )
         response.raise_for_status()
-        return response.json()
+        result: dict[str, Any] = response.json()
+        return result
 
     async def _google_continuation(
         self,
@@ -419,7 +427,8 @@ class BatchResultProcessor:
             timeout=self.config.continuation_timeout,
         )
         response.raise_for_status()
-        return response.json()
+        result: dict[str, Any] = response.json()
+        return result
 
     def _messages_to_google_contents(
         self,

@@ -1844,7 +1844,7 @@ class HeadroomProxy:
 
         body = await request.body()
 
-        response = await self.http_client.request(
+        response = await self.http_client.request(  # type: ignore[union-attr]
             method=request.method,
             url=url,
             headers=headers,
@@ -1937,7 +1937,7 @@ class HeadroomProxy:
         headers = dict(request.headers.items())
         headers.pop("host", None)
 
-        response = await self.http_client.get(url, headers=headers)
+        response = await self.http_client.get(url, headers=headers)  # type: ignore[union-attr]
 
         if response.status_code != 200:
             # Error - pass through
@@ -1987,7 +1987,7 @@ class HeadroomProxy:
             )
 
         # Process results with CCR handler
-        processor = BatchResultProcessor(self.http_client)
+        processor = BatchResultProcessor(self.http_client)  # type: ignore[arg-type]
         processed = await processor.process_results(batch_id, results, "anthropic")
 
         # Convert back to JSONL format
@@ -2305,7 +2305,7 @@ class HeadroomProxy:
         else:
             body_content = json.dumps(body).encode()
 
-        response = await self.http_client.post(
+        response = await self.http_client.post(  # type: ignore[union-attr]
             url,
             headers=headers,
             content=body_content,
@@ -2365,7 +2365,7 @@ class HeadroomProxy:
 
         body = await request.body()
 
-        response = await self.http_client.request(
+        response = await self.http_client.request(  # type: ignore[union-attr]
             method=request.method,
             url=url,
             headers=headers,
@@ -2478,7 +2478,7 @@ class HeadroomProxy:
             else:
                 url = f"{url}?key={api_key}"
 
-        response = await self.http_client.get(url, headers=headers)
+        response = await self.http_client.get(url, headers=headers)  # type: ignore[union-attr]
 
         if response.status_code != 200:
             # Error - pass through
@@ -2551,7 +2551,7 @@ class HeadroomProxy:
             )
 
         # Process results with CCR handler
-        processor = BatchResultProcessor(self.http_client)
+        processor = BatchResultProcessor(self.http_client)  # type: ignore[arg-type]
         processed = await processor.process_results(batch_name, results, "google")
 
         # Update response with processed results
@@ -3171,7 +3171,8 @@ class HeadroomProxy:
             )
             if response.status_code == 200:
                 result = response.json()
-                return result.get("id")
+                file_id: str | None = result.get("id")
+                return file_id
             logger.error(f"Failed to upload file: {response.status_code} - {response.text}")
             return None
         except Exception as e:
@@ -3756,7 +3757,7 @@ class HeadroomProxy:
         self,
         request: Request,
         model: str,
-    ) -> StreamingResponse:
+    ) -> StreamingResponse | JSONResponse:
         """Handle Gemini streaming endpoint /v1beta/models/{model}:streamGenerateContent."""
         start_time = time.time()
         request_id = await self._next_request_id()

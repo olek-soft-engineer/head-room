@@ -937,9 +937,9 @@ class TokenCounter:
 
     def __init__(self, model: str = "claude-sonnet-4-20250514"):
         self.model = model
-        self._tokenizer = None
+        self._tokenizer: Any = None
 
-    def _get_tokenizer(self):
+    def _get_tokenizer(self) -> Any:
         """Lazy load tokenizer."""
         if self._tokenizer is None:
             try:
@@ -956,7 +956,7 @@ class TokenCounter:
         tokenizer = self._get_tokenizer()
         if tokenizer:
             try:
-                return tokenizer.count_text(text)
+                return int(tokenizer.count_text(text))
             except Exception:
                 pass
         # Fallback: estimate ~4 chars per token
@@ -1446,7 +1446,7 @@ def run_quick_batch_eval(
 # =============================================================================
 
 
-def main():
+def main() -> None:
     """CLI entry point."""
     import argparse
 
@@ -1487,26 +1487,26 @@ def main():
     args = parser.parse_args()
 
     if args.token_counting:
-        results = evaluate_token_counting_accuracy()
-        print(results.summary())
+        token_results = evaluate_token_counting_accuracy()
+        print(token_results.summary())
         if args.output:
             import json
 
             with open(args.output, "w") as f:
                 json.dump(
                     {
-                        "model": results.model,
-                        "test_cases": results.test_cases,
-                        "exact_matches": results.exact_matches,
-                        "avg_error_percent": results.avg_error_percent,
-                        "max_error_percent": results.max_error_percent,
-                        "results": results.results,
+                        "model": token_results.model,
+                        "test_cases": token_results.test_cases,
+                        "exact_matches": token_results.exact_matches,
+                        "avg_error_percent": token_results.avg_error_percent,
+                        "max_error_percent": token_results.max_error_percent,
+                        "results": token_results.results,
                     },
                     f,
                     indent=2,
                 )
     else:
-        results = run_batch_compression_eval(
+        eval_results = run_batch_compression_eval(
             provider=args.provider,
             n_samples=args.samples,
             categories=args.categories,
@@ -1517,7 +1517,7 @@ def main():
             import json
 
             with open(args.output, "w") as f:
-                json.dump(results.to_dict(), f, indent=2)
+                json.dump(eval_results.to_dict(), f, indent=2)
             print(f"\nResults saved to {args.output}")
 
 
