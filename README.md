@@ -186,8 +186,9 @@ For deep technical details, see [Architecture Documentation](docs/ARCHITECTURE.m
 
 - **Zero code changes** - works as a transparent proxy
 - **47-92% savings** - depends on your workload (tool-heavy = more savings)
+- **Image compression** - 40-90% reduction via trained ML router (OpenAI, Anthropic, Google)
 - **Reversible compression** - LLM retrieves original data via CCR
-- **Content-aware** - code, logs, JSON each handled optimally
+- **Content-aware** - code, logs, JSON, images each handled optimally
 - **Provider caching** - automatic prefix optimization for cache hits
 - **Framework native** - LangChain, Agno, MCP, agents supported
 
@@ -272,6 +273,7 @@ See the full [Agno Integration Guide](docs/agno.md) for hooks, multi-provider su
 
 | Feature | Description | Docs |
 |---------|-------------|------|
+| **Image Compression** | 40-90% token reduction for images via trained ML router | [Image Compression](docs/image-compression.md) |
 | **Memory** | Persistent memory across conversations (zero-latency inline extraction) | [Memory](docs/memory.md) |
 | **Universal Compression** | ML-based content detection + structure-preserving compression | [Compression](docs/compression.md) |
 | **SmartCrusher** | Compresses JSON tool outputs statistically | [Transforms](docs/transforms.md) |

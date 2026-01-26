@@ -168,6 +168,7 @@ class ContentRouterConfig:
         enable_smart_crusher: Enable JSON array compression.
         enable_search_compressor: Enable search result compression.
         enable_log_compressor: Enable build/test log compression.
+        enable_image_optimizer: Enable image token optimization.
         prefer_code_aware_for_code: Use CodeAware over LLMLingua for code.
         mixed_content_threshold: Min distinct types to consider "mixed".
         min_section_tokens: Minimum tokens for a section to compress.
@@ -183,6 +184,7 @@ class ContentRouterConfig:
     enable_smart_crusher: bool = True
     enable_search_compressor: bool = True
     enable_log_compressor: bool = True
+    enable_image_optimizer: bool = True  # Image token optimization
 
     # Routing preferences
     prefer_code_aware_for_code: bool = True
@@ -413,6 +415,7 @@ class ContentRouter(Transform):
         self._log_compressor: Any = None
         self._llmlingua: Any = None
         self._text_compressor: Any = None
+        self._image_optimizer: Any = None
 
     def compress(
         self,
@@ -779,6 +782,77 @@ class ContentRouter(Transform):
             except ImportError:
                 logger.debug("TextCompressor not available")
         return self._text_compressor
+
+    def _get_image_optimizer(self) -> Any:
+        """Get ImageCompressor (lazy load).
+
+        The ImageCompressor handles image token compression using:
+        - Trained MiniLM classifier from HuggingFace (chopratejas/technique-router)
+        - SigLIP for image analysis
+        - Provider-specific compression (OpenAI detail, Anthropic/Google resize)
+        """
+        if self._image_optimizer is None:
+            try:
+                from ..image import ImageCompressor
+
+                self._image_optimizer = ImageCompressor()
+            except ImportError:
+                logger.debug("ImageCompressor not available")
+        return self._image_optimizer
+
+    def optimize_images_in_messages(
+        self,
+        messages: list[dict[str, Any]],
+        tokenizer: Tokenizer,
+        provider: str = "openai",
+        user_query: str | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Optimize images in messages.
+
+        This is a convenience method for image optimization that can be called
+        directly or as part of the transform pipeline.
+
+        Uses ImageCompressor with trained MiniLM router from HuggingFace
+        (chopratejas/technique-router) + SigLIP for image analysis.
+
+        Args:
+            messages: Messages potentially containing images.
+            tokenizer: Tokenizer for token counting (unused, kept for API compat).
+            provider: LLM provider (openai, anthropic, google).
+            user_query: User query for task intent detection (unused, auto-extracted).
+
+        Returns:
+            Tuple of (optimized_messages, metrics).
+        """
+        if not self.config.enable_image_optimizer:
+            return messages, {"images_optimized": 0, "tokens_saved": 0}
+
+        compressor = self._get_image_optimizer()
+        if compressor is None:
+            return messages, {"images_optimized": 0, "tokens_saved": 0}
+
+        # Check if there are images to compress
+        if not compressor.has_images(messages):
+            return messages, {"images_optimized": 0, "tokens_saved": 0}
+
+        # Compress images (query is auto-extracted from messages)
+        optimized = compressor.compress(messages, provider=provider)
+
+        # Get metrics from last compression
+        result = compressor.last_result
+        if result:
+            metrics = {
+                "images_optimized": result.compressed_tokens < result.original_tokens,
+                "tokens_before": result.original_tokens,
+                "tokens_after": result.compressed_tokens,
+                "tokens_saved": result.original_tokens - result.compressed_tokens,
+                "technique": result.technique.value,
+                "confidence": result.confidence,
+            }
+        else:
+            metrics = {"images_optimized": 0, "tokens_saved": 0}
+
+        return optimized, metrics
 
     # Transform interface
 

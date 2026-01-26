@@ -931,6 +931,102 @@ class ContextTrackerConfig:
 
 ---
 
+## Image Compression Architecture
+
+Vision models charge by the token, and images are expensive (765-2900 tokens for a typical image). Headroom's image compression uses a **trained ML router** to automatically select the optimal compression technique.
+
+### The Key Insight
+
+Not all image queries need full resolution:
+- "What is this?" → Low detail is fine (87% savings)
+- "Count the whiskers" → Need full detail (0% savings)
+- "Read the sign" → Could convert to text (99% savings)
+
+### How It Works
+
+```
+User: [image] + "What animal is this?"
+           ↓
+┌─────────────────────────────────┐
+│  1. Query Analysis              │
+│  TrainedRouter (MiniLM)         │
+│  Classifies → full_low          │
+└─────────────────────────────────┘
+           ↓
+┌─────────────────────────────────┐
+│  2. Image Analysis (Optional)   │
+│  SigLIP checks:                 │
+│  - Has text? Is complex?        │
+│  - Fine details needed?         │
+└─────────────────────────────────┘
+           ↓
+┌─────────────────────────────────┐
+│  3. Apply Compression           │
+│  OpenAI: detail="low"           │
+│  Anthropic: Resize to 512px     │
+│  Google: Resize to 768px        │
+└─────────────────────────────────┘
+           ↓
+Compressed request → LLM → Response
+```
+
+### The Trained Router
+
+A fine-tuned MiniLM classifier hosted on HuggingFace:
+
+- **Model**: `chopratejas/technique-router`
+- **Size**: ~128MB (downloaded once, cached)
+- **Accuracy**: 93.7% on 1,157 training examples
+- **Latency**: ~10ms CPU, ~2ms GPU
+
+The router learns from examples like:
+| Query | Technique |
+|-------|-----------|
+| "What is this?" | `full_low` |
+| "Count the items" | `preserve` |
+| "Read the text" | `transcode` |
+| "What's in the corner?" | `crop` |
+
+### Provider-Specific Compression
+
+Each provider handles images differently:
+
+| Provider | Method | Savings |
+|----------|--------|---------|
+| **OpenAI** | `detail="low"` parameter | ~87% |
+| **Anthropic** | PIL resize to 512px | ~75% |
+| **Google** | PIL resize to 768px (tile-optimized) | ~75% |
+
+### Integration Points
+
+Image compression runs in the proxy **before** text compression:
+
+```
+Request arrives
+      ↓
+[Image Compression] ← NEW
+      ↓
+[Transform Pipeline: Cache Aligner → Smart Crusher → ...]
+      ↓
+Forward to LLM
+```
+
+This ensures images are compressed first, then text compression (CCR, SmartCrusher) handles the rest.
+
+### Code Location
+
+```
+headroom/
+├── image/
+│   ├── __init__.py         # Public API
+│   ├── compressor.py       # ImageCompressor class
+│   └── trained_router.py   # TrainedRouter (HuggingFace model)
+├── proxy/
+│   └── server.py           # Integration point
+```
+
+---
+
 ## File Structure Explained
 
 ```

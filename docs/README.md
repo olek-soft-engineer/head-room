@@ -23,6 +23,7 @@ Welcome to the Headroom documentation.
 | Topic | Description |
 |-------|-------------|
 | [Universal Compression](compression.md) | ML-based content detection + structure preservation |
+| [Image Compression](image-compression.md) | 40-90% token reduction for images via trained ML router |
 | [Transforms](transforms.md) | How compression works |
 | [CCR](ccr.md) | Reversible compression architecture |
 | [Configuration](configuration.md) | All configuration options |

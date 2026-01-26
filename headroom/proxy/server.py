@@ -87,6 +87,22 @@ from headroom.transforms import (
     is_tree_sitter_available,
 )
 
+# Image compression (lazy-loaded to avoid heavy dependencies at startup)
+_image_compressor = None
+
+def _get_image_compressor():
+    """Lazy load image compressor to avoid startup overhead."""
+    global _image_compressor
+    if _image_compressor is None:
+        try:
+            from headroom.image import ImageCompressor
+            _image_compressor = ImageCompressor()
+            logger.info("Image compression enabled (model: chopratejas/technique-router)")
+        except ImportError as e:
+            logger.warning(f"Image compression not available: {e}")
+            _image_compressor = False  # Mark as unavailable
+    return _image_compressor if _image_compressor else None
+
 # Conditionally import LLMLingua if available
 if _LLMLINGUA_AVAILABLE:
     from headroom.transforms import LLMLinguaCompressor, LLMLinguaConfig
@@ -180,6 +196,7 @@ class ProxyConfig:
 
     # Optimization
     optimize: bool = True
+    image_optimize: bool = True  # Compress images using trained ML router
     min_tokens_to_crush: int = 500
     max_items_after_crush: int = 50
     keep_last_turns: int = 4
@@ -1197,6 +1214,19 @@ class HeadroomProxy:
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
         stream = body.get("stream", False)
+
+        # Image compression (before text optimization)
+        if self.config.image_optimize and messages:
+            compressor = _get_image_compressor()
+            if compressor and compressor.has_images(messages):
+                messages = compressor.compress(messages, provider="anthropic")
+                if compressor.last_result:
+                    logger.info(
+                        f"Image compression: {compressor.last_result.technique.value} "
+                        f"({compressor.last_result.savings_percent:.0f}% saved, "
+                        f"{compressor.last_result.original_tokens} -> "
+                        f"{compressor.last_result.compressed_tokens} tokens)"
+                    )
 
         # Extract headers and tags
         headers = dict(request.headers.items())
@@ -2731,6 +2761,19 @@ class HeadroomProxy:
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
         stream = body.get("stream", False)
+
+        # Image compression (before text optimization)
+        if self.config.image_optimize and messages:
+            compressor = _get_image_compressor()
+            if compressor and compressor.has_images(messages):
+                messages = compressor.compress(messages, provider="openai")
+                if compressor.last_result:
+                    logger.info(
+                        f"Image compression: {compressor.last_result.technique.value} "
+                        f"({compressor.last_result.savings_percent:.0f}% saved, "
+                        f"{compressor.last_result.original_tokens} -> "
+                        f"{compressor.last_result.compressed_tokens} tokens)"
+                    )
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
