@@ -102,10 +102,17 @@ Usage with OpenAI-compatible clients:
 {
         ""
         if not config.memory_enabled
-        else '''
+        else f'''
 Memory:
-  Memories are scoped per user. Set x-headroom-user-id header for multi-user setups (defaults to 'default').
+  - Memories are scoped per user. Set x-headroom-user-id header (defaults to 'default').
+  - Tools: {"ENABLED" if config.memory_inject_tools else "DISABLED"}  Context: {"ENABLED" if config.memory_inject_context else "DISABLED"}
 '''
+        + (
+            "  - NOTE: Memory tools require ANTHROPIC_API_KEY (Claude Code subscription credentials have restrictions)."
+            + chr(10)
+            if config.memory_inject_tools
+            else ""
+        )
     }
 Endpoints:
   GET  /health     Health check

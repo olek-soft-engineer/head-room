@@ -1190,15 +1190,34 @@ class HeadroomProxy:
         self,
         messages: list[dict[str, Any]],
         context: str,
+        body: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        """Inject context into the system message.
+        """Inject context into the system message/parameter.
 
-        If a system message exists, appends the context to it.
-        Otherwise, creates a new system message at the beginning.
+        For Anthropic API: Uses top-level 'system' parameter (not messages array).
+        For OpenAI API: Uses system role in messages array.
+
+        Args:
+            messages: The messages list.
+            context: Context to inject.
+            body: Optional request body to update system parameter (for Anthropic).
+
+        Returns:
+            Updated messages list.
         """
         messages = list(messages)  # Copy to avoid mutation
 
-        # Find existing system message
+        # For Anthropic API: use top-level 'system' parameter
+        if body is not None:
+            existing_system = body.get("system", "")
+            if isinstance(existing_system, str):
+                body["system"] = (existing_system + "\n\n" + context).strip()
+            else:
+                # system can be a list of content blocks
+                body["system"] = context
+            return messages
+
+        # For OpenAI API: use system role in messages
         for i, msg in enumerate(messages):
             if msg.get("role") == "system":
                 content = msg.get("content", "")
@@ -1499,7 +1518,7 @@ class HeadroomProxy:
                     )
                     if memory_context:
                         optimized_messages = self._inject_system_context(
-                            optimized_messages, memory_context
+                            optimized_messages, memory_context, body=body
                         )
                         logger.info(
                             f"[{request_id}] Memory: Injected {len(memory_context)} chars of context"
@@ -1511,7 +1530,10 @@ class HeadroomProxy:
             if self.memory_handler.config.inject_tools:
                 tools, mem_tools_injected = self.memory_handler.inject_tools(tools, "anthropic")
                 if mem_tools_injected:
-                    logger.debug(f"[{request_id}] Memory: Injected memory tools")
+                    tool_names = [
+                        t.get("name") for t in tools if t.get("name", "").startswith("memory_")
+                    ]
+                    logger.info(f"[{request_id}] Memory: Injected tools: {tool_names}")
 
         # Update body
         body["messages"] = optimized_messages
@@ -1536,6 +1558,7 @@ class HeadroomProxy:
                     transforms_applied,
                     tags,
                     optimization_latency,
+                    memory_user_id=memory_user_id,
                 )
             else:
                 response = await self._retry_request("POST", url, headers, body)
@@ -2981,6 +3004,186 @@ class HeadroomProxy:
 
         return usage_found if usage_found else None
 
+    def _parse_sse_to_response(self, sse_data: str, provider: str) -> dict[str, Any] | None:
+        """Parse SSE data to reconstruct the API response JSON.
+
+        Args:
+            sse_data: Raw SSE data string.
+            provider: Provider type for parsing.
+
+        Returns:
+            Reconstructed response dict or None if parsing fails.
+        """
+        if provider != "anthropic":
+            return None  # Only implemented for Anthropic
+
+        response: dict[str, Any] = {"content": [], "usage": {}}
+        current_block: dict[str, Any] | None = None
+
+        for line in sse_data.split("\n"):
+            if not line.startswith("data: "):
+                continue
+            data_str = line[6:].strip()
+            if not data_str or data_str == "[DONE]":
+                continue
+
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            event_type = data.get("type", "")
+
+            if event_type == "message_start":
+                msg = data.get("message", {})
+                response["id"] = msg.get("id")
+                response["model"] = msg.get("model")
+                response["role"] = msg.get("role", "assistant")
+                response["stop_reason"] = msg.get("stop_reason")
+                if msg.get("usage"):
+                    response["usage"].update(msg["usage"])
+
+            elif event_type == "content_block_start":
+                block = data.get("content_block", {})
+                current_block = {
+                    "type": block.get("type"),
+                    "index": data.get("index", len(response["content"])),
+                }
+                if block.get("type") == "text":
+                    current_block["text"] = block.get("text", "")
+                elif block.get("type") == "tool_use":
+                    current_block["id"] = block.get("id")
+                    current_block["name"] = block.get("name")
+                    current_block["input"] = {}
+
+            elif event_type == "content_block_delta":
+                if current_block:
+                    delta = data.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        current_block["text"] = current_block.get("text", "") + delta.get(
+                            "text", ""
+                        )
+                    elif delta.get("type") == "input_json_delta":
+                        # Accumulate partial JSON for tool input
+                        partial = delta.get("partial_json", "")
+                        current_block["_partial_json"] = (
+                            current_block.get("_partial_json", "") + partial
+                        )
+
+            elif event_type == "content_block_stop":
+                if current_block:
+                    # Parse accumulated JSON for tool_use blocks
+                    if current_block.get("type") == "tool_use" and "_partial_json" in current_block:
+                        try:
+                            current_block["input"] = json.loads(current_block["_partial_json"])
+                        except json.JSONDecodeError:
+                            current_block["input"] = {}
+                        del current_block["_partial_json"]
+                    response["content"].append(current_block)
+                    current_block = None
+
+            elif event_type == "message_delta":
+                delta = data.get("delta", {})
+                if delta.get("stop_reason"):
+                    response["stop_reason"] = delta["stop_reason"]
+                if data.get("usage"):
+                    response["usage"].update(data["usage"])
+
+        return response if response.get("content") else None
+
+    def _response_to_sse(self, response: dict[str, Any], provider: str) -> list[bytes]:
+        """Convert a response dict back to SSE format.
+
+        Args:
+            response: API response dict.
+            provider: Provider type for formatting.
+
+        Returns:
+            List of SSE event bytes.
+        """
+        if provider != "anthropic":
+            return []
+
+        events: list[bytes] = []
+
+        # message_start
+        msg_start = {
+            "type": "message_start",
+            "message": {
+                "id": response.get("id", "msg_generated"),
+                "type": "message",
+                "role": response.get("role", "assistant"),
+                "model": response.get("model", "unknown"),
+                "content": [],
+                "stop_reason": None,
+                "usage": response.get("usage", {}),
+            },
+        }
+        events.append(f"event: message_start\ndata: {json.dumps(msg_start)}\n\n".encode())
+
+        # Content blocks
+        for idx, block in enumerate(response.get("content", [])):
+            # content_block_start
+            if block.get("type") == "text":
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "text", "text": ""},
+                }
+            elif block.get("type") == "tool_use":
+                block_start = {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": block.get("id", f"toolu_{idx}"),
+                        "name": block.get("name", ""),
+                        "input": {},
+                    },
+                }
+            else:
+                continue
+
+            events.append(
+                f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n".encode()
+            )
+
+            # content_block_delta(s)
+            if block.get("type") == "text" and block.get("text"):
+                delta = {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "text_delta", "text": block["text"]},
+                }
+                events.append(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
+            elif block.get("type") == "tool_use" and block.get("input"):
+                delta = {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(block["input"]),
+                    },
+                }
+                events.append(f"event: content_block_delta\ndata: {json.dumps(delta)}\n\n".encode())
+
+            # content_block_stop
+            block_stop = {"type": "content_block_stop", "index": idx}
+            events.append(f"event: content_block_stop\ndata: {json.dumps(block_stop)}\n\n".encode())
+
+        # message_delta
+        msg_delta = {
+            "type": "message_delta",
+            "delta": {"stop_reason": response.get("stop_reason", "end_turn")},
+            "usage": {"output_tokens": response.get("usage", {}).get("output_tokens", 0)},
+        }
+        events.append(f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n".encode())
+
+        # message_stop
+        events.append(b'event: message_stop\ndata: {"type": "message_stop"}\n\n')
+
+        return events
+
     async def _stream_response(
         self,
         url: str,
@@ -2995,11 +3198,18 @@ class HeadroomProxy:
         transforms_applied: list[str],
         tags: dict[str, str],
         optimization_latency: float,
+        memory_user_id: str | None = None,
     ) -> StreamingResponse:
-        """Stream response with metrics tracking.
+        """Stream response with metrics tracking and memory tool handling.
 
         Parses SSE events to extract actual usage information from the API response
         for accurate token counting and cost calculation.
+
+        When memory is enabled (memory_user_id provided), this method:
+        1. Buffers the response to detect memory tool calls
+        2. Executes memory tools if found
+        3. Makes continuation requests until no memory tools remain
+        4. Streams the final response to the client
         """
         start_time = time.time()
 
@@ -3013,7 +3223,20 @@ class HeadroomProxy:
             "sse_buffer": "",  # Buffer for incomplete SSE events
         }
 
+        # Track if we need to handle memory tools
+        memory_enabled = (
+            memory_user_id is not None
+            and self.memory_handler is not None
+            and provider == "anthropic"
+        )
+
         async def generate():
+            nonlocal body  # May need to modify for continuation requests
+
+            # For memory mode, we buffer the response to check for tool calls
+            buffered_chunks: list[bytes] = []
+            full_sse_data = ""
+
             try:
                 async with self.http_client.stream(
                     "POST", url, json=body, headers=headers
@@ -3022,7 +3245,16 @@ class HeadroomProxy:
                         stream_state["total_bytes"] += len(chunk)
 
                         # Buffer SSE data to handle chunks split across calls
-                        stream_state["sse_buffer"] += chunk.decode("utf-8", errors="ignore")
+                        chunk_str = chunk.decode("utf-8", errors="ignore")
+                        stream_state["sse_buffer"] += chunk_str
+
+                        if memory_enabled:
+                            # Buffer for memory tool detection
+                            buffered_chunks.append(chunk)
+                            full_sse_data += chunk_str
+                        else:
+                            # Immediate streaming when memory not enabled
+                            yield chunk
 
                         # Parse complete SSE events from buffer
                         usage = self._parse_sse_usage_from_buffer(stream_state, provider)
@@ -3040,7 +3272,102 @@ class HeadroomProxy:
                                     "cache_creation_input_tokens"
                                 ]
 
-                        yield chunk
+                # Memory tool handling after stream completes
+                if memory_enabled and full_sse_data:
+                    # Check for Claude Code credential error in initial response
+                    if "only authorized for use with Claude Code" in full_sse_data:
+                        logger.warning(
+                            f"[{request_id}] Memory: Claude Code subscription credentials "
+                            "do not support custom tool injection. Set ANTHROPIC_API_KEY "
+                            "environment variable or use --no-memory-tools flag."
+                        )
+                        # Yield buffered error response as-is (contains error details)
+                        for chunk in buffered_chunks:
+                            yield chunk
+                        return
+
+                    # Parse SSE to get response JSON
+                    parsed_response = self._parse_sse_to_response(full_sse_data, provider)
+
+                    if parsed_response and self.memory_handler.has_memory_tool_calls(
+                        parsed_response, provider
+                    ):
+                        logger.info(
+                            f"[{request_id}] Memory: Detected tool calls in streaming response"
+                        )
+
+                        # Execute memory tool calls
+                        tool_results = await self.memory_handler.handle_memory_tool_calls(
+                            parsed_response, memory_user_id, provider
+                        )
+
+                        if tool_results:
+                            # Build continuation messages
+                            # Filter out system role messages (Anthropic uses top-level 'system' param)
+                            messages = [
+                                m for m in body.get("messages", []) if m.get("role") != "system"
+                            ]
+                            assistant_msg = {
+                                "role": "assistant",
+                                "content": parsed_response.get("content", []),
+                            }
+                            user_msg = {"role": "user", "content": tool_results}
+                            continuation_messages = messages + [assistant_msg, user_msg]
+
+                            # Make continuation request (streaming to support Claude Code API key)
+                            continuation_body = {
+                                **body,
+                                "messages": continuation_messages,
+                                "stream": True,
+                            }
+
+                            logger.info(
+                                f"[{request_id}] Memory: Tool execution complete, streaming continuation"
+                            )
+
+                            # Stream continuation response directly
+                            async with self.http_client.stream(
+                                "POST", url, json=continuation_body, headers=headers
+                            ) as cont_response:
+                                cont_buffer = ""
+                                async for chunk in cont_response.aiter_bytes():
+                                    chunk_str = chunk.decode("utf-8", errors="ignore")
+                                    cont_buffer += chunk_str
+
+                                    # Check for Claude Code credential error
+                                    if "only authorized for use with Claude Code" in cont_buffer:
+                                        logger.warning(
+                                            f"[{request_id}] Memory: Claude Code subscription "
+                                            "credentials do not support custom tool injection. "
+                                            "Set ANTHROPIC_API_KEY environment variable to use "
+                                            "memory tools, or disable memory tools with "
+                                            "--no-memory-tools flag."
+                                        )
+                                        # Yield a helpful error message in SSE format
+                                        error_msg = (
+                                            "Memory tools require a regular Anthropic API key. "
+                                            "Claude Code subscription credentials do not allow "
+                                            "custom tool injection. "
+                                            "To fix: (1) Set ANTHROPIC_API_KEY=your_api_key before "
+                                            "starting the proxy, or (2) Run proxy with "
+                                            "--no-memory-tools flag."
+                                        )
+                                        error_event = (
+                                            f'data: {{"type":"error","error":{{"type":"permission_error",'
+                                            f'"message":"{error_msg}"}}}}\n\n'
+                                        )
+                                        yield error_event.encode()
+                                        return
+
+                                    yield chunk
+                        else:
+                            # No tool results, yield original buffered chunks
+                            for chunk in buffered_chunks:
+                                yield chunk
+                    else:
+                        # No memory tool calls, yield original buffered chunks
+                        for chunk in buffered_chunks:
+                            yield chunk
             finally:
                 # Record metrics after stream completes
                 total_latency = (time.time() - start_time) * 1000

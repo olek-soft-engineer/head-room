@@ -55,6 +55,7 @@ dependencies = [
     "semantic-router>=0.1.12",
     "pillow>=10.0.0",             # Image processing for compression
     "datasets>=4.5.0",
+    "hnswlib>=0.8.0",             # HNSW vector index for memory system
 ]
 
 [project.optional-dependencies]
