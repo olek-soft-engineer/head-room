@@ -60,7 +60,7 @@ Headroom is the Context Optimization Layer for LLM applications. It reduces your
 1. **Universal Compression** — ML-based content detection with structure-preserving compression
 2. **SmartCrusher** — Compresses JSON tool outputs, keeping errors, anomalies, and relevant items
 3. **CacheAligner** — Stabilizes message prefixes so provider caching works
-4. **RollingWindow** — Manages context limits without breaking tool call pairs
+4. **IntelligentContextManager** — Score-based context dropping using TOIN-learned importance (default)
 5. **CCR** — Caches original data so compression is reversible
 
 ### Safety Guarantees

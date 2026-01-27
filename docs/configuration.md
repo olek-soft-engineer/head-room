@@ -217,6 +217,29 @@ config = IntelligentContextConfig(
 )
 ```
 
+### CCR Integration
+
+When IntelligentContext drops messages, they're stored in CCR for potential retrieval:
+
+```python
+from headroom.telemetry import get_toin
+
+# Pass TOIN for bidirectional integration
+toin = get_toin()
+manager = IntelligentContextManager(config=config, toin=toin)
+
+# Dropped messages are:
+# 1. Stored in CCR (so LLM can retrieve if needed)
+# 2. Recorded to TOIN (so it learns which patterns matter)
+# 3. Marked with CCR reference in the inserted message
+```
+
+The marker inserted when messages are dropped includes the CCR reference:
+```
+[Earlier context compressed: 14 message(s) dropped by importance scoring.
+Full content available via ccr_retrieve tool with reference 'abc123def456'.]
+```
+
 ### Scoring Weights
 
 The `ScoringWeights` class controls how messages are scored:

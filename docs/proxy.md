@@ -34,6 +34,26 @@ headroom proxy \
 | `--budget` | None | Daily budget limit in USD |
 | `--openai-api-url` | `https://api.openai.com` | Custom OpenAI API URL endpoint |
 
+### Context Management Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--no-intelligent-context` | `false` | Disable IntelligentContextManager (fall back to RollingWindow) |
+| `--no-intelligent-scoring` | `false` | Disable multi-factor importance scoring (use position-based) |
+| `--no-compress-first` | `false` | Disable trying deeper compression before dropping messages |
+
+By default, the proxy uses **IntelligentContextManager** which scores messages by multiple factors (recency, semantic similarity, TOIN-learned patterns, error indicators, forward references) and drops lowest-scored messages first. This is smarter than simple age-based truncation.
+
+**CCR Integration:** When messages are dropped, they're stored in CCR so the LLM can retrieve them if needed. The inserted marker includes the CCR reference. Drops are also recorded to TOIN, so the system learns which message patterns are important across all users.
+
+```bash
+# Use legacy RollingWindow (drops oldest first)
+headroom proxy --no-intelligent-context
+
+# Disable semantic scoring (faster, but less intelligent)
+headroom proxy --no-intelligent-scoring
+```
+
 ### LLMLingua Options (ML Compression)
 
 | Option | Default | Description |

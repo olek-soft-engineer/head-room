@@ -1,6 +1,6 @@
 # CCR: Compress-Cache-Retrieve
 
-Headroom's CCR architecture makes compression **reversible**. When tool outputs are compressed, the original data is cached. If the LLM needs more data, it can retrieve it instantly.
+Headroom's CCR architecture makes compression **reversible**. When content is compressed, the original data is cached. If the LLM needs more data, it can retrieve it instantly.
 
 ## The Problem with Traditional Compression
 
@@ -10,6 +10,14 @@ Traditional compression is lossy — if you guess wrong about what's important, 
 - **Conservative compression**: Miss out on token savings
 
 CCR eliminates this tradeoff.
+
+## CCR-Enabled Components
+
+| Component | What it compresses | CCR integration |
+|-----------|-------------------|-----------------|
+| **SmartCrusher** | JSON arrays (tool outputs) | Stores original array, marker includes hash |
+| **ContentRouter** | Code, logs, search results, text | Stores original content by strategy |
+| **IntelligentContextManager** | Messages (conversation turns) | Stores dropped messages, marker includes hash |
 
 ## How CCR Works
 
@@ -82,6 +90,37 @@ Turn 5: User asks "What about the auth middleware?"
         → Proactively expands compressed content
         → LLM sees full file list, finds auth_middleware.py
 ```
+
+## Message-Level CCR (IntelligentContext)
+
+IntelligentContextManager is a **message-level compressor**. When it drops low-importance messages to fit the context budget, those messages are stored in CCR:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  LONG CONVERSATION (100 messages, 50K tokens)                    │
+│  └─ IntelligentContext scores messages by importance            │
+│  └─ Drops 60 low-scoring messages                               │
+│  └─ Dropped messages cached with hash=def456                    │
+│  └─ Marker inserted: "60 messages dropped, retrieve: def456"    │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  LLM PROCESSING                                                  │
+│  Option A: LLM solves task with remaining messages → Done       │
+│  Option B: LLM needs earlier context                            │
+│            → Calls headroom_retrieve(hash=def456)               │
+│            → Full conversation restored                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**The marker includes the CCR reference:**
+```
+[Earlier context compressed: 60 message(s) dropped by importance scoring.
+Full content available via ccr_retrieve tool with reference 'def456'.]
+```
+
+**TOIN integration:** When users retrieve dropped messages, TOIN learns to score those message patterns higher next time, improving future drop decisions across all users.
 
 ## Features
 

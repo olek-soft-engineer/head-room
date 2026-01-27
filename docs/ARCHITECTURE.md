@@ -316,6 +316,36 @@ scores = {
 
 **Key principle:** No hardcoded patterns. Error detection uses TOIN's learned `field_semantics.inferred_type == "error_indicator"`, not keyword matching like "error" or "fail".
 
+**TOIN + CCR Integration:**
+
+IntelligentContext is a **message-level compressor** — just like SmartCrusher compresses items in an array, IntelligentContext "compresses" messages in a conversation. This means full CCR integration:
+
+```python
+# When messages are dropped:
+# 1. Store dropped messages in CCR for potential retrieval
+ccr_ref = store.store(
+    original=json.dumps(dropped_messages),
+    compressed="[60 messages dropped]",
+    tool_name="intelligent_context_drop",
+)
+
+# 2. Record drop to TOIN for cross-user learning
+toin.record_compression(
+    tool_signature=message_signature,  # Pattern of roles, tools, errors
+    original_count=len(dropped_messages),
+    compressed_count=1,  # The marker
+    strategy="intelligent_context_drop",
+)
+
+# 3. Insert marker with CCR reference
+marker = f"[Earlier context compressed: 60 messages dropped. Retrieve: {ccr_ref}]"
+```
+
+**The feedback loop:**
+- If users retrieve dropped messages via CCR, TOIN learns those patterns are important
+- Future drops of similar message patterns get higher importance scores
+- The system gets smarter across all users, not just within one session
+
 ---
 
 ### 5. Storage (`storage/`) - Metrics Database
