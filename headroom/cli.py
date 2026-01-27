@@ -67,6 +67,10 @@ def cmd_proxy(args: argparse.Namespace) -> int:
         llmlingua_target_rate=args.llmlingua_rate,
         # Code-aware: ON by default (use --no-code-aware to disable)
         code_aware_enabled=not args.no_code_aware,
+        # Intelligent Context: ON by default (use --no-intelligent-context to disable)
+        intelligent_context=not args.no_intelligent_context,
+        intelligent_context_scoring=not args.no_intelligent_scoring,
+        intelligent_context_compress_first=not args.no_compress_first,
         # Memory System
         memory_enabled=args.memory,
         memory_backend=args.memory_backend,
@@ -490,6 +494,22 @@ Documentation: https://github.com/headroom-sdk/headroom
         "--no-code-aware",
         action="store_true",
         help="Disable AST-based code compression",
+    )
+    # Intelligent Context Management (ON by default)
+    proxy_parser.add_argument(
+        "--no-intelligent-context",
+        action="store_true",
+        help="Disable IntelligentContextManager (fall back to RollingWindow)",
+    )
+    proxy_parser.add_argument(
+        "--no-intelligent-scoring",
+        action="store_true",
+        help="Disable multi-factor importance scoring (use position-based)",
+    )
+    proxy_parser.add_argument(
+        "--no-compress-first",
+        action="store_true",
+        help="Disable trying deeper compression before dropping messages",
     )
     # Memory System
     proxy_parser.add_argument(

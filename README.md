@@ -146,7 +146,7 @@ flowchart TB
 subgraph Pipeline["Transform Pipeline"]
   CA["Cache Aligner<br/><i>Stabilizes dynamic tokens</i>"]
   SC["Smart Crusher<br/><i>Removes redundant tool output</i>"]
-  CM["Context Manager<br/><i>Fits token budget</i>"]
+  CM["Intelligent Context<br/><i>Score-based token fitting</i>"]
   CA --> SC --> CM
 end
 
@@ -278,7 +278,7 @@ See the full [Agno Integration Guide](docs/agno.md) for hooks, multi-provider su
 | **Universal Compression** | ML-based content detection + structure-preserving compression | [Compression](docs/compression.md) |
 | **SmartCrusher** | Compresses JSON tool outputs statistically | [Transforms](docs/transforms.md) |
 | **CacheAligner** | Stabilizes prefixes for provider caching | [Transforms](docs/transforms.md) |
-| **RollingWindow** | Manages context limits without breaking tools | [Transforms](docs/transforms.md) |
+| **IntelligentContext** | Score-based context dropping with TOIN-learned importance | [Transforms](docs/transforms.md) |
 | **CCR** | Reversible compression with automatic retrieval | [CCR Guide](docs/ccr.md) |
 | **LangChain** | Memory, retrievers, agents, streaming | [LangChain](docs/langchain.md) |
 | **Agno** | Agent framework integration with hooks | [Agno](docs/agno.md) |
