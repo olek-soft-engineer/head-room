@@ -1608,8 +1608,10 @@ class HeadroomProxy:
                 resp_json = None
                 try:
                     resp_json = response.json()
-                except Exception:
-                    pass
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.debug(
+                        f"[{request_id}] Failed to parse response JSON for CCR handling: {e}"
+                    )
 
                 # CCR Response Handling: Handle headroom_retrieve tool calls automatically
                 if (
@@ -2961,9 +2963,9 @@ class HeadroomProxy:
                 if usage:
                     return usage
 
-        except Exception:
+        except (UnicodeDecodeError, KeyError, TypeError) as e:
             # Don't fail streaming on parse errors
-            pass
+            logger.debug(f"SSE usage parsing error for {provider}: {e}")
 
         return None
 
@@ -3687,8 +3689,10 @@ class HeadroomProxy:
                     # These are charged at 50% of the input price
                     prompt_details = usage.get("prompt_tokens_details", {})
                     cache_read_tokens = prompt_details.get("cached_tokens", 0)
-                except Exception:
-                    pass
+                except (KeyError, TypeError, AttributeError) as e:
+                    logger.debug(
+                        f"[{request_id}] Failed to extract cached tokens from OpenAI response: {e}"
+                    )
 
                 # For OpenAI, prompt_tokens is TOTAL (includes cached)
                 # Normalize to non-cached input for consistent cost calculation
@@ -4423,8 +4427,10 @@ class HeadroomProxy:
                         "prompt_tokens_details", usage.get("input_tokens_details", {})
                     )
                     cache_read_tokens = prompt_details.get("cached_tokens", 0)
-                except Exception:
-                    pass
+                except (KeyError, TypeError, AttributeError) as e:
+                    logger.debug(
+                        f"[{request_id}] Failed to extract cached tokens from OpenAI passthrough response: {e}"
+                    )
 
                 # For OpenAI, input_tokens is TOTAL (includes cached)
                 # Normalize to non-cached input for consistent cost calculation
@@ -4687,8 +4693,10 @@ class HeadroomProxy:
                     # Gemini returns cachedContentTokenCount for context-cached tokens
                     # These are charged at 10-25% of the input price depending on model
                     cache_read_tokens = usage.get("cachedContentTokenCount", 0)
-                except Exception:
-                    pass
+                except (KeyError, TypeError, AttributeError) as e:
+                    logger.debug(
+                        f"[{request_id}] Failed to extract cached tokens from Gemini response: {e}"
+                    )
 
                 # For Gemini, promptTokenCount is TOTAL (includes cached)
                 # Normalize to non-cached input for consistent cost calculation
@@ -4939,8 +4947,8 @@ class HeadroomProxy:
             try:
                 resp_json = response.json()
                 compressed_tokens = resp_json.get("totalTokens", 0)
-            except Exception:
-                pass
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.debug(f"[{request_id}] Failed to parse Gemini token count response: {e}")
 
             # Track stats
             tokens_saved = original_tokens - compressed_tokens if compressed_tokens > 0 else 0

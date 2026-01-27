@@ -316,13 +316,11 @@ class LocalBackend:
             entities: Optional filter by related entities.
             include_related: If True, expand results via knowledge graph.
             min_similarity: Minimum cosine similarity threshold.
-            session_id: Optional session filter (not yet implemented).
+            session_id: Optional session filter to isolate memories by session.
 
         Returns:
             List of MemorySearchResult objects with scores and related entities.
         """
-        # Note: session_id filtering is not yet implemented in LocalBackend
-        _ = session_id  # Acknowledge parameter for protocol compliance
         await self._ensure_initialized()
         assert self._hierarchical_memory is not None
         assert self._graph is not None
@@ -331,6 +329,7 @@ class LocalBackend:
         vector_results = await self._hierarchical_memory.search(
             query=query,
             user_id=user_id,
+            session_id=session_id,
             top_k=top_k * 2 if include_related else top_k,  # Over-fetch for deduplication
             min_similarity=min_similarity,
         )
@@ -386,6 +385,9 @@ class LocalBackend:
                 for mem_id in new_memory_ids:
                     memory = await self._hierarchical_memory.get(mem_id)
                     if memory and memory.user_id == user_id:
+                        # Filter by session_id if specified (security: prevent session leakage)
+                        if session_id is not None and memory.session_id != session_id:
+                            continue
                         # Add with lower score since it's from graph expansion
                         results.append(
                             MemorySearchResult(
