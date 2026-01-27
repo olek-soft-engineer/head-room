@@ -35,6 +35,7 @@ Pipeline Usage:
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -47,6 +48,53 @@ from .base import Transform
 from .content_detector import ContentType, detect_content_type
 
 logger = logging.getLogger(__name__)
+
+
+def _create_content_signature(
+    content_type: str,
+    content: str,
+    language: str | None = None,
+) -> Any:
+    """Create a ToolSignature for non-JSON content types.
+
+    This allows TOIN to track compression patterns for code, search results,
+    logs, and text - not just JSON arrays.
+
+    Args:
+        content_type: The type of content (e.g., "code_aware", "search", "log", "text").
+        content: The content being compressed (for structural hints).
+        language: Optional language hint for code.
+
+    Returns:
+        A ToolSignature for TOIN tracking.
+    """
+    try:
+        from ..telemetry.models import ToolSignature
+
+        # Create a deterministic structure hash based on content type
+        # This groups similar content types together for pattern learning
+        if language:
+            hash_input = f"content:{content_type}:{language}"
+        else:
+            hash_input = f"content:{content_type}"
+
+        # Add a structural hint from the content (first 100 chars, hashed)
+        # This helps differentiate tool outputs of the same type
+        content_sample = content[:100] if content else ""
+        structure_hint = hashlib.sha256(content_sample.encode()).hexdigest()[:8]
+        hash_input = f"{hash_input}:{structure_hint}"
+
+        structure_hash = hashlib.sha256(hash_input.encode()).hexdigest()[:24]
+
+        return ToolSignature(
+            structure_hash=structure_hash,
+            field_count=0,  # Not applicable for non-JSON
+            has_nested_objects=False,
+            has_arrays=False,
+            max_depth=0,
+        )
+    except ImportError:
+        return None
 
 
 class CompressionStrategy(Enum):
@@ -417,6 +465,81 @@ class ContentRouter(Transform):
         self._text_compressor: Any = None
         self._image_optimizer: Any = None
 
+        # TOIN integration for cross-strategy learning
+        self._toin: Any = None
+
+    def _record_to_toin(
+        self,
+        strategy: CompressionStrategy,
+        content: str,
+        compressed: str,
+        original_tokens: int,
+        compressed_tokens: int,
+        language: str | None = None,
+        context: str = "",
+    ) -> None:
+        """Record compression to TOIN for cross-user learning.
+
+        This allows TOIN to track compression patterns for ALL content types,
+        not just JSON arrays. When the LLM retrieves original content via CCR,
+        TOIN learns which compressions users need to expand.
+
+        Args:
+            strategy: The compression strategy used.
+            content: Original content (for signature generation).
+            compressed: Compressed content.
+            original_tokens: Token count before compression.
+            compressed_tokens: Token count after compression.
+            language: Optional language hint for code.
+            context: Query context for pattern learning.
+        """
+        # Skip SmartCrusher - it handles its own TOIN recording
+        if strategy == CompressionStrategy.SMART_CRUSHER:
+            return
+
+        # Skip if no actual compression happened
+        if original_tokens <= compressed_tokens:
+            return
+
+        try:
+            # Lazy load TOIN
+            if self._toin is None:
+                from ..telemetry.toin import get_toin
+
+                self._toin = get_toin()
+
+            # Create a content-type signature
+            signature = _create_content_signature(
+                content_type=strategy.value,
+                content=content,
+                language=language,
+            )
+
+            if signature is None:
+                return
+
+            # Record the compression
+            self._toin.record_compression(
+                tool_signature=signature,
+                original_count=1,  # Single content block
+                compressed_count=1,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
+                strategy=strategy.value,
+                query_context=context if context else None,
+            )
+
+            logger.debug(
+                "TOIN: Recorded %s compression: %d → %d tokens",
+                strategy.value,
+                original_tokens,
+                compressed_tokens,
+            )
+
+        except Exception as e:
+            # TOIN recording should never break compression
+            logger.debug("TOIN recording failed (non-fatal): %s", e)
+
     def compress(
         self,
         content: str,
@@ -604,17 +727,25 @@ class ContentRouter(Transform):
         Returns:
             Tuple of (compressed_content, compressed_token_count).
         """
+        # Track original tokens for TOIN recording
+        original_tokens = len(content.split())
+        compressed: str | None = None
+        compressed_tokens: int | None = None
+
         try:
             if strategy == CompressionStrategy.CODE_AWARE:
                 if self.config.enable_code_aware:
                     compressor = self._get_code_compressor()
                     if compressor:
                         result = compressor.compress(content, language=language, context=context)
-                        return result.compressed, result.compressed_tokens
-                # Fallback to LLMLingua
-                return self._try_llmlingua(content, context)
+                        compressed, compressed_tokens = result.compressed, result.compressed_tokens
+                if compressed is None:
+                    # Fallback to LLMLingua
+                    compressed, compressed_tokens = self._try_llmlingua(content, context)
+                    strategy = CompressionStrategy.LLMLINGUA  # Update for TOIN
 
             elif strategy == CompressionStrategy.SMART_CRUSHER:
+                # SmartCrusher handles its own TOIN recording
                 if self.config.enable_smart_crusher:
                     crusher = self._get_smart_crusher()
                     if crusher:
@@ -626,28 +757,47 @@ class ContentRouter(Transform):
                     compressor = self._get_search_compressor()
                     if compressor:
                         result = compressor.compress(content, context=context)
-                        return result.compressed, len(result.compressed.split())
+                        compressed, compressed_tokens = (
+                            result.compressed,
+                            len(result.compressed.split()),
+                        )
 
             elif strategy == CompressionStrategy.LOG:
                 if self.config.enable_log_compressor:
                     compressor = self._get_log_compressor()
                     if compressor:
                         result = compressor.compress(content)
-                        return result.compressed, result.compressed_line_count
+                        compressed, compressed_tokens = (
+                            result.compressed,
+                            result.compressed_line_count,
+                        )
 
             elif strategy == CompressionStrategy.LLMLINGUA:
-                return self._try_llmlingua(content, context)
+                compressed, compressed_tokens = self._try_llmlingua(content, context)
 
             elif strategy == CompressionStrategy.TEXT:
                 # Prefer LLMLingua for text if available (ML-based, better compression)
                 # Falls back to heuristic TextCompressor if LLMLingua unavailable
-                return self._try_llmlingua(content, context)
+                compressed, compressed_tokens = self._try_llmlingua(content, context)
 
         except Exception as e:
             logger.warning("Compression with %s failed: %s", strategy.value, e)
 
+        # If compression succeeded, record to TOIN
+        if compressed is not None and compressed_tokens is not None:
+            self._record_to_toin(
+                strategy=strategy,
+                content=content,
+                compressed=compressed,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
+                language=language,
+                context=context,
+            )
+            return compressed, compressed_tokens
+
         # Fallback: return unchanged
-        return content, len(content.split())
+        return content, original_tokens
 
     def _try_llmlingua(self, content: str, context: str) -> tuple[str, int]:
         """Try LLMLingua compression with fallback.

@@ -551,6 +551,16 @@ The router automatically detects content types by analyzing the content itself:
 
 No manual hints required - the router inspects content directly.
 
+### TOIN Integration
+
+ContentRouter records all compressions to TOIN (Tool Output Intelligence Network) for cross-user learning:
+
+- **All strategies tracked**: Code, search, logs, text, and LLMLingua compressions are recorded
+- **Retrieval feedback**: When users retrieve original content via CCR, TOIN learns which compressions need expansion
+- **Pattern learning**: TOIN builds signatures for each content type to improve future compressions
+
+This enables the feedback loop where compression decisions improve based on actual user behavior across all content types, not just JSON arrays.
+
 ---
 
 ## TransformPipeline
