@@ -90,18 +90,21 @@ from headroom.transforms import (
 # Image compression (lazy-loaded to avoid heavy dependencies at startup)
 _image_compressor = None
 
+
 def _get_image_compressor():
     """Lazy load image compressor to avoid startup overhead."""
     global _image_compressor
     if _image_compressor is None:
         try:
             from headroom.image import ImageCompressor
+
             _image_compressor = ImageCompressor()
             logger.info("Image compression enabled (model: chopratejas/technique-router)")
         except ImportError as e:
             logger.warning(f"Image compression not available: {e}")
             _image_compressor = False  # Mark as unavailable
     return _image_compressor if _image_compressor else None
+
 
 # Conditionally import LLMLingua if available
 if _LLMLINGUA_AVAILABLE:
@@ -2644,6 +2647,86 @@ class HeadroomProxy:
 
         return JSONResponse(content=response_data, status_code=200)
 
+    def _parse_sse_usage(self, chunk: bytes, provider: str) -> dict[str, int] | None:
+        """Parse usage information from SSE chunk.
+
+        For Anthropic: Looks for message_start (input tokens) and message_delta (output tokens)
+        For OpenAI: Looks for final chunk with usage object (requires stream_options.include_usage=true)
+        For Gemini: Looks for usageMetadata in each chunk
+
+        Returns dict with keys: input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens
+        Returns None if no usage found in this chunk.
+        """
+        try:
+            text = chunk.decode("utf-8", errors="ignore")
+            # SSE format: "data: {...}\n\n" or "event: ...\ndata: {...}\n\n"
+            for line in text.split("\n"):
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
+
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                usage = {}
+
+                if provider == "anthropic":
+                    # Anthropic sends message_start with input tokens
+                    # and message_delta with output tokens
+                    event_type = data.get("type", "")
+
+                    if event_type == "message_start":
+                        msg = data.get("message", {})
+                        msg_usage = msg.get("usage", {})
+                        if msg_usage:
+                            usage["input_tokens"] = msg_usage.get("input_tokens", 0)
+                            usage["cache_read_input_tokens"] = msg_usage.get(
+                                "cache_read_input_tokens", 0
+                            )
+                            usage["cache_creation_input_tokens"] = msg_usage.get(
+                                "cache_creation_input_tokens", 0
+                            )
+
+                    elif event_type == "message_delta":
+                        delta_usage = data.get("usage", {})
+                        if delta_usage:
+                            usage["output_tokens"] = delta_usage.get("output_tokens", 0)
+
+                elif provider == "openai":
+                    # OpenAI sends usage in final chunk (when stream_options.include_usage=true)
+                    chunk_usage = data.get("usage")
+                    if chunk_usage:
+                        usage["input_tokens"] = chunk_usage.get("prompt_tokens", 0)
+                        usage["output_tokens"] = chunk_usage.get("completion_tokens", 0)
+                        # OpenAI has cached tokens in prompt_tokens_details
+                        details = chunk_usage.get("prompt_tokens_details", {})
+                        usage["cache_read_input_tokens"] = details.get("cached_tokens", 0)
+
+                elif provider == "gemini":
+                    # Gemini sends usageMetadata in each streaming chunk
+                    # Format: {"usageMetadata": {"promptTokenCount": N, "candidatesTokenCount": M}}
+                    usage_meta = data.get("usageMetadata")
+                    if usage_meta:
+                        usage["input_tokens"] = usage_meta.get("promptTokenCount", 0)
+                        usage["output_tokens"] = usage_meta.get("candidatesTokenCount", 0)
+                        # Gemini also has cachedContentTokenCount for context caching
+                        usage["cache_read_input_tokens"] = usage_meta.get(
+                            "cachedContentTokenCount", 0
+                        )
+
+                if usage:
+                    return usage
+
+        except Exception:
+            # Don't fail streaming on parse errors
+            pass
+
+        return None
+
     async def _stream_response(
         self,
         url: str,
@@ -2661,40 +2744,71 @@ class HeadroomProxy:
     ) -> StreamingResponse:
         """Stream response with metrics tracking.
 
-        Calculates output size incrementally to avoid accumulating all chunks in memory.
+        Parses SSE events to extract actual usage information from the API response
+        for accurate token counting and cost calculation.
         """
         start_time = time.time()
 
+        # Mutable state for the generator to update
+        stream_state: dict[str, Any] = {
+            "input_tokens": None,
+            "output_tokens": None,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "total_bytes": 0,
+        }
+
         async def generate():
-            # Track total bytes incrementally instead of accumulating chunks
-            total_bytes = 0
             try:
                 async with self.http_client.stream(
                     "POST", url, json=body, headers=headers
                 ) as response:
                     async for chunk in response.aiter_bytes():
-                        total_bytes += len(chunk)
+                        stream_state["total_bytes"] += len(chunk)
+
+                        # Parse usage from SSE events
+                        usage = self._parse_sse_usage(chunk, provider)
+                        if usage:
+                            if "input_tokens" in usage:
+                                stream_state["input_tokens"] = usage["input_tokens"]
+                            if "output_tokens" in usage:
+                                stream_state["output_tokens"] = usage["output_tokens"]
+                            if "cache_read_input_tokens" in usage:
+                                stream_state["cache_read_input_tokens"] = usage[
+                                    "cache_read_input_tokens"
+                                ]
+                            if "cache_creation_input_tokens" in usage:
+                                stream_state["cache_creation_input_tokens"] = usage[
+                                    "cache_creation_input_tokens"
+                                ]
+
                         yield chunk
             finally:
                 # Record metrics after stream completes
                 total_latency = (time.time() - start_time) * 1000
 
-                # Estimate output tokens from total bytes (rough estimate: ~4 bytes per token)
-                output_tokens = total_bytes // 4
+                # Use actual output tokens from API if available, otherwise estimate
+                output_tokens = stream_state["output_tokens"]
+                if output_tokens is None:
+                    # Fallback: estimate from bytes (but this is inaccurate for SSE)
+                    # Use a more conservative estimate - SSE overhead is ~10-20x
+                    output_tokens = stream_state["total_bytes"] // 40
+                    logger.debug(
+                        f"[{request_id}] No usage in stream, estimated {output_tokens} output tokens"
+                    )
 
-                # TODO: For accurate cost tracking with streaming, we'd need to parse
-                # the final SSE event which contains usage info including cached tokens.
-                # Currently streaming doesn't account for cache discounts.
+                # Use actual input tokens from API if available
+                cache_read_tokens = stream_state["cache_read_input_tokens"]
 
-                # Calculate cost
+                # Calculate cost (accounting for cached tokens at discounted rate)
                 cost_usd = None
                 savings_usd = None
                 if self.cost_tracker:
                     cost_usd = self.cost_tracker.estimate_cost(
-                        model, optimized_tokens, output_tokens
+                        model, optimized_tokens, output_tokens, cached_tokens=cache_read_tokens
                     )
                     original_cost = self.cost_tracker.estimate_cost(
-                        model, original_tokens, output_tokens
+                        model, original_tokens, output_tokens, cached_tokens=cache_read_tokens
                     )
                     if cost_usd and original_cost:
                         savings_usd = original_cost - cost_usd
@@ -2870,6 +2984,13 @@ class HeadroomProxy:
 
         try:
             if stream:
+                # Inject stream_options to get usage stats in streaming response
+                # This allows accurate token counting instead of byte-based estimation
+                if "stream_options" not in body:
+                    body["stream_options"] = {"include_usage": True}
+                elif isinstance(body.get("stream_options"), dict):
+                    body["stream_options"]["include_usage"] = True
+
                 return await self._stream_response(
                     url,
                     headers,
