@@ -16,10 +16,20 @@ Strategy Selection (in order of preference):
 - SUMMARIZE: When <summarize_threshold over budget and summarization_enabled,
   create anchored summaries of older messages (requires summarize_fn callback)
 - DROP_BY_SCORE: When significantly over budget, drop lowest-scored messages
+
+TOIN + CCR Integration:
+IntelligentContextManager is a message-level compressor. Just like SmartCrusher
+compresses items in a JSON array, IntelligentContext "compresses" messages in
+a conversation by dropping low-value ones. This means:
+- Dropped messages are stored in CCR for potential retrieval
+- Drops are recorded to TOIN so it learns which message patterns shouldn't be dropped
+- When users ask about dropped content, TOIN learns from that retrieval signal
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from enum import Enum
 from typing import TYPE_CHECKING, Any
@@ -32,11 +42,80 @@ from .base import Transform
 from .scoring import MessageScore, MessageScorer
 
 if TYPE_CHECKING:
+    from ..cache.compression_store import CompressionStore
     from ..telemetry.toin import ToolIntelligenceNetwork
     from .content_router import ContentRouter
     from .progressive_summarizer import ProgressiveSummarizer, SummarizeFn
 
 logger = logging.getLogger(__name__)
+
+
+def _create_message_signature(messages: list[dict[str, Any]]) -> Any:
+    """Create a ToolSignature for dropped messages.
+
+    This allows TOIN to track patterns of which message types get dropped
+    and later retrieved, learning to preserve important message patterns.
+
+    Args:
+        messages: List of messages being dropped.
+
+    Returns:
+        A ToolSignature for TOIN tracking.
+    """
+    try:
+        from ..telemetry.models import ToolSignature
+
+        # Create signature based on message structure
+        # Group by role to create a pattern signature
+        role_counts: dict[str, int] = {}
+        has_tool_content = False
+        has_error_indicators = False
+        total_content_length = 0
+
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            role_counts[role] = role_counts.get(role, 0) + 1
+
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_content_length += len(content)
+                # Check for error patterns (learned from TOIN, but basic heuristic here)
+                content_lower = content.lower()
+                if any(
+                    indicator in content_lower
+                    for indicator in ["error", "fail", "exception", "traceback"]
+                ):
+                    has_error_indicators = True
+            elif isinstance(content, list):
+                # Anthropic format with content blocks
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") in ("tool_result", "tool_use"):
+                            has_tool_content = True
+
+            # Check for tool calls
+            if msg.get("tool_calls") or msg.get("role") == "tool":
+                has_tool_content = True
+
+        # Create deterministic hash from structure
+        structure = {
+            "roles": sorted(role_counts.items()),
+            "has_tools": has_tool_content,
+            "has_errors": has_error_indicators,
+            "avg_length_bucket": total_content_length // 1000,  # Bucket by KB
+        }
+        structure_str = json.dumps(structure, sort_keys=True)
+        structure_hash = hashlib.sha256(f"message_drop:{structure_str}".encode()).hexdigest()[:24]
+
+        return ToolSignature(
+            structure_hash=structure_hash,
+            field_count=len(role_counts),
+            has_nested_objects=has_tool_content,
+            has_arrays=False,
+            max_depth=1,
+        )
+    except ImportError:
+        return None
 
 
 class ContextStrategy(Enum):
@@ -106,6 +185,9 @@ class IntelligentContextManager(Transform):
 
         # Lazy-loaded progressive summarizer for SUMMARIZE strategy
         self._progressive_summarizer: ProgressiveSummarizer | None = None
+
+        # Lazy-loaded compression store for CCR integration
+        self._compression_store: CompressionStore | None = None
 
     def should_apply(
         self,
@@ -310,6 +392,23 @@ class IntelligentContextManager(Transform):
             if candidate["type"] == "tool_unit":
                 tool_units_dropped += 1
 
+        # ========== TOIN + CCR INTEGRATION ==========
+        # Before removing messages, store them in CCR and record to TOIN
+        ccr_ref_id: str | None = None
+        if indices_to_drop:
+            # Calculate total tokens being dropped
+            tokens_dropped = sum(
+                tokenizer.count_message(result_messages[idx])
+                for idx in indices_to_drop
+                if idx < len(result_messages)
+            )
+
+            # Store dropped messages in CCR for potential retrieval
+            ccr_ref_id = self._store_dropped_in_ccr(result_messages, indices_to_drop)
+
+            # Record the drop event to TOIN for cross-user learning
+            self._record_drops_to_toin(result_messages, indices_to_drop, tokens_dropped)
+
         # Remove dropped messages (reverse order)
         for idx in sorted(indices_to_drop, reverse=True):
             if idx < len(result_messages):
@@ -327,7 +426,15 @@ class IntelligentContextManager(Transform):
                 current_tokens,
             )
 
-            marker = create_dropped_context_marker("intelligent_cap", dropped_count)
+            # Create marker with CCR reference if available
+            if ccr_ref_id:
+                marker = (
+                    f"[Earlier context compressed: {dropped_count} message(s) dropped by "
+                    f"importance scoring. Full content available via ccr_retrieve "
+                    f"tool with reference '{ccr_ref_id}'.]"
+                )
+            else:
+                marker = create_dropped_context_marker("intelligent_cap", dropped_count)
             markers_inserted.append(marker)
 
             # Insert marker after system messages
@@ -777,3 +884,138 @@ class IntelligentContextManager(Transform):
         except Exception as e:
             logger.warning("SUMMARIZE: summarization failed: %s", e)
             return messages, [], 0
+
+    def _get_compression_store(self) -> CompressionStore | None:
+        """Get or create compression store for CCR integration (lazy load)."""
+        if self._compression_store is None:
+            try:
+                from ..cache.compression_store import get_compression_store
+
+                self._compression_store = get_compression_store()
+            except ImportError:
+                logger.debug("CompressionStore not available for CCR integration")
+        return self._compression_store
+
+    def _store_dropped_in_ccr(
+        self,
+        messages: list[dict[str, Any]],
+        indices_to_drop: set[int],
+    ) -> str | None:
+        """Store dropped messages in CCR for potential retrieval.
+
+        This allows the LLM to retrieve the full context of dropped messages
+        if it needs them later, making the drop reversible.
+
+        Args:
+            messages: Full message list.
+            indices_to_drop: Set of indices being dropped.
+
+        Returns:
+            CCR reference ID if stored, None otherwise.
+        """
+        store = self._get_compression_store()
+        if store is None:
+            return None
+
+        # Collect the messages being dropped
+        dropped_messages = []
+        for idx in sorted(indices_to_drop):
+            if idx < len(messages):
+                dropped_messages.append(messages[idx])
+
+        if not dropped_messages:
+            return None
+
+        try:
+            # Serialize dropped messages for storage
+            dropped_content = json.dumps(dropped_messages, indent=2, default=str)
+
+            # Create a summary for the compressed version
+            summary_parts = []
+            role_counts: dict[str, int] = {}
+            for msg in dropped_messages:
+                role = msg.get("role", "unknown")
+                role_counts[role] = role_counts.get(role, 0) + 1
+
+            for role, count in sorted(role_counts.items()):
+                summary_parts.append(f"{count} {role}")
+
+            summary = f"[Dropped {len(dropped_messages)} messages: {', '.join(summary_parts)}. Use ccr_retrieve to access full content.]"
+
+            # Store in CCR
+            ref_id = store.store(
+                original=dropped_content,
+                compressed=summary,
+                tool_name="intelligent_context_drop",
+                tool_call_id=f"drop_{hashlib.sha256(dropped_content.encode()).hexdigest()[:12]}",
+            )
+
+            logger.debug(
+                "CCR: stored %d dropped messages under ref %s",
+                len(dropped_messages),
+                ref_id,
+            )
+            return ref_id
+
+        except Exception as e:
+            logger.warning("CCR: failed to store dropped messages: %s", e)
+            return None
+
+    def _record_drops_to_toin(
+        self,
+        messages: list[dict[str, Any]],
+        indices_to_drop: set[int],
+        tokens_dropped: int,
+    ) -> None:
+        """Record message drops to TOIN for cross-user learning.
+
+        This allows TOIN to learn patterns about which message types
+        are frequently dropped and later retrieved, helping it adjust
+        importance scores for similar patterns.
+
+        Args:
+            messages: Full message list.
+            indices_to_drop: Set of indices being dropped.
+            tokens_dropped: Total tokens being dropped.
+        """
+        if self.toin is None:
+            return
+
+        # Collect dropped messages for signature creation
+        dropped_messages = []
+        for idx in sorted(indices_to_drop):
+            if idx < len(messages):
+                dropped_messages.append(messages[idx])
+
+        if not dropped_messages:
+            return
+
+        try:
+            signature = _create_message_signature(dropped_messages)
+            if signature is None:
+                return
+
+            # Record the compression (drop) event
+            # compressed_count is 1 since we replace N messages with 1 marker
+            # But we record the marker size (~50 tokens) as the "compressed" version
+            marker_tokens = 50  # Approximate marker size
+
+            self.toin.record_compression(
+                tool_signature=signature,
+                original_count=len(dropped_messages),
+                compressed_count=1,  # The marker message
+                original_tokens=tokens_dropped,
+                compressed_tokens=marker_tokens,
+                strategy="intelligent_context_drop",
+                query_context="message_level_compression",
+            )
+
+            logger.debug(
+                "TOIN: recorded drop of %d messages (%d tokens) with signature %s",
+                len(dropped_messages),
+                tokens_dropped,
+                signature.structure_hash[:12],
+            )
+
+        except Exception as e:
+            logger.warning("TOIN: failed to record message drops: %s", e)

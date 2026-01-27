@@ -273,9 +273,11 @@ class TestApplyBasic:
 
         # Should have marker inserted
         assert len(result.markers_inserted) > 0
-        # Marker should be in messages
+        # Marker should be in messages (either standard or CCR-aware format)
         marker_found = any(
-            "<headroom:dropped_context" in msg.get("content", "") for msg in result.messages
+            "<headroom:dropped_context" in msg.get("content", "")
+            or "Earlier context compressed:" in msg.get("content", "")
+            for msg in result.messages
         )
         assert marker_found
 

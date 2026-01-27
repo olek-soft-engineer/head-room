@@ -249,9 +249,16 @@ Based on how much over budget you are:
 | < 10% over | COMPRESS_FIRST | Try deeper compression |
 | >= 10% over | DROP_BY_SCORE | Drop lowest-scored messages |
 
-### TOIN Integration
+### TOIN + CCR Integration
 
-When TOIN is available, scoring uses learned patterns:
+IntelligentContextManager is a **message-level compressor**. Just like SmartCrusher compresses items in a JSON array, IntelligentContext "compresses" messages in a conversation by dropping low-value ones.
+
+**Bidirectional TOIN integration:**
+
+1. **Scoring uses TOIN patterns**: Learned retrieval rates and field semantics inform importance scores
+2. **Drops are recorded to TOIN**: When messages are dropped, TOIN learns the pattern
+3. **CCR stores originals**: Dropped messages are stored in CCR for potential retrieval
+4. **Retrievals feed back to TOIN**: If users retrieve dropped messages, TOIN learns to score those patterns higher
 
 ```python
 from headroom.telemetry import get_toin
@@ -259,11 +266,21 @@ from headroom.telemetry import get_toin
 toin = get_toin()
 manager = IntelligentContextManager(config, toin=toin)
 
-# TOIN provides:
-# - retrieval_rate: How often this tool's output is retrieved (high = important)
+# TOIN provides (for scoring):
+# - retrieval_rate: How often this message pattern is retrieved (high = important)
 # - field_semantics: Learned field types (error_indicator, identifier, etc.)
 # - commonly_retrieved_fields: Fields that users frequently need
+
+# TOIN receives (from drops):
+# - Message pattern signatures (role counts, has_tools, has_errors)
+# - Token counts (original vs marker size)
+# - Retrieval feedback when users access CCR
 ```
+
+**What this means:**
+- When you drop a message pattern and users frequently retrieve it, TOIN learns to score it higher next time
+- When you drop a pattern and no one retrieves it, that confirms it was safe to drop
+- The feedback loop improves drop decisions across all users, not just in one session
 
 ### Example: Before vs After
 
