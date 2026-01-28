@@ -1155,7 +1155,9 @@ class StructuralExtractor(BaseFeatureExtractor):
         delimiters = self.DELIMITER.findall(text)
         features.delimiter_types = list({d[0] for d in delimiters if d})
         features.has_structured_template = (
-            features.xml_tag_count > 2 or bool(features.delimiter_types) or features.json_object_count > 0
+            features.xml_tag_count > 2
+            or bool(features.delimiter_types)
+            or features.json_object_count > 0
         )
 
         # Conversation structure

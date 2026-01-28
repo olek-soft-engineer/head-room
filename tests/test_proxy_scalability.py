@@ -224,8 +224,7 @@ class TestWorkerConfiguration:
 
     def test_uvicorn_workers_parameter(self):
         """Test that uvicorn accepts workers parameter."""
-        # uvicorn.run accepts workers=N for multi-process
-        import uvicorn
+        uvicorn = pytest.importorskip("uvicorn")
 
         # Verify the Config class accepts workers
         config = uvicorn.Config(
@@ -238,7 +237,7 @@ class TestWorkerConfiguration:
 
     def test_single_worker_default(self):
         """Test that default is single worker (None)."""
-        import uvicorn
+        uvicorn = pytest.importorskip("uvicorn")
 
         config = uvicorn.Config(app="app:app")
         # Default should be None (single process)
