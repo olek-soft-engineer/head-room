@@ -232,7 +232,7 @@ class DirectMem0Adapter:
             input=text,
             model=self._config.embedder_model,
         )
-        return response.data[0].embedding
+        return list(response.data[0].embedding)
 
     def _generate_id(self, content: str, user_id: str) -> str:
         """Generate a deterministic ID for a memory."""

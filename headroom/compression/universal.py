@@ -375,7 +375,7 @@ class UniversalCompressor:
                 original_tokens=self._estimate_tokens(original),
                 compressed_tokens=self._estimate_tokens(compressed),
             )
-            return key
+            return str(key) if key else None
         except ImportError:
             logger.debug("CCR store not available")
             return None

@@ -143,7 +143,7 @@ class SQLiteMemoryStore:
         """Serialize numpy array to bytes for BLOB storage."""
         if embedding is None:
             return None
-        return embedding.astype(np.float32).tobytes()
+        return bytes(embedding.astype(np.float32).tobytes())
 
     def _deserialize_embedding(
         self, data: bytes | None, dim: int | None = None

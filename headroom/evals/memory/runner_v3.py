@@ -277,8 +277,8 @@ class LoCoMoEvaluatorV3:
                     all_results.append(result)
 
             finally:
-                if self._backend:
-                    await self._backend.close()
+                if self._backend and hasattr(self._backend, "close"):
+                    await self._backend.close()  # type: ignore[union-attr]
 
         # Aggregate results
         duration = time.time() - start_time

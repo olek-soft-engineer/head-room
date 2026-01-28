@@ -579,7 +579,7 @@ class AnthropicProvider(Provider):
                                 "cached_input", pricing["input"]
                             )
                             cost += cached_cost
-                return cost
+                return cost  # type: ignore[no-any-return]
             except Exception as e:
                 logger.debug(f"LiteLLM cost estimation failed for {model}: {e}")
 
@@ -596,7 +596,7 @@ class AnthropicProvider(Provider):
             + (output_tokens / 1_000_000) * pricing["output"]
         )
 
-        return cost
+        return cost  # type: ignore[no-any-return]
 
     def _get_pricing(self, model: str) -> dict[str, float] | None:
         """Get pricing for a model with fallback logic."""

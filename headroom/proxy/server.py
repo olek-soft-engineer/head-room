@@ -4035,7 +4035,7 @@ class HeadroomProxy:
         try:
             response = await self.http_client.get(url, headers=headers)  # type: ignore[union-attr]
             if response.status_code == 200:
-                return response.text
+                return str(response.text)
             logger.error(f"Failed to download file {file_id}: {response.status_code}")
             return None
         except Exception as e:

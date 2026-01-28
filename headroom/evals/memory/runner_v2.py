@@ -403,8 +403,8 @@ class LoCoMoEvaluatorV2:
 
             finally:
                 # Clean up backend
-                if self._backend:
-                    await self._backend.close()
+                if self._backend and hasattr(self._backend, "close"):
+                    await self._backend.close()  # type: ignore[union-attr]
 
         # Calculate final metrics
         duration = time.time() - start_time

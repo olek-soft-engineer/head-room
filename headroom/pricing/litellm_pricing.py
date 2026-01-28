@@ -37,7 +37,7 @@ def get_litellm_model_cost() -> dict[str, Any]:
     Returns:
         Dictionary mapping model names to their pricing/capability info.
     """
-    return litellm.model_cost
+    return litellm.model_cost  # type: ignore[no-any-return]
 
 
 def get_model_pricing(model: str) -> LiteLLMModelPricing | None:

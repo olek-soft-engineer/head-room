@@ -207,7 +207,7 @@ class HeadroomToolWrapper:
         # Check if compression is needed
         if len(result) < self.min_chars_to_compress:
             self._record_metrics(result, result, was_compressed=False)
-            return result
+            return str(result)
 
         # Try to compress
         compressed = self._compress_output(result)

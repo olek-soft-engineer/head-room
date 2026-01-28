@@ -241,7 +241,7 @@ class ImageCompressor:
         # High detail: 85 tokens per 512x512 tile + 170 base
         tiles_x = (width + 511) // 512
         tiles_y = (height + 511) // 512
-        return 85 * tiles_x * tiles_y + 170
+        return int(85 * tiles_x * tiles_y + 170)
 
     def _apply_compression(
         self,

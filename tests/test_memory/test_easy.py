@@ -7,6 +7,9 @@ Tests cover:
 - Error handling and edge cases
 - Backend type switching
 - Resource cleanup
+
+Note: These are integration tests that may hit external embedding APIs.
+Tests are marked to skip on network timeouts (flaky CI).
 """
 
 # CRITICAL: Must set TOKENIZERS_PARALLELISM before any imports that might
@@ -18,9 +21,25 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import tempfile
 from pathlib import Path
 
+import httpx
 import pytest
 
 from headroom.memory.easy import Memory, MemoryResult
+
+
+def network_timeout_handler(func):
+    """Decorator to skip tests on network timeouts (flaky CI)."""
+    import functools
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except httpx.ReadTimeout:
+            pytest.skip("Skipped due to network timeout (flaky CI)")
+
+    return wrapper
+
 
 # =============================================================================
 # Fixtures
@@ -165,6 +184,7 @@ class TestMemorySave:
         assert memory_id is not None
 
     @pytest.mark.asyncio
+    @network_timeout_handler
     async def test_save_with_entities(self, memory_instance):
         """Test saving with pre-extracted entities."""
         memory_id = await memory_instance.save(
@@ -455,6 +475,7 @@ class TestMemoryClose:
         assert mem._initialized is False
 
     @pytest.mark.asyncio
+    @network_timeout_handler
     async def test_close_idempotent(self, temp_db_path):
         """Test that close can be called multiple times."""
         mem = Memory(backend="local", db_path=temp_db_path)

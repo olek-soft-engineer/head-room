@@ -271,11 +271,11 @@ class CohereProvider(Provider):
                     if info and "max_input_tokens" in info:
                         result = info["max_input_tokens"]
                         if result is not None:
-                            return result
+                            return int(result)
                     if info and "max_tokens" in info:
                         result = info["max_tokens"]
                         if result is not None:
-                            return result
+                            return int(result)
                 except Exception:
                     pass
 
@@ -335,7 +335,7 @@ class CohereProvider(Provider):
                         completion_tokens=output_tokens,
                     )
                     if cost is not None:
-                        return cost
+                        return float(cost)
                 except Exception:
                     pass
 

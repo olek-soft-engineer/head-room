@@ -9,6 +9,9 @@ Tests cover:
 - History chain traversal
 - Deletion operations
 - Convenience methods (remember, recall, get_user_memories, get_session_memories)
+
+Note: These are integration tests that may hit external embedding APIs.
+Tests are marked to skip on network timeouts (flaky CI).
 """
 
 # CRITICAL: Must set TOKENIZERS_PARALLELISM before any imports
@@ -16,15 +19,31 @@ import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+import functools
 import tempfile
 from pathlib import Path
 
+import httpx
 import pytest
 
 from headroom.memory.config import MemoryConfig
 from headroom.memory.core import HierarchicalMemory
 from headroom.memory.models import Memory, ScopeLevel
 from headroom.memory.ports import MemoryFilter
+
+
+def network_timeout_handler(func):
+    """Decorator to skip tests on network timeouts (flaky CI)."""
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except httpx.ReadTimeout:
+            pytest.skip("Skipped due to network timeout (flaky CI)")
+
+    return wrapper
+
 
 # =============================================================================
 # Fixtures
@@ -60,6 +79,7 @@ class TestAddBatch:
     """Tests for HierarchicalMemory.add_batch()."""
 
     @pytest.mark.asyncio
+    @network_timeout_handler
     async def test_add_batch_basic(self, memory_system):
         """Test basic batch addition."""
         memories_data = [
