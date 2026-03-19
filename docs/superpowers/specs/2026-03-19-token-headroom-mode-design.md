@@ -38,16 +38,28 @@ class CompressionCache:
     """
     cache: dict[str, str]          # content_hash → compressed_content
     token_savings: dict[str, int]  # content_hash → tokens saved
-    max_entries: int = 2000        # LRU eviction beyond this
+    max_entries: int = 10000       # LRU eviction beyond this
 
     def get_compressed(self, content_hash: str) -> str | None
     def store_compressed(self, content_hash: str, compressed: str, tokens_saved: int)
     def compute_frozen_count(self, messages: list[dict]) -> int
+    def update_from_result(self, originals: list[dict], compressed: list[dict]) -> None
 ```
 
 **Cache key**: SHA-256 of original content. Same file content across turns = same hash = cache hit. Edited file = different hash = cache miss = fresh compression.
 
-**Frozen count calculation**: Count consecutive messages from the start that have cache hits. First cache miss = end of stable compressed prefix. This handles Claude Code dropping messages (breaks the consecutive run, stops the frozen prefix there).
+**Max entries**: 10,000 (not 2,000). Long coding sessions can generate thousands of tool results. Evicting cache entries forces re-compression, defeating the re-freeze optimization. 10K entries at ~1KB average compressed text = ~10MB — acceptable.
+
+**Frozen count calculation**: Count consecutive messages from the start that are "stable" (either have cache hits OR are non-compressible messages like user/assistant/tool-use). The key rule:
+
+- **Tool-result messages**: Stable if content hash is in cache (compressed version available).
+- **User, assistant, system, tool-use messages**: Always considered stable (they pass through unchanged, so they won't bust the prefix cache).
+
+First *unstable* message (tool-result with cache miss) = end of frozen prefix. This prevents the frozen count from being 0 just because message 0 is a user message.
+
+This handles Claude Code dropping messages: if a cached tool-result is dropped, the next message may not be in cache, breaking the consecutive run and stopping the frozen prefix there.
+
+**`update_from_result` contract**: Performs index-aligned comparison between `originals` and `compressed`. For each index where content differs, stores the mapping original_hash → compressed_content. Assumes the pipeline does NOT reorder or merge messages (this is a pipeline contract that holds today and must be preserved).
 
 ### Pipeline Flow in Token Headroom Mode
 
@@ -70,6 +82,27 @@ Zone 3: Protection window → Pass through unchanged (last 30% of messages)
 
 **Critical invariant**: The proxy ONLY operates on messages Claude Code actually sends. It never adds, re-inserts, or reorders messages. If Claude Code drops a message via its own context management, the proxy does not re-add it.
 
+### Zone 3 (Protection Window) Definition
+
+Zone 3 protects the **last 30% of excluded-tool messages** (Read, Glob, Grep, Write, Edit results), not 30% of all messages. This matches the existing `protect_recent_reads_fraction` semantics in ContentRouter. User messages, assistant messages, and tool-use blocks are always protected regardless of position — they don't factor into the 30% calculation.
+
+Example: 100 messages, 40 of which are Read/Glob/Grep results → last 12 excluded-tool results protected (30% of 40). All user/assistant messages protected independently.
+
+### Config Plumbing
+
+`protect_recent_reads_fraction` is a `ContentRouterConfig` instance attribute, not a per-call kwarg. It is set **at proxy startup** based on mode:
+
+```python
+# In HeadroomProxy.__init__ or _build_pipelines:
+if self.config.mode == "token_headroom":
+    router_config.protect_recent_reads_fraction = 0.3
+    router_config.ccr_ttl = 14400
+else:
+    router_config.protect_recent_reads_fraction = 0.0  # protect all (current default)
+```
+
+Similarly, `force_compress_threshold` on `PrefixFreezeConfig` is set to `0.0` in token_headroom mode (always allow compression through the cache). This avoids two competing mechanisms for cache-bust decisions.
+
 ### Integration Point
 
 In `server.py`, `_handle_anthropic_request` (line ~2071):
@@ -81,17 +114,16 @@ if self.config.mode == "token_headroom":
     # Zone 1: Swap cached compressed versions
     working_messages = comp_cache.apply_cached(messages)
 
-    # Calculate re-freeze boundary (consecutive cache hits from start)
+    # Calculate re-freeze boundary (consecutive stable messages from start)
     frozen_count = comp_cache.compute_frozen_count(messages)
 
-    # Zone 2+3: Pipeline compresses Zone 2, skips Zone 3
+    # Zone 2+3: Pipeline compresses Zone 2, skips Zone 3 (protected)
     result = self.anthropic_pipeline.apply(
         working_messages, model,
         frozen_message_count=frozen_count,
-        protect_recent_fraction=0.3,
     )
 
-    # Cache newly compressed messages
+    # Cache newly compressed messages (index-aligned diff)
     comp_cache.update_from_result(messages, result.messages)
 else:
     # Current cost_savings behavior — unchanged
@@ -168,7 +200,18 @@ Headroom proxy v0.4.6 | Mode: token_headroom
   Compression cache: active
 ```
 
-## Also Fix: Missing Model Entry
+## Observability
+
+In token_headroom mode, the `/stats` endpoint and startup logs must expose:
+
+- **Per-turn zone breakdown**: Zone 1/2/3 message counts and token counts
+- **Compression cache stats**: entries, hits, misses, hit rate
+- **Net token savings**: tokens saved by compression minus tokens lost to cache bust write premium
+- **CCR store stats**: entries, memory usage, eviction count
+
+The CCR store uses TTL-based eviction (entries expire after 4 hours). The `CompressionCache` uses LRU eviction at 10K entries. Both report eviction counts in stats so operators can detect if bounds are too tight.
+
+## Also Fix: Missing Model Entry (Separate Task)
 
 `claude-opus-4-6` is not in `ANTHROPIC_CONTEXT_LIMITS`. Falls back to pattern match → 200K. Real context is 1M. Add it with correct limit. (Separate from token_headroom mode but discovered during investigation.)
 
@@ -186,7 +229,11 @@ Headroom proxy v0.4.6 | Mode: token_headroom
 
 6. **Compression makes content larger**: ContentRouter already checks compression_ratio >= min_ratio and passes through unchanged. Cache only stores actual reductions.
 
-7. **Claude Code drops messages**: Cache entries go unused (LRU eviction eventually). Proxy never re-inserts dropped messages. Frozen count stops at first cache miss, preventing stale frozen prefix.
+7. **Claude Code drops messages**: Cache entries go unused (LRU eviction eventually). Proxy never re-inserts dropped messages. Frozen count stops at first unstable message, preventing stale frozen prefix.
+
+8. **Mode switch mid-session**: If proxy restarts with a different mode, the CompressionCache is empty (new process) and the prefix tracker is reset. In token_headroom mode, the first turn does a full compression pass (edge case 5). In cost_savings mode, the prefix tracker rebuilds from the first API response. No stale state carries over.
+
+9. **Large Zone 2 on first turn after --resume**: Many tool results age out simultaneously. ContentRouter processes them sequentially. If compression latency exceeds 10 seconds, log a warning but do not skip — the user explicitly chose token_headroom mode and the one-time cost is justified. Subsequent turns are fast (cache hits).
 
 ## Testing Strategy
 
@@ -221,9 +268,8 @@ Headroom proxy v0.4.6 | Mode: token_headroom
 ## Files to Modify
 
 1. **New file**: `headroom/cache/compression_cache.py` — CompressionCache class
-2. **Modify**: `headroom/proxy/server.py` — ProxyConfig.mode, pipeline flow branch, session store
-3. **Modify**: `headroom/transforms/pipeline.py` — Accept protect_recent_fraction kwarg
-4. **Modify**: `headroom/transforms/content_router.py` — Use protect_recent_fraction from kwargs
-5. **Modify**: `headroom/providers/anthropic.py` — Add claude-opus-4-6 to ANTHROPIC_CONTEXT_LIMITS
-6. **New file**: `tests/test_compression_cache.py` — Unit tests
-7. **New file**: `tests/test_token_headroom_mode.py` — Integration + E2E tests
+2. **Modify**: `headroom/proxy/server.py` — ProxyConfig.mode, mode-based config at startup, pipeline flow branch, CompressionCache session store, stats endpoint additions
+3. **Modify**: `headroom/proxy/server.py` — Set `ContentRouterConfig.protect_recent_reads_fraction` and `PrefixFreezeConfig.force_compress_threshold` at startup based on mode
+4. **Modify**: `headroom/providers/anthropic.py` — Add claude-opus-4-6 to ANTHROPIC_CONTEXT_LIMITS (separate commit)
+5. **New file**: `tests/test_compression_cache.py` — Unit tests for CompressionCache
+6. **New file**: `tests/test_token_headroom_mode.py` — Integration + E2E tests
