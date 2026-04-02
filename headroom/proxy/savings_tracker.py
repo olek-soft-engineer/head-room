@@ -824,7 +824,10 @@ class SavingsTracker:
             delta_tokens = max(total_tokens_saved - prev_total_tokens, 0)
             delta_usd = max(total_usd - prev_total_usd, 0.0)
             delta_input_tokens = max(total_input_tokens - prev_total_input_tokens, 0)
-            delta_input_cost_usd = max(total_input_cost_usd - prev_total_input_cost_usd, 0.0)
+            delta_input_cost_usd = max(
+                total_input_cost_usd - prev_total_input_cost_usd,
+                0.0,
+            )
 
             prev_total_tokens = total_tokens_saved
             prev_total_usd = total_usd

@@ -362,7 +362,9 @@ def test_display_session_rolls_after_inactivity_and_counts_zero_savings_requests
     }
 
 
-def test_savings_tracker_rollups_preserve_spend_and_input_history(tmp_path, monkeypatch):
+def test_savings_tracker_rollups_preserve_spend_and_input_history(
+    tmp_path, monkeypatch
+):
     path = tmp_path / "proxy_savings.json"
     tracker = SavingsTracker(
         path=str(path),
@@ -553,9 +555,9 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(
         ]
         assert history_data["exports"]["available_series"][-2:] == ["weekly", "monthly"]
         assert history_data["series"]["hourly"][0]["total_input_tokens_delta"] == 120
-        assert history_data["series"]["hourly"][0]["total_input_cost_usd_delta"] == pytest.approx(
-            0.24
-        )
+        assert history_data["series"]["hourly"][0][
+            "total_input_cost_usd_delta"
+        ] == pytest.approx(0.24)
 
         assert stats_data["display_session"] == history_data["display_session"]
         assert (
@@ -582,7 +584,9 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(
         assert updated["display_session"]["total_input_tokens"] == 240
         assert updated["display_session"]["savings_percent"] == pytest.approx(18.64)
         assert updated["series"]["daily"][0]["total_input_tokens_delta"] == 240
-        assert updated["series"]["daily"][0]["total_input_cost_usd_delta"] == pytest.approx(0.48)
+        assert updated["series"]["daily"][0][
+            "total_input_cost_usd_delta"
+        ] == pytest.approx(0.48)
 
         persisted = json.loads(savings_path.read_text())
         assert persisted["lifetime"]["tokens_saved"] == 55
