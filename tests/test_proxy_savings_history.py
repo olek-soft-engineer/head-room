@@ -20,6 +20,8 @@ from headroom.proxy.server import ProxyConfig, create_app
 
 def _record_request(client: TestClient, *, model: str, tokens_saved: int) -> None:
     proxy = client.app.state.proxy
+    if proxy.cost_tracker:
+        proxy.cost_tracker.record_tokens(model, tokens_saved, 120)
     asyncio.run(
         proxy.metrics.record_request(
             provider="openai",
@@ -58,6 +60,8 @@ def test_savings_tracker_helpers_normalize_inputs_and_paths(tmp_path, monkeypatc
         "timestamp": "2026-03-27T09:00:00Z",
         "total_tokens_saved": 12,
         "compression_savings_usd": 0.5,
+        "total_input_tokens": 0,
+        "total_input_cost_usd": 0.0,
     }
     assert savings_tracker_module._normalize_history_entry({"timestamp": "bad"}) is None
     assert savings_tracker_module._normalize_history_entry(object()) is None
@@ -99,12 +103,16 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
     assert snapshot["lifetime"] == {
         "tokens_saved": 30,
         "compression_savings_usd": pytest.approx(0.03),
+        "total_input_tokens": 0,
+        "total_input_cost_usd": 0.0,
     }
     assert snapshot["history"] == [
         {
             "timestamp": "2026-03-27T09:00:00Z",
             "total_tokens_saved": 30,
             "compression_savings_usd": 0.03,
+            "total_input_tokens": 0,
+            "total_input_cost_usd": 0.0,
         }
     ]
     assert snapshot["retention"] == {
@@ -123,6 +131,8 @@ def test_non_dict_savings_state_resets_to_default(tmp_path):
     assert snapshot["lifetime"] == {
         "tokens_saved": 0,
         "compression_savings_usd": 0.0,
+        "total_input_tokens": 0,
+        "total_input_cost_usd": 0.0,
     }
     assert snapshot["history"] == []
 
@@ -145,6 +155,8 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
     assert tracker.record_compression_savings(
         model="gpt-4o",
         tokens_saved=10,
+        total_input_tokens=120,
+        total_input_cost_usd=0.24,
         timestamp=local_time,
     )
 
@@ -153,6 +165,8 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
     assert tracker.record_compression_savings(
         model="gpt-4o",
         tokens_saved=5,
+        total_input_tokens=180,
+        total_input_cost_usd=0.36,
         timestamp="not-a-timestamp",
     )
 
@@ -162,16 +176,22 @@ def test_record_compression_savings_skips_empty_updates_and_normalizes_timestamp
             "timestamp": "2026-03-27T08:00:00Z",
             "total_tokens_saved": 10,
             "compression_savings_usd": 0.01,
+            "total_input_tokens": 120,
+            "total_input_cost_usd": 0.24,
         },
         {
             "timestamp": "2026-03-27T12:34:00Z",
             "total_tokens_saved": 15,
             "compression_savings_usd": 0.015,
+            "total_input_tokens": 180,
+            "total_input_cost_usd": 0.36,
         },
     ]
 
     persisted = json.loads(path.read_text(encoding="utf-8"))
     assert persisted["lifetime"]["tokens_saved"] == 15
+    assert persisted["lifetime"]["total_input_tokens"] == 180
+    assert persisted["lifetime"]["total_input_cost_usd"] == pytest.approx(0.36)
     assert persisted["history"][-1]["timestamp"] == "2026-03-27T12:34:00Z"
 
 
@@ -219,7 +239,7 @@ def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
     assert savings_tracker_module._estimate_compression_savings_usd("gpt-4o", 100) == 0.0
 
 
-def test_savings_tracker_rollups_are_chart_friendly(tmp_path, monkeypatch):
+def test_savings_tracker_rollups_preserve_spend_and_input_history(tmp_path, monkeypatch):
     path = tmp_path / "proxy_savings.json"
     tracker = SavingsTracker(path=str(path), max_history_points=100, max_history_age_days=30)
     monkeypatch.setattr(
@@ -230,26 +250,36 @@ def test_savings_tracker_rollups_are_chart_friendly(tmp_path, monkeypatch):
     tracker.record_compression_savings(
         model="gpt-4o",
         tokens_saved=100,
+        total_input_tokens=120,
+        total_input_cost_usd=0.24,
         timestamp="2026-03-27T09:10:00Z",
     )
     tracker.record_compression_savings(
         model="gpt-4o",
         tokens_saved=50,
+        total_input_tokens=210,
+        total_input_cost_usd=0.42,
         timestamp="2026-03-27T09:40:00Z",
     )
     tracker.record_compression_savings(
         model="gpt-4o",
         tokens_saved=25,
+        total_input_tokens=300,
+        total_input_cost_usd=0.63,
         timestamp="2026-03-27T10:05:00Z",
     )
     tracker.record_compression_savings(
         model="gpt-4o",
         tokens_saved=10,
+        total_input_tokens=360,
+        total_input_cost_usd=0.75,
         timestamp="2026-03-28T08:00:00Z",
     )
     tracker.record_compression_savings(
         model="gpt-4o",
         tokens_saved=20,
+        total_input_tokens=450,
+        total_input_cost_usd=0.93,
         timestamp="2026-04-02T14:00:00Z",
     )
 
@@ -257,6 +287,8 @@ def test_savings_tracker_rollups_are_chart_friendly(tmp_path, monkeypatch):
 
     assert response["lifetime"]["tokens_saved"] == 205
     assert response["lifetime"]["compression_savings_usd"] == pytest.approx(0.205)
+    assert response["lifetime"]["total_input_tokens"] == 450
+    assert response["lifetime"]["total_input_cost_usd"] == pytest.approx(0.93)
     assert len(response["history"]) == 5
 
     hourly = response["series"]["hourly"]
@@ -268,12 +300,28 @@ def test_savings_tracker_rollups_are_chart_friendly(tmp_path, monkeypatch):
     ]
     assert hourly[0]["tokens_saved"] == 150
     assert hourly[0]["total_tokens_saved"] == 150
+    assert hourly[0]["total_input_tokens_delta"] == 210
+    assert hourly[0]["total_input_tokens"] == 210
+    assert hourly[0]["total_input_cost_usd_delta"] == pytest.approx(0.42)
+    assert hourly[0]["total_input_cost_usd"] == pytest.approx(0.42)
     assert hourly[1]["tokens_saved"] == 25
     assert hourly[1]["total_tokens_saved"] == 175
+    assert hourly[1]["total_input_tokens_delta"] == 90
+    assert hourly[1]["total_input_tokens"] == 300
+    assert hourly[1]["total_input_cost_usd_delta"] == pytest.approx(0.21)
+    assert hourly[1]["total_input_cost_usd"] == pytest.approx(0.63)
     assert hourly[2]["tokens_saved"] == 10
     assert hourly[2]["total_tokens_saved"] == 185
+    assert hourly[2]["total_input_tokens_delta"] == 60
+    assert hourly[2]["total_input_tokens"] == 360
+    assert hourly[2]["total_input_cost_usd_delta"] == pytest.approx(0.12)
+    assert hourly[2]["total_input_cost_usd"] == pytest.approx(0.75)
     assert hourly[3]["tokens_saved"] == 20
     assert hourly[3]["total_tokens_saved"] == 205
+    assert hourly[3]["total_input_tokens_delta"] == 90
+    assert hourly[3]["total_input_tokens"] == 450
+    assert hourly[3]["total_input_cost_usd_delta"] == pytest.approx(0.18)
+    assert hourly[3]["total_input_cost_usd"] == pytest.approx(0.93)
 
     daily = response["series"]["daily"]
     assert [point["timestamp"] for point in daily] == [
@@ -283,10 +331,22 @@ def test_savings_tracker_rollups_are_chart_friendly(tmp_path, monkeypatch):
     ]
     assert daily[0]["tokens_saved"] == 175
     assert daily[0]["total_tokens_saved"] == 175
+    assert daily[0]["total_input_tokens_delta"] == 300
+    assert daily[0]["total_input_tokens"] == 300
+    assert daily[0]["total_input_cost_usd_delta"] == pytest.approx(0.63)
+    assert daily[0]["total_input_cost_usd"] == pytest.approx(0.63)
     assert daily[1]["tokens_saved"] == 10
     assert daily[1]["total_tokens_saved"] == 185
+    assert daily[1]["total_input_tokens_delta"] == 60
+    assert daily[1]["total_input_tokens"] == 360
+    assert daily[1]["total_input_cost_usd_delta"] == pytest.approx(0.12)
+    assert daily[1]["total_input_cost_usd"] == pytest.approx(0.75)
     assert daily[2]["tokens_saved"] == 20
     assert daily[2]["total_tokens_saved"] == 205
+    assert daily[2]["total_input_tokens_delta"] == 90
+    assert daily[2]["total_input_tokens"] == 450
+    assert daily[2]["total_input_cost_usd_delta"] == pytest.approx(0.18)
+    assert daily[2]["total_input_cost_usd"] == pytest.approx(0.93)
 
     weekly = response["series"]["weekly"]
     assert [point["timestamp"] for point in weekly] == [
@@ -321,6 +381,10 @@ def test_savings_tracker_rollups_are_chart_friendly(tmp_path, monkeypatch):
 def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_path, monkeypatch):
     savings_path = tmp_path / "proxy_savings.json"
     monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
+    monkeypatch.setattr(
+        "headroom.proxy.server.CostTracker._get_cache_prices",
+        lambda self, model: (0.001, 0.0015, 0.002),
+    )
 
     config = ProxyConfig(
         cache_enabled=False,
@@ -346,8 +410,14 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
         assert history_data["schema_version"] == 1
         assert history_data["storage_path"] == str(savings_path)
         assert history_data["lifetime"]["tokens_saved"] == 40
+        assert history_data["lifetime"]["total_input_tokens"] == 120
+        assert history_data["lifetime"]["total_input_cost_usd"] == pytest.approx(0.24)
         assert list(history_data["series"].keys()) == ["hourly", "daily", "weekly", "monthly"]
         assert history_data["exports"]["available_series"][-2:] == ["weekly", "monthly"]
+        assert history_data["series"]["hourly"][0]["total_input_tokens_delta"] == 120
+        assert history_data["series"]["hourly"][0]["total_input_cost_usd_delta"] == pytest.approx(
+            0.24
+        )
 
     with TestClient(create_app(config)) as client:
         history = client.get("/stats-history")
@@ -358,15 +428,25 @@ def test_stats_history_persists_across_restarts_and_stats_stays_compatible(tmp_p
 
         updated = client.get("/stats-history").json()
         assert updated["lifetime"]["tokens_saved"] == 55
+        assert updated["lifetime"]["total_input_tokens"] == 240
+        assert updated["lifetime"]["total_input_cost_usd"] == pytest.approx(0.48)
         assert len(updated["history"]) == 2
+        assert updated["series"]["daily"][0]["total_input_tokens_delta"] == 240
+        assert updated["series"]["daily"][0]["total_input_cost_usd_delta"] == pytest.approx(0.48)
 
         persisted = json.loads(savings_path.read_text())
         assert persisted["lifetime"]["tokens_saved"] == 55
+        assert persisted["lifetime"]["total_input_tokens"] == 240
+        assert persisted["lifetime"]["total_input_cost_usd"] == pytest.approx(0.48)
 
 
 def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):
     savings_path = tmp_path / "proxy_savings.json"
     monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(savings_path))
+    monkeypatch.setattr(
+        "headroom.proxy.server.CostTracker._get_cache_prices",
+        lambda self, model: (0.001, 0.0015, 0.002),
+    )
 
     config = ProxyConfig(
         cache_enabled=False,
@@ -388,10 +468,12 @@ def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):
         lines = response.text.strip().splitlines()
         assert lines[0] == (
             "timestamp,tokens_saved,compression_savings_usd_delta,total_tokens_saved,"
-            "compression_savings_usd"
+            "compression_savings_usd,total_input_tokens_delta,total_input_tokens,"
+            "total_input_cost_usd_delta,total_input_cost_usd"
         )
         assert len(lines) >= 2
         assert "total_tokens_saved" in lines[0]
+        assert "total_input_cost_usd" in lines[0]
 
 
 def test_malformed_savings_state_is_ignored_safely(tmp_path, monkeypatch):

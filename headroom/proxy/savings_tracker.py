@@ -145,16 +145,24 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     timestamp: datetime | None = None
     total_tokens_saved = 0
     compression_savings_usd = 0.0
+    total_input_tokens = 0
+    total_input_cost_usd = 0.0
 
     if isinstance(entry, dict):
         timestamp = _parse_timestamp(entry.get("timestamp"))
         total_tokens_saved = _coerce_int(entry.get("total_tokens_saved"))
         compression_savings_usd = _coerce_float(entry.get("compression_savings_usd"))
+        total_input_tokens = _coerce_int(entry.get("total_input_tokens"))
+        total_input_cost_usd = _coerce_float(entry.get("total_input_cost_usd"))
     elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
         timestamp = _parse_timestamp(entry[0])
         total_tokens_saved = _coerce_int(entry[1])
         if len(entry) >= 3:
             compression_savings_usd = _coerce_float(entry[2])
+        if len(entry) >= 4:
+            total_input_tokens = _coerce_int(entry[3])
+        if len(entry) >= 5:
+            total_input_cost_usd = _coerce_float(entry[4])
     else:
         return None
 
@@ -165,6 +173,8 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         "timestamp": _to_utc_iso(timestamp),
         "total_tokens_saved": total_tokens_saved,
         "compression_savings_usd": round(compression_savings_usd, 6),
+        "total_input_tokens": total_input_tokens,
+        "total_input_cost_usd": round(total_input_cost_usd, 6),
     }
 
 
@@ -192,6 +202,8 @@ class SavingsTracker:
         *,
         model: str,
         tokens_saved: int,
+        total_input_tokens: int | None = None,
+        total_input_cost_usd: float | None = None,
         timestamp: datetime | str | None = None,
     ) -> bool:
         """Persist a cumulative savings checkpoint when compression changed totals."""
@@ -217,12 +229,28 @@ class SavingsTracker:
             lifetime["compression_savings_usd"] = round(
                 lifetime["compression_savings_usd"] + delta_usd, 6
             )
+            lifetime["total_input_tokens"] = max(
+                lifetime["total_input_tokens"],
+                _coerce_int(total_input_tokens, default=lifetime["total_input_tokens"]),
+            )
+            lifetime["total_input_cost_usd"] = round(
+                max(
+                    lifetime["total_input_cost_usd"],
+                    _coerce_float(
+                        total_input_cost_usd,
+                        default=lifetime["total_input_cost_usd"],
+                    ),
+                ),
+                6,
+            )
 
             self._state["history"].append(
                 {
                     "timestamp": _to_utc_iso(timestamp_dt),
                     "total_tokens_saved": lifetime["tokens_saved"],
                     "compression_savings_usd": lifetime["compression_savings_usd"],
+                    "total_input_tokens": lifetime["total_input_tokens"],
+                    "total_input_cost_usd": lifetime["total_input_cost_usd"],
                 }
             )
             self._trim_history_locked(reference_time=timestamp_dt)
@@ -277,7 +305,13 @@ class SavingsTracker:
         """Export history or rollup series as CSV."""
         rows = self.export_rows(series=series)
         if series == "history":
-            fieldnames = ["timestamp", "total_tokens_saved", "compression_savings_usd"]
+            fieldnames = [
+                "timestamp",
+                "total_tokens_saved",
+                "compression_savings_usd",
+                "total_input_tokens",
+                "total_input_cost_usd",
+            ]
         else:
             fieldnames = [
                 "timestamp",
@@ -285,6 +319,10 @@ class SavingsTracker:
                 "compression_savings_usd_delta",
                 "total_tokens_saved",
                 "compression_savings_usd",
+                "total_input_tokens_delta",
+                "total_input_tokens",
+                "total_input_cost_usd_delta",
+                "total_input_cost_usd",
             ]
 
         buffer = StringIO()
@@ -311,7 +349,12 @@ class SavingsTracker:
     def _default_state(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
-            "lifetime": {"tokens_saved": 0, "compression_savings_usd": 0.0},
+            "lifetime": {
+                "tokens_saved": 0,
+                "compression_savings_usd": 0.0,
+                "total_input_tokens": 0,
+                "total_input_cost_usd": 0.0,
+            },
             "history": [],
         }
 
@@ -345,9 +388,13 @@ class SavingsTracker:
         lifetime_raw = raw.get("lifetime", {})
         lifetime_tokens_saved = 0
         lifetime_savings_usd = 0.0
+        lifetime_input_tokens = 0
+        lifetime_input_cost_usd = 0.0
         if isinstance(lifetime_raw, dict):
             lifetime_tokens_saved = _coerce_int(lifetime_raw.get("tokens_saved"))
             lifetime_savings_usd = _coerce_float(lifetime_raw.get("compression_savings_usd"))
+            lifetime_input_tokens = _coerce_int(lifetime_raw.get("total_input_tokens"))
+            lifetime_input_cost_usd = _coerce_float(lifetime_raw.get("total_input_cost_usd"))
 
         if normalized_history:
             last = normalized_history[-1]
@@ -356,12 +403,22 @@ class SavingsTracker:
                 lifetime_savings_usd,
                 _coerce_float(last["compression_savings_usd"]),
             )
+            lifetime_input_tokens = max(
+                lifetime_input_tokens,
+                _coerce_int(last.get("total_input_tokens")),
+            )
+            lifetime_input_cost_usd = max(
+                lifetime_input_cost_usd,
+                _coerce_float(last.get("total_input_cost_usd")),
+            )
 
         state = {
             "schema_version": SCHEMA_VERSION,
             "lifetime": {
                 "tokens_saved": lifetime_tokens_saved,
                 "compression_savings_usd": round(lifetime_savings_usd, 6),
+                "total_input_tokens": lifetime_input_tokens,
+                "total_input_cost_usd": round(lifetime_input_cost_usd, 6),
             },
             "history": normalized_history,
         }
@@ -437,6 +494,8 @@ class SavingsTracker:
         aggregated: dict[str, dict[str, Any]] = {}
         prev_total_tokens = 0
         prev_total_usd = 0.0
+        prev_total_input_tokens = 0
+        prev_total_input_cost_usd = 0.0
 
         for point in history:
             timestamp = _parse_timestamp(point["timestamp"])
@@ -448,11 +507,17 @@ class SavingsTracker:
             bucket_key = _to_utc_iso(bucket_start)
             total_tokens_saved = _coerce_int(point.get("total_tokens_saved"))
             total_usd = _coerce_float(point.get("compression_savings_usd"))
+            total_input_tokens = _coerce_int(point.get("total_input_tokens"))
+            total_input_cost_usd = _coerce_float(point.get("total_input_cost_usd"))
             delta_tokens = max(total_tokens_saved - prev_total_tokens, 0)
             delta_usd = max(total_usd - prev_total_usd, 0.0)
+            delta_input_tokens = max(total_input_tokens - prev_total_input_tokens, 0)
+            delta_input_cost_usd = max(total_input_cost_usd - prev_total_input_cost_usd, 0.0)
 
             prev_total_tokens = total_tokens_saved
             prev_total_usd = total_usd
+            prev_total_input_tokens = total_input_tokens
+            prev_total_input_cost_usd = total_input_cost_usd
 
             entry = aggregated.setdefault(
                 bucket_key,
@@ -462,6 +527,10 @@ class SavingsTracker:
                     "compression_savings_usd_delta": 0.0,
                     "total_tokens_saved": total_tokens_saved,
                     "compression_savings_usd": total_usd,
+                    "total_input_tokens_delta": 0,
+                    "total_input_tokens": total_input_tokens,
+                    "total_input_cost_usd_delta": 0.0,
+                    "total_input_cost_usd": total_input_cost_usd,
                 },
             )
             entry["tokens_saved"] += delta_tokens
@@ -469,7 +538,14 @@ class SavingsTracker:
                 entry["compression_savings_usd_delta"] + delta_usd,
                 6,
             )
+            entry["total_input_tokens_delta"] += delta_input_tokens
+            entry["total_input_cost_usd_delta"] = round(
+                entry["total_input_cost_usd_delta"] + delta_input_cost_usd,
+                6,
+            )
             entry["total_tokens_saved"] = total_tokens_saved
             entry["compression_savings_usd"] = round(total_usd, 6)
+            entry["total_input_tokens"] = total_input_tokens
+            entry["total_input_cost_usd"] = round(total_input_cost_usd, 6)
 
         return list(aggregated.values())

@@ -1137,7 +1137,11 @@ class CostTracker:
 class PrometheusMetrics:
     """Prometheus-compatible metrics."""
 
-    def __init__(self, savings_tracker: SavingsTracker | None = None):
+    def __init__(
+        self,
+        savings_tracker: SavingsTracker | None = None,
+        cost_tracker: CostTracker | None = None,
+    ):
         self.requests_total = 0
         self.requests_by_provider: dict[str, int] = defaultdict(int)
         self.requests_by_model: dict[str, int] = defaultdict(int)
@@ -1201,8 +1205,54 @@ class PrometheusMetrics:
         # Cumulative savings history (timestamp → cumulative tokens saved)
         self.savings_history: list[tuple[str, int]] = []
         self.savings_tracker = savings_tracker or SavingsTracker()
+        self.cost_tracker = cost_tracker
+        tracker_lifetime = self.savings_tracker.snapshot()["lifetime"]
+        self._savings_tracker_input_tokens_offset = max(
+            int(tracker_lifetime.get("total_input_tokens", 0) or 0),
+            0,
+        )
+        self._savings_tracker_input_cost_usd_offset = max(
+            float(tracker_lifetime.get("total_input_cost_usd", 0.0) or 0.0),
+            0.0,
+        )
 
         self._lock = asyncio.Lock()
+
+    def _current_savings_tracker_totals(self) -> tuple[int, float]:
+        total_input_tokens = self._savings_tracker_input_tokens_offset + self.tokens_input_total
+        total_input_cost_usd = self._savings_tracker_input_cost_usd_offset
+
+        if self.cost_tracker is None:
+            return total_input_tokens, total_input_cost_usd
+
+        try:
+            cost_stats = self.cost_tracker.stats()
+        except Exception:
+            logger.debug("Failed to read cost tracker totals for savings history", exc_info=True)
+            return total_input_tokens, total_input_cost_usd
+
+        tracked_input_tokens = cost_stats.get("total_input_tokens")
+        tracked_input_cost_usd = cost_stats.get("total_input_cost_usd")
+
+        if tracked_input_tokens is not None:
+            try:
+                total_input_tokens = self._savings_tracker_input_tokens_offset + max(
+                    int(tracked_input_tokens),
+                    0,
+                )
+            except (TypeError, ValueError):
+                pass
+
+        if tracked_input_cost_usd is not None:
+            try:
+                total_input_cost_usd = self._savings_tracker_input_cost_usd_offset + max(
+                    float(tracked_input_cost_usd),
+                    0.0,
+                )
+            except (TypeError, ValueError):
+                pass
+
+        return total_input_tokens, total_input_cost_usd
 
     async def record_request(
         self,
@@ -1293,9 +1343,12 @@ class PrometheusMetrics:
                 self.savings_history = self.savings_history[-500:]
 
             if tokens_saved > 0:
+                total_input_tokens, total_input_cost_usd = self._current_savings_tracker_totals()
                 self.savings_tracker.record_compression_savings(
                     model=model,
                     tokens_saved=tokens_saved,
+                    total_input_tokens=total_input_tokens,
+                    total_input_cost_usd=total_input_cost_usd,
                 )
 
     async def record_rate_limited(self):
@@ -1603,7 +1656,7 @@ class HeadroomProxy:
             else None
         )
 
-        self.metrics = PrometheusMetrics()
+        self.metrics = PrometheusMetrics(cost_tracker=self.cost_tracker)
 
         # Prefix cache tracking: freeze already-cached messages to avoid
         # invalidating the provider's prefix cache with our transforms
