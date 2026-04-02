@@ -132,8 +132,11 @@ class BaseTokenizer(ABC):
 
                 if part_type == "text":
                     total += self.count_text(part.get("text", ""))
-                elif part_type == "image_url":
-                    # Images have fixed token cost (varies by model)
+                elif part_type in ("image_url", "image"):
+                    # Images have fixed token cost — NOT tokenized as text.
+                    # Anthropic images are type="image" with base64 in source.data.
+                    # Without this, the base64 string gets json.dumps'd and counted
+                    # as text tokens (1MB image = ~330K fake tokens).
                     total += 85  # Base image token count
                 elif part_type == "tool_result":
                     content = part.get("content", "")
