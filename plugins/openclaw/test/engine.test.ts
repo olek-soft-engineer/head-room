@@ -145,38 +145,39 @@ describe("AgentMessage conversion", () => {
   });
 });
 
-describe.skipIf(!RUN)("ProxyManager", () => {
-  it("connects to configured proxy URL", { timeout: 30000 }, async () => {
-    const manager = new ProxyManager({ proxyUrl: PROXY_URL });
-    try {
-      const url = await manager.start();
-      expect(url).toMatch(/^http:\/\/(127\.0\.0\.1|localhost):\d+$/);
+if (RUN) {
+  describe("ProxyManager", () => {
+    it("connects to configured proxy URL", { timeout: 30000 }, async () => {
+      const manager = new ProxyManager({ proxyUrl: PROXY_URL });
+      try {
+        const url = await manager.start();
+        expect(url).toMatch(/^http:\/\/(127\.0\.0\.1|localhost):\d+$/);
 
-      // Verify health
-      const resp = await fetch(`${url}/health`);
-      expect(resp.ok).toBe(true);
-    } finally {
-      await manager.stop();
-    }
-  });
-});
-
-describe.skipIf(!RUN)("HeadroomContextEngine", () => {
-  let engine: HeadroomContextEngine;
-
-  beforeAll(async () => {
-    engine = new HeadroomContextEngine({ proxyUrl: PROXY_URL });
-    await engine.bootstrap({
-      sessionId: "test-session",
-      sessionFile: "/tmp/test-session.jsonl",
+        // Verify health
+        const resp = await fetch(`${url}/health`);
+        expect(resp.ok).toBe(true);
+      } finally {
+        await manager.stop();
+      }
     });
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.dispose();
   });
 
-  it("assemble() compresses tool outputs", { timeout: 15000 }, async () => {
+  describe("HeadroomContextEngine", () => {
+    let engine: HeadroomContextEngine;
+
+    beforeAll(async () => {
+      engine = new HeadroomContextEngine({ proxyUrl: PROXY_URL });
+      await engine.bootstrap({
+        sessionId: "test-session",
+        sessionFile: "/tmp/test-session.jsonl",
+      });
+    }, 30000);
+
+    afterAll(async () => {
+      await engine.dispose();
+    });
+
+    it("assemble() compresses tool outputs", { timeout: 15000 }, async () => {
     // Simulate an OpenClaw agent conversation with large tool result
     const serverData = Array.from({ length: 100 }, (_, i) => ({
       id: i + 1,
@@ -223,9 +224,9 @@ describe.skipIf(!RUN)("HeadroomContextEngine", () => {
     // First and last messages should still be user messages
     expect(result.messages[0].role).toBe("user");
     expect(result.messages[result.messages.length - 1].role).toBe("user");
-  });
+    });
 
-  it("assemble() preserves small conversations", { timeout: 15000 }, async () => {
+    it("assemble() preserves small conversations", { timeout: 15000 }, async () => {
     const messages = [
       { role: "user", content: "Hello", timestamp: Date.now() },
       { role: "assistant", content: "Hi there!", timestamp: Date.now() },
@@ -239,9 +240,9 @@ describe.skipIf(!RUN)("HeadroomContextEngine", () => {
     expect(result.messages).toHaveLength(2);
     expect(result.messages[0].content).toBe("Hello");
     expect(result.messages[1].content).toBe("Hi there!");
-  });
+    });
 
-  it("compact() returns success (compression handled in assemble)", async () => {
+    it("compact() returns success (compression handled in assemble)", async () => {
     const result = await engine.compact({
       sessionId: "test-session",
       sessionFile: "/tmp/test.jsonl",
@@ -249,12 +250,13 @@ describe.skipIf(!RUN)("HeadroomContextEngine", () => {
 
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
-  });
+    });
 
-  it("getStats() returns compression statistics", () => {
+    it("getStats() returns compression statistics", () => {
     const stats = engine.getStats();
     expect(stats).toHaveProperty("totalCompressions");
     expect(stats).toHaveProperty("totalTokensSaved");
     expect(stats.totalCompressions).toBeGreaterThanOrEqual(0);
+    });
   });
-});
+}
