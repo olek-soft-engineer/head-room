@@ -28,14 +28,29 @@
     }
   },
   "devDependencies": {
+    "@types/node": "^22.10.0",
     "tsup": "^8.0.0",
     "typescript": "^5.5.0",
     "vitest": "^2.0.0"
   },
   "openclaw": {
+    "hooks": {
+      "contextEngine": "dist/index.js",
+      "tools": [
+        "dist/index.js"
+      ]
+    },
     "extensions": [
       "./dist/index.js"
-    ]
+    ],
+    "capabilities": {
+      "network": {
+        "allow": [
+          "http://localhost:*",
+          "http://127.0.0.1:*"
+        ]
+      }
+    }
   },
   "license": "Apache-2.0"
 }

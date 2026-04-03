@@ -7,12 +7,39 @@
  * Requires: Python 3 + headroom-ai[proxy] installed
  * Run: HEADROOM_INTEGRATION=1 npx vitest run test/engine.test.ts
  */
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi, afterEach } from "vitest";
 import { HeadroomContextEngine } from "../src/engine.js";
 import { agentToOpenAI, openAIToAgent } from "../src/convert.js";
-import { ProxyManager } from "../src/proxy-manager.js";
+import { ProxyManager, probeHeadroomProxy } from "../src/proxy-manager.js";
 
 const RUN = process.env.HEADROOM_INTEGRATION === "1";
+const PROXY_URL = process.env.HEADROOM_PROXY_URL ?? "http://127.0.0.1:8787";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("Proxy probing", () => {
+  it("detects running Headroom proxy", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200 })
+      .mockResolvedValueOnce({ ok: true, status: 200 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await probeHeadroomProxy("http://127.0.0.1:8787");
+    expect(result).toEqual({ reachable: true, isHeadroom: true });
+  });
+
+  it("flags non-headroom service at configured URL", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 200 })
+      .mockResolvedValueOnce({ ok: false, status: 404 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const manager = new ProxyManager({ proxyUrl: "http://127.0.0.1:8787" });
+    await expect(manager.start()).rejects.toThrow(/does not appear to be a Headroom proxy/);
+  });
+});
 
 describe("AgentMessage conversion", () => {
   it("converts user message", () => {
@@ -118,38 +145,39 @@ describe("AgentMessage conversion", () => {
   });
 });
 
-describe.skipIf(!RUN)("ProxyManager", () => {
-  it("detects running proxy or starts one", { timeout: 30000 }, async () => {
-    const manager = new ProxyManager({ autoStart: true });
-    try {
-      const url = await manager.start();
-      expect(url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+if (RUN) {
+  describe("ProxyManager", () => {
+    it("connects to configured proxy URL", { timeout: 30000 }, async () => {
+      const manager = new ProxyManager({ proxyUrl: PROXY_URL });
+      try {
+        const url = await manager.start();
+        expect(url).toMatch(/^http:\/\/(127\.0\.0\.1|localhost):\d+$/);
 
-      // Verify health
-      const resp = await fetch(`${url}/health`);
-      expect(resp.ok).toBe(true);
-    } finally {
-      await manager.stop();
-    }
-  });
-});
-
-describe.skipIf(!RUN)("HeadroomContextEngine", () => {
-  let engine: HeadroomContextEngine;
-
-  beforeAll(async () => {
-    engine = new HeadroomContextEngine({ autoStart: true });
-    await engine.bootstrap({
-      sessionId: "test-session",
-      sessionFile: "/tmp/test-session.jsonl",
+        // Verify health
+        const resp = await fetch(`${url}/health`);
+        expect(resp.ok).toBe(true);
+      } finally {
+        await manager.stop();
+      }
     });
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.dispose();
   });
 
-  it("assemble() compresses tool outputs", { timeout: 15000 }, async () => {
+  describe("HeadroomContextEngine", () => {
+    let engine: HeadroomContextEngine;
+
+    beforeAll(async () => {
+      engine = new HeadroomContextEngine({ proxyUrl: PROXY_URL });
+      await engine.bootstrap({
+        sessionId: "test-session",
+        sessionFile: "/tmp/test-session.jsonl",
+      });
+    }, 30000);
+
+    afterAll(async () => {
+      await engine.dispose();
+    });
+
+    it("assemble() compresses tool outputs", { timeout: 15000 }, async () => {
     // Simulate an OpenClaw agent conversation with large tool result
     const serverData = Array.from({ length: 100 }, (_, i) => ({
       id: i + 1,
@@ -196,9 +224,9 @@ describe.skipIf(!RUN)("HeadroomContextEngine", () => {
     // First and last messages should still be user messages
     expect(result.messages[0].role).toBe("user");
     expect(result.messages[result.messages.length - 1].role).toBe("user");
-  });
+    });
 
-  it("assemble() preserves small conversations", { timeout: 15000 }, async () => {
+    it("assemble() preserves small conversations", { timeout: 15000 }, async () => {
     const messages = [
       { role: "user", content: "Hello", timestamp: Date.now() },
       { role: "assistant", content: "Hi there!", timestamp: Date.now() },
@@ -212,9 +240,9 @@ describe.skipIf(!RUN)("HeadroomContextEngine", () => {
     expect(result.messages).toHaveLength(2);
     expect(result.messages[0].content).toBe("Hello");
     expect(result.messages[1].content).toBe("Hi there!");
-  });
+    });
 
-  it("compact() returns success (compression handled in assemble)", async () => {
+    it("compact() returns success (compression handled in assemble)", async () => {
     const result = await engine.compact({
       sessionId: "test-session",
       sessionFile: "/tmp/test.jsonl",
@@ -222,12 +250,13 @@ describe.skipIf(!RUN)("HeadroomContextEngine", () => {
 
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
-  });
+    });
 
-  it("getStats() returns compression statistics", () => {
+    it("getStats() returns compression statistics", () => {
     const stats = engine.getStats();
     expect(stats).toHaveProperty("totalCompressions");
     expect(stats).toHaveProperty("totalTokensSaved");
     expect(stats.totalCompressions).toBeGreaterThanOrEqual(0);
+    });
   });
-});
+}
