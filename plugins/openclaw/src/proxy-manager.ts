@@ -1,10 +1,10 @@
 /**
- * Manages connectivity to an externally managed Headroom proxy.
+ * Manages connectivity to a Headroom proxy (local or remote).
  *
  * Security model:
- * - Optional local process execution to auto-start Headroom proxy
+ * - Local proxies (127.0.0.1 / localhost) can be auto-started via subprocess
+ * - Remote proxies are connect-only: probe and use, never launch
  * - No environment variable access
- * - Localhost-only network access (127.0.0.1 / localhost)
  */
 import { spawn } from "node:child_process";
 import { spawnSync } from "node:child_process";
@@ -27,6 +27,14 @@ export interface ProxyManagerLogger {
   debug(message: string): void;
 }
 
+/** Default logger that prefixes all messages with `[headroom]`. */
+export const defaultLogger: ProxyManagerLogger = {
+  info: (m) => console.log(`[headroom] ${m}`),
+  warn: (m) => console.warn(`[headroom] ${m}`),
+  error: (m) => console.error(`[headroom] ${m}`),
+  debug: () => {},
+};
+
 export interface ProxyProbeResult {
   reachable: boolean;
   isHeadroom: boolean;
@@ -40,13 +48,6 @@ interface LaunchSpec {
   checkCommand: string;
   checkArgs: string[];
 }
-
-const defaultLogger: ProxyManagerLogger = {
-  info: (m) => console.log(`[headroom] ${m}`),
-  warn: (m) => console.warn(`[headroom] ${m}`),
-  error: (m) => console.error(`[headroom] ${m}`),
-  debug: () => {},
-};
 
 export class ProxyManager {
   private config: ProxyManagerConfig;
@@ -63,10 +64,14 @@ export class ProxyManager {
    */
   async start(): Promise<string> {
     const port = this.getProxyPort();
-    const explicitUrl =
+    const rawExplicitUrl =
       typeof this.config.proxyUrl === "string" && this.config.proxyUrl.trim().length > 0
         ? normalizeAndValidateProxyUrl(this.config.proxyUrl)
         : null;
+    // Only apply proxyPort default to local URLs — remote URLs use their protocol default
+    const explicitUrl = rawExplicitUrl
+      ? isLocalProxyUrl(rawExplicitUrl) ? withDefaultPort(rawExplicitUrl, port) : rawExplicitUrl
+      : null;
     const defaultCandidates = this.getDefaultProxyCandidates(port);
     const candidateUrls = explicitUrl ? [explicitUrl] : [...defaultCandidates];
     const probeByUrl = new Map<string, ProxyProbeResult>();
@@ -90,6 +95,14 @@ export class ProxyManager {
       }
     }
 
+    // Remote URLs are connect-only — never auto-start a subprocess for them
+    if (explicitUrl && !isLocalProxyUrl(explicitUrl)) {
+      throw new Error(
+        `Remote Headroom proxy not reachable at ${explicitUrl}. Ensure the proxy is running at that address.`,
+      );
+    }
+
+    // Auto-start is only available for local proxies
     if (this.config.autoStart !== false) {
       const startupUrl = explicitUrl ?? defaultCandidates[0];
       const startupProbe = probeByUrl.get(startupUrl);
@@ -102,7 +115,7 @@ export class ProxyManager {
       this.logger.info(
         `No Headroom proxy detected${explicitUrl ? ` at ${startupUrl}` : " on default local endpoints"}; attempting to auto-start...`,
       );
-      await this.startHeadroomProxy(startupUrl);
+      await this.startHeadroomProxy(startupUrl, port);
 
       const startedProbe = await waitForHeadroomProxy(
         startupUrl,
@@ -144,7 +157,7 @@ export class ProxyManager {
   }
 
   /**
-   * No-op: plugin never starts or manages external processes.
+   * Stop manager state. Spawned proxy processes are detached and externally managed.
    */
   async stop(): Promise<void> {
     this.proxyUrl = null;
@@ -156,10 +169,10 @@ export class ProxyManager {
 
   // --- Internal ---
 
-  private async startHeadroomProxy(proxyUrl: string): Promise<void> {
+  private async startHeadroomProxy(proxyUrl: string, defaultPort: number): Promise<void> {
     const parsed = new URL(proxyUrl);
     const host = parsed.hostname;
-    const port = parsed.port || "80";
+    const port = parsed.port || String(defaultPort);
     const specs = this.buildLaunchSpecs(host, port);
     const errors: string[] = [];
 
@@ -297,25 +310,44 @@ export class ProxyManager {
   }
 }
 
-export function normalizeAndValidateProxyUrl(proxyUrl: string): string {
-  let parsed: URL;
+/** Parse a URL, returning the parsed object or throwing a descriptive error. */
+function parseProxyUrl(proxyUrl: string): URL {
   try {
-    parsed = new URL(proxyUrl);
+    return new URL(proxyUrl);
   } catch {
     throw new Error(`Invalid proxyUrl: "${proxyUrl}"`);
   }
+}
 
-  if (parsed.protocol !== "http:") {
-    throw new Error("proxyUrl must use http://");
-  }
-  if (parsed.hostname !== "127.0.0.1" && parsed.hostname !== "localhost") {
-    throw new Error("proxyUrl host must be localhost or 127.0.0.1");
+export function normalizeAndValidateProxyUrl(proxyUrl: string): string {
+  const parsed = parseProxyUrl(proxyUrl);
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("proxyUrl must use http:// or https://");
   }
 
   if (parsed.pathname !== "/" || parsed.search || parsed.hash) {
     throw new Error("proxyUrl must not include a path, query, or hash");
   }
 
+  return parsed.origin;
+}
+
+/** Returns true if the URL points to a local address (localhost or 127.0.0.1). */
+export function isLocalProxyUrl(proxyUrl: string): boolean {
+  try {
+    const parsed = new URL(proxyUrl);
+    return parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
+  } catch {
+    return false;
+  }
+}
+
+function withDefaultPort(proxyUrl: string, defaultPort: number): string {
+  const parsed = parseProxyUrl(proxyUrl);
+  if (!parsed.port) {
+    parsed.port = String(defaultPort);
+  }
   return parsed.origin;
 }
 

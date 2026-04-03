@@ -10,7 +10,7 @@
 import { describe, it, expect, beforeAll, afterAll, vi, afterEach } from "vitest";
 import { HeadroomContextEngine } from "../src/engine.js";
 import { agentToOpenAI, openAIToAgent } from "../src/convert.js";
-import { ProxyManager, probeHeadroomProxy } from "../src/proxy-manager.js";
+import { ProxyManager } from "../src/proxy-manager.js";
 
 const RUN = process.env.HEADROOM_INTEGRATION === "1";
 const PROXY_URL = process.env.HEADROOM_PROXY_URL ?? "http://127.0.0.1:8787";
@@ -19,27 +19,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("Proxy probing", () => {
-  it("detects running Headroom proxy", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce({ ok: true, status: 200 })
-      .mockResolvedValueOnce({ ok: true, status: 200 });
-    vi.stubGlobal("fetch", fetchMock);
-
-    const result = await probeHeadroomProxy("http://127.0.0.1:8787");
-    expect(result).toEqual({ reachable: true, isHeadroom: true });
-  });
-
-  it("flags non-headroom service at configured URL", async () => {
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce({ ok: true, status: 200 })
-      .mockResolvedValueOnce({ ok: false, status: 404 });
-    vi.stubGlobal("fetch", fetchMock);
-
-    const manager = new ProxyManager({ proxyUrl: "http://127.0.0.1:8787" });
-    await expect(manager.start()).rejects.toThrow(/does not appear to be a Headroom proxy/);
-  });
-});
+// Proxy probing and ProxyManager.start tests live in proxy-manager.test.ts
 
 describe("AgentMessage conversion", () => {
   it("converts user message", () => {
