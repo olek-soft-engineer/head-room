@@ -3,7 +3,7 @@
   "uiHints": {
     "proxyUrl": {
       "label": "Proxy URL",
-      "help": "Required. URL of an already running Headroom proxy on localhost (example: http://127.0.0.1:8787)"
+      "help": "Optional. URL of a Headroom proxy on localhost (example: http://127.0.0.1:8787). If omitted, plugin auto-detects defaults."
     }
   },
   "configSchema": {

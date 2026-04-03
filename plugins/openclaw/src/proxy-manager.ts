@@ -39,6 +39,11 @@ interface LaunchSpec {
   checkArgs: string[];
 }
 
+const DEFAULT_PROXY_CANDIDATES = [
+  "http://127.0.0.1:8787",
+  "http://localhost:8787",
+];
+
 const defaultLogger: ProxyManagerLogger = {
   info: (m) => console.log(`[headroom] ${m}`),
   warn: (m) => console.warn(`[headroom] ${m}`),
@@ -60,47 +65,70 @@ export class ProxyManager {
    * Ensure a proxy is available. Returns the normalized URL origin.
    */
   async start(): Promise<string> {
-    if (!this.config.proxyUrl) {
-      throw new Error(
-        "Headroom proxy URL is required. Configure plugins.entries.headroom.config.proxyUrl " +
-          '(example: "http://127.0.0.1:8787").',
-      );
+    const explicitUrl =
+      typeof this.config.proxyUrl === "string" && this.config.proxyUrl.trim().length > 0
+        ? normalizeAndValidateProxyUrl(this.config.proxyUrl)
+        : null;
+    const candidateUrls = explicitUrl ? [explicitUrl] : [...DEFAULT_PROXY_CANDIDATES];
+    const probeByUrl = new Map<string, ProxyProbeResult>();
+
+    for (const url of candidateUrls) {
+      const probe = await probeHeadroomProxy(url);
+      probeByUrl.set(url, probe);
+      if (probe.reachable && probe.isHeadroom) {
+        this.proxyUrl = url;
+        this.logger.info(`Headroom proxy already running at ${url}`);
+        return url;
+      }
     }
 
-    const url = normalizeAndValidateProxyUrl(this.config.proxyUrl);
-    const probe = await probeHeadroomProxy(url);
-
-    if (probe.reachable && probe.isHeadroom) {
-      this.proxyUrl = url;
-      this.logger.info(`Headroom proxy already running at ${url}`);
-      return url;
-    }
-
-    if (probe.reachable && !probe.isHeadroom) {
-      throw new Error(
-        `Service reachable at ${url}, but it does not appear to be a Headroom proxy (${probe.reason ?? "unknown service"}).`,
-      );
+    if (explicitUrl) {
+      const explicitProbe = probeByUrl.get(explicitUrl);
+      if (explicitProbe?.reachable && !explicitProbe.isHeadroom) {
+        throw new Error(
+          `Service reachable at ${explicitUrl}, but it does not appear to be a Headroom proxy (${explicitProbe.reason ?? "unknown service"}).`,
+        );
+      }
     }
 
     if (this.config.autoStart !== false) {
-      this.logger.info(`No proxy detected at ${url}; attempting to auto-start Headroom proxy...`);
-      await this.startHeadroomProxy(url);
+      const startupUrl = explicitUrl ?? DEFAULT_PROXY_CANDIDATES[0];
+      const startupProbe = probeByUrl.get(startupUrl);
+      if (startupProbe?.reachable && !startupProbe.isHeadroom) {
+        throw new Error(
+          `Cannot auto-start Headroom at ${startupUrl}: port is in use by a non-Headroom service (${startupProbe.reason ?? "unknown service"}).`,
+        );
+      }
+
+      this.logger.info(
+        `No Headroom proxy detected${explicitUrl ? ` at ${startupUrl}` : " on default local endpoints"}; attempting to auto-start...`,
+      );
+      await this.startHeadroomProxy(startupUrl);
 
       const startedProbe = await waitForHeadroomProxy(
-        url,
+        startupUrl,
         this.config.startupTimeoutMs ?? 20_000,
       );
       if (startedProbe.reachable && startedProbe.isHeadroom) {
-        this.proxyUrl = url;
-        this.logger.info(`Headroom proxy started and reachable at ${url}`);
-        return url;
+        this.proxyUrl = startupUrl;
+        this.logger.info(`Headroom proxy started and reachable at ${startupUrl}`);
+        return startupUrl;
       }
       throw new Error(
-        `Attempted to start Headroom proxy, but it was not reachable at ${url} (${startedProbe.reason ?? "unknown"}).`,
+        `Attempted to start Headroom proxy, but it was not reachable at ${startupUrl} (${startedProbe.reason ?? "unknown"}).`,
       );
     }
 
-    throw new Error(`Headroom proxy not reachable at ${url}. Ensure the proxy is running first.`);
+    if (explicitUrl) {
+      throw new Error(
+        `Headroom proxy not reachable at ${explicitUrl}. Ensure the proxy is running first.`,
+      );
+    }
+
+    throw new Error(
+      `Headroom proxy not detected on default endpoints (${DEFAULT_PROXY_CANDIDATES.join(", ")}). ` +
+        "Set proxyUrl explicitly or enable autoStart.",
+    );
   }
 
   /**

@@ -23,12 +23,10 @@ export default function headroomPlugin(api: any) {
   const config = api.config?.plugins?.entries?.headroom?.config ?? {};
   const logger = api.logger ?? console;
   const rawProxyUrl = config.proxyUrl;
-  if (!rawProxyUrl || typeof rawProxyUrl !== "string") {
-    throw new Error(
-      '[headroom] Missing required config: plugins.entries.headroom.config.proxyUrl (example: "http://127.0.0.1:8787")',
-    );
-  }
-  const proxyUrl = normalizeAndValidateProxyUrl(rawProxyUrl);
+  const proxyUrl =
+    typeof rawProxyUrl === "string" && rawProxyUrl.trim().length > 0
+      ? normalizeAndValidateProxyUrl(rawProxyUrl)
+      : undefined;
 
   const engine = new HeadroomContextEngine({ ...config, proxyUrl }, {
     info: (m: string) => logger.info(m),
@@ -43,6 +41,7 @@ export default function headroomPlugin(api: any) {
   // Register CCR retrieval tool (active once proxy is running)
   api.registerTool((ctx: any) => {
     const activeProxyUrl = engine.getProxyUrl() ?? proxyUrl;
+    if (!activeProxyUrl) return null;
     return createHeadroomRetrieveTool({ proxyUrl: activeProxyUrl });
   });
 

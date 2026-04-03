@@ -32,6 +32,12 @@ This plugin auto-starts `headroom proxy` when needed. OpenClaw treats process-la
 ```
 
 `proxyUrl` must be localhost (`127.0.0.1` or `localhost`). If the proxy is not running, the plugin will try to start it with `headroom proxy --host ... --port ...`.
+`proxyUrl` is optional. If omitted, the plugin auto-detects on:
+- `http://127.0.0.1:8787`
+- `http://localhost:8787`
+If no proxy is found, it will auto-start on `http://127.0.0.1:8787` (when `autoStart` is enabled).
+
+If set, `proxyUrl` must be localhost (`127.0.0.1` or `localhost`). If that proxy is not running, the plugin will try to start it with `headroom proxy --host ... --port ...`.
 Auto-start launch order is:
 1. `headroom` from `PATH`
 2. local npm bin (`node_modules/.bin/headroom`)
@@ -71,7 +77,7 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `proxyUrl` | required | URL of an already running Headroom proxy (`http://127.0.0.1:<port>` or `http://localhost:<port>`) |
+| `proxyUrl` | auto-detected | Optional URL of a Headroom proxy (`http://127.0.0.1:<port>` or `http://localhost:<port>`). Defaults to probing `:8787`. |
 | `autoStart` | `true` | Auto-start `headroom proxy` if not already running |
 | `startupTimeoutMs` | `20000` | Time to wait for auto-started proxy to become healthy |
 
