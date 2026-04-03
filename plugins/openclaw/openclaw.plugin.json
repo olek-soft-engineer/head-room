@@ -23,7 +23,7 @@
       },
       "proxyUrl": {
         "type": "string",
-        "pattern": "^http:\\/\\/(localhost|127\\.0\\.0\\.1)(:\\d+)?$"
+        "pattern": "^http:\\/\\/(localhost|127\\.0\\.0\\.1)(:\\d+)?\\/?$"
       },
       "proxyPort": {
         "type": "integer",

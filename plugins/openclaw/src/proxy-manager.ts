@@ -1,5 +1,5 @@
 /**
- * Manages connectivity to an externally managed Headroom proxy.
+ * Manages connectivity to a local Headroom proxy.
  *
  * Security model:
  * - Optional local process execution to auto-start Headroom proxy
@@ -59,13 +59,13 @@ export class ProxyManager {
   }
 
   /**
-   * Ensure a proxy is available. Returns the normalized URL origin.
+ * Ensure a proxy is available. Returns the normalized URL origin.
    */
   async start(): Promise<string> {
     const port = this.getProxyPort();
     const explicitUrl =
       typeof this.config.proxyUrl === "string" && this.config.proxyUrl.trim().length > 0
-        ? normalizeAndValidateProxyUrl(this.config.proxyUrl)
+        ? withDefaultPort(normalizeAndValidateProxyUrl(this.config.proxyUrl), port)
         : null;
     const defaultCandidates = this.getDefaultProxyCandidates(port);
     const candidateUrls = explicitUrl ? [explicitUrl] : [...defaultCandidates];
@@ -102,7 +102,7 @@ export class ProxyManager {
       this.logger.info(
         `No Headroom proxy detected${explicitUrl ? ` at ${startupUrl}` : " on default local endpoints"}; attempting to auto-start...`,
       );
-      await this.startHeadroomProxy(startupUrl);
+      await this.startHeadroomProxy(startupUrl, port);
 
       const startedProbe = await waitForHeadroomProxy(
         startupUrl,
@@ -144,7 +144,7 @@ export class ProxyManager {
   }
 
   /**
-   * No-op: plugin never starts or manages external processes.
+   * Stop manager state. Spawned proxy processes are detached and externally managed.
    */
   async stop(): Promise<void> {
     this.proxyUrl = null;
@@ -156,10 +156,10 @@ export class ProxyManager {
 
   // --- Internal ---
 
-  private async startHeadroomProxy(proxyUrl: string): Promise<void> {
+  private async startHeadroomProxy(proxyUrl: string, defaultPort: number): Promise<void> {
     const parsed = new URL(proxyUrl);
     const host = parsed.hostname;
-    const port = parsed.port || "80";
+    const port = parsed.port || String(defaultPort);
     const specs = this.buildLaunchSpecs(host, port);
     const errors: string[] = [];
 
@@ -316,6 +316,14 @@ export function normalizeAndValidateProxyUrl(proxyUrl: string): string {
     throw new Error("proxyUrl must not include a path, query, or hash");
   }
 
+  return parsed.origin;
+}
+
+function withDefaultPort(proxyUrl: string, defaultPort: number): string {
+  const parsed = new URL(proxyUrl);
+  if (!parsed.port) {
+    parsed.port = String(defaultPort);
+  }
   return parsed.origin;
 }
 

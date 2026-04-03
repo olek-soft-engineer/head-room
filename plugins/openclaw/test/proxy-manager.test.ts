@@ -104,6 +104,22 @@ describe("ProxyManager.start", () => {
     await expect(manager.start()).rejects.toThrow(/does not appear to be a Headroom proxy/);
   });
 
+  it("applies default proxyPort when explicit proxyUrl omits port", async () => {
+    const manager = new ProxyManager({ proxyUrl: "http://127.0.0.1", autoStart: true });
+    const startSpy = vi.spyOn(manager as any, "startHeadroomProxy").mockResolvedValue(undefined);
+
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("down"))
+      .mockResolvedValueOnce({ ok: true, status: 200 })
+      .mockResolvedValueOnce({ ok: true, status: 200 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const url = await manager.start();
+    expect(url).toBe("http://127.0.0.1:8787");
+    expect(startSpy).toHaveBeenCalledWith("http://127.0.0.1:8787", 8787);
+  });
+
   it("auto-starts when nothing is detected", async () => {
     const manager = new ProxyManager({ autoStart: true });
     const startSpy = vi.spyOn(manager as any, "startHeadroomProxy").mockResolvedValue(undefined);
@@ -119,7 +135,7 @@ describe("ProxyManager.start", () => {
 
     const url = await manager.start();
     expect(url).toBe("http://127.0.0.1:8787");
-    expect(startSpy).toHaveBeenCalledWith("http://127.0.0.1:8787");
+    expect(startSpy).toHaveBeenCalledWith("http://127.0.0.1:8787", 8787);
   });
 });
 
