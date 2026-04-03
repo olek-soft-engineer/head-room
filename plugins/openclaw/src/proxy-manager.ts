@@ -27,6 +27,14 @@ export interface ProxyManagerLogger {
   debug(message: string): void;
 }
 
+/** Default logger that prefixes all messages with `[headroom]`. */
+export const defaultLogger: ProxyManagerLogger = {
+  info: (m) => console.log(`[headroom] ${m}`),
+  warn: (m) => console.warn(`[headroom] ${m}`),
+  error: (m) => console.error(`[headroom] ${m}`),
+  debug: () => {},
+};
+
 export interface ProxyProbeResult {
   reachable: boolean;
   isHeadroom: boolean;
@@ -40,13 +48,6 @@ interface LaunchSpec {
   checkCommand: string;
   checkArgs: string[];
 }
-
-const defaultLogger: ProxyManagerLogger = {
-  info: (m) => console.log(`[headroom] ${m}`),
-  warn: (m) => console.warn(`[headroom] ${m}`),
-  error: (m) => console.error(`[headroom] ${m}`),
-  debug: () => {},
-};
 
 export class ProxyManager {
   private config: ProxyManagerConfig;
@@ -309,13 +310,17 @@ export class ProxyManager {
   }
 }
 
-export function normalizeAndValidateProxyUrl(proxyUrl: string): string {
-  let parsed: URL;
+/** Parse a URL, returning the parsed object or throwing a descriptive error. */
+function parseProxyUrl(proxyUrl: string): URL {
   try {
-    parsed = new URL(proxyUrl);
+    return new URL(proxyUrl);
   } catch {
     throw new Error(`Invalid proxyUrl: "${proxyUrl}"`);
   }
+}
+
+export function normalizeAndValidateProxyUrl(proxyUrl: string): string {
+  const parsed = parseProxyUrl(proxyUrl);
 
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new Error("proxyUrl must use http:// or https://");
@@ -339,7 +344,7 @@ export function isLocalProxyUrl(proxyUrl: string): boolean {
 }
 
 function withDefaultPort(proxyUrl: string, defaultPort: number): string {
-  const parsed = new URL(proxyUrl);
+  const parsed = parseProxyUrl(proxyUrl);
   if (!parsed.port) {
     parsed.port = String(defaultPort);
   }

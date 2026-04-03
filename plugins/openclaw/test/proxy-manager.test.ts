@@ -10,6 +10,29 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+/** Stub fetch with a sequence of health/retrieve probe outcomes. */
+function stubProbeSuccess() {
+  const mock = vi.fn()
+    .mockResolvedValueOnce({ ok: true, status: 200 })   // /health
+    .mockResolvedValueOnce({ ok: true, status: 200 });   // /v1/retrieve/stats
+  vi.stubGlobal("fetch", mock);
+  return mock;
+}
+
+function stubProbeNonHeadroom() {
+  const mock = vi.fn()
+    .mockResolvedValueOnce({ ok: true, status: 200 })   // /health OK
+    .mockResolvedValueOnce({ ok: false, status: 404 });  // /v1/retrieve/stats 404
+  vi.stubGlobal("fetch", mock);
+  return mock;
+}
+
+function stubProbeUnreachable() {
+  const mock = vi.fn().mockRejectedValue(new Error("ECONNREFUSED"));
+  vi.stubGlobal("fetch", mock);
+  return mock;
+}
+
 describe("normalizeAndValidateProxyUrl", () => {
   it("accepts localhost origins", () => {
     expect(normalizeAndValidateProxyUrl("http://127.0.0.1:8787")).toBe("http://127.0.0.1:8787");
@@ -50,23 +73,13 @@ describe("isLocalProxyUrl", () => {
 
 describe("probeHeadroomProxy", () => {
   it("returns reachable+isHeadroom when both endpoints succeed", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({ ok: true, status: 200 })
-      .mockResolvedValueOnce({ ok: true, status: 200 });
-    vi.stubGlobal("fetch", fetchMock);
-
+    stubProbeSuccess();
     const result = await probeHeadroomProxy("http://127.0.0.1:8787");
     expect(result).toEqual({ reachable: true, isHeadroom: true });
   });
 
   it("returns reachable but non-headroom when retrieve endpoint fails", async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({ ok: true, status: 200 })
-      .mockResolvedValueOnce({ ok: false, status: 404 });
-    vi.stubGlobal("fetch", fetchMock);
-
+    stubProbeNonHeadroom();
     const result = await probeHeadroomProxy("http://127.0.0.1:8787");
     expect(result.reachable).toBe(true);
     expect(result.isHeadroom).toBe(false);
@@ -74,7 +87,7 @@ describe("probeHeadroomProxy", () => {
   });
 
   it("returns unreachable when health check fails", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("boom")));
+    stubProbeUnreachable();
     const result = await probeHeadroomProxy("http://127.0.0.1:8787");
     expect(result.reachable).toBe(false);
     expect(result.isHeadroom).toBe(false);
@@ -115,12 +128,7 @@ describe("ProxyManager.start", () => {
 
   it("fails when explicit URL is reachable but not a headroom proxy", async () => {
     const manager = new ProxyManager({ proxyUrl: "http://127.0.0.1:8787" });
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({ ok: true, status: 200 })
-      .mockResolvedValueOnce({ ok: false, status: 404 });
-    vi.stubGlobal("fetch", fetchMock);
-
+    stubProbeNonHeadroom();
     await expect(manager.start()).rejects.toThrow(/does not appear to be a Headroom proxy/);
   });
 
@@ -143,13 +151,7 @@ describe("ProxyManager.start", () => {
   it("connects to remote proxy without auto-start", async () => {
     const manager = new ProxyManager({ proxyUrl: "http://headroom.remote.example:8787", autoStart: true });
     const startSpy = vi.spyOn(manager as any, "startHeadroomProxy").mockResolvedValue(undefined);
-
-    // Remote probe succeeds
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({ ok: true, status: 200 })   // /health
-      .mockResolvedValueOnce({ ok: true, status: 200 });   // /v1/retrieve/stats
-    vi.stubGlobal("fetch", fetchMock);
+    stubProbeSuccess();
 
     const url = await manager.start();
     expect(url).toBe("http://headroom.remote.example:8787");
@@ -157,14 +159,8 @@ describe("ProxyManager.start", () => {
   });
 
   it("does not apply proxyPort default to remote URLs", async () => {
-    // Remote URL without port should use protocol default, not proxyPort
     const manager = new ProxyManager({ proxyUrl: "https://headroom.remote.example", proxyPort: 9999 });
-
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce({ ok: true, status: 200 })
-      .mockResolvedValueOnce({ ok: true, status: 200 });
-    vi.stubGlobal("fetch", fetchMock);
+    stubProbeSuccess();
 
     const url = await manager.start();
     expect(url).toBe("https://headroom.remote.example");
@@ -173,9 +169,7 @@ describe("ProxyManager.start", () => {
   it("fails fast for unreachable remote proxy without attempting auto-start", async () => {
     const manager = new ProxyManager({ proxyUrl: "https://headroom.remote.example:8787", autoStart: true });
     const startSpy = vi.spyOn(manager as any, "startHeadroomProxy").mockResolvedValue(undefined);
-
-    const fetchMock = vi.fn().mockRejectedValue(new Error("ECONNREFUSED"));
-    vi.stubGlobal("fetch", fetchMock);
+    stubProbeUnreachable();
 
     await expect(manager.start()).rejects.toThrow(/Remote Headroom proxy not reachable/);
     expect(startSpy).not.toHaveBeenCalled();
