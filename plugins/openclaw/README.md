@@ -11,6 +11,23 @@ openclaw plugins install --dangerously-force-unsafe-install headroom-ai/openclaw
 
 This plugin auto-starts `headroom proxy` when needed. OpenClaw treats process-launching plugins as unsafe by default, so `--dangerously-force-unsafe-install` is required.
 
+## Local Development Install (Detection-Friendly)
+
+If you are testing from this repo, run npm install/build from the plugin directory so local launcher detection aligns with runtime paths:
+
+```bash
+cd plugins/openclaw
+npm install
+npm run build
+openclaw plugins install --dangerously-force-unsafe-install --link .
+```
+
+Why this matters:
+- The plugin checks launchers in this order: PATH -> local npm bin -> global npm -> python.
+- "local npm bin" means `plugins/openclaw/node_modules/.bin/headroom` relative to the installed plugin root.
+- Using `--link .` from `plugins/openclaw` keeps that local path aligned for detection.
+- If you install from a `.tgz`, local npm bin may not exist in the installed extension and detection will fall back to PATH/global/python.
+
 ## Configure
 
 ```json
