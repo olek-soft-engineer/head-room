@@ -67,8 +67,7 @@ def test_wrap_openclaw_default_installs_from_npm_and_restarts(runner: CliRunner)
     install_call = next(
         c
         for c in calls
-        if c["cmd"][:4]
-        == ["openclaw", "plugins", "install", "--dangerously-force-unsafe-install"]
+        if c["cmd"][:4] == ["openclaw", "plugins", "install", "--dangerously-force-unsafe-install"]
     )
     assert install_call["cwd"] is None
 
@@ -77,7 +76,11 @@ def test_wrap_openclaw_default_installs_from_npm_and_restarts(runner: CliRunner)
     assert ["npm", "run", "build"] not in cmds
 
     # Verify config payload includes enabled + expected defaults
-    set_entry = next(c for c in calls if c["cmd"][:4] == ["openclaw", "config", "set", "plugins.entries.headroom"])
+    set_entry = next(
+        c
+        for c in calls
+        if c["cmd"][:4] == ["openclaw", "config", "set", "plugins.entries.headroom"]
+    )
     payload = json.loads(set_entry["cmd"][4])
     assert payload["enabled"] is True
     assert payload["config"]["proxyPort"] == 8787
@@ -116,7 +119,9 @@ def test_wrap_openclaw_skip_build_and_no_restart(runner: CliRunner, plugin_dir: 
     assert ["openclaw", "gateway", "restart"] not in cmds
 
 
-def test_wrap_openclaw_local_source_mode_builds_and_links(runner: CliRunner, plugin_dir: Path) -> None:
+def test_wrap_openclaw_local_source_mode_builds_and_links(
+    runner: CliRunner, plugin_dir: Path
+) -> None:
     calls: list[dict] = []
 
     def which(name: str) -> str | None:

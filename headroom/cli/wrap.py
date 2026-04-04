@@ -417,7 +417,9 @@ def _resolve_openclaw_extensions_dir(openclaw_bin: str) -> Path:
     result = _run_checked([openclaw_bin, "config", "file"], action="openclaw config file")
     config_path_str = result.stdout.strip().splitlines()[-1].strip()
     if not config_path_str:
-        raise click.ClickException("Unable to resolve OpenClaw config path from `openclaw config file`.")
+        raise click.ClickException(
+            "Unable to resolve OpenClaw config path from `openclaw config file`."
+        )
     config_path = Path(config_path_str).expanduser()
     return config_path.parent / "extensions"
 
@@ -888,9 +890,7 @@ def openclaw(
     """
     openclaw_bin = shutil.which("openclaw")
     if not openclaw_bin:
-        raise click.ClickException(
-            "'openclaw' not found in PATH. Install OpenClaw CLI first."
-        )
+        raise click.ClickException("'openclaw' not found in PATH. Install OpenClaw CLI first.")
 
     plugin_dir = plugin_path.resolve() if plugin_path else None
     local_source_mode = plugin_dir is not None
