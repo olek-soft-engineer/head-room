@@ -35,9 +35,7 @@ def _make_successful_run(calls: list[dict]) -> object:
     return run
 
 
-def test_wrap_openclaw_happy_path_installs_builds_configures_and_restarts(
-    runner: CliRunner, plugin_dir: Path
-) -> None:
+def test_wrap_openclaw_default_installs_from_npm_and_restarts(runner: CliRunner) -> None:
     calls: list[dict] = []
 
     def which(name: str) -> str | None:
@@ -48,35 +46,35 @@ def test_wrap_openclaw_happy_path_installs_builds_configures_and_restarts(
         return mapping.get(name)
 
     with patch("headroom.cli.wrap.shutil.which", side_effect=which):
-        with patch("headroom.cli.wrap._default_openclaw_plugin_dir", return_value=plugin_dir):
-            with patch("headroom.cli.wrap.subprocess.run", side_effect=_make_successful_run(calls)):
-                result = runner.invoke(main, ["wrap", "openclaw"])
+        with patch("headroom.cli.wrap.subprocess.run", side_effect=_make_successful_run(calls)):
+            result = runner.invoke(main, ["wrap", "openclaw"])
 
     assert result.exit_code == 0, result.output
 
     cmds = [c["cmd"] for c in calls]
-    assert ["npm", "install"] in cmds
-    assert ["npm", "run", "build"] in cmds
     assert [
         "openclaw",
         "plugins",
         "install",
         "--dangerously-force-unsafe-install",
-        "--link",
-        ".",
+        "headroom-openclaw",
     ] in cmds
     assert ["openclaw", "config", "validate"] in cmds
     assert ["openclaw", "gateway", "restart"] in cmds
     assert ["openclaw", "plugins", "inspect", "headroom"] in cmds
 
-    # Verify plugin install uses plugin cwd when linking
+    # Verify plugin install in npm mode does not set cwd
     install_call = next(
         c
         for c in calls
         if c["cmd"][:4]
         == ["openclaw", "plugins", "install", "--dangerously-force-unsafe-install"]
     )
-    assert install_call["cwd"] == str(plugin_dir)
+    assert install_call["cwd"] is None
+
+    # No local build in npm mode
+    assert ["npm", "install"] not in cmds
+    assert ["npm", "run", "build"] not in cmds
 
     # Verify config payload includes enabled + expected defaults
     set_entry = next(c for c in calls if c["cmd"][:4] == ["openclaw", "config", "set", "plugins.entries.headroom"])
@@ -116,6 +114,37 @@ def test_wrap_openclaw_skip_build_and_no_restart(runner: CliRunner, plugin_dir: 
     assert ["npm", "install"] not in cmds
     assert ["npm", "run", "build"] not in cmds
     assert ["openclaw", "gateway", "restart"] not in cmds
+
+
+def test_wrap_openclaw_local_source_mode_builds_and_links(runner: CliRunner, plugin_dir: Path) -> None:
+    calls: list[dict] = []
+
+    def which(name: str) -> str | None:
+        mapping = {
+            "openclaw": "openclaw",
+            "npm": "npm",
+        }
+        return mapping.get(name)
+
+    with patch("headroom.cli.wrap.shutil.which", side_effect=which):
+        with patch("headroom.cli.wrap.subprocess.run", side_effect=_make_successful_run(calls)):
+            result = runner.invoke(
+                main,
+                ["wrap", "openclaw", "--plugin-path", str(plugin_dir)],
+            )
+
+    assert result.exit_code == 0, result.output
+    cmds = [c["cmd"] for c in calls]
+    assert ["npm", "install"] in cmds
+    assert ["npm", "run", "build"] in cmds
+    assert [
+        "openclaw",
+        "plugins",
+        "install",
+        "--dangerously-force-unsafe-install",
+        "--link",
+        ".",
+    ] in cmds
 
 
 def test_wrap_openclaw_fails_when_openclaw_missing(runner: CliRunner, plugin_dir: Path) -> None:
@@ -171,3 +200,35 @@ def test_wrap_openclaw_uses_extension_fallback_on_linked_install_bug(
 
     assert result.exit_code == 0, result.output
     copy_fallback.assert_called_once()
+
+
+def test_wrap_openclaw_continues_when_plugin_already_exists(
+    runner: CliRunner,
+) -> None:
+    calls: list[dict] = []
+
+    def which(name: str) -> str | None:
+        mapping = {
+            "openclaw": "openclaw",
+            "npm": "npm",
+        }
+        return mapping.get(name)
+
+    def run(cmd, **kwargs):  # noqa: ANN001
+        calls.append({"cmd": list(cmd), **kwargs})
+        if cmd[:3] == ["openclaw", "plugins", "install"]:
+            return MagicMock(
+                returncode=1,
+                stdout="plugin already exists: C:\\Users\\test\\.openclaw\\extensions\\headroom",
+                stderr="",
+            )
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("headroom.cli.wrap.shutil.which", side_effect=which):
+        with patch("headroom.cli.wrap.subprocess.run", side_effect=run):
+            result = runner.invoke(main, ["wrap", "openclaw", "--no-restart"])
+
+    assert result.exit_code == 0, result.output
+    cmds = [c["cmd"] for c in calls]
+    assert ["openclaw", "config", "validate"] in cmds
+    assert ["openclaw", "plugins", "inspect", "headroom"] in cmds

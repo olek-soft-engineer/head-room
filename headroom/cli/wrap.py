@@ -412,11 +412,6 @@ def _run_checked(
         raise click.ClickException(f"{action} failed: {details}") from e
 
 
-def _default_openclaw_plugin_dir() -> Path:
-    """Return repo-relative plugins/openclaw path for editable/dev installs."""
-    return Path(__file__).resolve().parents[2] / "plugins" / "openclaw"
-
-
 def _resolve_openclaw_extensions_dir(openclaw_bin: str) -> Path:
     """Resolve OpenClaw extension root from active config file path."""
     result = _run_checked([openclaw_bin, "config", "file"], action="openclaw config file")
@@ -828,12 +823,18 @@ def cursor(port: int, no_rtk: bool, no_proxy: bool, learn: bool, verbose: bool) 
     "--plugin-path",
     type=click.Path(path_type=Path, file_okay=False, dir_okay=True),
     default=None,
-    help="Path to the OpenClaw plugin source directory (default: repo plugins/openclaw)",
+    help="Path to local OpenClaw plugin source directory (advanced/dev override)",
+)
+@click.option(
+    "--plugin-spec",
+    default="headroom-openclaw",
+    show_default=True,
+    help="NPM plugin spec for OpenClaw install (used when --plugin-path is omitted)",
 )
 @click.option(
     "--skip-build",
     is_flag=True,
-    help="Skip npm install/build before plugin install",
+    help="Skip npm install/build in local source mode (--plugin-path)",
 )
 @click.option(
     "--copy",
@@ -860,6 +861,7 @@ def cursor(port: int, no_rtk: bool, no_proxy: bool, learn: bool, verbose: bool) 
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 def openclaw(
     plugin_path: Path | None,
+    plugin_spec: str,
     skip_build: bool,
     copy: bool,
     proxy_port: int,
@@ -873,8 +875,8 @@ def openclaw(
 
     \b
     What this command does:
-      1. Builds plugin source (npm install + npm run build)
-      2. Installs plugin with unsafe-install flag required by OpenClaw
+      1. Installs OpenClaw plugin from npm (or local --plugin-path)
+      2. Builds plugin source if --plugin-path is used
       3. Writes minimal plugin config and sets contextEngine slot
       4. Validates config
       5. Restarts OpenClaw gateway (unless --no-restart)
@@ -890,17 +892,17 @@ def openclaw(
             "'openclaw' not found in PATH. Install OpenClaw CLI first."
         )
 
-    plugin_dir = (plugin_path or _default_openclaw_plugin_dir()).resolve()
-    if not plugin_dir.exists():
-        raise click.ClickException(
-            f"Plugin path not found: {plugin_dir}. Pass --plugin-path explicitly."
-        )
-    if not (plugin_dir / "package.json").exists():
-        raise click.ClickException(f"Invalid plugin path (missing package.json): {plugin_dir}")
-    if not (plugin_dir / "openclaw.plugin.json").exists():
-        raise click.ClickException(
-            f"Invalid plugin path (missing openclaw.plugin.json): {plugin_dir}"
-        )
+    plugin_dir = plugin_path.resolve() if plugin_path else None
+    local_source_mode = plugin_dir is not None
+    if plugin_dir:
+        if not plugin_dir.exists():
+            raise click.ClickException(f"Plugin path not found: {plugin_dir}.")
+        if not (plugin_dir / "package.json").exists():
+            raise click.ClickException(f"Invalid plugin path (missing package.json): {plugin_dir}")
+        if not (plugin_dir / "openclaw.plugin.json").exists():
+            raise click.ClickException(
+                f"Invalid plugin path (missing openclaw.plugin.json): {plugin_dir}"
+            )
 
     npm_bin = shutil.which("npm")
     if not skip_build and not npm_bin:
@@ -913,12 +915,17 @@ def openclaw(
     click.echo("  ║           HEADROOM WRAP: OPENCLAW             ║")
     click.echo("  ╚═══════════════════════════════════════════════╝")
     click.echo()
-    click.echo(f"  Plugin source: {plugin_dir}")
+    if local_source_mode:
+        click.echo(f"  Plugin source: local ({plugin_dir})")
+    else:
+        click.echo(f"  Plugin source: npm ({plugin_spec})")
 
-    if not skip_build:
+    if local_source_mode and not skip_build:
         click.echo("  Building OpenClaw plugin (npm install + npm run build)...")
         _run_checked([npm_bin or "npm", "install"], cwd=plugin_dir, action="npm install")
         _run_checked([npm_bin or "npm", "run", "build"], cwd=plugin_dir, action="npm run build")
+    elif not local_source_mode and skip_build:
+        click.echo("  Skipping build: npm install mode does not build local source.")
 
     install_cmd = [
         openclaw_bin,
@@ -926,12 +933,16 @@ def openclaw(
         "install",
         "--dangerously-force-unsafe-install",
     ]
-    if copy:
-        install_cmd.append(str(plugin_dir))
-        install_cwd = None
+    if local_source_mode:
+        if copy:
+            install_cmd.append(str(plugin_dir))
+            install_cwd = None
+        else:
+            install_cmd.extend(["--link", "."])
+            install_cwd = plugin_dir
     else:
-        install_cmd.extend(["--link", "."])
-        install_cwd = plugin_dir
+        install_cmd.append(plugin_spec)
+        install_cwd = None
 
     click.echo("  Installing OpenClaw plugin with required unsafe-install flag...")
     install_result = subprocess.run(
@@ -946,11 +957,14 @@ def openclaw(
         combined_error = "\n".join(
             x for x in [install_result.stderr.strip(), install_result.stdout.strip()] if x
         )
+        plugin_already_exists = "plugin already exists" in combined_error.lower()
         linked_install_bug = (
             "also not a valid hook pack" in combined_error.lower()
             and "--dangerously-force-unsafe-install" in " ".join(install_cmd)
         )
-        if linked_install_bug:
+        if plugin_already_exists:
+            click.echo("  Plugin already installed; continuing with configuration/update steps.")
+        elif linked_install_bug and local_source_mode and plugin_dir is not None:
             click.echo(
                 "  OpenClaw linked-path install bug detected; applying extension-path fallback..."
             )
