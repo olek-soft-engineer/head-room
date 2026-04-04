@@ -53,6 +53,11 @@ headroom proxy --mode token
 HEADROOM_MODE=cache headroom proxy
 ```
 
+When to pick each:
+
+- `token`: best for maximizing immediate compression savings.
+- `cache`: best for long conversations where preserving prior-turn bytes improves prefix-cache reuse.
+
 Legacy values (`token_headroom`, `cost_savings`) are still accepted as aliases.
 
 ### Context Management Options

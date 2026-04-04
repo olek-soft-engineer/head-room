@@ -207,3 +207,10 @@ python -c "from headroom import compress; print(compress([{'role':'user','conten
 # Run local proxy mode benchmark (no API calls)
 python benchmarks/proxy_mode_benchmark.py --turns 12 --show-real-harness
 ```
+
+This benchmark compares `token` vs `cache` proxy modes on the same synthetic conversation:
+
+- `token` should show higher compression.
+- `cache` should preserve prior-turn stability and can win in long sessions with strong prefix-cache reuse.
+
+`--show-real-harness` prints optional steps for running the same comparison with Claude Code, but does not call APIs by default.
