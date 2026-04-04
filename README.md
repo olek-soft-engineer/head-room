@@ -125,6 +125,7 @@ headroom wrap claude       # Starts proxy + launches Claude Code
 headroom wrap codex        # Starts proxy + launches OpenAI Codex CLI
 headroom wrap aider        # Starts proxy + launches Aider
 headroom wrap cursor       # Starts proxy + prints Cursor config
+headroom wrap openclaw     # Installs + configures OpenClaw plugin
 ```
 
 Headroom starts a proxy, points your tool at it, and compresses everything automatically.
@@ -164,7 +165,7 @@ Gives your AI tool three MCP tools: `headroom_compress`, `headroom_retrieve`, `h
 | **Any Python proxy** | ASGI Middleware | `app.add_middleware(CompressionMiddleware)` |
 | **Agno agents** | Wrap model | `HeadroomAgnoModel(your_model)` |
 | **LangChain** | Wrap model | `HeadroomChatModel(your_llm)` |
-| **OpenClaw** | ContextEngine plugin | `openclaw plugins install headroom-openclaw` |
+| **OpenClaw** | One-command wrap | `headroom wrap openclaw` |
 | **Claude Code** | Wrap | `headroom wrap claude` |
 | **Codex / Aider** | Wrap | `headroom wrap codex` or `headroom wrap aider` |
 
@@ -363,6 +364,35 @@ Context compression is a new space. Here's how the approaches differ:
 | MCP (Claude Code, Cursor, etc.) | **Stable** | [MCP Guide](docs/mcp.md) |
 | Strands | **Stable** | [Strands Guide](docs/strands.md) |
 | LangChain | **Stable** | [LangChain Guide](docs/langchain.md) |
+| **OpenClaw** | **Stable** | [OpenClaw plugin](#openclaw-plugin) |
+
+---
+
+## OpenClaw Plugin
+
+The [`@headroom-ai/openclaw`](plugins/openclaw) plugin integrates Headroom as a ContextEngine for [OpenClaw](https://github.com/openclaw/openclaw). It compresses tool outputs, code, logs, and structured data inline — 70-90% token savings with zero LLM calls. The plugin can connect to a local or remote Headroom proxy and will auto-start one locally if needed.
+
+### Install
+
+```bash
+pip install "headroom-ai[proxy]"
+openclaw plugins install --dangerously-force-unsafe-install headroom-ai/openclaw
+```
+
+> **Why `--dangerously-force-unsafe-install`?** The plugin auto-starts `headroom proxy` as a subprocess when no running proxy is detected. OpenClaw blocks process-launching plugins by default, so this flag is required to permit that behavior.
+
+Once installed, assign Headroom as the context engine in your OpenClaw config:
+
+```json
+{
+  "plugins": {
+    "entries": { "headroom": { "enabled": true } },
+    "slots": { "contextEngine": "headroom" }
+  }
+}
+```
+
+The plugin auto-detects and auto-starts the proxy — no manual proxy management needed. See the [plugin README](plugins/openclaw/README.md) for full configuration options, local development setup, and launcher details.
 
 ---
 

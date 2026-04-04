@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "headroom-ai"
-version = "0.5.17"
+version = "0.5.18"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -249,6 +249,12 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = [
     "headroom.proxy.server",
+    "headroom.proxy.cost",
+    "headroom.proxy.prometheus_metrics",
+    "headroom.proxy.semantic_cache",
+    "headroom.proxy.rate_limiter",
+    "headroom.proxy.request_logger",
+    "headroom.proxy.helpers",
     "headroom.integrations.langchain",
     "headroom.integrations.mcp",
     "headroom.ccr.mcp_server",
@@ -265,6 +271,12 @@ module = [
 ]
 disallow_untyped_defs = false
 warn_return_any = false
+
+# Handler mixins use self.* from HeadroomProxy via duck typing — mypy can't resolve these
+[[tool.mypy.overrides]]
+module = ["headroom.proxy.handlers.*"]
+disallow_untyped_defs = false
+ignore_errors = true
 
 # Ignore third-party stubs with syntax errors
 [[tool.mypy.overrides]]

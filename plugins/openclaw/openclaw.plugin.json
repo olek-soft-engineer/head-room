@@ -3,15 +3,15 @@
   "uiHints": {
     "proxyUrl": {
       "label": "Proxy URL",
-      "help": "URL of the Headroom proxy (auto-detected or auto-started if not set)"
+      "help": "Optional. URL of a Headroom proxy (example: http://127.0.0.1:8787 or https://headroom.example.com). If omitted, plugin auto-detects on localhost. Auto-start only works for local addresses."
+    },
+    "proxyPort": {
+      "label": "Proxy Port",
+      "help": "Default port used for auto-detect/auto-start when proxyUrl is not set (default: 8787)."
     },
     "pythonPath": {
       "label": "Python Path",
-      "help": "Path to Python binary (auto-detected if not set)"
-    },
-    "autoStart": {
-      "label": "Auto-Start Proxy",
-      "help": "Automatically start the Headroom proxy if not already running"
+      "help": "Optional explicit python executable for python fallback launcher (for example: python, python3, py, or full path)."
     }
   },
   "configSchema": {
@@ -22,7 +22,14 @@
         "type": "boolean"
       },
       "proxyUrl": {
-        "type": "string"
+        "type": "string",
+        "pattern": "^https?:\\/\\/.+(:\\d+)?\\/?$"
+      },
+      "proxyPort": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 65535,
+        "default": 8787
       },
       "pythonPath": {
         "type": "string"
@@ -31,11 +38,20 @@
         "type": "boolean",
         "default": true
       },
-      "proxyPort": {
+      "startupTimeoutMs": {
         "type": "integer",
-        "minimum": 0,
-        "maximum": 65535
+        "minimum": 1000,
+        "maximum": 120000,
+        "default": 20000
       }
+    }
+  },
+  "capabilities": {
+    "network": {
+      "allow": [
+        "http://*:*",
+        "https://*:*"
+      ]
     }
   }
 }

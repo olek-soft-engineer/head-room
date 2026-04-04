@@ -1,27 +1,23 @@
 /**
- * Manages the Headroom proxy process lifecycle.
+ * Manages connectivity to a Headroom proxy (local or remote).
  *
- * - Detects if a proxy is already running (e.g., user has `headroom proxy` for Claude Code)
- * - If not, spawns one as a child process with auto-assigned port
- * - Health checks, restart on crash, graceful shutdown
+ * Security model:
+ * - Local proxies (127.0.0.1 / localhost) can be auto-started via subprocess
+ * - Remote proxies are connect-only: probe and use, never launch
+ * - No environment variable access
  */
-
-import { spawn, type ChildProcess } from "node:child_process";
-import { createWriteStream } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
-
-const DEFAULT_PORT = 8787;
-const HEALTH_CHECK_INTERVAL_MS = 30_000;
-const STARTUP_TIMEOUT_MS = 15_000;
-const RESTART_DELAY_MS = 2_000;
-const MAX_RESTART_ATTEMPTS = 3;
+import { spawn } from "node:child_process";
+import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface ProxyManagerConfig {
   proxyUrl?: string;
+  proxyPort?: number;
   pythonPath?: string;
   autoStart?: boolean;
-  proxyPort?: number;
+  startupTimeoutMs?: number;
 }
 
 export interface ProxyManagerLogger {
@@ -31,22 +27,32 @@ export interface ProxyManagerLogger {
   debug(message: string): void;
 }
 
-const defaultLogger: ProxyManagerLogger = {
+/** Default logger that prefixes all messages with `[headroom]`. */
+export const defaultLogger: ProxyManagerLogger = {
   info: (m) => console.log(`[headroom] ${m}`),
   warn: (m) => console.warn(`[headroom] ${m}`),
   error: (m) => console.error(`[headroom] ${m}`),
   debug: () => {},
 };
 
+export interface ProxyProbeResult {
+  reachable: boolean;
+  isHeadroom: boolean;
+  reason?: string;
+}
+
+interface LaunchSpec {
+  label: string;
+  command: string;
+  args: string[];
+  checkCommand: string;
+  checkArgs: string[];
+}
+
 export class ProxyManager {
   private config: ProxyManagerConfig;
   private logger: ProxyManagerLogger;
-  private process: ChildProcess | null = null;
   private proxyUrl: string | null = null;
-  private weStartedIt = false;
-  private restartCount = 0;
-  private healthInterval: ReturnType<typeof setInterval> | null = null;
-  private disposed = false;
 
   constructor(config: ProxyManagerConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
@@ -54,149 +60,107 @@ export class ProxyManager {
   }
 
   /**
-   * Ensure a proxy is available. Returns the URL.
-   *
-   * 1. If proxyUrl is configured, use it
-   * 2. Check if proxy is already running on default port
-   * 3. If autoStart, spawn one
+   * Ensure a proxy is available. Returns the normalized URL origin.
    */
   async start(): Promise<string> {
-    // Option 1: Explicit URL configured
-    if (this.config.proxyUrl) {
-      const url = this.config.proxyUrl.replace(/\/+$/, "");
-      if (await this.healthCheck(url)) {
+    const port = this.getProxyPort();
+    const rawExplicitUrl =
+      typeof this.config.proxyUrl === "string" && this.config.proxyUrl.trim().length > 0
+        ? normalizeAndValidateProxyUrl(this.config.proxyUrl)
+        : null;
+    // Only apply proxyPort default to local URLs — remote URLs use their protocol default
+    const explicitUrl = rawExplicitUrl
+      ? isLocalProxyUrl(rawExplicitUrl) ? withDefaultPort(rawExplicitUrl, port) : rawExplicitUrl
+      : null;
+    const defaultCandidates = this.getDefaultProxyCandidates(port);
+    const candidateUrls = explicitUrl ? [explicitUrl] : [...defaultCandidates];
+    const probeByUrl = new Map<string, ProxyProbeResult>();
+
+    for (const url of candidateUrls) {
+      const probe = await probeHeadroomProxy(url);
+      probeByUrl.set(url, probe);
+      if (probe.reachable && probe.isHeadroom) {
         this.proxyUrl = url;
-        this.logger.info(`Connected to proxy at ${url}`);
+        this.logger.info(`Headroom proxy already running at ${url}`);
         return url;
       }
-      throw new Error(`Headroom proxy not reachable at ${url}`);
     }
 
-    // Option 2: Check default port
-    const defaultUrl = `http://127.0.0.1:${DEFAULT_PORT}`;
-    if (await this.healthCheck(defaultUrl)) {
-      this.proxyUrl = defaultUrl;
-      this.logger.info(`Found running proxy at ${defaultUrl}`);
-      this.startHealthMonitor();
-      return defaultUrl;
+    if (explicitUrl) {
+      const explicitProbe = probeByUrl.get(explicitUrl);
+      if (explicitProbe?.reachable && !explicitProbe.isHeadroom) {
+        throw new Error(
+          `Service reachable at ${explicitUrl}, but it does not appear to be a Headroom proxy (${explicitProbe.reason ?? "unknown service"}).`,
+        );
+      }
     }
 
-    // Option 3: Auto-start
+    // Remote URLs are connect-only — never auto-start a subprocess for them
+    if (explicitUrl && !isLocalProxyUrl(explicitUrl)) {
+      throw new Error(
+        `Remote Headroom proxy not reachable at ${explicitUrl}. Ensure the proxy is running at that address.`,
+      );
+    }
+
+    // Auto-start is only available for local proxies
     if (this.config.autoStart !== false) {
-      return this.spawnProxy();
+      const startupUrl = explicitUrl ?? defaultCandidates[0];
+      const startupProbe = probeByUrl.get(startupUrl);
+      if (startupProbe?.reachable && !startupProbe.isHeadroom) {
+        throw new Error(
+          `Cannot auto-start Headroom at ${startupUrl}: port is in use by a non-Headroom service (${startupProbe.reason ?? "unknown service"}).`,
+        );
+      }
+
+      this.logger.info(
+        `No Headroom proxy detected${explicitUrl ? ` at ${startupUrl}` : " on default local endpoints"}; attempting to auto-start...`,
+      );
+      await this.startHeadroomProxy(startupUrl, port);
+
+      const startedProbe = await waitForHeadroomProxy(
+        startupUrl,
+        this.config.startupTimeoutMs ?? 20_000,
+      );
+      if (startedProbe.reachable && startedProbe.isHeadroom) {
+        this.proxyUrl = startupUrl;
+        this.logger.info(`Headroom proxy started and reachable at ${startupUrl}`);
+        return startupUrl;
+      }
+      throw new Error(
+        `Attempted to start Headroom proxy, but it was not reachable at ${startupUrl} (${startedProbe.reason ?? "unknown"}).`,
+      );
+    }
+
+    if (explicitUrl) {
+      throw new Error(
+        `Headroom proxy not reachable at ${explicitUrl}. Ensure the proxy is running first.`,
+      );
     }
 
     throw new Error(
-      "Headroom proxy not running. Start with: headroom proxy --port 8787\n" +
-        "Or install: pip install 'headroom-ai[proxy]'",
+      `Headroom proxy not detected on default endpoints (${defaultCandidates.join(", ")}). ` +
+        "Set proxyUrl explicitly or enable autoStart.",
     );
   }
 
-  /**
-   * Spawn the headroom proxy as a child process.
-   */
-  private async spawnProxy(): Promise<string> {
-    const pythonPath = await this.findPython();
-    if (!pythonPath) {
-      throw new Error(
-        "Python not found. Install Python 3.10+ and run: pip install 'headroom-ai[proxy]'",
-      );
+  private getProxyPort(): number {
+    const rawPort = this.config.proxyPort;
+    if (!Number.isInteger(rawPort) || rawPort === undefined) return 8787;
+    if (rawPort < 1 || rawPort > 65535) {
+      throw new Error("proxyPort must be an integer between 1 and 65535");
     }
+    return rawPort;
+  }
 
-    // Check if headroom-ai is installed
-    const installed = await this.checkHeadroomInstalled(pythonPath);
-    if (!installed) {
-      throw new Error(
-        "headroom-ai Python package not found.\n" +
-          "Install with: pip install 'headroom-ai[proxy]'",
-      );
-    }
-
-    const port = this.config.proxyPort ?? 0; // 0 = OS picks a free port
-    const actualPort = port === 0 ? await this.findFreePort() : port;
-    const url = `http://127.0.0.1:${actualPort}`;
-
-    this.logger.info(`Starting proxy on port ${actualPort}...`);
-
-    // Log file
-    const logDir = join(homedir(), ".headroom", "logs");
-    const logPath = join(logDir, "openclaw-proxy.log");
-
-    let logStream: ReturnType<typeof createWriteStream> | null = null;
-    try {
-      const { mkdirSync } = await import("node:fs");
-      mkdirSync(logDir, { recursive: true });
-      logStream = createWriteStream(logPath, { flags: "a" });
-    } catch {
-      // Can't create log file — use /dev/null
-    }
-
-    const proc = spawn(
-      pythonPath,
-      ["-m", "headroom.cli", "proxy", "--port", String(actualPort)],
-      {
-        env: { ...process.env, PYTHONIOENCODING: "utf-8" },
-        stdio: ["ignore", logStream ? "pipe" : "ignore", logStream ? "pipe" : "ignore"],
-        detached: false,
-      },
-    );
-
-    if (logStream) {
-      proc.stdout?.pipe(logStream);
-      proc.stderr?.pipe(logStream);
-    }
-
-    proc.on("exit", (code) => {
-      if (!this.disposed && this.weStartedIt) {
-        this.logger.warn(`Proxy exited with code ${code}`);
-        this.handleCrash();
-      }
-    });
-
-    this.process = proc;
-    this.weStartedIt = true;
-
-    // Wait for healthy
-    const healthy = await this.waitForHealthy(url, STARTUP_TIMEOUT_MS);
-    if (!healthy) {
-      proc.kill();
-      this.process = null;
-      throw new Error(
-        `Proxy failed to start within ${STARTUP_TIMEOUT_MS / 1000}s. Check ${logPath}`,
-      );
-    }
-
-    this.proxyUrl = url;
-    this.logger.info(`Proxy started on port ${actualPort} (PID: ${proc.pid})`);
-    this.startHealthMonitor();
-    return url;
+  private getDefaultProxyCandidates(port: number): string[] {
+    return [`http://127.0.0.1:${port}`, `http://localhost:${port}`];
   }
 
   /**
-   * Stop the proxy if we started it.
+   * Stop manager state. Spawned proxy processes are detached and externally managed.
    */
   async stop(): Promise<void> {
-    this.disposed = true;
-    if (this.healthInterval) {
-      clearInterval(this.healthInterval);
-      this.healthInterval = null;
-    }
-    if (this.process && this.weStartedIt) {
-      this.logger.info("Stopping proxy...");
-      this.process.kill("SIGTERM");
-      // Give it 3s to shutdown gracefully
-      await new Promise<void>((resolve) => {
-        const timeout = setTimeout(() => {
-          this.process?.kill("SIGKILL");
-          resolve();
-        }, 3000);
-        this.process?.on("exit", () => {
-          clearTimeout(timeout);
-          resolve();
-        });
-      });
-      this.process = null;
-    }
+    this.proxyUrl = null;
   }
 
   getUrl(): string | null {
@@ -205,93 +169,234 @@ export class ProxyManager {
 
   // --- Internal ---
 
-  private async healthCheck(url: string): Promise<boolean> {
-    try {
-      const resp = await fetch(`${url}/health`, {
-        signal: AbortSignal.timeout(3000),
-      });
-      return resp.ok;
-    } catch {
-      return false;
-    }
-  }
+  private async startHeadroomProxy(proxyUrl: string, defaultPort: number): Promise<void> {
+    const parsed = new URL(proxyUrl);
+    const host = parsed.hostname;
+    const port = parsed.port || String(defaultPort);
+    const specs = this.buildLaunchSpecs(host, port);
+    const errors: string[] = [];
 
-  private async waitForHealthy(url: string, timeoutMs: number): Promise<boolean> {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      if (await this.healthCheck(url)) return true;
-      await new Promise((r) => setTimeout(r, 500));
-    }
-    return false;
-  }
-
-  private startHealthMonitor(): void {
-    if (this.healthInterval) return;
-    this.healthInterval = setInterval(async () => {
-      if (this.proxyUrl && !(await this.healthCheck(this.proxyUrl))) {
-        this.logger.warn("Proxy health check failed");
-        if (this.weStartedIt) this.handleCrash();
-      }
-    }, HEALTH_CHECK_INTERVAL_MS);
-  }
-
-  private async handleCrash(): Promise<void> {
-    if (this.disposed) return;
-    if (this.restartCount >= MAX_RESTART_ATTEMPTS) {
-      this.logger.error(`Proxy crashed ${MAX_RESTART_ATTEMPTS} times. Giving up.`);
-      return;
-    }
-    this.restartCount++;
-    this.logger.info(`Restarting proxy (attempt ${this.restartCount}/${MAX_RESTART_ATTEMPTS})...`);
-    await new Promise((r) => setTimeout(r, RESTART_DELAY_MS));
-    try {
-      await this.spawnProxy();
-    } catch (e) {
-      this.logger.error(`Restart failed: ${e}`);
-    }
-  }
-
-  private async findPython(): Promise<string | null> {
-    if (this.config.pythonPath) return this.config.pythonPath;
-
-    for (const cmd of ["python3", "python"]) {
-      try {
-        const { execSync } = await import("node:child_process");
-        const version = execSync(`${cmd} --version 2>&1`, { encoding: "utf-8" }).trim();
-        if (version.includes("Python 3.")) return cmd;
-      } catch {
+    for (const spec of specs) {
+      if (!this.canExecute(spec.checkCommand, spec.checkArgs)) {
+        this.logger.debug(`Launcher unavailable: ${spec.label}`);
         continue;
       }
+
+      try {
+        const child = spawn(spec.command, spec.args, {
+          detached: true,
+          stdio: "ignore",
+        });
+        child.unref();
+        this.logger.info(`Auto-start launcher selected: ${spec.label}`);
+        return;
+      } catch (error) {
+        errors.push(`${spec.label}: ${String(error)}`);
+      }
     }
-    return null;
+
+    throw new Error(
+      "No usable Headroom launcher found. Tried PATH, local npm, global npm, and Python. " +
+        "Install headroom-ai (npm or pip) and ensure one launcher is available.\n" +
+        (errors.length > 0 ? `Launch errors: ${errors.join("; ")}` : ""),
+    );
   }
 
-  private async checkHeadroomInstalled(pythonPath: string): Promise<boolean> {
-    try {
-      const { execSync } = await import("node:child_process");
-      execSync(`${pythonPath} -c "import headroom"`, {
-        encoding: "utf-8",
-        stdio: "pipe",
+  private buildLaunchSpecs(host: string, port: string): LaunchSpec[] {
+    const commonArgs = ["proxy", "--host", host, "--port", port];
+    const specs: LaunchSpec[] = [];
+
+    // 1) PATH
+    specs.push({
+      label: "PATH: headroom",
+      command: "headroom",
+      args: commonArgs,
+      checkCommand: "headroom",
+      checkArgs: ["--version"],
+    });
+
+    // 2) Local npm install (inside plugin install path)
+    const moduleDir = dirname(fileURLToPath(import.meta.url)); // .../dist
+    const packageRoot = dirname(moduleDir);
+    const localBinDir = join(packageRoot, "node_modules", ".bin");
+    const localBins = process.platform === "win32"
+      ? [join(localBinDir, "headroom.cmd"), join(localBinDir, "headroom")]
+      : [join(localBinDir, "headroom")];
+    for (const localBin of localBins) {
+      if (!existsSync(localBin)) continue;
+      specs.push({
+        label: `Local npm: ${localBin}`,
+        command: localBin,
+        args: commonArgs,
+        checkCommand: localBin,
+        checkArgs: ["--version"],
       });
-      return true;
+    }
+
+    // 3) Global npm install
+    const npmPrefix = this.getNpmGlobalPrefix();
+    if (npmPrefix) {
+      const globalBins = process.platform === "win32"
+        ? [join(npmPrefix, "headroom.cmd"), join(npmPrefix, "headroom")]
+        : [join(npmPrefix, "bin", "headroom"), join(npmPrefix, "headroom")];
+
+      for (const globalBin of globalBins) {
+        if (!existsSync(globalBin)) continue;
+        specs.push({
+          label: `Global npm: ${globalBin}`,
+          command: globalBin,
+          args: commonArgs,
+          checkCommand: globalBin,
+          checkArgs: ["--version"],
+        });
+      }
+    }
+
+    // 4) Python module fallback
+    const pythonCommands = this.getPythonCommands();
+    for (const pyCmd of pythonCommands) {
+      specs.push({
+        label: `Python: ${pyCmd} -m headroom.cli`,
+        command: pyCmd,
+        args: ["-m", "headroom.cli", ...commonArgs],
+        checkCommand: pyCmd,
+        checkArgs: ["-c", "import headroom"],
+      });
+    }
+
+    return specs;
+  }
+
+  private getPythonCommands(): string[] {
+    const commands: string[] = [];
+    const configured = typeof this.config.pythonPath === "string"
+      ? this.config.pythonPath.trim()
+      : "";
+    if (configured.length > 0) {
+      commands.push(configured);
+    }
+    for (const fallback of ["python", "python3", "py"]) {
+      if (!commands.includes(fallback)) commands.push(fallback);
+    }
+    return commands;
+  }
+
+  private canExecute(command: string, args: string[]): boolean {
+    try {
+      const result = spawnSync(command, args, {
+        stdio: "ignore",
+        timeout: 5000,
+      });
+      if (result.error) return false;
+      return result.status === 0;
     } catch {
       return false;
     }
   }
 
-  private async findFreePort(): Promise<number> {
-    const { createServer } = await import("node:net");
-    return new Promise((resolve, reject) => {
-      const server = createServer();
-      server.listen(0, () => {
-        const addr = server.address();
-        if (addr && typeof addr === "object") {
-          const port = addr.port;
-          server.close(() => resolve(port));
-        } else {
-          reject(new Error("Could not find free port"));
-        }
+  private getNpmGlobalPrefix(): string | null {
+    try {
+      const result = spawnSync("npm", ["prefix", "-g"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 5000,
       });
-    });
+      if (result.error || result.status !== 0) return null;
+      const prefix = (result.stdout ?? "").trim();
+      return prefix.length > 0 ? prefix : null;
+    } catch {
+      return null;
+    }
   }
+}
+
+/** Parse a URL, returning the parsed object or throwing a descriptive error. */
+function parseProxyUrl(proxyUrl: string): URL {
+  try {
+    return new URL(proxyUrl);
+  } catch {
+    throw new Error(`Invalid proxyUrl: "${proxyUrl}"`);
+  }
+}
+
+export function normalizeAndValidateProxyUrl(proxyUrl: string): string {
+  const parsed = parseProxyUrl(proxyUrl);
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("proxyUrl must use http:// or https://");
+  }
+
+  if (parsed.pathname !== "/" || parsed.search || parsed.hash) {
+    throw new Error("proxyUrl must not include a path, query, or hash");
+  }
+
+  return parsed.origin;
+}
+
+/** Returns true if the URL points to a local address (localhost or 127.0.0.1). */
+export function isLocalProxyUrl(proxyUrl: string): boolean {
+  try {
+    const parsed = new URL(proxyUrl);
+    return parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
+  } catch {
+    return false;
+  }
+}
+
+function withDefaultPort(proxyUrl: string, defaultPort: number): string {
+  const parsed = parseProxyUrl(proxyUrl);
+  if (!parsed.port) {
+    parsed.port = String(defaultPort);
+  }
+  return parsed.origin;
+}
+
+/**
+ * Probe a configured URL and verify whether it is a running Headroom proxy.
+ */
+export async function probeHeadroomProxy(proxyUrl: string): Promise<ProxyProbeResult> {
+  const origin = normalizeAndValidateProxyUrl(proxyUrl);
+
+  try {
+    const health = await fetch(`${origin}/health`, {
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (!health.ok) {
+      return { reachable: false, isHeadroom: false, reason: `health HTTP ${health.status}` };
+    }
+  } catch {
+    return { reachable: false, isHeadroom: false, reason: "health check failed" };
+  }
+
+  try {
+    const retrieveStats = await fetch(`${origin}/v1/retrieve/stats`, {
+      signal: AbortSignal.timeout(3_000),
+    });
+    if (retrieveStats.ok) {
+      return { reachable: true, isHeadroom: true };
+    }
+    return {
+      reachable: true,
+      isHeadroom: false,
+      reason: `retrieve stats HTTP ${retrieveStats.status}`,
+    };
+  } catch {
+    return {
+      reachable: true,
+      isHeadroom: false,
+      reason: "retrieve stats endpoint unavailable",
+    };
+  }
+}
+
+async function waitForHeadroomProxy(proxyUrl: string, timeoutMs: number): Promise<ProxyProbeResult> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const result = await probeHeadroomProxy(proxyUrl);
+    if (result.reachable && result.isHeadroom) {
+      return result;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return probeHeadroomProxy(proxyUrl);
 }

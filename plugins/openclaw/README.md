@@ -4,16 +4,51 @@ Context compression plugin for [OpenClaw](https://github.com/openclaw/openclaw).
 
 ## Install
 
+Recommended one-command setup:
+
+```bash
+headroom wrap openclaw
+```
+
+Manual install:
+
 ```bash
 pip install "headroom-ai[proxy]"
-openclaw plugins install @headroom-ai/openclaw
+openclaw plugins install --dangerously-force-unsafe-install headroom-ai/openclaw
 ```
+
+This plugin can auto-start a local `headroom proxy` when needed. OpenClaw treats process-launching plugins as unsafe by default, so `--dangerously-force-unsafe-install` is required even if you plan to use a remote proxy (the capability is declared at install time).
+
+## Local Development Install (Detection-Friendly)
+
+If you are testing from this repo, run npm install/build from the plugin directory so local launcher detection aligns with runtime paths:
+
+```bash
+cd plugins/openclaw
+npm install
+npm run build
+openclaw plugins install --dangerously-force-unsafe-install --link .
+```
+
+Why this matters:
+- The plugin checks launchers in this order: PATH -> local npm bin -> global npm -> python.
+- "local npm bin" means `plugins/openclaw/node_modules/.bin/headroom` relative to the installed plugin root.
+- Using `--link .` from `plugins/openclaw` keeps that local path aligned for detection.
+- If you install from a `.tgz`, local npm bin may not exist in the installed extension and detection will fall back to PATH/global/python.
 
 ## Configure
 
 ```json
 {
   "plugins": {
+    "entries": {
+      "headroom": {
+        "enabled": true,
+        "config": {
+          "proxyUrl": "http://127.0.0.1:8787"
+        }
+      }
+    },
     "slots": {
       "contextEngine": "headroom"
     }
@@ -21,7 +56,53 @@ openclaw plugins install @headroom-ai/openclaw
 }
 ```
 
-That's it. The plugin auto-starts the Headroom proxy if it's not already running.
+`proxyUrl` is optional. If omitted, the plugin auto-detects on localhost:
+- `http://127.0.0.1:<proxyPort>`
+- `http://localhost:<proxyPort>`
+
+Default `proxyPort` is `8787`.
+
+### Local proxy (auto-start)
+
+When `proxyUrl` points to localhost (or is omitted), the plugin will auto-start `headroom proxy` if no running proxy is detected. Launch order:
+1. `headroom` from `PATH`
+2. local npm bin (`node_modules/.bin/headroom`)
+3. global npm bin
+4. Python module (`python -m headroom.cli proxy ...`)
+
+If `pythonPath` is set, it is tried first in the Python fallback step.
+
+### Remote proxy (connect-only)
+
+Point `proxyUrl` to any reachable Headroom instance:
+
+```json
+{
+  "config": {
+    "proxyUrl": "https://headroom.example.com:8787"
+  }
+}
+```
+
+Remote URLs are **connect-only** — the plugin probes the URL at startup and fails fast if the proxy is not reachable. No subprocess is spawned for remote addresses.
+
+## Manual Proxy Setup
+
+If you prefer to manage the proxy yourself (or are running a remote instance), start it before launching OpenClaw:
+
+Python install:
+
+```bash
+pip install "headroom-ai[proxy]"
+headroom proxy --host 127.0.0.1 --port 8787
+```
+
+NPM install:
+
+```bash
+npm install -g headroom-ai
+headroom proxy --host 127.0.0.1 --port 8787
+```
 
 ## How It Works
 
@@ -38,10 +119,11 @@ Compression is lossless via CCR (Compress-Cache-Retrieve): originals are stored 
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `proxyUrl` | auto-detected | URL of the Headroom proxy |
-| `autoStart` | `true` | Start proxy automatically if not running |
-| `pythonPath` | auto-detected | Path to Python binary |
-| `proxyPort` | `8787` | Port for auto-started proxy |
+| `proxyUrl` | auto-detected | Optional URL of a Headroom proxy. Local addresses (`http://127.0.0.1:<port>`, `http://localhost:<port>`) enable auto-start; remote URLs (`https://headroom.example.com`) are connect-only. |
+| `proxyPort` | `8787` | Port used for default auto-detect/auto-start when `proxyUrl` is not set. |
+| `pythonPath` | auto-detected | Optional Python executable override for Python fallback launcher. |
+| `autoStart` | `true` | Auto-start a local `headroom proxy` if not already running (local URLs only; ignored for remote proxies) |
+| `startupTimeoutMs` | `20000` | Time to wait for auto-started proxy to become healthy |
 
 ## Comparison with lossless-claw
 

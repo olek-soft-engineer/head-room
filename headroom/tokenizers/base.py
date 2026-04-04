@@ -132,9 +132,17 @@ class BaseTokenizer(ABC):
 
                 if part_type == "text":
                     total += self.count_text(part.get("text", ""))
-                elif part_type == "image_url":
-                    # Images have fixed token cost (varies by model)
-                    total += 85  # Base image token count
+                elif part_type in ("image_url", "image", "input_image"):
+                    # Images are NOT tokenized as text — they have a pixel-based cost.
+                    # Anthropic: tokens = (width * height) / 750, max ~1600 after resize.
+                    # OpenAI: similar tile-based calculation, ~765 tokens for high-detail.
+                    # We use 1600 as a conservative estimate (max after auto-resize).
+                    # This prevents the base64 blob from being json.dumps'd and counted
+                    # as text tokens (1MB image = ~330K fake tokens without this).
+                    total += 1600
+                elif part_type in ("input_audio", "audio"):
+                    # Audio has fixed token cost, not tokenized as text
+                    total += 200
                 elif part_type == "tool_result":
                     content = part.get("content", "")
                     if isinstance(content, str):

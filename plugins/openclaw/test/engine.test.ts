@@ -7,12 +7,19 @@
  * Requires: Python 3 + headroom-ai[proxy] installed
  * Run: HEADROOM_INTEGRATION=1 npx vitest run test/engine.test.ts
  */
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi, afterEach } from "vitest";
 import { HeadroomContextEngine } from "../src/engine.js";
 import { agentToOpenAI, openAIToAgent } from "../src/convert.js";
 import { ProxyManager } from "../src/proxy-manager.js";
 
 const RUN = process.env.HEADROOM_INTEGRATION === "1";
+const PROXY_URL = process.env.HEADROOM_PROXY_URL ?? "http://127.0.0.1:8787";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+// Proxy probing and ProxyManager.start tests live in proxy-manager.test.ts
 
 describe("AgentMessage conversion", () => {
   it("converts user message", () => {
@@ -36,6 +43,25 @@ describe("AgentMessage conversion", () => {
     expect(openai[0].role).toBe("assistant");
     expect(openai[0].content).toBe("Let me search");
     expect(openai[0].tool_calls).toHaveLength(1);
+    expect(openai[0].tool_calls![0].function.name).toBe("search");
+  });
+
+  it("converts assistant with toolCall blocks", () => {
+    const agent = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Let me search" },
+          { type: "toolCall", id: "call_1|fc_1", name: "search", arguments: { q: "test" } },
+        ],
+        timestamp: Date.now(),
+      },
+    ];
+    const openai = agentToOpenAI(agent);
+    expect(openai[0].role).toBe("assistant");
+    expect(openai[0].content).toBe("Let me search");
+    expect(openai[0].tool_calls).toHaveLength(1);
+    expect(openai[0].tool_calls![0].id).toBe("call_1|fc_1");
     expect(openai[0].tool_calls![0].function.name).toBe("search");
   });
 
@@ -85,7 +111,7 @@ describe("AgentMessage conversion", () => {
         role: "assistant",
         content: [
           { type: "text", text: "Searching..." },
-          { type: "tool_use", id: "tu_1", name: "search", input: { q: "test" } },
+          { type: "toolCall", id: "call_1|fc_1", name: "search", arguments: { q: "test" } },
         ],
         timestamp: Date.now(),
       },
@@ -97,7 +123,7 @@ describe("AgentMessage conversion", () => {
     expect(Array.isArray(content)).toBe(true);
     expect(content).toContainEqual(expect.objectContaining({ type: "text", text: "Searching..." }));
     expect(content).toContainEqual(
-      expect.objectContaining({ type: "tool_use", id: "tu_1", name: "search" }),
+      expect.objectContaining({ type: "toolCall", id: "call_1|fc_1", name: "search" }),
     );
   });
 
@@ -113,43 +139,44 @@ describe("AgentMessage conversion", () => {
     const openai = agentToOpenAI(original);
     const back = openAIToAgent(openai);
     expect(back[0].role).toBe("toolResult");
-    expect(back[0].content).toBe('{"data": true}');
+    expect(back[0].content).toEqual([{ type: "text", text: '{"data": true}' }]);
     expect(back[0].tool_use_id).toBe("tu_1");
   });
 });
 
-describe.skipIf(!RUN)("ProxyManager", () => {
-  it("detects running proxy or starts one", { timeout: 30000 }, async () => {
-    const manager = new ProxyManager({ autoStart: true });
-    try {
-      const url = await manager.start();
-      expect(url).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+if (RUN) {
+  describe("ProxyManager", () => {
+    it("connects to configured proxy URL", { timeout: 30000 }, async () => {
+      const manager = new ProxyManager({ proxyUrl: PROXY_URL });
+      try {
+        const url = await manager.start();
+        expect(url).toMatch(/^http:\/\/(127\.0\.0\.1|localhost):\d+$/);
 
-      // Verify health
-      const resp = await fetch(`${url}/health`);
-      expect(resp.ok).toBe(true);
-    } finally {
-      await manager.stop();
-    }
-  });
-});
-
-describe.skipIf(!RUN)("HeadroomContextEngine", () => {
-  let engine: HeadroomContextEngine;
-
-  beforeAll(async () => {
-    engine = new HeadroomContextEngine({ autoStart: true });
-    await engine.bootstrap({
-      sessionId: "test-session",
-      sessionFile: "/tmp/test-session.jsonl",
+        // Verify health
+        const resp = await fetch(`${url}/health`);
+        expect(resp.ok).toBe(true);
+      } finally {
+        await manager.stop();
+      }
     });
-  }, 30000);
-
-  afterAll(async () => {
-    await engine.dispose();
   });
 
-  it("assemble() compresses tool outputs", { timeout: 15000 }, async () => {
+  describe("HeadroomContextEngine", () => {
+    let engine: HeadroomContextEngine;
+
+    beforeAll(async () => {
+      engine = new HeadroomContextEngine({ proxyUrl: PROXY_URL });
+      await engine.bootstrap({
+        sessionId: "test-session",
+        sessionFile: "/tmp/test-session.jsonl",
+      });
+    }, 30000);
+
+    afterAll(async () => {
+      await engine.dispose();
+    });
+
+    it("assemble() compresses tool outputs", { timeout: 15000 }, async () => {
     // Simulate an OpenClaw agent conversation with large tool result
     const serverData = Array.from({ length: 100 }, (_, i) => ({
       id: i + 1,
@@ -196,9 +223,9 @@ describe.skipIf(!RUN)("HeadroomContextEngine", () => {
     // First and last messages should still be user messages
     expect(result.messages[0].role).toBe("user");
     expect(result.messages[result.messages.length - 1].role).toBe("user");
-  });
+    });
 
-  it("assemble() preserves small conversations", { timeout: 15000 }, async () => {
+    it("assemble() preserves small conversations", { timeout: 15000 }, async () => {
     const messages = [
       { role: "user", content: "Hello", timestamp: Date.now() },
       { role: "assistant", content: "Hi there!", timestamp: Date.now() },
@@ -212,9 +239,9 @@ describe.skipIf(!RUN)("HeadroomContextEngine", () => {
     expect(result.messages).toHaveLength(2);
     expect(result.messages[0].content).toBe("Hello");
     expect(result.messages[1].content).toBe("Hi there!");
-  });
+    });
 
-  it("compact() returns success (compression handled in assemble)", async () => {
+    it("compact() returns success (compression handled in assemble)", async () => {
     const result = await engine.compact({
       sessionId: "test-session",
       sessionFile: "/tmp/test.jsonl",
@@ -222,12 +249,13 @@ describe.skipIf(!RUN)("HeadroomContextEngine", () => {
 
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
-  });
+    });
 
-  it("getStats() returns compression statistics", () => {
+    it("getStats() returns compression statistics", () => {
     const stats = engine.getStats();
     expect(stats).toHaveProperty("totalCompressions");
     expect(stats).toHaveProperty("totalTokensSaved");
     expect(stats.totalCompressions).toBeGreaterThanOrEqual(0);
+    });
   });
-});
+}

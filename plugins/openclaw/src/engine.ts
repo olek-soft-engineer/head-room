@@ -8,7 +8,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import { compress } from "headroom-ai";
-import { ProxyManager, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
+import { ProxyManager, defaultLogger, type ProxyManagerConfig, type ProxyManagerLogger } from "./proxy-manager.js";
 import { agentToOpenAI, openAIToAgent } from "./convert.js";
 
 export interface HeadroomEngineConfig extends ProxyManagerConfig {
@@ -36,12 +36,7 @@ export class HeadroomContextEngine {
 
   constructor(config: HeadroomEngineConfig = {}, logger?: ProxyManagerLogger) {
     this.config = config;
-    this.logger = logger ?? {
-      info: (m) => console.log(`[headroom] ${m}`),
-      warn: (m) => console.warn(`[headroom] ${m}`),
-      error: (m) => console.error(`[headroom] ${m}`),
-      debug: () => {},
-    };
+    this.logger = logger ?? defaultLogger;
     this.proxyManager = new ProxyManager(config, this.logger);
   }
 
@@ -114,7 +109,7 @@ export class HeadroomContextEngine {
         baseUrl: this.proxyUrl,
         fallback: true,
         tokenBudget: params.tokenBudget,
-      });
+      } as any);
 
       if (!result.compressed || result.tokensSaved === 0) {
         return { messages: params.messages, estimatedTokens: result.tokensBefore };
