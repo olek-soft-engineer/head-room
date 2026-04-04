@@ -829,7 +829,7 @@ def cursor(port: int, no_rtk: bool, no_proxy: bool, learn: bool, verbose: bool) 
 )
 @click.option(
     "--plugin-spec",
-    default="headroom-openclaw",
+    default="headroom-ai/openclaw",
     show_default=True,
     help="NPM plugin spec for OpenClaw install (used when --plugin-path is omitted)",
 )

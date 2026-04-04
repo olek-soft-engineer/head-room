@@ -57,7 +57,7 @@ def test_wrap_openclaw_default_installs_from_npm_and_restarts(runner: CliRunner)
         "plugins",
         "install",
         "--dangerously-force-unsafe-install",
-        "headroom-openclaw",
+        "headroom-ai/openclaw",
     ] in cmds
     assert ["openclaw", "config", "validate"] in cmds
     assert ["openclaw", "gateway", "restart"] in cmds
