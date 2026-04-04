@@ -343,6 +343,7 @@ class BatchResultProcessor:
             "max_tokens": request_context.extras.get("max_tokens", 4096),
         }
         if tools:
+
             def _tool_sort_key(tool: dict[str, Any]) -> tuple[str, str]:
                 name = (
                     str(tool.get("name", ""))

@@ -6,8 +6,8 @@ Contains all OpenAI Chat Completions, Responses API, and passthrough handlers.
 from __future__ import annotations
 
 import asyncio
-import copy
 import contextlib
+import copy
 import json
 import logging
 import os

@@ -172,8 +172,8 @@ class AnthropicHandlerMixin:
             _get_image_compressor,
             _read_request_json,
         )
-        from headroom.proxy.modes import is_cache_mode, is_token_mode
         from headroom.proxy.models import RequestLog
+        from headroom.proxy.modes import is_cache_mode, is_token_mode
         from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
@@ -594,10 +594,12 @@ class AnthropicHandlerMixin:
                     )
                     if memory_context:
                         if frozen_message_count > 0:
-                            optimized_messages = self._append_context_to_latest_non_frozen_user_turn(
-                                optimized_messages,
-                                memory_context,
-                                frozen_message_count=frozen_message_count,
+                            optimized_messages = (
+                                self._append_context_to_latest_non_frozen_user_turn(
+                                    optimized_messages,
+                                    memory_context,
+                                    frozen_message_count=frozen_message_count,
+                                )
                             )
                             logger.info(
                                 f"[{request_id}] Memory: Appended {len(memory_context)} chars "
@@ -1192,8 +1194,8 @@ class AnthropicHandlerMixin:
         from fastapi.responses import JSONResponse, Response
 
         from headroom.ccr import CCRToolInjector
-        from headroom.proxy.modes import is_cache_mode
         from headroom.proxy.helpers import MAX_REQUEST_BODY_SIZE, _read_request_json
+        from headroom.proxy.modes import is_cache_mode
         from headroom.utils import extract_user_query
 
         start_time = time.time()

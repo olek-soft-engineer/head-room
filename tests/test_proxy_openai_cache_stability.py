@@ -49,7 +49,9 @@ def test_openai_cache_mode_freezes_previous_turns() -> None:
         proxy.config.mode = "cache"
 
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = (
+            lambda request, model, messages: "stable-session"
+        )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
         def _fake_apply(**kwargs):
@@ -71,7 +73,11 @@ def test_openai_cache_mode_freezes_previous_turns() -> None:
                 json={
                     "id": "chatcmpl_1",
                     "choices": [
-                        {"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
                     ],
                     "usage": {"prompt_tokens": 60, "completion_tokens": 3, "total_tokens": 63},
                 },
@@ -104,7 +110,9 @@ def test_openai_cache_mode_restores_mutated_frozen_prefix() -> None:
         proxy.config.mode = "cache"
 
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = (
+            lambda request, model, messages: "stable-session"
+        )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
         original_messages = [
@@ -134,7 +142,11 @@ def test_openai_cache_mode_restores_mutated_frozen_prefix() -> None:
                 json={
                     "id": "chatcmpl_2",
                     "choices": [
-                        {"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
                     ],
                     "usage": {"prompt_tokens": 65, "completion_tokens": 3, "total_tokens": 68},
                 },

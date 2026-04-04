@@ -102,16 +102,16 @@ from headroom.proxy.helpers import (
     _read_request_json,  # noqa: F401
     _setup_file_logging,  # noqa: F401
 )
+from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
+
+# Data models (extracted to headroom/proxy/models.py for maintainability)
+from headroom.proxy.models import CacheEntry, ProxyConfig, RateLimitState, RequestLog  # noqa: F401
 from headroom.proxy.modes import (
     PROXY_MODE_CACHE,
     PROXY_MODE_TOKEN,
     is_token_mode,
     normalize_proxy_mode,
 )
-from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
-
-# Data models (extracted to headroom/proxy/models.py for maintainability)
-from headroom.proxy.models import CacheEntry, ProxyConfig, RateLimitState, RequestLog  # noqa: F401
 from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401

@@ -28,7 +28,6 @@ from headroom.proxy.server import HeadroomProxy
 from headroom.tokenizers import get_tokenizer
 from headroom.utils import extract_user_query
 
-
 MODEL = "claude-sonnet-4-6"
 
 
@@ -50,7 +49,11 @@ class ModeBenchmarkResult:
 
     @property
     def cache_hit_pct(self) -> float:
-        total = self.total_cache_read_tokens + self.total_cache_write_tokens + self.total_uncached_tokens
+        total = (
+            self.total_cache_read_tokens
+            + self.total_cache_write_tokens
+            + self.total_uncached_tokens
+        )
         if total <= 0:
             return 0.0
         return self.total_cache_read_tokens / total * 100.0
@@ -76,7 +79,10 @@ def _build_conversation(turn: int) -> list[dict[str, Any]]:
     for t in range(1, turn):
         messages.extend(
             [
-                {"role": "user", "content": f"Analyze tool output turn {t} and summarize anomalies."},
+                {
+                    "role": "user",
+                    "content": f"Analyze tool output turn {t} and summarize anomalies.",
+                },
                 {
                     "role": "user",
                     "content": [
@@ -93,7 +99,10 @@ def _build_conversation(turn: int) -> list[dict[str, Any]]:
     # Current turn: user request + fresh tool output, no assistant response yet.
     messages.extend(
         [
-            {"role": "user", "content": f"Analyze tool output turn {turn} and summarize anomalies."},
+            {
+                "role": "user",
+                "content": f"Analyze tool output turn {turn} and summarize anomalies.",
+            },
             {
                 "role": "user",
                 "content": [

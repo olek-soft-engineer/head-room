@@ -152,7 +152,11 @@ def test_image_compression_does_not_touch_previous_turns_if_last_message_not_use
             "content": [
                 {
                     "type": "image",
-                    "source": {"type": "base64", "media_type": "image/png", "data": "OLD_IMAGE_BYTES"},
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "OLD_IMAGE_BYTES",
+                    },
                 }
             ],
         },
@@ -192,7 +196,12 @@ def test_anthropic_batch_tools_sorted_deterministically_before_forward() -> None
                     "id": "msgbatch_1",
                     "type": "message_batch",
                     "processing_status": "in_progress",
-                    "request_counts": {"processing": 1, "succeeded": 0, "errored": 0, "canceled": 0},
+                    "request_counts": {
+                        "processing": 1,
+                        "succeeded": 0,
+                        "errored": 0,
+                        "canceled": 0,
+                    },
                 },
             )
 
@@ -210,9 +219,21 @@ def test_anthropic_batch_tools_sorted_deterministically_before_forward() -> None
                             "max_tokens": 128,
                             "messages": [{"role": "user", "content": "hello"}],
                             "tools": [
-                                {"name": "zeta", "description": "z", "input_schema": {"type": "object"}},
-                                {"name": "alpha", "description": "a", "input_schema": {"type": "object"}},
-                                {"name": "mu", "description": "m", "input_schema": {"type": "object"}},
+                                {
+                                    "name": "zeta",
+                                    "description": "z",
+                                    "input_schema": {"type": "object"},
+                                },
+                                {
+                                    "name": "alpha",
+                                    "description": "a",
+                                    "input_schema": {"type": "object"},
+                                },
+                                {
+                                    "name": "mu",
+                                    "description": "m",
+                                    "input_schema": {"type": "object"},
+                                },
                             ],
                         },
                     }
@@ -262,7 +283,9 @@ def test_token_mode_freeze_is_capped_by_prefix_tracker() -> None:
         proxy.config.image_optimize = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = (
+            lambda request, model, messages: "stable-session"
+        )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
         class _FakeCompressionCache:
@@ -332,7 +355,9 @@ def test_memory_context_avoids_system_mutation_when_prefix_frozen() -> None:
         proxy.config.ccr_proactive_expansion = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = (
+            lambda request, model, messages: "stable-session"
+        )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
         proxy.memory_handler = SimpleNamespace(
@@ -396,7 +421,9 @@ def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatc
         proxy.config.ccr_inject_system_instructions = True
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = (
+            lambda request, model, messages: "stable-session"
+        )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
         class _FakeInjector:
@@ -457,7 +484,9 @@ def test_previous_turns_always_frozen_only_final_turn_mutable() -> None:
         proxy.config.image_optimize = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = (
+            lambda request, model, messages: "stable-session"
+        )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
         def _fake_apply(**kwargs):
@@ -538,7 +567,12 @@ def test_batch_optimization_freezes_previous_turns_only() -> None:
                     "id": "msgbatch_2",
                     "type": "message_batch",
                     "processing_status": "in_progress",
-                    "request_counts": {"processing": 1, "succeeded": 0, "errored": 0, "canceled": 0},
+                    "request_counts": {
+                        "processing": 1,
+                        "succeeded": 0,
+                        "errored": 0,
+                        "canceled": 0,
+                    },
                 },
             )
 
@@ -578,7 +612,9 @@ def test_token_mode_does_not_force_freeze_all_previous_turns() -> None:
         proxy.config.image_optimize = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = (
+            lambda request, model, messages: "stable-session"
+        )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
         class _FakeCompressionCache:
@@ -652,7 +688,9 @@ def test_cache_mode_restores_frozen_prefix_if_transform_mutates_history() -> Non
         proxy.config.image_optimize = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = (
+            lambda request, model, messages: "stable-session"
+        )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
         original_messages = [
