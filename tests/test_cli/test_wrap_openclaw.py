@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+from headroom.cli import wrap as wrap_cli
 from headroom.cli.main import main
 
 
@@ -237,3 +238,195 @@ def test_wrap_openclaw_continues_when_plugin_already_exists(
     cmds = [c["cmd"] for c in calls]
     assert ["openclaw", "config", "validate"] in cmds
     assert ["openclaw", "plugins", "inspect", "headroom"] in cmds
+
+
+def test_wrap_openclaw_verbose_prints_install_restart_and_inspect_output(
+    runner: CliRunner,
+) -> None:
+    def which(name: str) -> str | None:
+        mapping = {
+            "openclaw": "openclaw",
+            "npm": "npm",
+        }
+        return mapping.get(name)
+
+    def run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[:3] == ["openclaw", "plugins", "install"]:
+            return MagicMock(returncode=0, stdout="install-ok", stderr="")
+        if cmd[:3] == ["openclaw", "gateway", "restart"]:
+            return MagicMock(returncode=0, stdout="restart-ok", stderr="")
+        if cmd[:3] == ["openclaw", "plugins", "inspect"]:
+            return MagicMock(returncode=0, stdout="inspect-ok", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("headroom.cli.wrap.shutil.which", side_effect=which):
+        with patch("headroom.cli.wrap.subprocess.run", side_effect=run):
+            result = runner.invoke(main, ["wrap", "openclaw", "--verbose"])
+
+    assert result.exit_code == 0, result.output
+    assert "install-ok" in result.output
+    assert "restart-ok" in result.output
+    assert "inspect-ok" in result.output
+
+
+def test_wrap_openclaw_fails_for_npm_mode_hook_pack_bug_without_local_fallback(
+    runner: CliRunner,
+) -> None:
+    def which(name: str) -> str | None:
+        mapping = {
+            "openclaw": "openclaw",
+            "npm": "npm",
+        }
+        return mapping.get(name)
+
+    def run(cmd, **kwargs):  # noqa: ANN001
+        if cmd[:3] == ["openclaw", "plugins", "install"]:
+            return MagicMock(
+                returncode=1,
+                stdout="Also not a valid hook pack",
+                stderr='Blocked despite "--dangerously-force-unsafe-install"',
+            )
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("headroom.cli.wrap.shutil.which", side_effect=which):
+        with patch("headroom.cli.wrap.subprocess.run", side_effect=run):
+            result = runner.invoke(main, ["wrap", "openclaw"])
+
+    assert result.exit_code != 0
+    assert "openclaw plugins install failed" in result.output
+
+
+def test_wrap_openclaw_copy_mode_uses_path_install(runner: CliRunner, plugin_dir: Path) -> None:
+    calls: list[dict] = []
+
+    def which(name: str) -> str | None:
+        mapping = {
+            "openclaw": "openclaw",
+            "npm": "npm",
+        }
+        return mapping.get(name)
+
+    with patch("headroom.cli.wrap.shutil.which", side_effect=which):
+        with patch("headroom.cli.wrap.subprocess.run", side_effect=_make_successful_run(calls)):
+            result = runner.invoke(
+                main,
+                [
+                    "wrap",
+                    "openclaw",
+                    "--plugin-path",
+                    str(plugin_dir),
+                    "--copy",
+                    "--skip-build",
+                    "--no-restart",
+                ],
+            )
+
+    assert result.exit_code == 0, result.output
+    cmds = [c["cmd"] for c in calls]
+    assert [
+        "openclaw",
+        "plugins",
+        "install",
+        "--dangerously-force-unsafe-install",
+        str(plugin_dir),
+    ] in cmds
+
+
+def test_wrap_openclaw_fails_when_npm_missing_for_local_build(
+    runner: CliRunner, plugin_dir: Path
+) -> None:
+    def which(name: str) -> str | None:
+        mapping = {
+            "openclaw": "openclaw",
+            "npm": None,
+        }
+        return mapping.get(name)
+
+    with patch("headroom.cli.wrap.shutil.which", side_effect=which):
+        result = runner.invoke(main, ["wrap", "openclaw", "--plugin-path", str(plugin_dir)])
+
+    assert result.exit_code != 0
+    assert "'npm' not found in PATH" in result.output
+
+
+def test_wrap_openclaw_fails_when_local_path_missing_manifest_files(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    plugin = tmp_path / "plugins" / "openclaw"
+    plugin.mkdir(parents=True)
+
+    with patch("headroom.cli.wrap.shutil.which", return_value="openclaw"):
+        result = runner.invoke(main, ["wrap", "openclaw", "--plugin-path", str(plugin)])
+    assert result.exit_code != 0
+    assert "missing package.json" in result.output
+
+    (plugin / "package.json").write_text("{}\n")
+    with patch("headroom.cli.wrap.shutil.which", return_value="openclaw"):
+        result = runner.invoke(main, ["wrap", "openclaw", "--plugin-path", str(plugin)])
+    assert result.exit_code != 0
+    assert "missing openclaw.plugin.json" in result.output
+
+
+def test_run_checked_raises_click_exception_on_command_errors() -> None:
+    with patch("headroom.cli.wrap.subprocess.run", side_effect=FileNotFoundError()):
+        with pytest.raises(Exception, match="command not found"):
+            wrap_cli._run_checked(["missing"], action="demo")
+
+    cpe_stderr = wrap_cli.subprocess.CalledProcessError(
+        returncode=2,
+        cmd=["x"],
+        stderr="bad-stderr",
+    )
+    with patch("headroom.cli.wrap.subprocess.run", side_effect=cpe_stderr):
+        with pytest.raises(Exception, match="bad-stderr"):
+            wrap_cli._run_checked(["x"], action="demo")
+
+    cpe_stdout = wrap_cli.subprocess.CalledProcessError(
+        returncode=3,
+        cmd=["x"],
+        output="bad-stdout",
+        stderr="",
+    )
+    with patch("headroom.cli.wrap.subprocess.run", side_effect=cpe_stdout):
+        with pytest.raises(Exception, match="bad-stdout"):
+            wrap_cli._run_checked(["x"], action="demo")
+
+
+def test_resolve_openclaw_extensions_dir_empty_output_raises() -> None:
+    with patch(
+        "headroom.cli.wrap._run_checked",
+        return_value=MagicMock(stdout="   \n", stderr="", returncode=0),
+    ):
+        with pytest.raises(Exception, match="Unable to resolve OpenClaw config path"):
+            wrap_cli._resolve_openclaw_extensions_dir("openclaw")
+
+
+def test_copy_openclaw_plugin_into_extensions_handles_missing_and_existing_dist(
+    tmp_path: Path,
+) -> None:
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+
+    with pytest.raises(Exception, match="Plugin dist folder missing"):
+        wrap_cli._copy_openclaw_plugin_into_extensions(plugin_dir=plugin, openclaw_bin="openclaw")
+
+    dist = plugin / "dist"
+    dist.mkdir()
+    (dist / "index.js").write_text("x\n")
+    (plugin / "package.json").write_text("{}\n")
+    (plugin / "openclaw.plugin.json").write_text("{}\n")
+
+    ext_root = tmp_path / ".openclaw" / "extensions"
+    target_headroom = ext_root / "headroom"
+    target_dist = target_headroom / "dist"
+    target_dist.mkdir(parents=True)
+    (target_dist / "old.js").write_text("old\n")
+
+    with patch("headroom.cli.wrap._resolve_openclaw_extensions_dir", return_value=ext_root):
+        out = wrap_cli._copy_openclaw_plugin_into_extensions(
+            plugin_dir=plugin, openclaw_bin="openclaw"
+        )
+
+    assert out == target_headroom
+    assert (target_dist / "index.js").exists()
+    assert not (target_dist / "old.js").exists()
