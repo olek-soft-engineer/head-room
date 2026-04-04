@@ -272,6 +272,12 @@ module = [
 disallow_untyped_defs = false
 warn_return_any = false
 
+# Handler mixins use self.* from HeadroomProxy via duck typing — mypy can't resolve these
+[[tool.mypy.overrides]]
+module = ["headroom.proxy.handlers.*"]
+disallow_untyped_defs = false
+ignore_errors = true
+
 # Ignore third-party stubs with syntax errors
 [[tool.mypy.overrides]]
 module = ["mlx.*"]
