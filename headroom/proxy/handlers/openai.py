@@ -41,6 +41,7 @@ class OpenAIHandlerMixin:
             MAX_REQUEST_BODY_SIZE,
             _read_request_json,
         )
+        from headroom.proxy.modes import is_token_mode
         from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
@@ -191,7 +192,7 @@ class OpenAIHandlerMixin:
             try:
                 context_limit = self.openai_provider.get_context_limit(model)
 
-                if self.config.mode == "token_headroom":
+                if is_token_mode(self.config.mode):
                     comp_cache = self._get_compression_cache(openai_session_id)
 
                     # Zone 1: Swap cached compressed versions
@@ -217,7 +218,7 @@ class OpenAIHandlerMixin:
                     if result.messages != working_messages:
                         comp_cache.update_from_result(messages, result.messages)
 
-                    # Always use pipeline result in token_headroom mode
+                    # Always use pipeline result in token mode
                     optimized_messages = result.messages
                     transforms_applied = result.transforms_applied
                     pipeline_timing = result.timing

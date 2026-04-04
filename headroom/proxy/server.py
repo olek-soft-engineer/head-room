@@ -102,6 +102,12 @@ from headroom.proxy.helpers import (
     _read_request_json,  # noqa: F401
     _setup_file_logging,  # noqa: F401
 )
+from headroom.proxy.modes import (
+    PROXY_MODE_CACHE,
+    PROXY_MODE_TOKEN,
+    is_token_mode,
+    normalize_proxy_mode,
+)
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
 # Data models (extracted to headroom/proxy/models.py for maintainability)
@@ -162,6 +168,7 @@ class HeadroomProxy(
 
     def __init__(self, config: ProxyConfig):
         self.config = config
+        self.config.mode = normalize_proxy_mode(self.config.mode)
 
         # Override ANTHROPIC_API_URL with config if set
         # Strip trailing /v1 or /v1/ to avoid double-path (e.g., .../v1/v1/models)
@@ -224,8 +231,8 @@ class HeadroomProxy(
                 tool_profiles=config.tool_profiles,
                 read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
             )
-            # Token headroom mode: allow compression of older excluded-tool results
-            if config.mode == "token_headroom":
+            # Token mode: allow compression of older excluded-tool results
+            if is_token_mode(config.mode):
                 router_config.protect_recent_reads_fraction = 0.3
             transforms = [
                 CacheAligner(CacheAlignerConfig(enabled=False)),
@@ -303,7 +310,7 @@ class HeadroomProxy(
             )
         )
 
-        # Compression cache store for token_headroom mode (session-scoped)
+        # Compression cache store for token mode (session-scoped)
         self._compression_caches: dict[str, CompressionCache] = {}
 
         self.logger = (
@@ -514,17 +521,16 @@ class HeadroomProxy(
         )
         logger.info("Headroom Proxy started")
         logger.info(f"Optimization: {'ENABLED' if self.config.optimize else 'DISABLED'}")
-        if self.config.mode not in ("cost_savings", "token_headroom"):
-            logger.warning(
-                f"Unknown HEADROOM_MODE '{self.config.mode}', falling back to 'cost_savings'"
-            )
-            self.config.mode = "token_headroom"
+        self.config.mode = normalize_proxy_mode(self.config.mode)
         logger.info(f"Mode: {self.config.mode}")
-        if self.config.mode == "token_headroom":
+        if self.config.mode == PROXY_MODE_TOKEN:
             logger.info("  Prefix freeze: re-freeze after compression")
             logger.info("  Read protection window: 30%% of excluded-tool messages")
             logger.info("  CCR TTL: extended for session lifetime")
             logger.info("  Compression cache: active")
+        if self.config.mode == PROXY_MODE_CACHE:
+            logger.info("  Prefix freeze: strict (all prior turns immutable)")
+            logger.info("  Mutations: latest turn only")
         logger.info(f"Caching: {'ENABLED' if self.config.cache_enabled else 'DISABLED'}")
         logger.info(f"Rate Limiting: {'ENABLED' if self.config.rate_limit_enabled else 'DISABLED'}")
         logger.info(
@@ -1019,9 +1025,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         except Exception:
             logger.warning("Failed to log /stats summary payload")
 
-        # Compression cache stats (token_headroom mode)
+        # Compression cache stats (token mode)
         compression_cache_stats: dict = {}
-        if proxy.config.mode == "token_headroom" and proxy._compression_caches:
+        if proxy.config.mode == PROXY_MODE_TOKEN and proxy._compression_caches:
             total_entries = 0
             total_hits = 0
             total_misses = 0
@@ -1033,7 +1039,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 total_misses += s.get("misses", 0)
                 total_tokens_saved += s.get("total_tokens_saved", 0)
             compression_cache_stats = {
-                "mode": "token_headroom",
+                "mode": PROXY_MODE_TOKEN,
                 "active_sessions": len(proxy._compression_caches),
                 "total_entries": total_entries,
                 "total_hits": total_hits,
@@ -1042,7 +1048,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "total_tokens_saved": total_tokens_saved,
             }
         else:
-            compression_cache_stats = {"mode": "token_headroom"}
+            compression_cache_stats = {"mode": PROXY_MODE_TOKEN}
 
         # Build unified savings summary (all layers)
         compression_tokens = m.tokens_saved_total
@@ -2327,7 +2333,7 @@ if __name__ == "__main__":
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),
         http2=not args.no_http2 and _get_env_bool("HEADROOM_HTTP2", True),
         tool_profiles=tool_profiles if tool_profiles else None,
-        mode=_get_env_str("HEADROOM_MODE", "token_headroom"),
+        mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
     )
 
     # Get worker and concurrency settings

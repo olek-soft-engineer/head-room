@@ -31,12 +31,29 @@ Telemetry is enabled by default. Opt out with `HEADROOM_TELEMETRY=off` or `headr
 |--------|---------|-------------|
 | `--host` | `127.0.0.1` | Host to bind to |
 | `--port` | `8787` | Port to bind to |
+| `--mode` | `token` | Run mode: `token` (maximize compression) or `cache` (freeze prior turns) |
 | `--no-optimize` | `false` | Disable optimization (passthrough mode) |
 | `--no-cache` | `false` | Disable semantic caching |
 | `--no-rate-limit` | `false` | Disable rate limiting |
 | `--log-file` | None | Path to JSONL log file |
 | `--budget` | None | Daily budget limit in USD |
 | `--openai-api-url` | `https://api.openai.com` | Custom OpenAI API URL endpoint |
+
+### Run Modes
+
+Headroom proxy has two explicit run modes:
+
+- `token` mode: prioritize token reduction. Prior history may be rewritten when that improves compression.
+- `cache` mode: prioritize provider prefix cache stability. Prior turns are frozen; only the newest turn is mutable.
+
+Set via CLI or env:
+
+```bash
+headroom proxy --mode token
+HEADROOM_MODE=cache headroom proxy
+```
+
+Legacy values (`token_headroom`, `cost_savings`) are still accepted as aliases.
 
 ### Context Management Options
 

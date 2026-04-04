@@ -1,4 +1,4 @@
-"""Integration tests for token_headroom mode.
+"""Integration tests for token mode (legacy token_headroom behavior).
 
 Tests the CompressionCache working across simulated multi-turn conversations,
 verifying the critical invariants: no message injection, correct frozen counts,

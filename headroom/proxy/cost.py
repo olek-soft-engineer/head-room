@@ -13,6 +13,8 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from headroom.proxy.modes import PROXY_MODE_CACHE
+
 if TYPE_CHECKING:
     from headroom.proxy.prometheus_metrics import PrometheusMetrics
 
@@ -314,10 +316,10 @@ def build_session_summary(
         },
     }
 
-    # Add tip if token_headroom mode would help
-    if proxy.config.mode == "cost_savings" and uncompressed_reasons["prefix_frozen"] > 10:
+    # Add tip if token mode would help
+    if proxy.config.mode == PROXY_MODE_CACHE and uncompressed_reasons["prefix_frozen"] > 10:
         summary["tip"] = (
-            "Most requests are prefix-frozen. Set HEADROOM_MODE=token_headroom "
+            "Most requests are prefix-frozen. Set HEADROOM_MODE=token "
             "to compress frozen messages and extend your session by ~25-35%."
         )
 

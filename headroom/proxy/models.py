@@ -86,8 +86,9 @@ class ProxyConfig:
     bedrock_profile: str | None = None
     anyllm_provider: str = "openai"
 
-    # Optimization mode
-    mode: str = "token_headroom"
+    # Optimization mode: "token" (rewrite for max compression) or
+    # "cache" (freeze prior turns for prefix-cache stability).
+    mode: str = "token"
 
     # Optimization
     optimize: bool = True

@@ -6,6 +6,7 @@ Contains all Anthropic Messages API handlers including batch operations.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import time
@@ -129,6 +130,31 @@ class AnthropicHandlerMixin:
             return max(base_frozen_count, final_idx)
         return len(messages)
 
+    @staticmethod
+    def _restore_frozen_prefix(
+        original_messages: list[dict[str, Any]],
+        candidate_messages: list[dict[str, Any]],
+        *,
+        frozen_message_count: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Force frozen prefix bytes to match the original request exactly."""
+        if frozen_message_count <= 0 or not original_messages:
+            return candidate_messages, 0
+
+        frozen = min(frozen_message_count, len(original_messages))
+        restored = list(candidate_messages)
+
+        # Defensive: if a transform dropped prefix messages, restore them.
+        if len(restored) < frozen:
+            return list(original_messages[:frozen]) + restored, frozen
+
+        changed = 0
+        for idx in range(frozen):
+            if restored[idx] != original_messages[idx]:
+                restored[idx] = original_messages[idx]
+                changed += 1
+        return restored, changed
+
     async def handle_anthropic_messages(
         self,
         request: Request,
@@ -143,8 +169,10 @@ class AnthropicHandlerMixin:
         from headroom.proxy.helpers import (
             MAX_MESSAGE_ARRAY_LENGTH,
             MAX_REQUEST_BODY_SIZE,
+            _get_image_compressor,
             _read_request_json,
         )
+        from headroom.proxy.modes import is_cache_mode, is_token_mode
         from headroom.proxy.models import RequestLog
         from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
@@ -182,6 +210,7 @@ class AnthropicHandlerMixin:
             )
         model = body.get("model", "unknown")
         messages = body.get("messages", [])
+        original_client_messages = copy.deepcopy(messages)
 
         # Validate message array size
         if len(messages) > MAX_MESSAGE_ARRAY_LENGTH:
@@ -306,21 +335,25 @@ class AnthropicHandlerMixin:
         session_id = self.session_tracker_store.compute_session_id(request, model, messages)
         prefix_tracker = self.session_tracker_store.get_or_create(session_id, "anthropic")
         frozen_message_count = prefix_tracker.get_frozen_message_count()
-        frozen_message_count = self._strict_previous_turn_frozen_count(
-            messages,
-            frozen_message_count,
-        )
+        if is_cache_mode(self.config.mode):
+            frozen_message_count = self._strict_previous_turn_frozen_count(
+                original_client_messages,
+                frozen_message_count,
+            )
 
         # Image compression (cache-safe): only compress latest non-frozen user turn.
         # Rewriting historical image bytes can invalidate Anthropic prompt caches.
         if self.config.image_optimize and messages and not _bypass:
             compressor = _get_image_compressor()
             if compressor and compressor.has_images(messages):
-                messages = self._compress_latest_user_turn_images_cache_safe(
-                    messages,
-                    frozen_message_count=frozen_message_count,
-                    compressor=compressor,
-                )
+                if is_cache_mode(self.config.mode):
+                    messages = self._compress_latest_user_turn_images_cache_safe(
+                        messages,
+                        frozen_message_count=frozen_message_count,
+                        compressor=compressor,
+                    )
+                else:
+                    messages = compressor.compress(messages, provider="anthropic")
                 if compressor.last_result:
                     logger.info(
                         f"Image compression: {compressor.last_result.technique.value} "
@@ -343,7 +376,7 @@ class AnthropicHandlerMixin:
                     else None
                 )
 
-                if self.config.mode == "token_headroom":
+                if is_token_mode(self.config.mode):
                     comp_cache = self._get_compression_cache(session_id)
 
                     # Zone 1: Swap cached compressed versions into working copy
@@ -353,10 +386,6 @@ class AnthropicHandlerMixin:
                     # Safety: never freeze beyond provider-confirmed cached prefix.
                     cache_frozen_count = comp_cache.compute_frozen_count(messages)
                     frozen_message_count = min(frozen_message_count, cache_frozen_count)
-                    frozen_message_count = self._strict_previous_turn_frozen_count(
-                        messages,
-                        frozen_message_count,
-                    )
 
                     result = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -613,6 +642,18 @@ class AnthropicHandlerMixin:
         # Query Echo: disabled — hurts prefix caching in long conversations.
         # The echo changes every turn, invalidating the cached prefix.
         # To re-enable, uncomment and set query_echo_enabled on ProxyConfig.
+
+        if is_cache_mode(self.config.mode):
+            optimized_messages, restored_count = self._restore_frozen_prefix(
+                original_client_messages,
+                optimized_messages,
+                frozen_message_count=frozen_message_count,
+            )
+            if restored_count > 0:
+                logger.warning(
+                    f"[{request_id}] Restored {restored_count} frozen prefix message(s) "
+                    "to preserve cache stability"
+                )
 
         # Update body
         body["messages"] = optimized_messages
@@ -1151,6 +1192,7 @@ class AnthropicHandlerMixin:
         from fastapi.responses import JSONResponse, Response
 
         from headroom.ccr import CCRToolInjector
+        from headroom.proxy.modes import is_cache_mode
         from headroom.proxy.helpers import MAX_REQUEST_BODY_SIZE, _read_request_json
         from headroom.utils import extract_user_query
 
@@ -1220,6 +1262,7 @@ class AnthropicHandlerMixin:
             if canonical_tools is not None:
                 canonical_params["tools"] = self._sort_tools_deterministically(canonical_tools)
             messages = params.get("messages", [])
+            original_messages = copy.deepcopy(messages)
             model = params.get("model", "unknown")
 
             if not messages or not self.config.optimize:
@@ -1235,15 +1278,26 @@ class AnthropicHandlerMixin:
             # Apply optimization
             try:
                 context_limit = self.anthropic_provider.get_context_limit(model)
+                frozen_message_count = (
+                    self._strict_previous_turn_frozen_count(original_messages, 0)
+                    if is_cache_mode(self.config.mode)
+                    else 0
+                )
                 result = self.anthropic_pipeline.apply(
                     messages=messages,
                     model=model,
                     model_limit=context_limit,
                     context=extract_user_query(messages),
-                    frozen_message_count=self._strict_previous_turn_frozen_count(messages, 0),
+                    frozen_message_count=frozen_message_count,
                 )
 
                 optimized_messages = result.messages
+                if is_cache_mode(self.config.mode):
+                    optimized_messages, _ = self._restore_frozen_prefix(
+                        original_messages,
+                        optimized_messages,
+                        frozen_message_count=frozen_message_count,
+                    )
                 for k, v in result.timing.items():
                     pipeline_timing[k] = pipeline_timing.get(k, 0.0) + v
                 # Use pipeline's token counts for consistency with pipeline logs

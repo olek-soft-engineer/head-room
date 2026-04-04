@@ -203,4 +203,7 @@ pytest tests/test_evals/ -v -s
 
 # Run compression benchmark
 python -c "from headroom import compress; print(compress([{'role':'user','content':'test'}]))"
+
+# Run local proxy mode benchmark (no API calls)
+python benchmarks/proxy_mode_benchmark.py --turns 12 --show-real-harness
 ```
