@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from benchmarks.claude_session_mode_benchmark import (
     PROXY_MODE_CACHE,
@@ -12,13 +13,18 @@ from benchmarks.claude_session_mode_benchmark import (
     ModeSummary,
     ReplayTurn,
     SessionReplay,
+    _extract_cache_stable_last_message_suffix,
+    _merge_appended_message_delta,
+    _rewrite_scope,
     _write_checkpoint_by_session_id,
     build_dataset_and_observed_from_files,
+    classify_metric_impact,
     decode_project_key,
     determine_winners,
     load_session_replay,
     resolve_checkpoint_dir,
     simulate_replays,
+    summarize_mode_impact_vs_baseline,
     summarize_observed_usage,
     trim_replay_to_recent_turns,
 )
@@ -147,6 +153,8 @@ def test_simulation_and_winner_logic() -> None:
     assert summaries["baseline"].cache_bust_turns == 0
     assert summaries[PROXY_MODE_CACHE].cache_bust_turns == 0
     assert summaries[PROXY_MODE_TOKEN].cache_bust_turns >= 0
+    assert summaries[PROXY_MODE_TOKEN].rewrite_turns >= 0
+    assert summaries[PROXY_MODE_CACHE].rewrite_turns >= 0
 
     winners = determine_winners(summaries)
     assert winners["total_cost"] in {"baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE}
@@ -334,3 +342,183 @@ def test_resolve_checkpoint_dir_namespaces_sampling_mode() -> None:
     assert (
         resolve_checkpoint_dir(base, recent_turns_per_session=200).name == "v4__ttl_5m__recent_200"
     )
+
+
+def test_cache_suffix_helpers_support_append_only_text_growth() -> None:
+    suffix_delta = _extract_cache_stable_last_message_suffix(
+        [{"role": "user", "content": "prefix + raw suffix"}],
+        [{"role": "user", "content": "prefix"}],
+        [{"role": "user", "content": "COMPRESSED_PREFIX"}],
+    )
+
+    assert suffix_delta is not None
+    stable_prefix, stable_last_message, delta_messages = suffix_delta
+    assert stable_prefix == []
+    assert stable_last_message == {"role": "user", "content": "COMPRESSED_PREFIX"}
+    assert delta_messages == [{"role": "user", "content": " + raw suffix"}]
+
+    merged = _merge_appended_message_delta(
+        stable_last_message,
+        {"role": "user", "content": " + COMPRESSED_SUFFIX"},
+    )
+    assert merged == {"role": "user", "content": "COMPRESSED_PREFIX + COMPRESSED_SUFFIX"}
+
+
+def test_mode_impact_classification_marks_assist_harm_and_no_change() -> None:
+    baseline = ModeSummary(
+        mode="baseline",
+        forwarded_input_tokens=100,
+        cache_read_tokens=50,
+        cache_write_tokens=10,
+        regular_input_tokens=40,
+        output_tokens=5,
+        total_cost_usd=1.0,
+    )
+    token = ModeSummary(
+        mode=PROXY_MODE_TOKEN,
+        forwarded_input_tokens=80,
+        cache_read_tokens=70,
+        cache_write_tokens=8,
+        regular_input_tokens=30,
+        output_tokens=5,
+        total_cost_usd=0.8,
+    )
+    cache = ModeSummary(
+        mode=PROXY_MODE_CACHE,
+        forwarded_input_tokens=120,
+        cache_read_tokens=45,
+        cache_write_tokens=15,
+        regular_input_tokens=60,
+        output_tokens=5,
+        total_cost_usd=1.2,
+    )
+
+    assert classify_metric_impact(baseline, token, "forwarded_input_tokens")["impact"] == "assist"
+    assert classify_metric_impact(baseline, token, "cache_read_tokens")["impact"] == "assist"
+    assert classify_metric_impact(baseline, cache, "total_cost_usd")["impact"] == "harm"
+    assert classify_metric_impact(baseline, token, "output_tokens")["impact"] == "no_change"
+
+    impacts = summarize_mode_impact_vs_baseline(
+        {"baseline": baseline, PROXY_MODE_TOKEN: token, PROXY_MODE_CACHE: cache}
+    )
+    assert impacts[PROXY_MODE_TOKEN]["total_cost_usd"]["impact"] == "assist"
+    assert impacts[PROXY_MODE_CACHE]["cache_write_tokens"]["impact"] == "harm"
+
+
+def test_rewrite_scope_distinguishes_retroactive_from_latest_turn_only() -> None:
+    rewrite, retroactive = _rewrite_scope(
+        [{"role": "user", "content": "prefix"}, {"role": "user", "content": "new raw"}],
+        [{"role": "user", "content": "prefix"}, {"role": "user", "content": "new compressed"}],
+        stable_prefix_message_count=1,
+    )
+    assert rewrite is True
+    assert retroactive is False
+
+    rewrite, retroactive = _rewrite_scope(
+        [{"role": "user", "content": "prefix"}, {"role": "user", "content": "new raw"}],
+        [
+            {"role": "user", "content": "compressed prefix"},
+            {"role": "user", "content": "new compressed"},
+        ],
+        stable_prefix_message_count=1,
+    )
+    assert rewrite is True
+    assert retroactive is True
+
+
+def test_synthetic_token_mode_busts_cache_while_cache_mode_stays_stable(monkeypatch) -> None:
+    class _FakeProvider:
+        @staticmethod
+        def get_context_limit(model: str) -> int:
+            return 200_000
+
+    class _FakePipeline:
+        @staticmethod
+        def apply(messages, **kwargs):  # noqa: ANN001
+            rewritten = []
+            should_rewrite_history = len(messages) > 2
+            for message in messages:
+                content = message.get("content")
+                if (
+                    should_rewrite_history
+                    and isinstance(content, list)
+                    and any(
+                        isinstance(block, dict) and block.get("type") == "tool_result"
+                        for block in content
+                    )
+                ):
+                    new_blocks = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_result":
+                            new_blocks.append({**block, "content": "[compressed-tool-result]"})
+                        else:
+                            new_blocks.append(block)
+                    rewritten.append({**message, "content": new_blocks})
+                else:
+                    rewritten.append(message)
+            return SimpleNamespace(messages=rewritten)
+
+    class _FakeProxy:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(image_optimize=False)
+            self.anthropic_provider = _FakeProvider()
+            self.anthropic_pipeline = _FakePipeline()
+
+    monkeypatch.setattr(
+        "benchmarks.claude_session_mode_benchmark._make_proxy",
+        lambda mode: _FakeProxy(),
+    )
+
+    tool_blob = "X" * 800
+    replay = SessionReplay(
+        session_id="synth-bust",
+        project_key="C--git-synth",
+        decoded_project_path=r"C:\git\synth",
+        turns=[
+            ReplayTurn(
+                session_id="synth-bust",
+                project_key="C--git-synth",
+                decoded_project_path=r"C:\git\synth",
+                request_id="r1",
+                model="claude-sonnet-4-6",
+                timestamp=datetime.fromisoformat("2026-03-13T01:00:00+00:00"),
+                input_messages=[
+                    {"role": "user", "content": "Summarize this tool output"},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "tool-1",
+                                "content": tool_blob,
+                            }
+                        ],
+                    },
+                ],
+                assistant_message={"role": "assistant", "content": "ok"},
+                output_tokens=10,
+            ),
+            ReplayTurn(
+                session_id="synth-bust",
+                project_key="C--git-synth",
+                decoded_project_path=r"C:\git\synth",
+                request_id="r2",
+                model="claude-sonnet-4-6",
+                timestamp=datetime.fromisoformat("2026-03-13T01:02:00+00:00"),
+                input_messages=[{"role": "user", "content": "What changed?"}],
+                assistant_message={"role": "assistant", "content": "done"},
+                output_tokens=12,
+            ),
+        ],
+    )
+
+    _, summaries = simulate_replays([replay], cache_ttl_minutes=5)
+
+    token = summaries[PROXY_MODE_TOKEN]
+    cache = summaries[PROXY_MODE_CACHE]
+
+    assert token.cache_bust_turns == 1
+    assert token.rewrite_turns >= 1
+    assert token.retroactive_rewrite_turns >= 1
+    assert cache.cache_bust_turns == 0
+    assert cache.retroactive_rewrite_turns == 0

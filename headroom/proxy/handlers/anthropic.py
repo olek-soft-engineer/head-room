@@ -180,6 +180,100 @@ class AnthropicHandlerMixin:
         )
 
     @staticmethod
+    def _extract_cache_stable_last_message_suffix(
+        current_messages: list[dict[str, Any]],
+        previous_original_messages: list[dict[str, Any]] | None,
+        previous_forwarded_messages: list[dict[str, Any]] | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]] | None:
+        """Return append-only delta when only the latest message grew in place."""
+        if not previous_original_messages or previous_forwarded_messages is None:
+            return None
+        if (
+            len(current_messages) != len(previous_original_messages)
+            or len(previous_forwarded_messages) != len(previous_original_messages)
+            or not current_messages
+        ):
+            return None
+
+        prefix_len = len(current_messages) - 1
+        if (
+            prefix_len > 0
+            and current_messages[:prefix_len] != previous_original_messages[:prefix_len]
+        ):
+            return None
+
+        current_last = current_messages[-1]
+        previous_original_last = previous_original_messages[-1]
+        previous_forwarded_last = previous_forwarded_messages[-1]
+        if current_last.get("role") != previous_original_last.get("role") or current_last.get(
+            "role"
+        ) != previous_forwarded_last.get("role"):
+            return None
+
+        current_content = current_last.get("content")
+        previous_original_content = previous_original_last.get("content")
+        previous_forwarded_content = previous_forwarded_last.get("content")
+
+        if (
+            isinstance(current_content, str)
+            and isinstance(previous_original_content, str)
+            and isinstance(previous_forwarded_content, str)
+            and current_content.startswith(previous_original_content)
+        ):
+            suffix = current_content[len(previous_original_content) :]
+            delta_messages = []
+            if suffix:
+                delta_messages = [{**copy.deepcopy(current_last), "content": suffix}]
+            return (
+                copy.deepcopy(previous_forwarded_messages[:-1]),
+                copy.deepcopy(previous_forwarded_last),
+                delta_messages,
+            )
+
+        if (
+            isinstance(current_content, list)
+            and isinstance(previous_original_content, list)
+            and isinstance(previous_forwarded_content, list)
+            and len(current_content) >= len(previous_original_content)
+            and current_content[: len(previous_original_content)] == previous_original_content
+        ):
+            delta_blocks = copy.deepcopy(current_content[len(previous_original_content) :])
+            delta_messages = []
+            if delta_blocks:
+                delta_messages = [{**copy.deepcopy(current_last), "content": delta_blocks}]
+            return (
+                copy.deepcopy(previous_forwarded_messages[:-1]),
+                copy.deepcopy(previous_forwarded_last),
+                delta_messages,
+            )
+        return None
+
+    @staticmethod
+    def _merge_appended_message_delta(
+        previous_forwarded_message: dict[str, Any],
+        delta_forwarded_message: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Merge a compressed suffix back into the prior forwarded message."""
+        if delta_forwarded_message is None:
+            return copy.deepcopy(previous_forwarded_message)
+        if previous_forwarded_message.get("role") != delta_forwarded_message.get("role"):
+            return None
+
+        previous_content = previous_forwarded_message.get("content")
+        delta_content = delta_forwarded_message.get("content")
+        if isinstance(previous_content, str) and isinstance(delta_content, str):
+            return {
+                **copy.deepcopy(previous_forwarded_message),
+                "content": previous_content + delta_content,
+            }
+        if isinstance(previous_content, list) and isinstance(delta_content, list):
+            return {
+                **copy.deepcopy(previous_forwarded_message),
+                "content": copy.deepcopy(previous_content) + copy.deepcopy(delta_content),
+            }
+        return None
+
+    @staticmethod
     def _assistant_message_from_response_json(
         resp_json: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
@@ -482,10 +576,7 @@ class AnthropicHandlerMixin:
                         previous_original_messages,
                         previous_forwarded_messages,
                     )
-                    if delta is None:
-                        optimized_messages = messages
-                        optimized_tokens = original_tokens
-                    else:
+                    if delta is not None:
                         stable_forwarded_prefix, delta_messages = delta
                         if delta_messages:
                             result = await asyncio.wait_for(
@@ -508,6 +599,13 @@ class AnthropicHandlerMixin:
                         else:
                             optimized_messages = stable_forwarded_prefix
                             optimized_tokens = tokenizer.count_messages(optimized_messages)
+                    else:
+                        # Conservative rule for cache mode:
+                        # only replay exact stable message-prefix extensions.
+                        # In-message append rewriting is deferred until we can
+                        # prove it is perfectly replayable across future turns.
+                        optimized_messages = messages
+                        optimized_tokens = original_tokens
 
                 if result and result.waste_signals:
                     waste_signals_dict = result.waste_signals.to_dict()

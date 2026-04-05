@@ -209,6 +209,9 @@ python benchmarks/proxy_mode_benchmark.py --turns 12 --show-real-harness
 
 # Replay local Claude Code transcripts (no API calls)
 python benchmarks/claude_session_mode_benchmark.py --workers 1
+
+# Compare two refs on the same local Claude transcript corpus
+python benchmarks/claude_session_branch_compare.py --left-ref upstream/main --right-ref HEAD --recent-turns-per-session 200 --workers 1
 ```
 
 This benchmark compares `token` vs `cache` proxy modes on the same synthetic conversation:
@@ -217,6 +220,13 @@ This benchmark compares `token` vs `cache` proxy modes on the same synthetic con
 - `cache` should preserve prior-turn stability and can win in long sessions with strong prefix-cache reuse.
 
 `--show-real-harness` prints optional steps for running the same comparison with Claude Code, but does not call APIs by default.
+
+`claude_session_branch_compare.py` runs the real local session replay benchmark twice, once per git ref, in isolated worktrees. It writes:
+
+- per-ref replay outputs under `benchmark_results/branch_compare/<label>/`
+- a combined comparison report under `benchmark_results/branch_compare/`
+
+Use it when you want a clean PR-vs-`main` comparison on the same transcript slice.
 
 The Claude session benchmark replays local transcript data from `~/.claude/projects`
 through `baseline`, `token`, and `cache` modes. It estimates raw tokens, cache

@@ -897,3 +897,78 @@ def test_cache_mode_reuses_prior_forwarded_prefix_and_compresses_only_new_suffix
             {"role": "assistant", "content": "turn2-assistant"},
             {"role": "user", "content": "COMPRESSED_TURN3"},
         ]
+
+
+def test_cache_mode_skips_same_message_append_rewrite_to_preserve_stability() -> None:
+    captured = {"calls": []}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "cache"
+        proxy.config.image_optimize = False
+
+        tracker = _FakePrefixTracker(frozen_count=0)
+        tracker._last_original_messages = [
+            {"role": "user", "content": "shared-prefix"},
+        ]
+        tracker._last_forwarded_messages = [
+            {"role": "user", "content": "COMPRESSED_PREFIX"},
+        ]
+        tracker.get_last_original_messages = lambda: tracker._last_original_messages.copy()
+        tracker.get_last_forwarded_messages = lambda: tracker._last_forwarded_messages.copy()
+
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+
+        def _fake_apply(**kwargs):
+            captured["calls"].append(kwargs["messages"])
+            return SimpleNamespace(
+                messages=[{"role": "user", "content": " + COMPRESSED_SUFFIX"}],
+                transforms_applied=["fake:suffix"],
+                timing={},
+                tokens_before=20,
+                tokens_after=10,
+                waste_signals=None,
+            )
+
+        proxy.anthropic_pipeline.apply = _fake_apply
+
+        async def _fake_retry(method, url, headers, body, stream=False):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_cache_suffix",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 80,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": [
+                    {"role": "user", "content": "shared-prefix + raw suffix"},
+                ],
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured["calls"] == []
+        assert captured["body"]["messages"] == [
+            {"role": "user", "content": "shared-prefix + raw suffix"},
+        ]

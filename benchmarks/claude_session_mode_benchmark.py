@@ -20,10 +20,15 @@ from headroom.cache.prefix_tracker import PrefixCacheTracker
 from headroom.pricing.litellm_pricing import get_model_pricing
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.models import ProxyConfig
-from headroom.proxy.modes import PROXY_MODE_CACHE, PROXY_MODE_TOKEN
 from headroom.proxy.server import HeadroomProxy
 from headroom.tokenizers import get_tokenizer
 from headroom.utils import extract_user_query
+
+try:
+    from headroom.proxy.modes import PROXY_MODE_CACHE, PROXY_MODE_TOKEN
+except ImportError:
+    PROXY_MODE_CACHE = "cache"
+    PROXY_MODE_TOKEN = "token"
 
 DEFAULT_ROOT = Path.home() / ".claude" / "projects"
 DEFAULT_OUTPUT_DIR = Path("benchmark_results")
@@ -96,6 +101,9 @@ class ModeSummary:
     cache_eligible_turns: int = 0
     cache_bust_turns: int = 0
     ttl_expiry_turns: int = 0
+    rewrite_turns: int = 0
+    retroactive_rewrite_turns: int = 0
+    latest_turn_only_rewrite_turns: int = 0
     turns: list[TurnMetrics] = field(default_factory=list)
 
     @property
@@ -134,6 +142,24 @@ class DatasetSummary:
     decoded_project_paths: int
     sampled_requests: int = 0
     sampling_note: str = ""
+
+
+IMPACT_DIRECTION = {
+    "forwarded_input_tokens": "lower",
+    "cache_read_tokens": "higher",
+    "cache_write_tokens": "lower",
+    "regular_input_tokens": "lower",
+    "output_tokens": "same",
+    "total_cost_usd": "lower",
+    "no_cache_total_cost_usd": "lower",
+    "prompt_window_with_cache": "lower",
+    "prompt_window_without_cache_reads": "lower",
+    "cache_bust_turns": "lower",
+    "ttl_expiry_turns": "lower",
+    "rewrite_turns": "lower",
+    "retroactive_rewrite_turns": "lower",
+    "latest_turn_only_rewrite_turns": "lower",
+}
 
 
 @dataclass
@@ -221,6 +247,9 @@ def _mode_summary_from_dict(data: dict[str, Any]) -> ModeSummary:
         cache_eligible_turns=data.get("cache_eligible_turns", 0),
         cache_bust_turns=data.get("cache_bust_turns", 0),
         ttl_expiry_turns=data.get("ttl_expiry_turns", 0),
+        rewrite_turns=data.get("rewrite_turns", 0),
+        retroactive_rewrite_turns=data.get("retroactive_rewrite_turns", 0),
+        latest_turn_only_rewrite_turns=data.get("latest_turn_only_rewrite_turns", 0),
         turns=turns,
     )
     return summary
@@ -618,6 +647,133 @@ def _common_prefix_tokens(
     return common
 
 
+def _rewrite_scope(
+    original_messages: list[dict[str, Any]],
+    forwarded_messages: list[dict[str, Any]],
+    *,
+    stable_prefix_message_count: int,
+) -> tuple[bool, bool]:
+    if original_messages == forwarded_messages:
+        return False, False
+    stable_count = min(
+        stable_prefix_message_count,
+        len(original_messages),
+        len(forwarded_messages),
+    )
+    retroactive = False
+    if len(forwarded_messages) < stable_prefix_message_count:
+        retroactive = True
+    elif stable_count > 0 and forwarded_messages[:stable_count] != original_messages[:stable_count]:
+        retroactive = True
+    return True, retroactive
+
+
+def _extract_cache_stable_delta(
+    current_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]] | None,
+    previous_forwarded_messages: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    if previous_original_messages is None or previous_forwarded_messages is None:
+        return None
+    if len(current_messages) < len(previous_original_messages):
+        return None
+    stable_count = len(previous_original_messages)
+    if current_messages[:stable_count] != previous_original_messages:
+        return None
+    return (
+        copy.deepcopy(previous_forwarded_messages),
+        copy.deepcopy(current_messages[stable_count:]),
+    )
+
+
+def _extract_cache_stable_last_message_suffix(
+    current_messages: list[dict[str, Any]],
+    previous_original_messages: list[dict[str, Any]] | None,
+    previous_forwarded_messages: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]] | None:
+    if not previous_original_messages or previous_forwarded_messages is None:
+        return None
+    if (
+        len(current_messages) != len(previous_original_messages)
+        or len(previous_forwarded_messages) != len(previous_original_messages)
+        or not current_messages
+    ):
+        return None
+    prefix_len = len(current_messages) - 1
+    if prefix_len > 0 and current_messages[:prefix_len] != previous_original_messages[:prefix_len]:
+        return None
+
+    current_last = current_messages[-1]
+    previous_original_last = previous_original_messages[-1]
+    previous_forwarded_last = previous_forwarded_messages[-1]
+    if current_last.get("role") != previous_original_last.get("role") or current_last.get(
+        "role"
+    ) != previous_forwarded_last.get("role"):
+        return None
+
+    current_content = current_last.get("content")
+    previous_original_content = previous_original_last.get("content")
+    previous_forwarded_content = previous_forwarded_last.get("content")
+
+    if (
+        isinstance(current_content, str)
+        and isinstance(previous_original_content, str)
+        and isinstance(previous_forwarded_content, str)
+        and current_content.startswith(previous_original_content)
+    ):
+        suffix = current_content[len(previous_original_content) :]
+        delta_messages = []
+        if suffix:
+            delta_messages = [{**copy.deepcopy(current_last), "content": suffix}]
+        return (
+            copy.deepcopy(previous_forwarded_messages[:-1]),
+            copy.deepcopy(previous_forwarded_last),
+            delta_messages,
+        )
+
+    if (
+        isinstance(current_content, list)
+        and isinstance(previous_original_content, list)
+        and isinstance(previous_forwarded_content, list)
+        and len(current_content) >= len(previous_original_content)
+        and current_content[: len(previous_original_content)] == previous_original_content
+    ):
+        delta_blocks = copy.deepcopy(current_content[len(previous_original_content) :])
+        delta_messages = []
+        if delta_blocks:
+            delta_messages = [{**copy.deepcopy(current_last), "content": delta_blocks}]
+        return (
+            copy.deepcopy(previous_forwarded_messages[:-1]),
+            copy.deepcopy(previous_forwarded_last),
+            delta_messages,
+        )
+    return None
+
+
+def _merge_appended_message_delta(
+    previous_forwarded_message: dict[str, Any],
+    delta_forwarded_message: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if delta_forwarded_message is None:
+        return copy.deepcopy(previous_forwarded_message)
+    if previous_forwarded_message.get("role") != delta_forwarded_message.get("role"):
+        return None
+
+    previous_content = previous_forwarded_message.get("content")
+    delta_content = delta_forwarded_message.get("content")
+    if isinstance(previous_content, str) and isinstance(delta_content, str):
+        return {
+            **copy.deepcopy(previous_forwarded_message),
+            "content": previous_content + delta_content,
+        }
+    if isinstance(previous_content, list) and isinstance(delta_content, list):
+        return {
+            **copy.deepcopy(previous_forwarded_message),
+            "content": copy.deepcopy(previous_content) + copy.deepcopy(delta_content),
+        }
+    return None
+
+
 def _make_proxy(mode: str) -> HeadroomProxy:
     cfg = ProxyConfig(
         mode=mode,
@@ -655,25 +811,47 @@ def _apply_mode_to_messages(
     assert proxy is not None
     assert prefix_tracker is not None
     if mode == PROXY_MODE_CACHE:
-        delta = AnthropicHandlerMixin._extract_cache_stable_delta(
+        supports_delta_replay = hasattr(
+            AnthropicHandlerMixin, "_extract_cache_stable_last_message_suffix"
+        )
+        if not supports_delta_replay:
+            frozen_message_count = prefix_tracker.get_frozen_message_count()
+            context_limit = proxy.anthropic_provider.get_context_limit(model)
+            result = proxy.anthropic_pipeline.apply(
+                messages=copy.deepcopy(messages),
+                model=model,
+                model_limit=context_limit,
+                context=extract_user_query(messages),
+                frozen_message_count=frozen_message_count,
+            )
+            if hasattr(AnthropicHandlerMixin, "_restore_frozen_prefix"):
+                result.messages, _ = AnthropicHandlerMixin._restore_frozen_prefix(
+                    messages,
+                    result.messages,
+                    frozen_message_count=frozen_message_count,
+                )
+            return result.messages
+
+        delta = _extract_cache_stable_delta(
             messages,
             previous_original_messages,
             previous_forwarded_messages,
         )
-        if delta is None:
-            return copy.deepcopy(messages)
-        stable_forwarded_prefix, delta_messages = delta
-        if not delta_messages:
-            return stable_forwarded_prefix
-        context_limit = proxy.anthropic_provider.get_context_limit(model)
-        result = proxy.anthropic_pipeline.apply(
-            messages=delta_messages,
-            model=model,
-            model_limit=context_limit,
-            context=extract_user_query(delta_messages),
-            frozen_message_count=0,
-        )
-        return stable_forwarded_prefix + result.messages
+        if delta is not None:
+            stable_forwarded_prefix, delta_messages = delta
+            if not delta_messages:
+                return stable_forwarded_prefix
+            context_limit = proxy.anthropic_provider.get_context_limit(model)
+            result = proxy.anthropic_pipeline.apply(
+                messages=delta_messages,
+                model=model,
+                model_limit=context_limit,
+                context=extract_user_query(delta_messages),
+                frozen_message_count=0,
+            )
+            return stable_forwarded_prefix + result.messages
+
+        return copy.deepcopy(messages)
 
     frozen_message_count = prefix_tracker.get_frozen_message_count()
 
@@ -842,6 +1020,9 @@ def _merge_mode_summary(target: ModeSummary, source: ModeSummary) -> None:
     target.cache_eligible_turns += source.cache_eligible_turns
     target.cache_bust_turns += source.cache_bust_turns
     target.ttl_expiry_turns += source.ttl_expiry_turns
+    target.rewrite_turns += source.rewrite_turns
+    target.retroactive_rewrite_turns += source.retroactive_rewrite_turns
+    target.latest_turn_only_rewrite_turns += source.latest_turn_only_rewrite_turns
 
 
 def _disable_headroom_benchmark_logging() -> None:
@@ -914,6 +1095,32 @@ def _write_checkpoint_by_session_id(
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _update_prefix_tracker(
+    prefix_tracker: PrefixCacheTracker,
+    *,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+    messages: list[dict[str, Any]],
+    message_token_counts: list[int],
+    original_messages: list[dict[str, Any]] | None = None,
+) -> None:
+    try:
+        prefix_tracker.update_from_response(
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            messages=messages,
+            message_token_counts=message_token_counts,
+            original_messages=original_messages,
+        )
+    except TypeError:
+        prefix_tracker.update_from_response(
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            messages=messages,
+            message_token_counts=message_token_counts,
+        )
+
+
 def _simulate_single_replay_mode(
     replay: SessionReplay,
     mode: str,
@@ -938,6 +1145,7 @@ def _simulate_single_replay_mode(
     for turn in replay.turns:
         tokenizer = get_tokenizer(turn.model)
         turn_input_token_total = sum(tokenizer.count_message(msg) for msg in turn.input_messages)
+        prior_context_message_count = len(conversation)
         conversation.extend(turn.input_messages)
         raw_input_tokens = conversation_token_total + turn_input_token_total
         forwarded = _apply_mode_to_messages(
@@ -950,6 +1158,17 @@ def _simulate_single_replay_mode(
             previous_original_messages=previous_original_context,
             previous_forwarded_messages=previous_forwarded_context,
         )
+        rewrite, retroactive_rewrite = _rewrite_scope(
+            conversation,
+            forwarded,
+            stable_prefix_message_count=prior_context_message_count,
+        )
+        if rewrite:
+            summary.rewrite_turns += 1
+            if retroactive_rewrite:
+                summary.retroactive_rewrite_turns += 1
+            else:
+                summary.latest_turn_only_rewrite_turns += 1
         if pending is not None:
             _apply_turn_metrics(
                 pending.summary,
@@ -968,7 +1187,8 @@ def _simulate_single_replay_mode(
             previous_timestamp = pending.turn.timestamp
 
         if prefix_tracker is not None:
-            prefix_tracker.update_from_response(
+            _update_prefix_tracker(
+                prefix_tracker,
                 cache_read_tokens=0,
                 cache_write_tokens=0,
                 messages=forwarded,
@@ -1231,12 +1451,60 @@ def determine_winners(summaries: dict[str, ModeSummary]) -> dict[str, str]:
     }
 
 
+def _metric_value(summary: ModeSummary, field: str) -> float:
+    value = getattr(summary, field)
+    return float(value)
+
+
+def classify_metric_impact(
+    baseline: ModeSummary,
+    candidate: ModeSummary,
+    field: str,
+) -> dict[str, float | str]:
+    baseline_value = _metric_value(baseline, field)
+    candidate_value = _metric_value(candidate, field)
+    delta = candidate_value - baseline_value
+    direction = IMPACT_DIRECTION[field]
+    tolerance = 1e-9
+
+    if abs(delta) <= tolerance:
+        impact = "no_change"
+    elif direction == "lower":
+        impact = "assist" if delta < 0 else "harm"
+    elif direction == "higher":
+        impact = "assist" if delta > 0 else "harm"
+    else:
+        impact = "harm" if abs(delta) > tolerance else "no_change"
+
+    return {
+        "baseline": baseline_value,
+        "candidate": candidate_value,
+        "delta": delta,
+        "impact": impact,
+        "direction": direction,
+    }
+
+
+def summarize_mode_impact_vs_baseline(
+    summaries: dict[str, ModeSummary],
+) -> dict[str, dict[str, dict[str, float | str]]]:
+    baseline = summaries["baseline"]
+    result: dict[str, dict[str, dict[str, float | str]]] = {}
+    for mode in (PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+        candidate = summaries[mode]
+        result[mode] = {
+            field: classify_metric_impact(baseline, candidate, field) for field in IMPACT_DIRECTION
+        }
+    return result
+
+
 def format_currency(value: float) -> str:
     return f"${value:,.2f}"
 
 
 def print_console_report(dataset: DatasetSummary, summaries: dict[str, ModeSummary]) -> None:
     winners = determine_winners(summaries)
+    impacts = summarize_mode_impact_vs_baseline(summaries)
     print("Claude session mode simulation")
     print(
         f"Dataset: {dataset.projects} projects, {dataset.sessions} sessions, "
@@ -1245,7 +1513,7 @@ def print_console_report(dataset: DatasetSummary, summaries: dict[str, ModeSumma
     print(f"Sampling: {dataset.sampling_note}")
     print()
     print(
-        "mode      raw_tok      cache_tok    cache_read   cache_write   paid_in      paid_out     busts   ttl_exp   total_cost    no_cache"
+        "mode      raw_tok      cache_tok    cache_read   cache_write   paid_in      paid_out     busts   ttl_exp   rewrite   retro_rw   total_cost    no_cache"
     )
     for mode in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
         summary = summaries[mode]
@@ -1254,6 +1522,7 @@ def print_console_report(dataset: DatasetSummary, summaries: dict[str, ModeSumma
             f"{summary.cache_read_tokens:>11,} {summary.cache_write_tokens:>12,} "
             f"{summary.regular_input_tokens:>10,} {summary.output_tokens:>12,} "
             f"{summary.cache_bust_turns:>7,} {summary.ttl_expiry_turns:>9,} "
+            f"{summary.rewrite_turns:>9,} {summary.retroactive_rewrite_turns:>10,} "
             f"{format_currency(summary.total_cost_usd):>11} "
             f"{format_currency(summary.no_cache_total_cost_usd):>11}"
         )
@@ -1265,6 +1534,26 @@ def print_console_report(dataset: DatasetSummary, summaries: dict[str, ModeSumma
         "Winner if cache read tokens do not count against window: "
         f"{winners['window_without_cache_reads']}"
     )
+    print()
+    print("Impact vs baseline")
+    for mode in (PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+        impact = impacts[mode]
+        print(
+            f"{mode}: total_cost={impact['total_cost_usd']['impact']} "
+            f"({format_currency(impact['total_cost_usd']['delta'])}), "
+            f"cache_read={impact['cache_read_tokens']['impact']} "
+            f"({int(impact['cache_read_tokens']['delta']):,}), "
+            f"cache_write={impact['cache_write_tokens']['impact']} "
+            f"({int(impact['cache_write_tokens']['delta']):,}), "
+            f"paid_input={impact['regular_input_tokens']['impact']} "
+            f"({int(impact['regular_input_tokens']['delta']):,}), "
+            f"rewrite={impact['rewrite_turns']['impact']} "
+            f"({int(impact['rewrite_turns']['delta']):,}), "
+            f"retro_rw={impact['retroactive_rewrite_turns']['impact']} "
+            f"({int(impact['retroactive_rewrite_turns']['delta']):,}), "
+            f"window={impact['prompt_window_with_cache']['impact']} "
+            f"({int(impact['prompt_window_with_cache']['delta']):,})"
+        )
 
 
 def print_observed_console_report(observed: ObservedSummary) -> None:
@@ -1288,6 +1577,7 @@ def build_report_markdown(
     summaries: dict[str, ModeSummary],
 ) -> str:
     winners = determine_winners(summaries)
+    impacts = summarize_mode_impact_vs_baseline(summaries)
     model_lines = "\n".join(f"- `{model}`: {count}" for model, count in dataset.models.items())
     rows = []
     for mode in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
@@ -1311,12 +1601,36 @@ def build_report_markdown(
                     format_currency(summary.no_cache_total_cost_usd),
                     f"{summary.cache_bust_turns:,}",
                     f"{summary.ttl_expiry_turns:,}",
+                    f"{summary.rewrite_turns:,}",
+                    f"{summary.retroactive_rewrite_turns:,}",
+                    f"{summary.latest_turn_only_rewrite_turns:,}",
                     f"{summary.prompt_window_with_cache:,}",
                     f"{summary.prompt_window_without_cache_reads:,}",
                 ]
             )
             + " |"
         )
+    impact_rows = []
+    for mode in (PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+        for metric_key, label in (
+            ("total_cost_usd", "Total Cost"),
+            ("cache_read_tokens", "Cache Read Tokens"),
+            ("cache_write_tokens", "Cache Write Tokens"),
+            ("regular_input_tokens", "Paid Input Tokens"),
+            ("output_tokens", "Paid Output Tokens"),
+            ("prompt_window_with_cache", "Window With Cache"),
+            ("prompt_window_without_cache_reads", "Window Without Cache Reads"),
+            ("cache_bust_turns", "Cache Bust Turns"),
+            ("rewrite_turns", "Rewrite Turns"),
+            ("retroactive_rewrite_turns", "Retroactive Rewrite Turns"),
+            ("latest_turn_only_rewrite_turns", "Latest-Turn-Only Rewrite Turns"),
+        ):
+            impact = impacts[mode][metric_key]
+            delta = impact["delta"]
+            delta_text = format_currency(delta) if "cost" in metric_key else f"{int(delta):,}"
+            impact_rows.append(
+                f"| {mode} | {label} | {impact['impact']} | {delta_text} | {impact['direction']} |"
+            )
     return "\n".join(
         [
             "# Claude Session Mode Simulation",
@@ -1351,9 +1665,15 @@ def build_report_markdown(
             "",
             "## Summary",
             "",
-            "| Mode | Raw Tokens | Cache Tokens | Cache Read | Cache Write | Paid Input Tokens | Paid Output Tokens | Paid Input Cost | Cache Read Cost | Cache Write Cost | Paid Output Cost | Total Cost | No-Cache Total Cost | Cache Bust Turns | TTL Expiry Turns | Window Tokens (Cache Counted) | Window Tokens (Cache Reads Excluded) |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Mode | Raw Tokens | Cache Tokens | Cache Read | Cache Write | Paid Input Tokens | Paid Output Tokens | Paid Input Cost | Cache Read Cost | Cache Write Cost | Paid Output Cost | Total Cost | No-Cache Total Cost | Cache Bust Turns | TTL Expiry Turns | Rewrite Turns | Retroactive Rewrite Turns | Latest-Turn-Only Rewrite Turns | Window Tokens (Cache Counted) | Window Tokens (Cache Reads Excluded) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             *rows,
+            "",
+            "## Impact vs Baseline",
+            "",
+            "| Mode | Metric | Classification | Delta | Better Direction |",
+            "| --- | --- | --- | ---: | --- |",
+            *impact_rows,
             "",
             "## Winners",
             "",
@@ -1372,6 +1692,7 @@ def build_report_html(
     summaries: dict[str, ModeSummary],
 ) -> str:
     winners = determine_winners(summaries)
+    impacts = summarize_mode_impact_vs_baseline(summaries)
     model_items = "".join(
         f"<li><code>{model}</code><span>{count:,}</span></li>"
         for model, count in dataset.models.items()
@@ -1390,12 +1711,42 @@ def build_report_html(
             f"<td>{summary.output_tokens:,}</td>"
             f"<td>{summary.cache_bust_turns:,}</td>"
             f"<td>{summary.ttl_expiry_turns:,}</td>"
+            f"<td>{summary.rewrite_turns:,}</td>"
+            f"<td>{summary.retroactive_rewrite_turns:,}</td>"
+            f"<td>{summary.latest_turn_only_rewrite_turns:,}</td>"
             f"<td>{format_currency(summary.total_cost_usd)}</td>"
             f"<td>{format_currency(summary.no_cache_total_cost_usd)}</td>"
             f"<td>{summary.prompt_window_with_cache:,}</td>"
             f"<td>{summary.prompt_window_without_cache_reads:,}</td>"
             "</tr>"
         )
+    impact_rows = []
+    for mode in (PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
+        for metric_key, label in (
+            ("total_cost_usd", "Total Cost"),
+            ("cache_read_tokens", "Cache Read Tokens"),
+            ("cache_write_tokens", "Cache Write Tokens"),
+            ("regular_input_tokens", "Paid Input Tokens"),
+            ("output_tokens", "Paid Output Tokens"),
+            ("prompt_window_with_cache", "Window With Cache"),
+            ("prompt_window_without_cache_reads", "Window Without Cache Reads"),
+            ("cache_bust_turns", "Cache Bust Turns"),
+            ("rewrite_turns", "Rewrite Turns"),
+            ("retroactive_rewrite_turns", "Retroactive Rewrite Turns"),
+            ("latest_turn_only_rewrite_turns", "Latest-Turn-Only Rewrite Turns"),
+        ):
+            impact = impacts[mode][metric_key]
+            delta = impact["delta"]
+            delta_text = format_currency(delta) if "cost" in metric_key else f"{int(delta):,}"
+            impact_rows.append(
+                "<tr>"
+                f"<td><span class='badge'>{mode}</span></td>"
+                f"<td>{label}</td>"
+                f"<td>{impact['impact']}</td>"
+                f"<td>{delta_text}</td>"
+                f"<td>{impact['direction']}</td>"
+                "</tr>"
+            )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1517,11 +1868,26 @@ def build_report_html(
         <table>
           <thead>
             <tr>
-              <th>Mode</th><th>Raw Tokens</th><th>Cache Tokens</th><th>Cache Read</th><th>Cache Write</th><th>Paid Input</th><th>Paid Output</th><th>Cache Busts</th><th>TTL Expiry</th><th>Total Cost</th><th>No-Cache Cost</th><th>Window With Cache</th><th>Window Without Cache Reads</th>
+              <th>Mode</th><th>Raw Tokens</th><th>Cache Tokens</th><th>Cache Read</th><th>Cache Write</th><th>Paid Input</th><th>Paid Output</th><th>Cache Busts</th><th>TTL Expiry</th><th>Rewrite Turns</th><th>Retroactive Rewrites</th><th>Latest-Turn-Only Rewrites</th><th>Total Cost</th><th>No-Cache Cost</th><th>Window With Cache</th><th>Window Without Cache Reads</th>
             </tr>
           </thead>
           <tbody>
             {"".join(summary_rows)}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <section class="section card">
+      <h2>Impact vs Baseline</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Mode</th><th>Metric</th><th>Classification</th><th>Delta</th><th>Better Direction</th>
+            </tr>
+          </thead>
+          <tbody>
+            {"".join(impact_rows)}
           </tbody>
         </table>
       </div>
@@ -1548,6 +1914,7 @@ def write_report(
         "observed": asdict(observed),
         "summaries": {mode: asdict(summary) for mode, summary in summaries.items()},
         "winners": determine_winners(summaries),
+        "impact_vs_baseline": summarize_mode_impact_vs_baseline(summaries),
     }
     json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return md_path, json_path, html_path
