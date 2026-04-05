@@ -93,6 +93,9 @@ class ModeSummary:
     cache_write_cost_usd: float = 0.0
     paid_output_cost_usd: float = 0.0
     total_cost_usd: float = 0.0
+    cache_eligible_turns: int = 0
+    cache_bust_turns: int = 0
+    ttl_expiry_turns: int = 0
     turns: list[TurnMetrics] = field(default_factory=list)
 
     @property
@@ -111,6 +114,16 @@ class ModeSummary:
     def prompt_window_without_cache_reads(self) -> int:
         return self.forwarded_input_tokens - self.cache_read_tokens
 
+    @property
+    def no_cache_total_cost_usd(self) -> float:
+        return (
+            self.paid_input_cost_usd + (self.cache_read_cost_usd * 10.0) + self.paid_output_cost_usd
+        )
+
+    @property
+    def no_cache_paid_input_tokens(self) -> int:
+        return self.forwarded_input_tokens
+
 
 @dataclass
 class DatasetSummary:
@@ -119,6 +132,8 @@ class DatasetSummary:
     requests: int
     models: dict[str, int]
     decoded_project_paths: int
+    sampled_requests: int = 0
+    sampling_note: str = ""
 
 
 @dataclass
@@ -203,6 +218,9 @@ def _mode_summary_from_dict(data: dict[str, Any]) -> ModeSummary:
         cache_write_cost_usd=data.get("cache_write_cost_usd", 0.0),
         paid_output_cost_usd=data.get("paid_output_cost_usd", 0.0),
         total_cost_usd=data.get("total_cost_usd", 0.0),
+        cache_eligible_turns=data.get("cache_eligible_turns", 0),
+        cache_bust_turns=data.get("cache_bust_turns", 0),
+        ttl_expiry_turns=data.get("ttl_expiry_turns", 0),
         turns=turns,
     )
     return summary
@@ -289,44 +307,24 @@ def load_session_replay(session_file: Path) -> SessionReplay | None:
     turns: list[ReplayTurn] = []
     current_group: dict[str, Any] | None = None
 
-    with session_file.open("r", encoding="utf-8") as handle:
-        for raw_line in handle:
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            event_type = event.get("type")
-            message = event.get("message")
+    try:
+        with session_file.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                event_type = event.get("type")
+                message = event.get("message")
 
-            if event_type == "user" and isinstance(message, dict) and message.get("role") == "user":
-                _finalize_group(
-                    current_group,
-                    pending_messages,
-                    turns,
-                    session_id=session_id,
-                    project_key=project_key,
-                    decoded_project_path=decoded_project_path,
-                )
-                current_group = None
-                pending_messages.clear()
-                pending_messages.append(copy.deepcopy(message))
-                continue
-
-            if (
-                event_type == "assistant"
-                and isinstance(message, dict)
-                and message.get("role") == "assistant"
-                and event.get("requestId")
-            ):
-                request_id = str(event["requestId"])
-                usage = message.get("usage") or {}
-                timestamp = _parse_timestamp(event.get("timestamp"))
-                blocks = _assistant_blocks_from_content(message.get("content"))
-                if current_group is None or current_group["request_id"] != request_id:
-                    had_group = current_group is not None
+                if (
+                    event_type == "user"
+                    and isinstance(message, dict)
+                    and message.get("role") == "user"
+                ):
                     _finalize_group(
                         current_group,
                         pending_messages,
@@ -335,40 +333,67 @@ def load_session_replay(session_file: Path) -> SessionReplay | None:
                         project_key=project_key,
                         decoded_project_path=decoded_project_path,
                     )
-                    if had_group:
-                        pending_messages.clear()
-                    current_group = {
-                        "request_id": request_id,
-                        "model": str(message.get("model", "unknown")),
-                        "timestamp": timestamp,
-                        "blocks": [],
-                        "seen": set(),
-                        "output_tokens": 0,
-                        "observed_input_tokens": 0,
-                        "observed_cache_read_tokens": 0,
-                        "observed_cache_write_tokens": 0,
-                    }
-                for block in blocks:
-                    key = _canonical_block_key(block)
-                    if key not in current_group["seen"]:
-                        current_group["seen"].add(key)
-                        current_group["blocks"].append(copy.deepcopy(block))
-                current_group["output_tokens"] = max(
-                    current_group["output_tokens"],
-                    int(usage.get("output_tokens", 0) or 0),
-                )
-                current_group["observed_input_tokens"] = max(
-                    current_group["observed_input_tokens"],
-                    int(usage.get("input_tokens", 0) or 0),
-                )
-                current_group["observed_cache_read_tokens"] = max(
-                    current_group["observed_cache_read_tokens"],
-                    int(usage.get("cache_read_input_tokens", 0) or 0),
-                )
-                current_group["observed_cache_write_tokens"] = max(
-                    current_group["observed_cache_write_tokens"],
-                    int(usage.get("cache_creation_input_tokens", 0) or 0),
-                )
+                    current_group = None
+                    pending_messages.clear()
+                    pending_messages.append(copy.deepcopy(message))
+                    continue
+
+                if (
+                    event_type == "assistant"
+                    and isinstance(message, dict)
+                    and message.get("role") == "assistant"
+                    and event.get("requestId")
+                ):
+                    request_id = str(event["requestId"])
+                    usage = message.get("usage") or {}
+                    timestamp = _parse_timestamp(event.get("timestamp"))
+                    blocks = _assistant_blocks_from_content(message.get("content"))
+                    if current_group is None or current_group["request_id"] != request_id:
+                        had_group = current_group is not None
+                        _finalize_group(
+                            current_group,
+                            pending_messages,
+                            turns,
+                            session_id=session_id,
+                            project_key=project_key,
+                            decoded_project_path=decoded_project_path,
+                        )
+                        if had_group:
+                            pending_messages.clear()
+                        current_group = {
+                            "request_id": request_id,
+                            "model": str(message.get("model", "unknown")),
+                            "timestamp": timestamp,
+                            "blocks": [],
+                            "seen": set(),
+                            "output_tokens": 0,
+                            "observed_input_tokens": 0,
+                            "observed_cache_read_tokens": 0,
+                            "observed_cache_write_tokens": 0,
+                        }
+                    for block in blocks:
+                        key = _canonical_block_key(block)
+                        if key not in current_group["seen"]:
+                            current_group["seen"].add(key)
+                            current_group["blocks"].append(copy.deepcopy(block))
+                    current_group["output_tokens"] = max(
+                        current_group["output_tokens"],
+                        int(usage.get("output_tokens", 0) or 0),
+                    )
+                    current_group["observed_input_tokens"] = max(
+                        current_group["observed_input_tokens"],
+                        int(usage.get("input_tokens", 0) or 0),
+                    )
+                    current_group["observed_cache_read_tokens"] = max(
+                        current_group["observed_cache_read_tokens"],
+                        int(usage.get("cache_read_input_tokens", 0) or 0),
+                    )
+                    current_group["observed_cache_write_tokens"] = max(
+                        current_group["observed_cache_write_tokens"],
+                        int(usage.get("cache_creation_input_tokens", 0) or 0),
+                    )
+    except OSError:
+        return None
 
     _finalize_group(
         current_group,
@@ -387,6 +412,33 @@ def load_session_replay(session_file: Path) -> SessionReplay | None:
         decoded_project_path=decoded_project_path,
         turns=turns,
     )
+
+
+def trim_replay_to_recent_turns(
+    replay: SessionReplay, recent_turns: int | None = None
+) -> SessionReplay:
+    if recent_turns is None or recent_turns <= 0 or len(replay.turns) <= recent_turns:
+        return replay
+    return SessionReplay(
+        session_id=replay.session_id,
+        project_key=replay.project_key,
+        decoded_project_path=replay.decoded_project_path,
+        turns=replay.turns[-recent_turns:],
+    )
+
+
+def resolve_checkpoint_dir(
+    base_dir: Path,
+    *,
+    recent_turns_per_session: int | None = None,
+    cache_ttl_minutes: int = DEFAULT_CACHE_TTL_MINUTES,
+) -> Path:
+    suffix_parts = ["v2", f"ttl_{cache_ttl_minutes}m"]
+    if recent_turns_per_session:
+        suffix_parts.append(f"recent_{recent_turns_per_session}")
+    else:
+        suffix_parts.append("full")
+    return base_dir / "__".join(suffix_parts)
 
 
 def discover_session_files(root: Path) -> list[Path]:
@@ -423,7 +475,10 @@ def select_session_files(root: Path, max_sessions: int | None = None) -> list[Pa
 
 
 def build_dataset_and_observed_from_files(
-    session_files: list[Path], *, cache_write_multiplier: float = 1.25
+    session_files: list[Path],
+    *,
+    cache_write_multiplier: float = 1.25,
+    recent_turns_per_session: int | None = None,
 ) -> tuple[DatasetSummary, ObservedSummary]:
     model_counts: Counter[str] = Counter()
     project_keys: set[str] = set()
@@ -438,6 +493,7 @@ def build_dataset_and_observed_from_files(
         replay = load_session_replay(session_file)
         if replay is None:
             continue
+        replay = trim_replay_to_recent_turns(replay, recent_turns_per_session)
         project_keys.add(replay.project_key)
         decoded_project_paths.add(replay.decoded_project_path)
         observed.sessions += 1
@@ -481,6 +537,12 @@ def build_dataset_and_observed_from_files(
         requests=requests,
         models=dict(sorted(model_counts.items())),
         decoded_project_paths=len(decoded_project_paths),
+        sampled_requests=requests,
+        sampling_note=(
+            f"Most recent {recent_turns_per_session} turns per session"
+            if recent_turns_per_session
+            else "Full replayable session history"
+        ),
     )
     return dataset, observed
 
@@ -700,8 +762,18 @@ def _apply_turn_metrics(
     forwarded_input_tokens = tokenizer.count_messages(forwarded)
 
     read_tokens = 0
-    if _cache_gap_within_ttl(turn.timestamp, previous_timestamp, ttl=ttl):
+    cache_eligible = _cache_gap_within_ttl(turn.timestamp, previous_timestamp, ttl=ttl)
+    if cache_eligible:
         read_tokens = _common_prefix_tokens(previous_forwarded, forwarded, tokenizer)
+        summary.cache_eligible_turns += 1
+        prefix_preserved = (
+            len(forwarded) >= len(previous_forwarded)
+            and forwarded[: len(previous_forwarded)] == previous_forwarded
+        )
+        if previous_forwarded and not prefix_preserved:
+            summary.cache_bust_turns += 1
+    elif previous_timestamp is not None:
+        summary.ttl_expiry_turns += 1
 
     write_tokens = 0
     if next_forwarded is not None and _cache_gap_within_ttl(
@@ -748,6 +820,9 @@ def _merge_mode_summary(target: ModeSummary, source: ModeSummary) -> None:
     target.cache_write_cost_usd += source.cache_write_cost_usd
     target.paid_output_cost_usd += source.paid_output_cost_usd
     target.total_cost_usd += source.total_cost_usd
+    target.cache_eligible_turns += source.cache_eligible_turns
+    target.cache_bust_turns += source.cache_bust_turns
+    target.ttl_expiry_turns += source.ttl_expiry_turns
 
 
 def _disable_headroom_benchmark_logging() -> None:
@@ -885,8 +960,8 @@ def _simulate_single_replay_mode(
             forwarded=forwarded,
         )
         conversation.append(turn.assistant_message)
-        conversation_token_total = (
-            raw_input_tokens + tokenizer.count_message(turn.assistant_message)
+        conversation_token_total = raw_input_tokens + tokenizer.count_message(
+            turn.assistant_message
         )
 
     if pending is not None:
@@ -912,10 +987,12 @@ def _simulate_single_session_file_mode(
     mode: str,
     cache_ttl_minutes: int,
     cache_write_multiplier: float,
+    recent_turns_per_session: int | None = None,
 ) -> tuple[str, ModeSummary]:
     replay = load_session_replay(session_file)
     if replay is None:
         return session_file.stem, ModeSummary(mode=mode)
+    replay = trim_replay_to_recent_turns(replay, recent_turns_per_session)
     return replay.session_id, _simulate_single_replay_mode(
         replay,
         mode,
@@ -1018,6 +1095,7 @@ def simulate_session_files(
     cache_write_multiplier: float = 1.25,
     workers: int = 1,
     checkpoint_dir: Path | None = None,
+    recent_turns_per_session: int | None = None,
 ) -> dict[str, ModeSummary]:
     summaries = {
         "baseline": ModeSummary(mode="baseline"),
@@ -1058,6 +1136,7 @@ def simulate_session_files(
                         mode,
                         cache_ttl_minutes,
                         cache_write_multiplier,
+                        recent_turns_per_session,
                     )
                     future_map[future] = session_id
                 for future in concurrent.futures.as_completed(future_map):
@@ -1090,6 +1169,7 @@ def simulate_session_files(
                 replay = load_session_replay(session_file)
                 if replay is None:
                     continue
+                replay = trim_replay_to_recent_turns(replay, recent_turns_per_session)
                 if index == 1 or index % 10 == 0 or index == total:
                     print(
                         f"[simulate] mode={mode} session={index}/{total} "
@@ -1112,6 +1192,9 @@ def simulate_session_files(
 def determine_winners(summaries: dict[str, ModeSummary]) -> dict[str, str]:
     return {
         "total_cost": min(summaries.values(), key=lambda s: s.total_cost_usd).mode,
+        "no_cache_total_cost": min(
+            summaries.values(), key=lambda s: s.no_cache_total_cost_usd
+        ).mode,
         "window_with_cache": min(summaries.values(), key=lambda s: s.prompt_window_with_cache).mode,
         "window_without_cache_reads": min(
             summaries.values(), key=lambda s: s.prompt_window_without_cache_reads
@@ -1130,9 +1213,10 @@ def print_console_report(dataset: DatasetSummary, summaries: dict[str, ModeSumma
         f"Dataset: {dataset.projects} projects, {dataset.sessions} sessions, "
         f"{dataset.requests} requests"
     )
+    print(f"Sampling: {dataset.sampling_note}")
     print()
     print(
-        "mode      raw_tok      cache_tok    cache_read   cache_write   paid_in      paid_out     total_cost"
+        "mode      raw_tok      cache_tok    cache_read   cache_write   paid_in      paid_out     busts   ttl_exp   total_cost    no_cache"
     )
     for mode in ("baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE):
         summary = summaries[mode]
@@ -1140,10 +1224,13 @@ def print_console_report(dataset: DatasetSummary, summaries: dict[str, ModeSumma
             f"{mode:<9} {summary.raw_tokens:>11,} {summary.cache_tokens:>12,} "
             f"{summary.cache_read_tokens:>11,} {summary.cache_write_tokens:>12,} "
             f"{summary.regular_input_tokens:>10,} {summary.output_tokens:>12,} "
-            f"{format_currency(summary.total_cost_usd):>11}"
+            f"{summary.cache_bust_turns:>7,} {summary.ttl_expiry_turns:>9,} "
+            f"{format_currency(summary.total_cost_usd):>11} "
+            f"{format_currency(summary.no_cache_total_cost_usd):>11}"
         )
     print()
     print(f"Winner by total cost: {winners['total_cost']}")
+    print(f"Winner by total cost with no cache help: {winners['no_cache_total_cost']}")
     print(f"Winner if cache tokens count against window: {winners['window_with_cache']}")
     print(
         "Winner if cache read tokens do not count against window: "
@@ -1192,6 +1279,9 @@ def build_report_markdown(
                     format_currency(summary.cache_write_cost_usd),
                     format_currency(summary.paid_output_cost_usd),
                     format_currency(summary.total_cost_usd),
+                    format_currency(summary.no_cache_total_cost_usd),
+                    f"{summary.cache_bust_turns:,}",
+                    f"{summary.ttl_expiry_turns:,}",
                     f"{summary.prompt_window_with_cache:,}",
                     f"{summary.prompt_window_without_cache_reads:,}",
                 ]
@@ -1207,7 +1297,9 @@ def build_report_markdown(
             f"- Projects: {dataset.projects}",
             f"- Sessions: {dataset.sessions}",
             f"- Requests: {dataset.requests}",
+            f"- Sampled requests: {dataset.sampled_requests}",
             f"- Distinct decoded project paths: {dataset.decoded_project_paths}",
+            f"- Sampling: {dataset.sampling_note}",
             "- Models:",
             model_lines or "- None",
             "",
@@ -1230,13 +1322,14 @@ def build_report_markdown(
             "",
             "## Summary",
             "",
-            "| Mode | Raw Tokens | Cache Tokens | Cache Read | Cache Write | Paid Input Tokens | Paid Output Tokens | Paid Input Cost | Cache Read Cost | Cache Write Cost | Paid Output Cost | Total Cost | Window Tokens (Cache Counted) | Window Tokens (Cache Reads Excluded) |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Mode | Raw Tokens | Cache Tokens | Cache Read | Cache Write | Paid Input Tokens | Paid Output Tokens | Paid Input Cost | Cache Read Cost | Cache Write Cost | Paid Output Cost | Total Cost | No-Cache Total Cost | Cache Bust Turns | TTL Expiry Turns | Window Tokens (Cache Counted) | Window Tokens (Cache Reads Excluded) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             *rows,
             "",
             "## Winners",
             "",
             f"- Total cost winner: `{winners['total_cost']}`",
+            f"- No-cache total cost winner: `{winners['no_cache_total_cost']}`",
             f"- Window winner if cache tokens count: `{winners['window_with_cache']}`",
             "- Window winner if cache read tokens do not count: "
             f"`{winners['window_without_cache_reads']}`",
@@ -1266,7 +1359,10 @@ def build_report_html(
             f"<td>{summary.cache_write_tokens:,}</td>"
             f"<td>{summary.regular_input_tokens:,}</td>"
             f"<td>{summary.output_tokens:,}</td>"
+            f"<td>{summary.cache_bust_turns:,}</td>"
+            f"<td>{summary.ttl_expiry_turns:,}</td>"
             f"<td>{format_currency(summary.total_cost_usd)}</td>"
+            f"<td>{format_currency(summary.no_cache_total_cost_usd)}</td>"
             f"<td>{summary.prompt_window_with_cache:,}</td>"
             f"<td>{summary.prompt_window_without_cache_reads:,}</td>"
             "</tr>"
@@ -1360,7 +1456,7 @@ def build_report_html(
         <div class="card"><div class="eyebrow">Projects</div><div class="value">{dataset.projects:,}</div><div class="subtle">{dataset.sessions:,} sessions / {dataset.requests:,} requests</div></div>
         <div class="card"><div class="eyebrow">Observed Cache Ratio</div><div class="value">{observed.cache_ratio_pct:.1f}%</div><div class="subtle">read / (read + write + input)</div></div>
         <div class="card"><div class="eyebrow">Observed Total Cost</div><div class="value">{format_currency(observed.total_cost_usd)}</div><div class="subtle">{observed.cache_read_tokens:,} read / {observed.cache_write_tokens:,} write</div></div>
-        <div class="card"><div class="eyebrow">Broken Prefix Turns</div><div class="value">{observed.broken_prefix_turns:,}</div><div class="subtle">CR stuck while CC grows</div></div>
+        <div class="card"><div class="eyebrow">Broken Prefix Turns</div><div class="value">{observed.broken_prefix_turns:,}</div><div class="subtle">{dataset.sampling_note}</div></div>
       </div>
     </section>
     <section class="section grid" style="grid-template-columns: 1.1fr .9fr;">
@@ -1368,6 +1464,7 @@ def build_report_html(
         <h2>Winners</h2>
         <div class="winner-list">
           <div><span class="eyebrow">Total cost</span><br><span class="badge">{winners["total_cost"]}</span></div>
+          <div><span class="eyebrow">No-cache total cost</span><br><span class="badge">{winners["no_cache_total_cost"]}</span></div>
           <div><span class="eyebrow">Window if cache counts</span><br><span class="badge">{winners["window_with_cache"]}</span></div>
           <div><span class="eyebrow">Window if cache reads do not count</span><br><span class="badge">{winners["window_without_cache_reads"]}</span></div>
         </div>
@@ -1391,7 +1488,7 @@ def build_report_html(
         <table>
           <thead>
             <tr>
-              <th>Mode</th><th>Raw Tokens</th><th>Cache Tokens</th><th>Cache Read</th><th>Cache Write</th><th>Paid Input</th><th>Paid Output</th><th>Total Cost</th><th>Window With Cache</th><th>Window Without Cache Reads</th>
+              <th>Mode</th><th>Raw Tokens</th><th>Cache Tokens</th><th>Cache Read</th><th>Cache Write</th><th>Paid Input</th><th>Paid Output</th><th>Cache Busts</th><th>TTL Expiry</th><th>Total Cost</th><th>No-Cache Cost</th><th>Window With Cache</th><th>Window Without Cache Reads</th>
             </tr>
           </thead>
           <tbody>
@@ -1432,6 +1529,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--max-sessions", type=int, default=None)
+    parser.add_argument(
+        "--recent-turns-per-session",
+        type=int,
+        default=None,
+        help="Limit each replay to its most recent N turns for broader, faster sampling.",
+    )
     parser.add_argument("--cache-ttl-minutes", type=int, default=DEFAULT_CACHE_TTL_MINUTES)
     parser.add_argument(
         "--cache-write-multiplier",
@@ -1458,6 +1561,11 @@ def main() -> int:
     args = parse_args()
     logging.getLogger("headroom.transforms").setLevel(logging.WARNING)
     logging.getLogger("headroom.proxy").setLevel(logging.WARNING)
+    checkpoint_dir = resolve_checkpoint_dir(
+        args.checkpoint_dir,
+        recent_turns_per_session=args.recent_turns_per_session,
+        cache_ttl_minutes=args.cache_ttl_minutes,
+    )
     session_files = select_session_files(args.root, max_sessions=args.max_sessions)
     if not session_files:
         print(f"No Claude session replays found under {args.root}")
@@ -1465,6 +1573,7 @@ def main() -> int:
     dataset, observed = build_dataset_and_observed_from_files(
         session_files,
         cache_write_multiplier=args.cache_write_multiplier,
+        recent_turns_per_session=args.recent_turns_per_session,
     )
     print(
         f"[load] loaded {dataset.sessions} sessions from {args.root}"
@@ -1477,7 +1586,8 @@ def main() -> int:
         cache_ttl_minutes=args.cache_ttl_minutes,
         cache_write_multiplier=args.cache_write_multiplier,
         workers=args.workers,
-        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_dir=checkpoint_dir,
+        recent_turns_per_session=args.recent_turns_per_session,
     )
     md_path, json_path, html_path = write_report(args.output_dir, dataset, observed, summaries)
     print_observed_console_report(observed)

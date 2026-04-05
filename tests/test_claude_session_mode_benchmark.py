@@ -13,11 +13,14 @@ from benchmarks.claude_session_mode_benchmark import (
     ReplayTurn,
     SessionReplay,
     _write_checkpoint_by_session_id,
+    build_dataset_and_observed_from_files,
     decode_project_key,
     determine_winners,
     load_session_replay,
+    resolve_checkpoint_dir,
     simulate_replays,
     summarize_observed_usage,
+    trim_replay_to_recent_turns,
 )
 
 
@@ -141,6 +144,9 @@ def test_simulation_and_winner_logic() -> None:
         <= summaries["baseline"].forwarded_input_tokens
     )
     assert summaries[PROXY_MODE_CACHE].cache_read_tokens >= 0
+    assert summaries["baseline"].cache_bust_turns == 0
+    assert summaries[PROXY_MODE_CACHE].cache_bust_turns == 0
+    assert summaries[PROXY_MODE_TOKEN].cache_bust_turns >= 0
 
     winners = determine_winners(summaries)
     assert winners["total_cost"] in {"baseline", PROXY_MODE_TOKEN, PROXY_MODE_CACHE}
@@ -220,3 +226,111 @@ def test_checkpoint_write_omits_per_turn_payload(tmp_path: Path) -> None:
 
     payload = json.loads((tmp_path / f"{PROXY_MODE_TOKEN}--session-1.json").read_text())
     assert payload["turns"] == []
+
+
+def test_trim_replay_to_recent_turns_keeps_latest_slice() -> None:
+    replay = SessionReplay(
+        session_id="s1",
+        project_key="C--git-demo",
+        decoded_project_path=r"C:\git\demo",
+        turns=[
+            ReplayTurn(
+                session_id="s1",
+                project_key="C--git-demo",
+                decoded_project_path=r"C:\git\demo",
+                request_id=f"r{i}",
+                model="claude-sonnet-4-6",
+                timestamp=datetime.fromisoformat(f"2026-03-13T01:0{i}:00+00:00"),
+                input_messages=[{"role": "user", "content": str(i)}],
+                assistant_message={"role": "assistant", "content": str(i)},
+                output_tokens=i,
+            )
+            for i in range(4)
+        ],
+    )
+
+    trimmed = trim_replay_to_recent_turns(replay, 2)
+
+    assert [turn.request_id for turn in trimmed.turns] == ["r2", "r3"]
+
+
+def test_build_dataset_and_observed_from_files_applies_recent_turn_sampling(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "C--git-BetBlocker"
+    project_dir.mkdir()
+    session_file = project_dir / "sess-1.jsonl"
+    lines = []
+    for i in range(3):
+        lines.append(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": f"Hello {i}"},
+                "timestamp": f"2026-03-13T01:0{i}:00Z",
+            }
+        )
+        lines.append(
+            {
+                "type": "assistant",
+                "requestId": f"req-{i}",
+                "timestamp": f"2026-03-13T01:0{i}:01Z",
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": f"Hi {i}"}],
+                    "usage": {
+                        "output_tokens": 3,
+                        "input_tokens": 10,
+                        "cache_read_input_tokens": 20,
+                        "cache_creation_input_tokens": 5,
+                    },
+                },
+            }
+        )
+    session_file.write_text("\n".join(json.dumps(line) for line in lines), encoding="utf-8")
+
+    dataset, observed = build_dataset_and_observed_from_files(
+        [session_file],
+        recent_turns_per_session=2,
+    )
+
+    assert dataset.requests == 2
+    assert dataset.sampled_requests == 2
+    assert dataset.sampling_note == "Most recent 2 turns per session"
+    assert observed.requests == 2
+
+
+def test_determine_winners_includes_no_cache_counterfactual() -> None:
+    summaries = {
+        "baseline": ModeSummary(
+            mode="baseline",
+            paid_input_cost_usd=1.0,
+            cache_read_cost_usd=0.2,
+            paid_output_cost_usd=0.5,
+        ),
+        PROXY_MODE_TOKEN: ModeSummary(
+            mode=PROXY_MODE_TOKEN,
+            paid_input_cost_usd=0.8,
+            cache_read_cost_usd=0.1,
+            paid_output_cost_usd=0.5,
+        ),
+        PROXY_MODE_CACHE: ModeSummary(
+            mode=PROXY_MODE_CACHE,
+            paid_input_cost_usd=0.7,
+            cache_read_cost_usd=0.3,
+            paid_output_cost_usd=0.5,
+        ),
+    }
+
+    winners = determine_winners(summaries)
+
+    assert winners["no_cache_total_cost"] == PROXY_MODE_TOKEN
+
+
+def test_resolve_checkpoint_dir_namespaces_sampling_mode() -> None:
+    base = Path("benchmark_results") / "checkpoints"
+
+    assert resolve_checkpoint_dir(base).name == "v2__ttl_5m__full"
+    assert (
+        resolve_checkpoint_dir(base, recent_turns_per_session=200).name == "v2__ttl_5m__recent_200"
+    )
