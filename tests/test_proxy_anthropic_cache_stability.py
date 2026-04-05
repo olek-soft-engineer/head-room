@@ -283,8 +283,8 @@ def test_token_mode_freeze_is_capped_by_prefix_tracker() -> None:
         proxy.config.image_optimize = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = (
-            lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
@@ -355,8 +355,8 @@ def test_memory_context_avoids_system_mutation_when_prefix_frozen() -> None:
         proxy.config.ccr_proactive_expansion = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = (
-            lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
@@ -421,8 +421,8 @@ def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatc
         proxy.config.ccr_inject_system_instructions = True
 
         fake_tracker = _FakePrefixTracker(frozen_count=1)
-        proxy.session_tracker_store.compute_session_id = (
-            lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
@@ -484,25 +484,17 @@ def test_previous_turns_always_frozen_only_final_turn_mutable() -> None:
         proxy.config.image_optimize = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = (
-            lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
-        def _fake_apply(**kwargs):
-            captured["frozen_message_count"] = kwargs.get("frozen_message_count")
-            return SimpleNamespace(
-                messages=kwargs["messages"],
-                transforms_applied=[],
-                timing={},
-                tokens_before=80,
-                tokens_after=80,
-                waste_signals=None,
-            )
-
-        proxy.anthropic_pipeline.apply = _fake_apply
+        proxy.anthropic_pipeline.apply = lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("cache mode should not invoke anthropic pipeline")
+        )
 
         async def _fake_retry(method, url, headers, body, stream=False):  # noqa: ANN001
+            captured["body"] = body
             return httpx.Response(
                 200,
                 json={
@@ -536,7 +528,11 @@ def test_previous_turns_always_frozen_only_final_turn_mutable() -> None:
         )
 
         assert response.status_code == 200
-        assert captured["frozen_message_count"] == 2
+        assert captured["body"]["messages"] == [
+            {"role": "user", "content": "turn1"},
+            {"role": "assistant", "content": "turn1-assistant"},
+            {"role": "user", "content": "current turn"},
+        ]
 
 
 def test_batch_optimization_freezes_previous_turns_only() -> None:
@@ -548,19 +544,12 @@ def test_batch_optimization_freezes_previous_turns_only() -> None:
         proxy.config.image_optimize = False
         proxy.config.ccr_inject_tool = False
 
-        def _fake_apply(**kwargs):
-            captured["frozen_message_count"] = kwargs.get("frozen_message_count")
-            return SimpleNamespace(
-                messages=kwargs["messages"],
-                transforms_applied=[],
-                timing={},
-                tokens_before=60,
-                tokens_after=60,
-            )
-
-        proxy.anthropic_pipeline.apply = _fake_apply
+        proxy.anthropic_pipeline.apply = lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("cache mode batch path should not invoke anthropic pipeline")
+        )
 
         async def _fake_retry(method, url, headers, body, stream=False):  # noqa: ANN001
+            captured["body"] = body
             return httpx.Response(
                 200,
                 json={
@@ -600,7 +589,11 @@ def test_batch_optimization_freezes_previous_turns_only() -> None:
         )
 
         assert response.status_code == 200
-        assert captured["frozen_message_count"] == 2
+        assert captured["body"]["requests"][0]["params"]["messages"] == [
+            {"role": "user", "content": "old turn"},
+            {"role": "assistant", "content": "old assistant"},
+            {"role": "user", "content": "current turn"},
+        ]
 
 
 def test_token_mode_does_not_force_freeze_all_previous_turns() -> None:
@@ -612,8 +605,8 @@ def test_token_mode_does_not_force_freeze_all_previous_turns() -> None:
         proxy.config.image_optimize = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = (
-            lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
@@ -688,8 +681,8 @@ def test_cache_mode_restores_frozen_prefix_if_transform_mutates_history() -> Non
         proxy.config.image_optimize = False
 
         fake_tracker = _FakePrefixTracker(frozen_count=0)
-        proxy.session_tracker_store.compute_session_id = (
-            lambda request, model, messages: "stable-session"
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
         )
         proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
 
@@ -747,3 +740,71 @@ def test_cache_mode_restores_frozen_prefix_if_transform_mutates_history() -> Non
         sent_messages = captured["body"]["messages"]
         assert sent_messages[0] == original_messages[0]
         assert sent_messages[1] == original_messages[1]
+
+
+def test_cache_mode_does_not_forward_latest_turn_rewrites() -> None:
+    captured = {}
+    with _make_proxy_client() as client:
+        proxy = client.app.state.proxy
+        proxy.config.optimize = True
+        proxy.config.mode = "cache"
+        proxy.config.image_optimize = False
+
+        fake_tracker = _FakePrefixTracker(frozen_count=0)
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stable-session"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+
+        original_messages = [
+            {"role": "user", "content": "turn1"},
+            {"role": "assistant", "content": "turn1-assistant"},
+            {"role": "user", "content": "current turn"},
+        ]
+
+        def _fake_apply(**kwargs):
+            mutated = list(kwargs["messages"])
+            mutated[2] = {**mutated[2], "content": "REWRITTEN_CURRENT_TURN"}
+            return SimpleNamespace(
+                messages=mutated,
+                transforms_applied=["fake:mutated-latest"],
+                timing={},
+                tokens_before=80,
+                tokens_after=60,
+                waste_signals=None,
+            )
+
+        proxy.anthropic_pipeline.apply = _fake_apply
+
+        async def _fake_retry(method, url, headers, body, stream=False):  # noqa: ANN001
+            captured["body"] = body
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_cache_2",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 80,
+                        "output_tokens": 3,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                },
+            )
+
+        proxy._retry_request = _fake_retry
+
+        response = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 64,
+                "messages": original_messages,
+            },
+        )
+
+        assert response.status_code == 200
+        assert captured["body"]["messages"] == original_messages

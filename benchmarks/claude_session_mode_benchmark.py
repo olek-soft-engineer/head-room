@@ -433,7 +433,7 @@ def resolve_checkpoint_dir(
     recent_turns_per_session: int | None = None,
     cache_ttl_minutes: int = DEFAULT_CACHE_TTL_MINUTES,
 ) -> Path:
-    suffix_parts = ["v2", f"ttl_{cache_ttl_minutes}m"]
+    suffix_parts = ["v3", f"ttl_{cache_ttl_minutes}m"]
     if recent_turns_per_session:
         suffix_parts.append(f"recent_{recent_turns_per_session}")
     else:
@@ -648,6 +648,8 @@ def _apply_mode_to_messages(
     comp_cache: CompressionCache | None,
 ) -> list[dict[str, Any]]:
     if mode == "baseline":
+        return copy.deepcopy(messages)
+    if mode == PROXY_MODE_CACHE:
         return copy.deepcopy(messages)
 
     assert proxy is not None

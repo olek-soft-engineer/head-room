@@ -341,19 +341,19 @@ class AnthropicHandlerMixin:
                 frozen_message_count,
             )
 
-        # Image compression (cache-safe): only compress latest non-frozen user turn.
-        # Rewriting historical image bytes can invalidate Anthropic prompt caches.
-        if self.config.image_optimize and messages and not _bypass:
+        # In cache mode, avoid rewriting any message body bytes. The latest user
+        # turn becomes historical on the next request, so even "latest turn only"
+        # rewrites can invalidate the next cache read when the client resends the
+        # original transcript.
+        if (
+            self.config.image_optimize
+            and messages
+            and not _bypass
+            and not is_cache_mode(self.config.mode)
+        ):
             compressor = _get_image_compressor()
             if compressor and compressor.has_images(messages):
-                if is_cache_mode(self.config.mode):
-                    messages = self._compress_latest_user_turn_images_cache_safe(
-                        messages,
-                        frozen_message_count=frozen_message_count,
-                        compressor=compressor,
-                    )
-                else:
-                    messages = compressor.compress(messages, provider="anthropic")
+                messages = compressor.compress(messages, provider="anthropic")
                 if compressor.last_result:
                     logger.info(
                         f"Image compression: {compressor.last_result.technique.value} "
@@ -370,6 +370,7 @@ class AnthropicHandlerMixin:
                 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 
                 context_limit = self.anthropic_provider.get_context_limit(model)
+                result = None
                 biases = (
                     self.config.hooks.compute_biases(messages, _hook_ctx)
                     if self.config.hooks
@@ -413,7 +414,7 @@ class AnthropicHandlerMixin:
                     # so tokens_saved captures both Zone 1 + Zone 2 savings.
                     # original_tokens was set at line ~2183 from uncompressed messages.
                     optimized_tokens = result.tokens_after
-                else:
+                elif not is_cache_mode(self.config.mode):
                     result = await asyncio.wait_for(
                         asyncio.to_thread(
                             lambda: self.anthropic_pipeline.apply(
@@ -434,8 +435,11 @@ class AnthropicHandlerMixin:
                         pipeline_timing = result.timing
                         original_tokens = result.tokens_before
                         optimized_tokens = result.tokens_after
+                else:
+                    optimized_messages = messages
+                    optimized_tokens = original_tokens
 
-                if result.waste_signals:
+                if result and result.waste_signals:
                     waste_signals_dict = result.waste_signals.to_dict()
             except Exception as e:
                 logger.warning(f"Optimization failed: {e}")
@@ -549,11 +553,19 @@ class AnthropicHandlerMixin:
                             f"[{request_id}] CCR: Proactively expanded {len(expansions)} context(s) "
                             f"based on query relevance"
                         )
-                        optimized_messages = self._append_context_to_latest_non_frozen_user_turn(
-                            optimized_messages,
-                            expansion_text,
-                            frozen_message_count=frozen_message_count,
-                        )
+                        if is_cache_mode(self.config.mode):
+                            logger.info(
+                                f"[{request_id}] CCR: skipping proactive expansion append "
+                                "in cache mode to preserve next-turn prefix stability"
+                            )
+                        else:
+                            optimized_messages = (
+                                self._append_context_to_latest_non_frozen_user_turn(
+                                    optimized_messages,
+                                    expansion_text,
+                                    frozen_message_count=frozen_message_count,
+                                )
+                            )
 
         # Traffic Learner: Extract patterns from inbound tool results
         if self.traffic_learner:
@@ -593,7 +605,12 @@ class AnthropicHandlerMixin:
                         memory_user_id, optimized_messages
                     )
                     if memory_context:
-                        if frozen_message_count > 0:
+                        if is_cache_mode(self.config.mode):
+                            logger.info(
+                                f"[{request_id}] Memory: skipping context append in cache mode "
+                                "to preserve next-turn prefix stability"
+                            )
+                        elif frozen_message_count > 0:
                             optimized_messages = (
                                 self._append_context_to_latest_non_frozen_user_turn(
                                     optimized_messages,
@@ -1196,6 +1213,7 @@ class AnthropicHandlerMixin:
         from headroom.ccr import CCRToolInjector
         from headroom.proxy.helpers import MAX_REQUEST_BODY_SIZE, _read_request_json
         from headroom.proxy.modes import is_cache_mode
+        from headroom.tokenizers import get_tokenizer
         from headroom.utils import extract_user_query
 
         start_time = time.time()
@@ -1285,26 +1303,25 @@ class AnthropicHandlerMixin:
                     if is_cache_mode(self.config.mode)
                     else 0
                 )
-                result = self.anthropic_pipeline.apply(
-                    messages=messages,
-                    model=model,
-                    model_limit=context_limit,
-                    context=extract_user_query(messages),
-                    frozen_message_count=frozen_message_count,
-                )
-
-                optimized_messages = result.messages
                 if is_cache_mode(self.config.mode):
-                    optimized_messages, _ = self._restore_frozen_prefix(
-                        original_messages,
-                        optimized_messages,
+                    optimized_messages = messages
+                    original_tokens = get_tokenizer(model).count_messages(messages)
+                    optimized_tokens = original_tokens
+                else:
+                    result = self.anthropic_pipeline.apply(
+                        messages=messages,
+                        model=model,
+                        model_limit=context_limit,
+                        context=extract_user_query(messages),
                         frozen_message_count=frozen_message_count,
                     )
-                for k, v in result.timing.items():
-                    pipeline_timing[k] = pipeline_timing.get(k, 0.0) + v
-                # Use pipeline's token counts for consistency with pipeline logs
-                original_tokens = result.tokens_before
-                optimized_tokens = result.tokens_after
+
+                    optimized_messages = result.messages
+                    for k, v in result.timing.items():
+                        pipeline_timing[k] = pipeline_timing.get(k, 0.0) + v
+                    # Use pipeline's token counts for consistency with pipeline logs
+                    original_tokens = result.tokens_before
+                    optimized_tokens = result.tokens_after
                 total_original_tokens += original_tokens
                 total_optimized_tokens += optimized_tokens
                 tokens_saved = max(0, original_tokens - optimized_tokens)
