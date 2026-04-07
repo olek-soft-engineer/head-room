@@ -74,8 +74,8 @@ def build_prefix_cache_stats(
     cost_tracker: CostTracker | None,
 ) -> dict:
     """Build provider-aware prefix cache statistics for the dashboard."""
-    by_provider = {}
-    totals = {
+    by_provider: dict[str, dict[str, Any]] = {}
+    totals: dict[str, Any] = {
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
         "cache_write_5m_tokens": 0,
@@ -147,7 +147,7 @@ def build_prefix_cache_stats(
             round(pc["hit_requests"] / pc["requests"] * 100, 1) if pc["requests"] > 0 else 0
         )
 
-        provider_stats = {
+        provider_stats: dict[str, Any] = {
             "cache_read_tokens": read_tokens,
             "cache_write_tokens": write_tokens,
             "cache_write_5m_tokens": write_5m_tokens,
