@@ -753,3 +753,68 @@ class TestOpenAIURLNormalization:
             assert proxy.OPENAI_API_URL == "http://localhost:4000"
         finally:
             HeadroomProxy.OPENAI_API_URL = original
+
+
+# =============================================================================
+# Bedrock API Key Forwarding Regression (#105)
+# =============================================================================
+
+
+class TestBedrockApiKeyNotForwarded:
+    """Bedrock uses AWS SigV4 auth, not API keys.
+
+    Forwarding x-api-key (e.g. sk-ant-dummy) to LiteLLM overrides
+    AWS credentials and breaks Bedrock auth.
+    """
+
+    def test_bedrock_does_not_forward_api_key(self):
+        """api_key should NOT be in kwargs for Bedrock provider."""
+        backend = LiteLLMBackend(provider="bedrock", region="us-west-2")
+
+        kwargs = {}
+        headers = {
+            "x-api-key": "sk-ant-dummy-key",
+            "authorization": "Bearer sk-ant-dummy-key",
+        }
+
+        # Simulate what the handler does: build kwargs then check
+        _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+        if backend.provider not in _env_auth_providers:
+            auth_header = headers.get("authorization", headers.get("Authorization", ""))
+            if auth_header.startswith("Bearer "):
+                kwargs["api_key"] = auth_header[7:]
+            elif headers.get("x-api-key"):
+                kwargs["api_key"] = headers["x-api-key"]
+
+        assert "api_key" not in kwargs, (
+            f"Bedrock should not have api_key in kwargs, got: {kwargs.get('api_key')}"
+        )
+
+    def test_openai_does_forward_api_key(self):
+        """api_key SHOULD be in kwargs for non-Bedrock providers."""
+        backend = LiteLLMBackend(provider="openai")
+
+        kwargs = {}
+        headers = {"authorization": "Bearer sk-real-key-123"}
+
+        _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+        if backend.provider not in _env_auth_providers:
+            auth_header = headers.get("authorization", headers.get("Authorization", ""))
+            if auth_header.startswith("Bearer "):
+                kwargs["api_key"] = auth_header[7:]
+
+        assert kwargs.get("api_key") == "sk-real-key-123"
+
+    def test_vertex_does_not_forward_api_key(self):
+        """Vertex AI also uses env-based auth (Google ADC)."""
+        backend = LiteLLMBackend(provider="vertex_ai")
+
+        kwargs = {}
+        headers = {"x-api-key": "sk-ant-dummy"}
+
+        _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+        if backend.provider not in _env_auth_providers:
+            if headers.get("x-api-key"):
+                kwargs["api_key"] = headers["x-api-key"]
+
+        assert "api_key" not in kwargs

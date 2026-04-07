@@ -669,12 +669,16 @@ class LiteLLMBackend(Backend):
                 elif self.provider in ("vertex_ai", "vertex_ai_beta"):
                     kwargs["vertex_location"] = self.region
 
-            # Forward API key from request headers if present
-            auth_header = headers.get("authorization", headers.get("Authorization", ""))
-            if auth_header.startswith("Bearer "):
-                kwargs["api_key"] = auth_header[7:]
-            elif headers.get("x-api-key"):
-                kwargs["api_key"] = headers["x-api-key"]
+            # Forward API key from request headers if present.
+            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
+            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
+            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+            if self.provider not in _env_auth_providers:
+                auth_header = headers.get("authorization", headers.get("Authorization", ""))
+                if auth_header.startswith("Bearer "):
+                    kwargs["api_key"] = auth_header[7:]
+                elif headers.get("x-api-key"):
+                    kwargs["api_key"] = headers["x-api-key"]
 
             logger.debug(f"LiteLLM request: model={litellm_model}")
 
@@ -769,12 +773,16 @@ class LiteLLMBackend(Backend):
                 elif self.provider in ("vertex_ai", "vertex_ai_beta"):
                     kwargs["vertex_location"] = self.region
 
-            # Forward API key from request headers if present
-            auth_header = headers.get("authorization", headers.get("Authorization", ""))
-            if auth_header.startswith("Bearer "):
-                kwargs["api_key"] = auth_header[7:]
-            elif headers.get("x-api-key"):
-                kwargs["api_key"] = headers["x-api-key"]
+            # Forward API key from request headers if present.
+            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
+            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
+            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+            if self.provider not in _env_auth_providers:
+                auth_header = headers.get("authorization", headers.get("Authorization", ""))
+                if auth_header.startswith("Bearer "):
+                    kwargs["api_key"] = auth_header[7:]
+                elif headers.get("x-api-key"):
+                    kwargs["api_key"] = headers["x-api-key"]
 
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -989,12 +997,16 @@ class LiteLLMBackend(Backend):
                 elif self.provider in ("vertex_ai", "vertex_ai_beta"):
                     kwargs["vertex_location"] = self.region
 
-            # Forward API key from request headers if present
-            auth_header = headers.get("authorization", headers.get("Authorization", ""))
-            if auth_header.startswith("Bearer "):
-                kwargs["api_key"] = auth_header[7:]
-            elif headers.get("x-api-key"):
-                kwargs["api_key"] = headers["x-api-key"]
+            # Forward API key from request headers if present.
+            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
+            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
+            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+            if self.provider not in _env_auth_providers:
+                auth_header = headers.get("authorization", headers.get("Authorization", ""))
+                if auth_header.startswith("Bearer "):
+                    kwargs["api_key"] = auth_header[7:]
+                elif headers.get("x-api-key"):
+                    kwargs["api_key"] = headers["x-api-key"]
 
             logger.debug(f"LiteLLM OpenAI request: model={litellm_model}")
 
@@ -1121,12 +1133,16 @@ class LiteLLMBackend(Backend):
                 elif self.provider in ("vertex_ai", "vertex_ai_beta"):
                     kwargs["vertex_location"] = self.region
 
-            # Forward API key from request headers if present
-            auth_header = headers.get("authorization", headers.get("Authorization", ""))
-            if auth_header.startswith("Bearer "):
-                kwargs["api_key"] = auth_header[7:]
-            elif headers.get("x-api-key"):
-                kwargs["api_key"] = headers["x-api-key"]
+            # Forward API key from request headers if present.
+            # Skip for Bedrock/Vertex: they use env-based auth (AWS SigV4 / Google ADC).
+            # Forwarding x-api-key (e.g. sk-ant-dummy) would override their credentials.
+            _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
+            if self.provider not in _env_auth_providers:
+                auth_header = headers.get("authorization", headers.get("Authorization", ""))
+                if auth_header.startswith("Bearer "):
+                    kwargs["api_key"] = auth_header[7:]
+                elif headers.get("x-api-key"):
+                    kwargs["api_key"] = headers["x-api-key"]
 
             response = await acompletion(**kwargs)
 
