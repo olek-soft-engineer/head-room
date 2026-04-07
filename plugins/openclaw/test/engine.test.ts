@@ -145,6 +145,44 @@ describe("AgentMessage conversion", () => {
   });
 });
 
+describe("HeadroomContextEngine startup behavior", () => {
+  it("bootstrap schedules proxy startup without blocking on it", async () => {
+    const start = vi.fn(
+      () => new Promise<string>((resolve) => setTimeout(() => resolve("http://127.0.0.1:8787"), 50)),
+    );
+    vi.spyOn(ProxyManager.prototype, "start").mockImplementation(start);
+
+    const engine = new HeadroomContextEngine();
+    const result = await engine.bootstrap({
+      sessionId: "test-session",
+      sessionFile: "/tmp/test-session.jsonl",
+    });
+
+    expect(result).toEqual({ bootstrapped: true, reason: "proxy startup scheduled" });
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(engine.getProxyUrl()).toBeNull();
+  });
+
+  it("assemble returns original messages while proxy startup is still pending", async () => {
+    const start = vi.fn(
+      () => new Promise<string>((resolve) => setTimeout(() => resolve("http://127.0.0.1:8787"), 50)),
+    );
+    vi.spyOn(ProxyManager.prototype, "start").mockImplementation(start);
+
+    const engine = new HeadroomContextEngine();
+    const messages = [{ role: "user", content: "hello", timestamp: Date.now() }];
+
+    const result = await engine.assemble({
+      sessionId: "test-session",
+      messages,
+      model: "claude-sonnet-4-5",
+    });
+
+    expect(result).toEqual({ messages, estimatedTokens: 0 });
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+});
+
 if (RUN) {
   describe("ProxyManager", () => {
     it("connects to configured proxy URL", { timeout: 30000 }, async () => {

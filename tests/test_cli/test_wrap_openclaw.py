@@ -90,6 +90,7 @@ def test_wrap_openclaw_default_installs_from_npm_and_restarts(runner: CliRunner)
     assert payload["config"]["proxyPort"] == 8787
     assert payload["config"]["autoStart"] is True
     assert payload["config"]["startupTimeoutMs"] == 20000
+    assert payload["config"]["gatewayProviderIds"] == ["openai-codex"]
 
 
 def test_wrap_openclaw_skip_build_and_no_restart(runner: CliRunner, plugin_dir: Path) -> None:
@@ -272,6 +273,63 @@ def test_wrap_openclaw_verbose_prints_install_restart_and_inspect_output(
     assert "inspect-ok" in result.output
 
 
+def test_wrap_openclaw_starts_gateway_when_restart_fails(runner: CliRunner) -> None:
+    calls: list[dict] = []
+
+    def which(name: str) -> str | None:
+        return {"openclaw": "openclaw", "npm": "npm"}.get(name)
+
+    def run(cmd, **kwargs):  # noqa: ANN001
+        calls.append({"cmd": list(cmd), **kwargs})
+        if cmd[:3] == ["openclaw", "gateway", "restart"]:
+            return MagicMock(returncode=1, stdout="", stderr="gateway not running")
+        if cmd[:3] == ["openclaw", "gateway", "start"]:
+            return MagicMock(returncode=0, stdout="started-ok", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("headroom.cli.wrap.shutil.which", side_effect=which):
+        with patch("headroom.cli.wrap.subprocess.run", side_effect=run):
+            result = runner.invoke(main, ["wrap", "openclaw", "--verbose"])
+
+    assert result.exit_code == 0, result.output
+    cmds = [c["cmd"] for c in calls]
+    assert ["openclaw", "gateway", "restart"] in cmds
+    assert ["openclaw", "gateway", "start"] in cmds
+    assert "Gateway started." in result.output
+    assert "started-ok" in result.output
+
+
+def test_wrap_openclaw_accepts_repeatable_gateway_provider_ids(runner: CliRunner) -> None:
+    calls: list[dict] = []
+
+    def which(name: str) -> str | None:
+        return {"openclaw": "openclaw", "npm": "npm"}.get(name)
+
+    with patch("headroom.cli.wrap.shutil.which", side_effect=which):
+        with patch("headroom.cli.wrap.subprocess.run", side_effect=_make_successful_run(calls)):
+            result = runner.invoke(
+                main,
+                [
+                    "wrap",
+                    "openclaw",
+                    "--gateway-provider-id",
+                    "openai-codex",
+                    "--gateway-provider-id",
+                    "anthropic",
+                    "--no-restart",
+                ],
+            )
+
+    assert result.exit_code == 0, result.output
+    set_entry = next(
+        c
+        for c in calls
+        if c["cmd"][:4] == ["openclaw", "config", "set", "plugins.entries.headroom"]
+    )
+    payload = json.loads(set_entry["cmd"][4])
+    assert payload["config"]["gatewayProviderIds"] == ["openai-codex", "anthropic"]
+
+
 def test_wrap_openclaw_fails_for_npm_mode_hook_pack_bug_without_local_fallback(
     runner: CliRunner,
 ) -> None:
@@ -448,3 +506,68 @@ def test_copy_openclaw_plugin_into_extensions_handles_missing_and_existing_dist(
     assert not (target_dist / "old.js").exists()
     assert (target_hook_shim / "index.js").exists()
     assert not (target_hook_shim / "old.js").exists()
+
+
+def test_unwrap_openclaw_disables_plugin_and_restores_legacy_slot(runner: CliRunner) -> None:
+    calls: list[dict] = []
+
+    def which(name: str) -> str | None:
+        return {"openclaw": "openclaw"}.get(name)
+
+    def run(cmd, **kwargs):  # noqa: ANN001
+        calls.append({"cmd": list(cmd), **kwargs})
+        if cmd[:4] == ["openclaw", "config", "get", "plugins.entries.headroom"]:
+            return MagicMock(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "enabled": True,
+                        "config": {
+                            "proxyPort": 8787,
+                            "gatewayProviderIds": ["openai-codex"],
+                            "customFlag": True,
+                        },
+                    }
+                ),
+                stderr="",
+            )
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("headroom.cli.wrap.shutil.which", side_effect=which):
+        with patch("headroom.cli.wrap.subprocess.run", side_effect=run):
+            result = runner.invoke(main, ["unwrap", "openclaw"])
+
+    assert result.exit_code == 0, result.output
+    set_entry = next(
+        c
+        for c in calls
+        if c["cmd"][:4] == ["openclaw", "config", "set", "plugins.entries.headroom"]
+    )
+    payload = json.loads(set_entry["cmd"][4])
+    assert payload == {"enabled": False, "config": {"customFlag": True}}
+
+    set_slot = next(
+        c
+        for c in calls
+        if c["cmd"][:4] == ["openclaw", "config", "set", "plugins.slots.contextEngine"]
+    )
+    assert json.loads(set_slot["cmd"][4]) == "legacy"
+    assert ["openclaw", "gateway", "restart"] in [c["cmd"] for c in calls]
+
+
+def test_unwrap_openclaw_no_restart_skips_gateway_restart(runner: CliRunner) -> None:
+    calls: list[dict] = []
+
+    def which(name: str) -> str | None:
+        return {"openclaw": "openclaw"}.get(name)
+
+    def run(cmd, **kwargs):  # noqa: ANN001
+        calls.append({"cmd": list(cmd), **kwargs})
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("headroom.cli.wrap.shutil.which", side_effect=which):
+        with patch("headroom.cli.wrap.subprocess.run", side_effect=run):
+            result = runner.invoke(main, ["unwrap", "openclaw", "--no-restart"])
+
+    assert result.exit_code == 0, result.output
+    assert ["openclaw", "gateway", "restart"] not in [c["cmd"] for c in calls]

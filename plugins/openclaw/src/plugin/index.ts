@@ -66,6 +66,7 @@ export default function headroomPlugin(api: any) {
     const activeProxyUrl = engine.getProxyUrl();
     if (!activeProxyUrl) {
       logger.debug?.("[headroom] Deferring upstream gateway routing until proxy is available");
+      engine.ensureProxyStarted();
       return;
     }
     await applyGatewayRouting(activeProxyUrl);

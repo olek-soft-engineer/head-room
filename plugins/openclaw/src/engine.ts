@@ -28,6 +28,7 @@ export class HeadroomContextEngine {
   private config: HeadroomEngineConfig;
   private logger: ProxyManagerLogger;
   private proxyReadyListeners = new Set<(proxyUrl: string) => void | Promise<void>>();
+  private proxyStartupPromise: Promise<string> | null = null;
   private stats = {
     totalCompressions: 0,
     totalTokensSaved: 0,
@@ -52,15 +53,8 @@ export class HeadroomContextEngine {
       return { bootstrapped: false, reason: "disabled" };
     }
 
-    try {
-      this.proxyUrl = await this.proxyManager.start();
-      await this.notifyProxyReady(this.proxyUrl);
-      this.logger.info(`Engine bootstrapped (proxy: ${this.proxyUrl})`);
-      return { bootstrapped: true };
-    } catch (error) {
-      this.logger.error(`Bootstrap failed: ${error}`);
-      return { bootstrapped: false, reason: String(error) };
-    }
+    this.ensureProxyStarted();
+    return { bootstrapped: true, reason: "proxy startup scheduled" };
   }
 
   async ingest(params: {
@@ -97,6 +91,7 @@ export class HeadroomContextEngine {
     systemPromptAddition?: string;
   }> {
     if (!this.proxyUrl || this.config.enabled === false) {
+      this.ensureProxyStarted();
       // Fallback: return messages unchanged
       return { messages: normalizeAgentMessages(params.messages), estimatedTokens: 0 };
     }
@@ -240,6 +235,28 @@ export class HeadroomContextEngine {
     return this.proxyUrl;
   }
 
+  ensureProxyStarted(): void {
+    if (this.config.enabled === false || this.proxyUrl || this.proxyStartupPromise) {
+      return;
+    }
+
+    this.proxyStartupPromise = this.proxyManager
+      .start()
+      .then(async (proxyUrl) => {
+        this.proxyUrl = proxyUrl;
+        await this.notifyProxyReady(proxyUrl);
+        this.logger.info(`Headroom proxy ready at ${proxyUrl}`);
+        return proxyUrl;
+      })
+      .catch((error) => {
+        this.logger.warn(`Headroom proxy unavailable: ${error}`);
+        throw error;
+      })
+      .finally(() => {
+        this.proxyStartupPromise = null;
+      });
+  }
+
   onProxyReady(listener: (proxyUrl: string) => void | Promise<void>): () => void {
     this.proxyReadyListeners.add(listener);
     return () => {
@@ -252,9 +269,11 @@ export class HeadroomContextEngine {
       return this.proxyUrl;
     }
 
-    this.proxyUrl = await this.proxyManager.start();
-    await this.notifyProxyReady(this.proxyUrl);
-    return this.proxyUrl;
+    this.ensureProxyStarted();
+    if (!this.proxyStartupPromise) {
+      throw new Error("Headroom proxy startup is disabled");
+    }
+    return this.proxyStartupPromise;
   }
 
   private async notifyProxyReady(proxyUrl: string): Promise<void> {
