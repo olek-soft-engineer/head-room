@@ -19,11 +19,27 @@ from headroom.proxy.server import ProxyConfig, create_app
 class _FakePrefixTracker:
     def __init__(self, frozen_count: int):
         self._frozen_count = frozen_count
+        self._cached_token_count = 0
+        self._last_original_messages = []
+        self._last_forwarded_messages = []
 
     def get_frozen_message_count(self) -> int:
         return self._frozen_count
 
+    def get_last_original_messages(self):  # noqa: ANN201
+        return self._last_original_messages.copy()
+
+    def get_last_forwarded_messages(self):  # noqa: ANN201
+        return self._last_forwarded_messages.copy()
+
     def update_from_response(self, **kwargs):  # noqa: ANN003
+        self._cached_token_count = kwargs.get("cache_read_tokens", 0) + kwargs.get(
+            "cache_write_tokens", 0
+        )
+        self._last_original_messages = kwargs.get(
+            "original_messages", kwargs.get("messages", [])
+        ).copy()
+        self._last_forwarded_messages = kwargs.get("messages", []).copy()
         return None
 
 

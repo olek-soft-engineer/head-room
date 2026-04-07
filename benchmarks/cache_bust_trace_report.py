@@ -322,7 +322,7 @@ def _render_html(events: list[BustEvent], recent_turns_per_session: int) -> str:
   <div class="shell">
     <h1>Cache Bust Trace Report</h1>
     <p>Most recent {recent_turns_per_session} turns per session.</p>
-    {''.join(sections)}
+    {"".join(sections)}
   </div>
 </body>
 </html>"""
@@ -344,7 +344,9 @@ def main() -> int:
     json_path = output_dir / "cache_bust_trace.json"
     html_path = output_dir / "cache_bust_trace.html"
     md_path.write_text(_render_markdown(events, recent_turns_per_session), encoding="utf-8")
-    json_path.write_text(json.dumps([asdict(event) for event in events], indent=2), encoding="utf-8")
+    json_path.write_text(
+        json.dumps([asdict(event) for event in events], indent=2), encoding="utf-8"
+    )
     html_path.write_text(_render_html(events, recent_turns_per_session), encoding="utf-8")
     print(md_path)
     print(json_path)

@@ -212,9 +212,9 @@ def _run_branch_benchmark(
             workers=args.workers,
         )
         env = os.environ.copy()
-        env["PYTHONPATH"] = os.pathsep.join(
-            [str(worktree_dir), env.get("PYTHONPATH", "")]
-        ).rstrip(os.pathsep)
+        env["PYTHONPATH"] = os.pathsep.join([str(worktree_dir), env.get("PYTHONPATH", "")]).rstrip(
+            os.pathsep
+        )
         subprocess.run(command, cwd=worktree_dir, check=True, env=env)
         return _load_branch_result(repo_root, ref, label, branch_output_dir)
     finally:

@@ -146,13 +146,10 @@ def _build_bust_events(replay: SessionReplay) -> dict[str, list[dict[str, object
                 previous_forwarded_messages=previous_forwarded_context,
             )
 
-            if (
-                previous_forwarded_request is not None
-                and _cache_gap_within_ttl(
-                    turn.timestamp,
-                    previous_timestamp,
-                    ttl=bench.timedelta(minutes=ttl_minutes),
-                )
+            if previous_forwarded_request is not None and _cache_gap_within_ttl(
+                turn.timestamp,
+                previous_timestamp,
+                ttl=bench.timedelta(minutes=ttl_minutes),
             ):
                 prefix_preserved = (
                     len(forwarded) >= len(previous_forwarded_request)
@@ -192,7 +189,9 @@ def _build_bust_events(replay: SessionReplay) -> dict[str, list[dict[str, object
 
             conversation.append(copy.deepcopy(turn.assistant_message))
             previous_original = copy.deepcopy(conversation)
-            previous_forwarded_context = copy.deepcopy(forwarded) + [copy.deepcopy(turn.assistant_message)]
+            previous_forwarded_context = copy.deepcopy(forwarded) + [
+                copy.deepcopy(turn.assistant_message)
+            ]
             previous_forwarded_request = copy.deepcopy(forwarded)
             previous_request_id = turn.request_id
             previous_timestamp = turn.timestamp
@@ -328,9 +327,7 @@ def _write_report(
         f"<li>no-cache total cost: <code>{html.escape(winners['no_cache_total_cost'])}</code></li>"
         f"<li>window with cache counted: <code>{html.escape(winners['window_with_cache'])}</code></li>"
         f"<li>window without cache reads: <code>{html.escape(winners['window_without_cache_reads'])}</code></li>"
-        "</ul><h2>Cache Bust Events</h2>"
-        + "".join(event_sections)
-        + "</body></html>"
+        "</ul><h2>Cache Bust Events</h2>" + "".join(event_sections) + "</body></html>"
     )
     html_path.write_text(html_doc, encoding="utf-8")
     return md_path, json_path, html_path

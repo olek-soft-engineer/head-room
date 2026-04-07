@@ -186,7 +186,9 @@ def _collect_real_processed_events(
                     stable_prefix_message_count=prior_context_message_count,
                 )
                 if rewrite:
-                    prior_forwarded = pending.forwarded if pending is not None else previous_forwarded
+                    prior_forwarded = (
+                        pending.forwarded if pending is not None else previous_forwarded
+                    )
                     prior_ts = pending.turn.timestamp if pending is not None else previous_timestamp
                     eligible = bool(
                         prior_ts is not None
@@ -210,23 +212,33 @@ def _collect_real_processed_events(
                     events.append(
                         {
                             "mode": mode,
-                            "session_id": replay.session_id if include_content else _redact_text(replay.session_id, prefix="session"),
-                            "project": replay.decoded_project_path if include_content else _redact_path(replay.decoded_project_path),
-                            "request_id": turn.request_id if include_content else _redact_text(turn.request_id, prefix="request"),
+                            "session_id": replay.session_id
+                            if include_content
+                            else _redact_text(replay.session_id, prefix="session"),
+                            "project": replay.decoded_project_path
+                            if include_content
+                            else _redact_path(replay.decoded_project_path),
+                            "request_id": turn.request_id
+                            if include_content
+                            else _redact_text(turn.request_id, prefix="request"),
                             "timestamp": turn.timestamp.isoformat(),
                             "cache_eligible": eligible,
                             "prefix_preserved": prefix_preserved,
                             "retroactive_rewrite": retro,
                             "first_diff_index": first_diff_index,
                             "original_tail": [
-                                _message_preview(m, max_chars=max_chars) if include_content else {
+                                _message_preview(m, max_chars=max_chars)
+                                if include_content
+                                else {
                                     "role": str(m.get("role")),
                                     "content_excerpt": "[redacted]",
                                 }
                                 for m in conversation[max(0, len(conversation) - 4) :]
                             ],
                             "forwarded_tail": [
-                                _message_preview(m, max_chars=max_chars) if include_content else {
+                                _message_preview(m, max_chars=max_chars)
+                                if include_content
+                                else {
                                     "role": str(m.get("role")),
                                     "content_excerpt": "[redacted]",
                                 }
@@ -248,6 +260,7 @@ def _collect_real_processed_events(
                     message_token_counts=[tokenizer.count_message(msg) for msg in forwarded],
                     original_messages=conversation,
                 )
+
                 class Pending:
                     pass
 
@@ -264,7 +277,9 @@ def _collect_real_processed_events(
     return {"events": events}
 
 
-def _write_processed_event_reports(output_dir: Path, payload: dict[str, Any]) -> tuple[Path, Path, Path]:
+def _write_processed_event_reports(
+    output_dir: Path, payload: dict[str, Any]
+) -> tuple[Path, Path, Path]:
     out_dir = output_dir / "real_processed"
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / "real_processed_rewrite_report.json"
@@ -524,7 +539,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--recent-turns-per-session", type=int, default=None)
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--cache-ttl-minutes", type=int, default=real_bench.DEFAULT_CACHE_TTL_MINUTES)
+    parser.add_argument(
+        "--cache-ttl-minutes", type=int, default=real_bench.DEFAULT_CACHE_TTL_MINUTES
+    )
     parser.add_argument("--cache-write-multiplier", type=float, default=1.25)
     parser.add_argument("--max-sessions", type=int, default=None)
     parser.add_argument("--max-real-events-per-mode", type=int, default=8)
@@ -604,7 +621,8 @@ def main() -> int:
     token_bust.bench._make_proxy = lambda mode: token_bust._FakeProxy()
     try:
         _, token_bust_summaries = token_bust.simulate_replays(
-            [token_bust_replay], cache_ttl_minutes=token_bust.TTL_MINUTES if hasattr(token_bust, "TTL_MINUTES") else 5
+            [token_bust_replay],
+            cache_ttl_minutes=token_bust.TTL_MINUTES if hasattr(token_bust, "TTL_MINUTES") else 5,
         )
         token_bust_events = token_bust._build_bust_events(token_bust_replay)
     finally:

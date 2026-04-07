@@ -230,10 +230,7 @@ def _write_report(
         "total_turns": TURNS_PER_SCENARIO * len(per_scenario),
         "ttl_minutes": TTL_MINUTES,
         "scenarios": {
-            session_id: {
-                mode: _summary_payload(summary)
-                for mode, summary in summaries.items()
-            }
+            session_id: {mode: _summary_payload(summary) for mode, summary in summaries.items()}
             for session_id, summaries in per_scenario.items()
         },
         "aggregate": {mode: _summary_payload(summary) for mode, summary in aggregate.items()},

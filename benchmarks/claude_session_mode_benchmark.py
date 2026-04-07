@@ -1183,7 +1183,9 @@ def _simulate_single_replay_mode(
                 summary.retroactive_rewrite_turns += 1
             else:
                 summary.latest_turn_only_rewrite_turns += 1
-            prior_forwarded_for_rewrite = pending.forwarded if pending is not None else previous_forwarded
+            prior_forwarded_for_rewrite = (
+                pending.forwarded if pending is not None else previous_forwarded
+            )
             prior_timestamp_for_rewrite = (
                 pending.turn.timestamp if pending is not None else previous_timestamp
             )
