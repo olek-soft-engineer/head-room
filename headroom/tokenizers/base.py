@@ -124,7 +124,11 @@ class BaseTokenizer(ABC):
         return total
 
     def _count_content_parts(self, parts: list[Any]) -> int:
-        """Count tokens in multi-part content."""
+        """Count tokens in multi-part content.
+
+        Handles both Anthropic format ({"type": "text", "text": "..."})
+        and Strands SDK format ({"text": "..."} without "type" field).
+        """
         total = 0
         for part in parts:
             if isinstance(part, dict):
@@ -152,6 +156,25 @@ class BaseTokenizer(ABC):
                 elif part_type == "tool_use":
                     total += self.count_text(part.get("name", ""))
                     total += self.count_text(json.dumps(part.get("input", {})))
+                elif not part_type and "text" in part:
+                    # Strands SDK format: {"text": "..."} without "type" field
+                    total += self.count_text(part["text"])
+                elif not part_type and "toolUse" in part:
+                    # Strands SDK tool_use: {"toolUse": {"name": ..., "input": ...}}
+                    tool_use = part["toolUse"]
+                    total += self.count_text(tool_use.get("name", ""))
+                    total += self.count_text(json.dumps(tool_use.get("input", {})))
+                elif not part_type and "toolResult" in part:
+                    # Strands SDK tool_result: {"toolResult": {"content": [...]}}
+                    tool_result = part["toolResult"]
+                    tr_content = tool_result.get("content", [])
+                    if isinstance(tr_content, str):
+                        total += self.count_text(tr_content)
+                    elif isinstance(tr_content, list):
+                        # Recurse into nested content blocks
+                        total += self._count_content_parts(tr_content)
+                    else:
+                        total += self.count_text(json.dumps(tr_content))
                 else:
                     # Unknown type - estimate from JSON
                     total += self.count_text(json.dumps(part))
