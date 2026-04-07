@@ -76,6 +76,7 @@ def build_prefix_cache_stats(
     totals = {
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
+        "uncached_input_tokens": 0,
         "requests": 0,
         "hit_requests": 0,
         "bust_count": 0,
@@ -127,14 +128,23 @@ def build_prefix_cache_stats(
             if write_mult > 1.0:
                 write_premium_usd = write_tokens * input_price_per_token * (write_mult - 1.0)
 
-        hit_rate = round(pc["hit_requests"] / pc["requests"] * 100, 1) if pc["requests"] > 0 else 0
+        # Token-level hit rate: what % of total input tokens were served from cache?
+        # This is more meaningful than request-level (binary "had any cache read").
+        uncached_tokens: int = pc["uncached_input_tokens"]  # type: ignore[assignment]
+        total_input = read_tokens + write_tokens + uncached_tokens
+        hit_rate = round(read_tokens / total_input * 100, 1) if total_input > 0 else 0
+        request_hit_rate = (
+            round(pc["hit_requests"] / pc["requests"] * 100, 1) if pc["requests"] > 0 else 0
+        )
 
         provider_stats = {
             "cache_read_tokens": read_tokens,
             "cache_write_tokens": write_tokens,
+            "uncached_input_tokens": uncached_tokens,
             "requests": pc["requests"],
             "hit_requests": pc["hit_requests"],
             "hit_rate": hit_rate,
+            "request_hit_rate": request_hit_rate,
             "bust_count": pc["bust_count"],
             "bust_write_tokens": pc["bust_write_tokens"],
             "read_discount": f"{(1.0 - read_mult) * 100:.0f}%",
@@ -149,6 +159,7 @@ def build_prefix_cache_stats(
         # Accumulate totals
         totals["cache_read_tokens"] += read_tokens
         totals["cache_write_tokens"] += write_tokens
+        totals["uncached_input_tokens"] += uncached_tokens
         totals["requests"] += pc["requests"]
         totals["hit_requests"] += pc["hit_requests"]
         totals["bust_count"] += pc["bust_count"]
@@ -159,7 +170,14 @@ def build_prefix_cache_stats(
     totals["net_savings_usd"] = round(totals["savings_usd"], 4)
     totals["savings_usd"] = round(totals["savings_usd"], 4)
     totals["write_premium_usd"] = round(totals["write_premium_usd"], 4)
+    # Token-level hit rate across all providers
+    _total_input = (
+        totals["cache_read_tokens"] + totals["cache_write_tokens"] + totals["uncached_input_tokens"]
+    )
     totals["hit_rate"] = (
+        round(totals["cache_read_tokens"] / _total_input * 100, 1) if _total_input > 0 else 0
+    )
+    totals["request_hit_rate"] = (
         round(totals["hit_requests"] / totals["requests"] * 100, 1) if totals["requests"] > 0 else 0
     )
 
@@ -173,6 +191,12 @@ def build_prefix_cache_stats(
             "net_benefit_tokens": (
                 metrics.prefix_freeze_tokens_preserved - metrics.prefix_freeze_compression_foregone
             ),
+        },
+        "compression_vs_cache": {
+            "tokens_saved_by_compression": metrics.tokens_saved_total,
+            "tokens_lost_to_cache_bust": metrics.cache_bust_tokens_lost,
+            "cache_bust_count": metrics.cache_bust_count,
+            "net_tokens": metrics.tokens_saved_total - metrics.cache_bust_tokens_lost,
         },
         "attribution": (
             "Prefix caching is performed by the LLM provider (Anthropic, OpenAI). "
