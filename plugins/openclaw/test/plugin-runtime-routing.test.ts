@@ -95,7 +95,7 @@ describe("headroomPlugin runtime routing", () => {
     await proxyReadyListeners[0]?.("http://127.0.0.1:8787");
 
     expect(api.config.models.providers["openai-codex"]).toEqual({
-      baseUrl: "http://127.0.0.1:8787",
+      baseUrl: "http://127.0.0.1:8787/backend-api",
       models: [],
     });
     expect(api.config.models.providers.anthropic).toEqual({

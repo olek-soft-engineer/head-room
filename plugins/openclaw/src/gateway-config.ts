@@ -2,6 +2,10 @@
 
 export const DEFAULT_GATEWAY_PROVIDER_IDS = ["openai-codex"] as const;
 
+const DEFAULT_PROVIDER_BASE_URLS: Readonly<Record<string, string>> = {
+  "openai-codex": "https://chatgpt.com/backend-api",
+};
+
 export function resolveGatewayProviderIds(config: Record<string, unknown> | undefined): string[] {
   const configuredProviderIds = normalizeGatewayProviderIds(config?.gatewayProviderIds);
   if (configuredProviderIds.length > 0) {
@@ -70,21 +74,51 @@ export function applyGatewayProviderBaseUrlsInPlace(
         ? currentValue
         : {};
     const nextConfig = { ...currentConfig };
+    const nextBaseUrl = routeBaseUrlThroughProxy({
+      providerId,
+      proxyUrl,
+      currentBaseUrl:
+        typeof nextConfig.baseUrl === "string" && nextConfig.baseUrl.trim().length > 0
+          ? nextConfig.baseUrl
+          : undefined,
+    });
 
     if (!Array.isArray(nextConfig.models)) {
       nextConfig.models = [];
       changed = true;
     }
 
-    if (nextConfig.baseUrl === proxyUrl) {
+    if (nextConfig.baseUrl === nextBaseUrl) {
       providers[providerId] = nextConfig;
       continue;
     }
 
-    nextConfig.baseUrl = proxyUrl;
+    nextConfig.baseUrl = nextBaseUrl;
     providers[providerId] = nextConfig;
     changed = true;
   }
 
   return changed;
+}
+
+function routeBaseUrlThroughProxy(params: {
+  providerId: string;
+  proxyUrl: string;
+  currentBaseUrl?: string;
+}): string {
+  const upstreamBaseUrl = params.currentBaseUrl ?? DEFAULT_PROVIDER_BASE_URLS[params.providerId];
+  if (!upstreamBaseUrl) {
+    return params.proxyUrl;
+  }
+
+  try {
+    const proxy = new URL(params.proxyUrl);
+    const upstream = new URL(upstreamBaseUrl);
+    proxy.pathname = upstream.pathname;
+    proxy.search = upstream.search;
+    proxy.hash = "";
+    return proxy.toString().replace(/\/$/, "");
+  } catch {
+    return params.proxyUrl;
+  }
 }

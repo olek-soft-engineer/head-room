@@ -37,7 +37,7 @@ describe("applyGatewayProviderBaseUrls", () => {
 
     expect(result.changed).toBe(true);
     expect((result.config as any).models.providers["openai-codex"]).toEqual({
-      baseUrl: "http://127.0.0.1:8787",
+      baseUrl: "http://127.0.0.1:8787/backend-api",
       models: [],
     });
   });
@@ -73,6 +73,7 @@ describe("applyGatewayProviderBaseUrls", () => {
           providers: {
             "openai-codex": {
               api: "openai-codex-responses",
+              baseUrl: "https://chatgpt.com/backend-api",
             },
           },
         },
@@ -84,7 +85,7 @@ describe("applyGatewayProviderBaseUrls", () => {
     expect(result.changed).toBe(true);
     expect((result.config as any).models.providers["openai-codex"]).toEqual({
       api: "openai-codex-responses",
-      baseUrl: "http://127.0.0.1:8787",
+      baseUrl: "http://127.0.0.1:8787/backend-api",
       models: [],
     });
   });
@@ -94,7 +95,7 @@ describe("applyGatewayProviderBaseUrls", () => {
       models: {
         providers: {
           "openai-codex": {
-            baseUrl: "http://127.0.0.1:8787",
+            baseUrl: "http://127.0.0.1:8787/backend-api",
             models: [],
           },
         },
@@ -105,6 +106,28 @@ describe("applyGatewayProviderBaseUrls", () => {
 
     expect(result.changed).toBe(false);
     expect(result.config).toEqual(cfg);
+  });
+
+  it("preserves upstream path segments when routing through the proxy", () => {
+    const result = applyGatewayProviderBaseUrls(
+      {
+        models: {
+          providers: {
+            anthropic: {
+              baseUrl: "https://api.anthropic.com/v1",
+            },
+          },
+        },
+      },
+      "http://127.0.0.1:8787",
+      ["anthropic"],
+    );
+
+    expect(result.changed).toBe(true);
+    expect((result.config as any).models.providers.anthropic).toEqual({
+      baseUrl: "http://127.0.0.1:8787/v1",
+      models: [],
+    });
   });
 });
 
@@ -120,7 +143,7 @@ describe("applyGatewayProviderBaseUrlsInPlace", () => {
 
     expect(changed).toBe(true);
     expect(cfg.models.providers["openai-codex"]).toEqual({
-      baseUrl: "http://127.0.0.1:8787",
+      baseUrl: "http://127.0.0.1:8787/backend-api",
       models: [],
     });
   });
@@ -131,6 +154,7 @@ describe("applyGatewayProviderBaseUrlsInPlace", () => {
         providers: {
           "openai-codex": {
             api: "openai-codex-responses",
+            baseUrl: "https://chatgpt.com/backend-api",
             envKey: "OPENAI_API_KEY",
             models: ["gpt-5.3-codex"],
           },
@@ -148,7 +172,7 @@ describe("applyGatewayProviderBaseUrlsInPlace", () => {
     expect(cfg.models.providers["openai-codex"]).toEqual({
       api: "openai-codex-responses",
       envKey: "OPENAI_API_KEY",
-      baseUrl: "http://127.0.0.1:8787",
+      baseUrl: "http://127.0.0.1:8787/backend-api",
       models: ["gpt-5.3-codex"],
     });
   });
