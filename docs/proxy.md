@@ -31,12 +31,34 @@ Telemetry is enabled by default. Opt out with `HEADROOM_TELEMETRY=off` or `headr
 |--------|---------|-------------|
 | `--host` | `127.0.0.1` | Host to bind to |
 | `--port` | `8787` | Port to bind to |
+| `--mode` | `token` | Run mode: `token` (maximize compression) or `cache` (freeze prior turns) |
 | `--no-optimize` | `false` | Disable optimization (passthrough mode) |
 | `--no-cache` | `false` | Disable semantic caching |
 | `--no-rate-limit` | `false` | Disable rate limiting |
 | `--log-file` | None | Path to JSONL log file |
 | `--budget` | None | Daily budget limit in USD |
 | `--openai-api-url` | `https://api.openai.com` | Custom OpenAI API URL endpoint |
+
+### Run Modes
+
+Headroom proxy has two explicit run modes:
+
+- `token` mode: prioritize token reduction. Prior history may be rewritten when that improves compression.
+- `cache` mode: prioritize provider prefix cache stability. Prior turns are frozen; only the newest turn is mutable.
+
+Set via CLI or env:
+
+```bash
+headroom proxy --mode token
+HEADROOM_MODE=cache headroom proxy
+```
+
+When to pick each:
+
+- `token`: best for maximizing immediate compression savings.
+- `cache`: best for long conversations where preserving prior-turn bytes improves prefix-cache reuse.
+
+Legacy values (`token_headroom`, `cost_savings`) are still accepted as aliases.
 
 ### Context Management Options
 
@@ -110,6 +132,16 @@ curl http://localhost:8787/stats
 `persistent_savings` block with durable proxy compression lifetime totals plus a
 small recent preview. The existing `savings_history` field is still present and
 remains session-scoped for backward compatibility.
+
+For providers that return cache-write TTL bucket usage, `/stats` also includes
+observed TTL breakdowns under `prefix_cache`:
+
+- `observed_ttl_buckets.5m.tokens`
+- `observed_ttl_buckets.1h.tokens`
+- `observed_ttl_mix`
+
+These are provider-reported observations, not configured TTL and not remaining
+expiration time.
 
 ### Historical Savings
 

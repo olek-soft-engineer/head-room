@@ -4,6 +4,8 @@ import os
 
 import click
 
+from headroom.proxy.modes import PROXY_MODE_TOKEN, normalize_proxy_mode
+
 from .main import main
 
 
@@ -13,8 +15,22 @@ from .main import main
 @click.option(
     "--mode",
     default=None,
-    type=click.Choice(["cost_savings", "token_headroom"]),
-    help="Optimization mode: token_headroom (compress for session extension) or cost_savings (preserve prefix cache). Default: token_headroom. Env: HEADROOM_MODE",
+    type=click.Choice(
+        [
+            "token",
+            "cache",
+            "token_mode",
+            "cache_mode",
+            "token_savings",
+            "cost_savings",
+            "token_headroom",
+        ]
+    ),
+    help=(
+        "Optimization mode: token (prioritize compression) or cache "
+        "(freeze prior turns for prefix-cache stability). "
+        "Legacy aliases are accepted. Default: token. Env: HEADROOM_MODE"
+    ),
 )
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
 @click.option("--no-cache", is_flag=True, help="Disable semantic caching")
@@ -195,7 +211,9 @@ def proxy(
     effective_anyllm_provider = os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
 
     # Resolve mode: CLI flag > env var > default
-    effective_mode: str = mode or os.environ.get("HEADROOM_MODE") or "token_headroom"
+    effective_mode: str = normalize_proxy_mode(
+        mode or os.environ.get("HEADROOM_MODE") or PROXY_MODE_TOKEN
+    )
 
     # Telemetry opt-out: --no-telemetry flag sets the env var
     if no_telemetry:

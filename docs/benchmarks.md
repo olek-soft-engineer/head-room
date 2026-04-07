@@ -203,4 +203,88 @@ pytest tests/test_evals/ -v -s
 
 # Run compression benchmark
 python -c "from headroom import compress; print(compress([{'role':'user','content':'test'}]))"
+
+# Run local proxy mode benchmark (no API calls)
+python benchmarks/proxy_mode_benchmark.py --turns 12 --show-real-harness
+
+# Replay local Claude Code transcripts (no API calls)
+python benchmarks/claude_session_mode_benchmark.py --workers 1
+
+# Compare two refs on the same local Claude transcript corpus
+python benchmarks/claude_session_branch_compare.py --left-ref upstream/main --right-ref HEAD --recent-turns-per-session 200 --workers 1
 ```
+
+This benchmark compares `token` vs `cache` proxy modes on the same synthetic conversation:
+
+- `token` should show higher compression.
+- `cache` should preserve prior-turn stability and can win in long sessions with strong prefix-cache reuse.
+
+`--show-real-harness` prints optional steps for running the same comparison with Claude Code, but does not call APIs by default.
+
+`claude_session_branch_compare.py` runs the real local session replay benchmark twice, once per git ref, in isolated worktrees. It writes:
+
+- per-ref replay outputs under `benchmark_results/branch_compare/<label>/`
+- a combined comparison report under `benchmark_results/branch_compare/`
+
+Use it when you want a clean PR-vs-`main` comparison on the same transcript slice.
+
+For a deterministic cache-busting proof case, run:
+
+```bash
+python benchmarks/synthetic_token_cache_bust_report.py
+```
+
+That synthetic replay forces `token` mode to retroactively rewrite a prior tool result on the second turn while `cache` mode remains stable. Use it to verify the simulator can distinguish:
+
+- `token`: history rewrite + cache bust
+- `cache`: no rewrite + no bust
+
+For a reproducible local report bundle that combines:
+
+- full real-session replay summaries
+- local-only processed real input/output excerpts
+- synthetic token-bust proof
+- synthetic long-form stress tests
+
+run:
+
+```bash
+python benchmarks/cache_validation_bundle.py --workers 1 --output-dir benchmark_results/cache_validation_bundle_full
+```
+
+Notes:
+
+- By default the bundle is redaction-safe for sharing:
+  - real processed reports redact transcript-derived content excerpts
+  - manifest paths are redacted
+- To include local processed content excerpts for private review on your own machine:
+
+```bash
+python benchmarks/cache_validation_bundle.py --workers 1 --include-content
+```
+
+- The bundle writes:
+  - `index.html` / `index.md`: top-level summary and links
+  - `bundle_manifest.json`: runtime metadata + corpus fingerprint
+  - `real/`: full real-session replay reports
+  - `real_processed/`: processed before/after excerpts from real transcripts
+  - `synthetic_token_bust/`: minimal explicit cache-bust proof
+  - `synthetic_long_suite/`: long deterministic rewrite/TTL scenarios
+- Checkpoints are scoped under the bundle output directory and fingerprinted by the selected corpus so stale runs do not contaminate new results.
+
+The Claude session benchmark replays local transcript data from `~/.claude/projects`
+through `baseline`, `token`, and `cache` modes. It estimates raw tokens, cache
+read/write tokens, paid input/output costs, and prompt-window winners under two
+assumptions:
+
+- cached tokens count against the model window
+- cache reads do not count against the model window
+
+Notes:
+
+- It writes local output to `benchmark_results/`, which is gitignored.
+- It is intentionally conservative on memory. Run with `--workers 1` for the
+  most stable full-corpus replay. Higher worker counts increase memory use.
+- It uses transcript-visible messages only. Hidden Claude Code system/tool schemas
+  are not available in the local `.jsonl` files, so the numbers are comparative
+  estimates rather than exact provider billing replicas.

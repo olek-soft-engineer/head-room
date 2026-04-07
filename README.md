@@ -111,10 +111,19 @@ headroom proxy --port 8787
 ```
 
 ```bash
+# Run mode (default: token)
+headroom proxy --mode token   # maximize compression
+headroom proxy --mode cache   # preserve Anthropic/OpenAI prefix cache stability
+```
+
+```bash
 # Point any LLM client at the proxy
 ANTHROPIC_BASE_URL=http://localhost:8787 your-app
 OPENAI_BASE_URL=http://localhost:8787/v1 your-app
 ```
+
+Use `token` mode for short/medium sessions where raw compression savings matter most.
+Use `cache` mode for long-running chats where preserving prior-turn bytes improves provider cache reuse.
 
 Works with any language, any tool, any framework. **[Proxy docs](docs/proxy.md)**
 
