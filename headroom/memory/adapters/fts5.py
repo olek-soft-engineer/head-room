@@ -235,8 +235,8 @@ class FTS5TextIndex:
 
         with self._get_conn() as conn:
             # Query with BM25 ranking (lower is better, so we order ASC)
-            cursor = conn.execute(
-                f"""  # nosec B608
+            cursor = conn.execute(  # nosec B608
+                f"""
                 SELECT memory_id, content, user_id, session_id, category,
                        bm25(memory_fts) as rank
                 FROM memory_fts

@@ -322,6 +322,9 @@ class HeadroomProxy(
             else None
         )
 
+        # Enterprise security plugin (loaded dynamically if available + licensed)
+        self.security = None
+
         # HTTP client
         self.http_client: httpx.AsyncClient | None = None
 

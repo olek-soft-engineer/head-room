@@ -229,8 +229,8 @@ class SQLiteStorage(Storage):
             where_clause += " AND timestamp <= ?"
             params.append(format_timestamp(end_time))
 
-        cursor.execute(
-            f"""  # nosec B608
+        cursor.execute(  # nosec B608
+            f"""
             SELECT
                 COUNT(*) as total_requests,
                 SUM(tokens_input_before) as total_tokens_before,
