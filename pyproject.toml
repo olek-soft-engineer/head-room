@@ -95,6 +95,7 @@ relevance = [
 # Image compression (ML-based routing)
 image = [
     "pillow>=10.0.0",
+    "sentencepiece>=0.1.99",  # Required by SigLIP tokenizer (SiglipTokenizer)
 ]
 # Report generation
 reports = [
