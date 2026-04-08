@@ -523,6 +523,7 @@ class StreamingMixin:
             # For memory mode, we buffer the response to check for tool calls
             buffered_chunks: list[bytes] = []
             full_sse_data = ""
+            parsed_response = None  # Set by memory block; used by CCR + prefix tracker
 
             try:
                 async with contextlib.aclosing(upstream_response) as response:
