@@ -1752,6 +1752,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         """OpenAI Responses API via WebSocket (Codex gpt-5.4+)."""
         await proxy.handle_openai_responses_ws(websocket)
 
+    # OpenAI Responses API sub-endpoints (passthrough).
+    # Codex sub-agents use /v1/responses/compact and other sub-paths
+    # that we don't need to compress — just forward with correct auth routing.
+    @app.api_route("/v1/responses/{sub_path:path}", methods=["GET", "POST", "DELETE"])
+    async def openai_responses_sub(request: Request, sub_path: str):
+        """Passthrough for /v1/responses/* sub-endpoints (compact, cancel, etc.)."""
+        # Route to correct endpoint based on auth mode (ChatGPT vs API key)
+        headers = dict(request.headers.items())
+        if headers.get("chatgpt-account-id"):
+            base_url = "https://chatgpt.com/backend-api/codex"
+        else:
+            base_url = proxy.OPENAI_API_URL
+        return await proxy.handle_passthrough(request, base_url, "responses", "openai")
+
     # OpenAI Batch API endpoints (with compression!)
     @app.post("/v1/batches")
     async def create_batch(request: Request):
