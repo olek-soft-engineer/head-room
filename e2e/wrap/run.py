@@ -21,6 +21,11 @@ REPO_ROOT = Path("/workspace")
 PLUGIN_DIR = REPO_ROOT / "plugins" / "openclaw"
 SDK_DIR = REPO_ROOT / "sdk" / "typescript"
 RTK_MARKER = "<!-- headroom:rtk-instructions -->"
+PROXY_PORT = 28887
+CODEX_PORT = 28888
+AIDER_PORT = 28889
+CURSOR_PORT = 28890
+OPENCLAW_PROXY_PORT = 28891
 
 
 def log(message: str) -> None:
@@ -199,6 +204,7 @@ def create_shims(shim_dir: Path) -> None:
         import json
         import os
         import sys
+        import urllib.request
         from pathlib import Path
 
         tool = Path(sys.argv[0]).name
@@ -214,6 +220,27 @@ def create_shims(shim_dir: Path) -> None:
                 if os.environ.get(key) is not None
             },
         }
+
+        probes = []
+
+        def fetch(url: str, *, headers: dict[str, str] | None = None) -> None:
+            request = urllib.request.Request(url, headers=headers or {})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                probes.append({"url": url, "status": response.status})
+
+        openai_base = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+        if openai_base:
+            fetch(
+                f"{openai_base.rstrip('/')}/models",
+                headers={"Authorization": "Bearer test-key"},
+            )
+
+        anthropic_base = os.environ.get("ANTHROPIC_BASE_URL")
+        if anthropic_base:
+            fetch(f"{anthropic_base.rstrip('/')}/health")
+
+        record["probes"] = probes
+
         with (log_dir / f"{tool}.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\\n")
         print(f"{tool} shim executed")
@@ -234,131 +261,9 @@ def create_shims(shim_dir: Path) -> None:
         raise SystemExit(0)
         """
     )
-    openclaw_shim = textwrap.dedent(
-        """\
-        #!/usr/bin/env python3
-        from __future__ import annotations
-
-        import json
-        import os
-        import sys
-        from pathlib import Path
-
-        state_path = Path(os.environ["HEADROOM_E2E_OPENCLAW_STATE"])
-        config_path = Path(os.environ["HEADROOM_E2E_OPENCLAW_CONFIG"])
-        log_dir = Path(os.environ["HEADROOM_E2E_LOG_DIR"])
-        log_dir.mkdir(parents=True, exist_ok=True)
-
-        def default_state() -> dict:
-            return {
-                "plugins": {
-                    "entries": {},
-                    "slots": {"contextEngine": "legacy"},
-                },
-                "installs": [],
-                "gateway_actions": [],
-            }
-
-        def load_state() -> dict:
-            if state_path.exists():
-                return json.loads(state_path.read_text(encoding="utf-8"))
-            state = default_state()
-            save_state(state)
-            return state
-
-        def save_state(state: dict) -> None:
-            state_path.parent.mkdir(parents=True, exist_ok=True)
-            state_path.write_text(json.dumps(state, indent=2) + "\\n", encoding="utf-8")
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            config_path.write_text(json.dumps(state, indent=2) + "\\n", encoding="utf-8")
-
-        def log_call(args: list[str]) -> None:
-            record = {
-                "tool": "openclaw",
-                "argv": args,
-                "cwd": os.getcwd(),
-            }
-            with (log_dir / "openclaw.jsonl").open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record) + "\\n")
-
-        def get_nested(container: dict, dotted_path: str):
-            current = container
-            for key in dotted_path.split("."):
-                if not isinstance(current, dict) or key not in current:
-                    return None
-                current = current[key]
-            return current
-
-        def set_nested(container: dict, dotted_path: str, value) -> None:
-            keys = dotted_path.split(".")
-            current = container
-            for key in keys[:-1]:
-                current = current.setdefault(key, {})
-            current[keys[-1]] = value
-
-        args = sys.argv[1:]
-        if not args or args[0] in {"--help", "-h", "help"}:
-            print("openclaw shim")
-            raise SystemExit(0)
-
-        log_call(args)
-        state = load_state()
-        extensions_dir = config_path.parent / "extensions"
-
-        if args[:2] == ["config", "file"]:
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            config_path.touch()
-            print(str(config_path))
-            raise SystemExit(0)
-
-        if args[:2] == ["config", "get"]:
-            print(json.dumps(get_nested(state, args[2])))
-            raise SystemExit(0)
-
-        if args[:2] == ["config", "set"]:
-            set_nested(state, args[2], json.loads(args[3]))
-            save_state(state)
-            print("ok")
-            raise SystemExit(0)
-
-        if args[:2] == ["config", "validate"]:
-            print("valid")
-            raise SystemExit(0)
-
-        if args[:2] == ["gateway", "restart"] or args[:2] == ["gateway", "start"]:
-            state["gateway_actions"].append(args[1])
-            save_state(state)
-            print(args[1])
-            raise SystemExit(0)
-
-        if args[:2] == ["plugins", "install"]:
-            state["installs"].append({"argv": args, "cwd": os.getcwd()})
-            save_state(state)
-            (extensions_dir / "headroom").mkdir(parents=True, exist_ok=True)
-            print("installed")
-            raise SystemExit(0)
-
-        if args[:3] == ["plugins", "inspect", "headroom"]:
-            print(
-                json.dumps(
-                    {
-                        "id": "headroom",
-                        "installed": True,
-                        "entry": get_nested(state, "plugins.entries.headroom"),
-                    }
-                )
-            )
-            raise SystemExit(0)
-
-        print(f"unsupported openclaw args: {args}", file=sys.stderr)
-        raise SystemExit(2)
-        """
-    )
-
     write_executable(shim_dir / "codex", generic_shim)
     write_executable(shim_dir / "aider", generic_shim)
     write_executable(shim_dir / "rtk", rtk_shim)
-    write_executable(shim_dir / "openclaw", openclaw_shim)
 
 
 def start_mock_server(port: int) -> tuple[MockOpenAIServer, threading.Thread]:
@@ -392,6 +297,62 @@ def stop_process(proc: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.communicate(timeout=5)
+
+
+def wait_for_command_success(
+    cmd: list[str],
+    *,
+    env: dict[str, str],
+    cwd: Path | None = None,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess[str]:
+    deadline = time.time() + timeout
+    last_output = ""
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        per_call_timeout = max(1.0, min(5.0, remaining))
+        try:
+            result = subprocess.run(
+                cmd,
+                env=env,
+                cwd=str(cwd) if cwd else None,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=per_call_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            last_output = f"Command timed out after {per_call_timeout:.1f}s"
+            time.sleep(1)
+            continue
+        if result.returncode == 0:
+            if result.stdout.strip():
+                print(result.stdout.rstrip(), flush=True)
+            if result.stderr.strip():
+                print(result.stderr.rstrip(), file=sys.stderr, flush=True)
+            return result
+        last_output = "\n".join(
+            part for part in (result.stdout.strip(), result.stderr.strip()) if part
+        )
+        time.sleep(1)
+    raise RuntimeError(
+        f"Timed out waiting for command to succeed: {' '.join(cmd)}\nLast output:\n{last_output}"
+    )
+
+
+def start_openclaw_gateway(env: dict[str, str], cwd: Path) -> subprocess.Popen[str]:
+    log("Starting OpenClaw gateway for e2e verification")
+    return subprocess.Popen(
+        ["openclaw", "gateway"],
+        env=env,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 def verify_installs() -> None:
@@ -430,7 +391,7 @@ def prepare_local_openclaw_plugin(base_env: dict[str, str], tmp_dir: Path) -> Pa
 
 
 def verify_proxy_round_trip(base_env: dict[str, str], mock_server: MockOpenAIServer) -> None:
-    proxy_port = 18787
+    proxy_port = PROXY_PORT
     proc = start_proxy(proxy_port, base_env)
     try:
         health = wait_for_http(f"http://127.0.0.1:{proxy_port}/health")
@@ -471,7 +432,7 @@ def verify_proxy_round_trip(base_env: dict[str, str], mock_server: MockOpenAISer
 
 
 def verify_codex_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path) -> None:
-    port = 18788
+    port = CODEX_PORT
     run(
         ["headroom", "wrap", "codex", "--port", str(port), "--", "--help"],
         env=base_env,
@@ -494,10 +455,14 @@ def verify_codex_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path
         env_vars.get("OPENAI_BASE_URL") == f"http://127.0.0.1:{port}/v1",
         "Codex wrap should set OPENAI_BASE_URL",
     )
+    assert_true(
+        entries[-1]["probes"] == [{"url": f"http://127.0.0.1:{port}/v1/models", "status": 200}],
+        "Codex shim should prove OPENAI_BASE_URL points at a live proxy",
+    )
 
 
 def verify_aider_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path) -> None:
-    port = 18789
+    port = AIDER_PORT
     run(
         ["headroom", "wrap", "aider", "--port", str(port), "--", "--help"],
         env=base_env,
@@ -522,10 +487,18 @@ def verify_aider_wrap(base_env: dict[str, str], project_dir: Path, log_dir: Path
         env_vars.get("ANTHROPIC_BASE_URL") == f"http://127.0.0.1:{port}",
         "Aider wrap should set ANTHROPIC_BASE_URL",
     )
+    assert_true(
+        entries[-1]["probes"]
+        == [
+            {"url": f"http://127.0.0.1:{port}/v1/models", "status": 200},
+            {"url": f"http://127.0.0.1:{port}/health", "status": 200},
+        ],
+        "Aider shim should prove both configured base URLs point at a live proxy",
+    )
 
 
 def verify_cursor_wrap(base_env: dict[str, str], project_dir: Path) -> None:
-    port = 18790
+    port = CURSOR_PORT
     proc = subprocess.Popen(
         ["headroom", "wrap", "cursor", "--port", str(port)],
         env=base_env,
@@ -542,6 +515,10 @@ def verify_cursor_wrap(base_env: dict[str, str], project_dir: Path) -> None:
             f"http://127.0.0.1:{port}/v1" in output,
             "Cursor wrap should print the OpenAI base URL override",
         )
+        assert_true(
+            f"http://127.0.0.1:{port}" in output,
+            "Cursor wrap should print the Anthropic base URL override",
+        )
         wait_for_http(f"http://127.0.0.1:{port}/health", timeout=15)
         cursorrules = project_dir / ".cursorrules"
         assert_true(cursorrules.exists(), "Cursor wrap should create .cursorrules")
@@ -557,8 +534,9 @@ def verify_openclaw_wrap(
     base_env: dict[str, str],
     project_dir: Path,
     plugin_dir: Path,
-    state_path: Path,
 ) -> None:
+    port = OPENCLAW_PROXY_PORT
+    gateway_proc: subprocess.Popen[str] | None = None
     run(
         [
             "headroom",
@@ -567,7 +545,7 @@ def verify_openclaw_wrap(
             "--plugin-path",
             str(plugin_dir),
             "--proxy-port",
-            "18791",
+            str(port),
             "--startup-timeout-ms",
             "5000",
             "--verbose",
@@ -579,19 +557,66 @@ def verify_openclaw_wrap(
     dist_index = plugin_dir / "dist" / "index.js"
     assert_true(dist_index.exists(), "OpenClaw plugin build should produce dist/index.js")
 
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    entry = state["plugins"]["entries"]["headroom"]
-    assert_true(entry["enabled"] is True, "OpenClaw wrap should enable the plugin")
-    assert_true(entry["config"]["proxyPort"] == 18791, "OpenClaw wrap should set proxy port")
-    assert_true(entry["config"]["autoStart"] is True, "OpenClaw wrap should enable autoStart")
-    assert_true(
-        state["plugins"]["slots"]["contextEngine"] == "headroom",
-        "OpenClaw wrap should set the context engine slot",
-    )
-    assert_true(
-        state["gateway_actions"] == ["restart"],
-        "OpenClaw wrap should restart the gateway once",
-    )
+    config_file = run(["openclaw", "config", "file"], env=base_env, cwd=project_dir, timeout=60)
+    config_path_str = config_file.stdout.strip().splitlines()[-1].strip()
+    if config_path_str.startswith("~/"):
+        config_path = Path(base_env["HOME"]) / config_path_str[2:]
+    else:
+        config_path = Path(config_path_str)
+    assert_true(config_path.exists(), "OpenClaw should create a config file")
+
+    state = json.loads(config_path.read_text(encoding="utf-8"))
+    if state.get("gateway", {}).get("mode") != "local":
+        run(
+            [
+                "openclaw",
+                "config",
+                "set",
+                "gateway.mode",
+                json.dumps("local"),
+                "--strict-json",
+            ],
+            env=base_env,
+            cwd=project_dir,
+            timeout=60,
+        )
+        state = json.loads(config_path.read_text(encoding="utf-8"))
+
+    try:
+        try:
+            wait_for_command_success(
+                ["openclaw", "health"], env=base_env, cwd=project_dir, timeout=5
+            )
+        except RuntimeError:
+            gateway_proc = start_openclaw_gateway(base_env, project_dir)
+            try:
+                wait_for_command_success(
+                    ["openclaw", "health"], env=base_env, cwd=project_dir, timeout=30
+                )
+            except RuntimeError as exc:
+                gateway_output = ""
+                if gateway_proc.stdout is not None:
+                    gateway_output = gateway_proc.stdout.read()
+                raise RuntimeError(f"{exc}\nGateway output:\n{gateway_output}") from exc
+
+        entry = state["plugins"]["entries"]["headroom"]
+        assert_true(entry["enabled"] is True, "OpenClaw wrap should enable the plugin")
+        assert_true(entry["config"]["proxyPort"] == port, "OpenClaw wrap should set proxy port")
+        assert_true(
+            entry["config"].get("autoStart", True) is True,
+            "OpenClaw wrap should leave autoStart enabled",
+        )
+        assert_true(
+            state["gateway"]["mode"] == "local",
+            "OpenClaw e2e bootstrap should set gateway.mode=local",
+        )
+        assert_true(
+            state["plugins"]["slots"]["contextEngine"] == "headroom",
+            "OpenClaw wrap should set the context engine slot",
+        )
+    finally:
+        if gateway_proc is not None:
+            stop_process(gateway_proc)
 
 
 def main() -> None:
@@ -602,8 +627,6 @@ def main() -> None:
         project_dir = tmp_dir / "project"
         shim_dir = tmp_dir / "shim-bin"
         log_dir = tmp_dir / "logs"
-        openclaw_state_path = tmp_dir / "openclaw" / "state.json"
-        openclaw_config_path = tmp_dir / "openclaw" / "config" / "config.json"
 
         for path in (home_dir, project_dir, shim_dir, log_dir):
             path.mkdir(parents=True, exist_ok=True)
@@ -616,8 +639,6 @@ def main() -> None:
                 "HOME": str(home_dir),
                 "PATH": f"{shim_dir}{os.pathsep}{base_env['PATH']}",
                 "HEADROOM_E2E_LOG_DIR": str(log_dir),
-                "HEADROOM_E2E_OPENCLAW_STATE": str(openclaw_state_path),
-                "HEADROOM_E2E_OPENCLAW_CONFIG": str(openclaw_config_path),
                 "OPENAI_TARGET_API_URL": "http://127.0.0.1:19001/v1",
             }
         )
@@ -628,7 +649,7 @@ def main() -> None:
             verify_aider_wrap(base_env, project_dir, log_dir)
             verify_cursor_wrap(base_env, project_dir)
             local_plugin_dir = prepare_local_openclaw_plugin(base_env, tmp_dir)
-            verify_openclaw_wrap(base_env, project_dir, local_plugin_dir, openclaw_state_path)
+            verify_openclaw_wrap(base_env, project_dir, local_plugin_dir)
         finally:
             mock_server.shutdown()
             mock_thread.join(timeout=5)
