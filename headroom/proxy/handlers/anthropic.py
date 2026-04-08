@@ -681,8 +681,9 @@ class AnthropicHandlerMixin:
                 # Flag compression failure for observability
                 _compression_failed = True
 
-        # Guard: if "optimization" inflated tokens, revert to originals
-        if optimized_tokens > original_tokens:
+        # Guard: if "optimization" inflated tokens, revert to originals.
+        # Skip in cache mode where prefix-stability may legitimately shift counts.
+        if optimized_tokens > original_tokens and not is_cache_mode(self.config.mode):
             logger.warning(
                 f"[{request_id}] Optimization inflated tokens "
                 f"({original_tokens} -> {optimized_tokens}), reverting to original messages"
@@ -691,7 +692,7 @@ class AnthropicHandlerMixin:
             optimized_tokens = original_tokens
             transforms_applied = []
 
-        tokens_saved = original_tokens - optimized_tokens
+        tokens_saved = max(0, original_tokens - optimized_tokens)
         optimization_latency = (time.time() - start_time) * 1000
 
         # Hook: post_compress — let hooks observe compression results
