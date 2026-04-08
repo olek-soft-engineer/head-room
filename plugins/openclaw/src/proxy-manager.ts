@@ -47,6 +47,8 @@ interface LaunchSpec {
   args: string[];
   checkCommand: string;
   checkArgs: string[];
+  useShell?: boolean;
+  checkUseShell?: boolean;
 }
 
 export class ProxyManager {
@@ -177,7 +179,7 @@ export class ProxyManager {
     const errors: string[] = [];
 
     for (const spec of specs) {
-      if (!this.canExecute(spec.checkCommand, spec.checkArgs)) {
+      if (!this.canExecute(spec.checkCommand, spec.checkArgs, spec.checkUseShell ?? spec.useShell)) {
         this.logger.debug(`Launcher unavailable: ${spec.label}`);
         continue;
       }
@@ -185,6 +187,7 @@ export class ProxyManager {
       try {
         const child = spawn(spec.command, spec.args, {
           detached: true,
+          shell: spec.useShell === true,
           stdio: "ignore",
         });
         child.unref();
@@ -213,6 +216,7 @@ export class ProxyManager {
       args: commonArgs,
       checkCommand: "headroom",
       checkArgs: ["--version"],
+      useShell: process.platform === "win32",
     });
 
     // 2) Local npm install (inside plugin install path)
@@ -224,14 +228,15 @@ export class ProxyManager {
       : [join(localBinDir, "headroom")];
     for (const localBin of localBins) {
       if (!existsSync(localBin)) continue;
-      specs.push({
-        label: `Local npm: ${localBin}`,
-        command: localBin,
-        args: commonArgs,
-        checkCommand: localBin,
-        checkArgs: ["--version"],
-      });
-    }
+        specs.push({
+          label: `Local npm: ${localBin}`,
+          command: localBin,
+          args: commonArgs,
+          checkCommand: localBin,
+          checkArgs: ["--version"],
+          useShell: process.platform === "win32",
+        });
+      }
 
     // 3) Global npm install
     const npmPrefix = this.getNpmGlobalPrefix();
@@ -248,6 +253,7 @@ export class ProxyManager {
           args: commonArgs,
           checkCommand: globalBin,
           checkArgs: ["--version"],
+          useShell: process.platform === "win32",
         });
       }
     }
@@ -281,9 +287,10 @@ export class ProxyManager {
     return commands;
   }
 
-  private canExecute(command: string, args: string[]): boolean {
+  private canExecute(command: string, args: string[], useShell = false): boolean {
     try {
       const result = spawnSync(command, args, {
+        shell: useShell,
         stdio: "ignore",
         timeout: 5000,
       });

@@ -229,6 +229,27 @@ describe("ProxyManager launch internals", () => {
     expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("second-node"));
   });
 
+  it("supports shell-backed launch specs for PATH shims and script wrappers", async () => {
+    const manager = new ProxyManager({});
+    const shellBuiltin = process.platform === "win32" ? "dir" : ":";
+    (manager as any).buildLaunchSpecs = () => [
+      {
+        label: "shell-backed",
+        command: shellBuiltin,
+        args: [],
+        checkCommand: shellBuiltin,
+        checkArgs: [],
+        useShell: true,
+      },
+    ];
+    const infoSpy = vi.spyOn((manager as any).logger, "info");
+
+    await (manager as any).startHeadroomProxy("http://127.0.0.1:8787", 8787);
+
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("Auto-start launcher selected"));
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("shell-backed"));
+  });
+
   it("throws when no launcher is executable", async () => {
     const manager = new ProxyManager({});
     (manager as any).buildLaunchSpecs = () => [
