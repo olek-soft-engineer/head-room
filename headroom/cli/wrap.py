@@ -1205,7 +1205,9 @@ def openclaw(
 
     if no_restart:
         click.echo("  Skipping gateway restart (--no-restart).")
-        click.echo("  Run `openclaw gateway restart` (or `openclaw gateway start`) to apply plugin changes.")
+        click.echo(
+            "  Run `openclaw gateway restart` (or `openclaw gateway start`) to apply plugin changes."
+        )
     else:
         click.echo("  Applying plugin changes to OpenClaw gateway...")
         gateway_action, gateway_output = _restart_or_start_openclaw_gateway(openclaw_bin)
@@ -1249,7 +1251,15 @@ def unwrap_openclaw(no_restart: bool, verbose: bool) -> None:
         existing_config = {
             key: value
             for key, value in existing_entry["config"].items()
-            if key not in {"gatewayProviderIds", "proxyUrl", "proxyPort", "autoStart", "startupTimeoutMs", "pythonPath"}
+            if key
+            not in {
+                "gatewayProviderIds",
+                "proxyUrl",
+                "proxyPort",
+                "autoStart",
+                "startupTimeoutMs",
+                "pythonPath",
+            }
         }
 
     entry = {"enabled": False, "config": existing_config}
@@ -1262,7 +1272,9 @@ def unwrap_openclaw(no_restart: bool, verbose: bool) -> None:
 
     if no_restart:
         click.echo("  Skipping gateway restart (--no-restart).")
-        click.echo("  Run `openclaw gateway restart` (or `openclaw gateway start`) to apply unwrap changes.")
+        click.echo(
+            "  Run `openclaw gateway restart` (or `openclaw gateway start`) to apply unwrap changes."
+        )
     else:
         click.echo("  Applying unwrap changes to OpenClaw gateway...")
         gateway_action, gateway_output = _restart_or_start_openclaw_gateway(openclaw_bin)
