@@ -51,6 +51,9 @@ interface LaunchSpec {
   checkUseShell?: boolean;
 }
 
+const HEADROOM_MODULE_DISCOVERY_SNIPPET =
+  "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('headroom') else 1)";
+
 export class ProxyManager {
   private config: ProxyManagerConfig;
   private logger: ProxyManagerLogger;
@@ -214,9 +217,12 @@ export class ProxyManager {
       label: "PATH: headroom",
       command: "headroom",
       args: commonArgs,
-      checkCommand: "headroom",
-      checkArgs: ["--version"],
+      checkCommand: process.platform === "win32" ? "where.exe" : "sh",
+      checkArgs: process.platform === "win32"
+        ? ["headroom"]
+        : ["-lc", "command -v headroom >/dev/null 2>&1"],
       useShell: process.platform === "win32",
+      checkUseShell: false,
     });
 
     // 2) Local npm install (inside plugin install path)
@@ -266,7 +272,7 @@ export class ProxyManager {
         command: pyCmd,
         args: ["-m", "headroom.cli", ...commonArgs],
         checkCommand: pyCmd,
-        checkArgs: ["-c", "import headroom"],
+        checkArgs: ["-c", HEADROOM_MODULE_DISCOVERY_SNIPPET],
       });
     }
 
