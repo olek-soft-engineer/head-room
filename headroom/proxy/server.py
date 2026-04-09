@@ -1822,7 +1822,6 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def openai_codex_nested_responses_sub(request: Request, sub_path: str):
         """Passthrough for /backend-api/codex/responses/* sub-endpoints."""
         return await openai_responses_sub(request, sub_path)
-
     # OpenAI Batch API endpoints (with compression!)
     @app.post("/v1/batches")
     async def create_batch(request: Request):
