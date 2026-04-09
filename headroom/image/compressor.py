@@ -359,6 +359,11 @@ class ImageCompressor:
     ) -> list[dict[str, Any]]:
         """Compress images in messages.
 
+        Pipeline:
+        1. Tile-boundary alignment (pure math, zero quality loss)
+        2. ML-based technique routing (ONNX, query + image analysis)
+        3. Apply compression technique
+
         Args:
             messages: LLM messages (OpenAI/Anthropic/Google format)
             provider: Target provider ('openai', 'anthropic', 'google')
@@ -369,26 +374,57 @@ class ImageCompressor:
         if not self.has_images(messages):
             return messages
 
-        # Extract query and image
+        # Step 1: Tile-boundary optimization (always safe, pure math)
+        try:
+            from .tile_optimizer import optimize_images_in_messages
+
+            messages, tile_results = optimize_images_in_messages(messages, provider)
+            tile_saved = sum(r.tokens_saved for r in tile_results)
+            if tile_saved > 0:
+                logger.info(
+                    f"Image tile optimization: saved {tile_saved} tokens "
+                    f"({len(tile_results)} image(s))"
+                )
+        except Exception as e:
+            logger.debug(f"Tile optimization skipped: {e}")
+            tile_saved = 0
+
+        # Step 2: ML-based technique routing
         query = self._extract_query(messages)
         image_data = self._extract_image_data(messages)
 
         if not query or not image_data:
-            logger.debug("Could not extract query or image, skipping compression")
+            # Still got tile savings even without ML routing
+            if tile_saved > 0:
+                self.last_result = CompressionResult(
+                    technique=Technique.PRESERVE,
+                    original_tokens=tile_saved,
+                    compressed_tokens=0,
+                    confidence=1.0,
+                )
             return messages
 
-        # Route to technique
+        # Try ONNX router first (lightweight), fall back to PyTorch router
         try:
-            router = self._get_router()
-            decision = router.classify(image_data, query)
+            from .onnx_router import OnnxTechniqueRouter
+
+            onnx_router = OnnxTechniqueRouter(use_siglip=self.use_siglip)
+            decision = onnx_router.classify(image_data, query)
             technique = decision.technique
             confidence = decision.confidence
-        except Exception as e:
-            logger.warning(f"Router failed, preserving image: {e}")
-            technique = Technique.PRESERVE
-            confidence = 0.0
+        except Exception as onnx_err:
+            logger.debug(f"ONNX router not available ({onnx_err}), trying PyTorch...")
+            try:
+                pt_router = self._get_router()
+                decision = pt_router.classify(image_data, query)
+                technique = decision.technique
+                confidence = decision.confidence
+            except Exception as e:
+                logger.warning(f"Router failed, preserving image: {e}")
+                technique = Technique.PRESERVE
+                confidence = 0.0
 
-        # Calculate tokens - compare by value since technique is from trained_router
+        # Calculate tokens
         original_tokens = self._estimate_tokens(image_data, "high")
 
         if technique.value == "full_low":
@@ -402,10 +438,10 @@ class ImageCompressor:
         else:
             compressed_tokens = original_tokens
 
-        # Store result
+        # Store result (include tile savings)
         self.last_result = CompressionResult(
             technique=technique,
-            original_tokens=original_tokens,
+            original_tokens=original_tokens + tile_saved,
             compressed_tokens=compressed_tokens,
             confidence=confidence,
         )
@@ -416,7 +452,7 @@ class ImageCompressor:
             f"{self.last_result.savings_percent:.0f}% saved)"
         )
 
-        # Apply compression
+        # Step 3: Apply compression technique
         return self._apply_compression(messages, technique, provider)
 
 
