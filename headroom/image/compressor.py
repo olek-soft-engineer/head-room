@@ -241,6 +241,104 @@ class ImageCompressor:
         tiles_y = (height + 511) // 512
         return int(85 * tiles_x * tiles_y + 170)
 
+    def _count_result_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        original_image_data: bytes,
+        provider: str,
+    ) -> int:
+        """Count actual tokens in compressed messages by inspecting the result.
+
+        If the image was replaced with OCR text → count text tokens (~4 chars/token).
+        If the image was resized → re-estimate from new dimensions.
+        If detail=low was set → use provider's low-detail cost.
+        """
+        total = 0
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+
+                # OCR replacement: text block with "[OCR from image]"
+                if item.get("type") == "text" and "[OCR from image]" in item.get("text", ""):
+                    text = item["text"]
+                    total += max(1, len(text) // 4)  # ~4 chars per token
+                    continue
+
+                # OpenAI: check if detail was set to "low"
+                if item.get("type") == "image_url":
+                    detail = item.get("image_url", {}).get("detail", "high")
+                    if detail == "low":
+                        total += 85  # OpenAI's documented low-detail cost
+                    else:
+                        # Re-estimate from the (possibly resized) image
+                        url = item.get("image_url", {}).get("url", "")
+                        if url.startswith("data:"):
+                            match = re.match(r"data:image/[^;]+;base64,(.+)", url)
+                            if match:
+                                data = base64.b64decode(match.group(1))
+                                total += self._estimate_tokens(data, "high")
+
+                # Anthropic: re-estimate from the (possibly resized) image
+                elif item.get("type") == "image":
+                    source = item.get("source", {})
+                    if source.get("type") == "base64":
+                        data = base64.b64decode(source.get("data", ""))
+                        total += self._estimate_tokens(data, "high")
+
+                # Google: re-estimate
+                elif "inlineData" in item:
+                    data = base64.b64decode(item.get("inlineData", {}).get("data", ""))
+                    total += self._estimate_tokens(data, "high")
+
+        return total if total > 0 else self._estimate_tokens(original_image_data, "high")
+
+    def _ocr_extract(self, image_data: bytes, min_confidence: float = 0.7) -> str | None:
+        """Extract text from image using RapidOCR.
+
+        Returns extracted text if OCR is confident, None otherwise (fallback to image).
+        """
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+
+            if not hasattr(self, "_ocr_engine"):
+                self._ocr_engine = RapidOCR()
+
+            result, _ = self._ocr_engine(image_data)
+            if not result:
+                return None
+
+            # Check average confidence
+            confidences = [line[2] for line in result]
+            avg_confidence = sum(confidences) / len(confidences)
+
+            if avg_confidence < min_confidence:
+                logger.debug(
+                    f"OCR confidence too low ({avg_confidence:.0%} < {min_confidence:.0%}), "
+                    f"falling back to image"
+                )
+                return None
+
+            # Combine lines into text
+            text = "\n".join(line[1] for line in result)
+
+            logger.info(
+                f"OCR extracted {len(result)} lines ({avg_confidence:.0%} avg confidence, "
+                f"{len(text)} chars)"
+            )
+            return text
+
+        except ImportError:
+            logger.debug("rapidocr-onnxruntime not installed, skipping OCR")
+            return None
+        except Exception as e:
+            logger.warning(f"OCR failed: {e}")
+            return None
+
     def _apply_compression(
         self,
         messages: list[dict[str, Any]],
@@ -265,87 +363,100 @@ class ImageCompressor:
                     new_content.append(item)
                     continue
 
-                # OpenAI format - compare by value since technique may be from trained_router
-                if item.get("type") == "image_url" and provider == "openai":
-                    if technique.value == "full_low":
-                        # Apply detail="low"
-                        new_item = {
-                            "type": "image_url",
-                            "image_url": {
-                                **item.get("image_url", {}),
-                                "detail": "low",
-                            },
-                        }
-                        new_content.append(new_item)
-                    elif technique.value == "crop":
-                        # For now, use low detail (TODO: implement actual cropping)
-                        new_item = {
-                            "type": "image_url",
-                            "image_url": {
-                                **item.get("image_url", {}),
-                                "detail": "low",
-                            },
-                        }
-                        new_content.append(new_item)
-                    elif technique.value == "transcode":
-                        # TODO: Convert to text description
-                        # For now, keep original
-                        new_content.append(item)
-                    else:
-                        new_content.append(item)
+                # Extract image bytes for OCR (transcode) across all formats
+                image_bytes_for_ocr: bytes | None = None
+                is_image_block = False
 
-                # Anthropic format - resize image for compression
-                elif item.get("type") == "image" and provider == "anthropic":
-                    if technique.value in ("full_low", "crop"):
-                        # Resize image to reduce tokens
-                        try:
-                            source = item.get("source", {})
-                            if source.get("type") == "base64":
-                                original_data = base64.b64decode(source.get("data", ""))
-                                resized_data, media_type = self._resize_image(
-                                    original_data, max_dimension=512
-                                )
-                                new_item = {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": media_type,
-                                        "data": base64.b64encode(resized_data).decode(),
-                                    },
-                                }
-                                new_content.append(new_item)
-                            else:
-                                new_content.append(item)
-                        except Exception as e:
-                            logger.warning(f"Failed to resize Anthropic image: {e}")
-                            new_content.append(item)
-                    else:
-                        new_content.append(item)
+                if item.get("type") == "image_url":
+                    is_image_block = True
+                    url = item.get("image_url", {}).get("url", "")
+                    if url.startswith("data:"):
+                        match = re.match(r"data:image/[^;]+;base64,(.+)", url)
+                        if match:
+                            image_bytes_for_ocr = base64.b64decode(match.group(1))
+                elif item.get("type") == "image":
+                    is_image_block = True
+                    source = item.get("source", {})
+                    if source.get("type") == "base64":
+                        image_bytes_for_ocr = base64.b64decode(source.get("data", ""))
+                elif "inlineData" in item:
+                    is_image_block = True
+                    image_bytes_for_ocr = base64.b64decode(
+                        item.get("inlineData", {}).get("data", "")
+                    )
 
-                # Google format - resize image for compression
-                elif "inlineData" in item and provider == "google":
-                    if technique.value in ("full_low", "crop"):
-                        try:
-                            inline = item.get("inlineData", {})
-                            original_data = base64.b64decode(inline.get("data", ""))
-                            resized_data, media_type = self._resize_image(
-                                original_data,
-                                max_dimension=768,  # Google uses 768x768 tiles
-                            )
-                            new_item = {
-                                "inlineData": {
-                                    "mimeType": media_type,
-                                    "data": base64.b64encode(resized_data).decode(),
-                                }
+                if not is_image_block:
+                    new_content.append(item)
+                    continue
+
+                # --- TRANSCODE: OCR the image and replace with text ---
+                if technique.value == "transcode" and image_bytes_for_ocr:
+                    extracted = self._ocr_extract(image_bytes_for_ocr)
+                    if extracted:
+                        # Replace image with extracted text
+                        new_content.append(
+                            {"type": "text", "text": f"[OCR from image]\n{extracted}"}
+                        )
+                        continue
+                    # OCR failed or low confidence — fall through to full_low
+                    logger.debug("OCR fallback: using full_low instead of transcode")
+
+                # --- FULL_LOW / CROP: reduce quality ---
+                if technique.value in ("full_low", "crop", "transcode"):
+                    if item.get("type") == "image_url" and provider == "openai":
+                        new_content.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    **item.get("image_url", {}),
+                                    "detail": "low",
+                                },
                             }
-                            new_content.append(new_item)
-                        except Exception as e:
-                            logger.warning(f"Failed to resize Google image: {e}")
+                        )
+                    elif item.get("type") == "image" and provider == "anthropic":
+                        if image_bytes_for_ocr:
+                            try:
+                                resized_data, media_type = self._resize_image(
+                                    image_bytes_for_ocr, max_dimension=512
+                                )
+                                new_content.append(
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": media_type,
+                                            "data": base64.b64encode(resized_data).decode(),
+                                        },
+                                    }
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to resize image: {e}")
+                                new_content.append(item)
+                        else:
+                            new_content.append(item)
+                    elif "inlineData" in item and provider == "google":
+                        if image_bytes_for_ocr:
+                            try:
+                                resized_data, media_type = self._resize_image(
+                                    image_bytes_for_ocr, max_dimension=768
+                                )
+                                new_content.append(
+                                    {
+                                        "inlineData": {
+                                            "mimeType": media_type,
+                                            "data": base64.b64encode(resized_data).decode(),
+                                        }
+                                    }
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to resize image: {e}")
+                                new_content.append(item)
+                        else:
                             new_content.append(item)
                     else:
                         new_content.append(item)
-
                 else:
+                    # PRESERVE or unknown — keep original
                     new_content.append(item)
 
             compressed.append({**message, "content": new_content})
@@ -424,24 +535,21 @@ class ImageCompressor:
                 technique = Technique.PRESERVE
                 confidence = 0.0
 
-        # Calculate tokens
-        original_tokens = self._estimate_tokens(image_data, "high")
+        # Count original tokens BEFORE compression
+        original_tokens = self._estimate_tokens(image_data, "high") + tile_saved
 
-        if technique.value == "full_low":
-            compressed_tokens = 85  # OpenAI low detail
-        elif technique.value == "preserve":
-            compressed_tokens = original_tokens
-        elif technique.value == "crop":
-            compressed_tokens = 85  # Approximation
-        elif technique.value == "transcode":
-            compressed_tokens = 50  # Text description estimate
-        else:
-            compressed_tokens = original_tokens
+        # Step 3: Apply compression technique
+        compressed_messages = self._apply_compression(messages, technique, provider)
 
-        # Store result (include tile savings)
+        # Count actual tokens AFTER compression by measuring the result.
+        # If the image was replaced with text (OCR), count text tokens.
+        # If resized, re-estimate from new dimensions.
+        compressed_tokens = self._count_result_tokens(compressed_messages, image_data, provider)
+
+        # Store result
         self.last_result = CompressionResult(
             technique=technique,
-            original_tokens=original_tokens + tile_saved,
+            original_tokens=original_tokens,
             compressed_tokens=compressed_tokens,
             confidence=confidence,
         )
@@ -452,8 +560,7 @@ class ImageCompressor:
             f"{self.last_result.savings_percent:.0f}% saved)"
         )
 
-        # Step 3: Apply compression technique
-        return self._apply_compression(messages, technique, provider)
+        return compressed_messages
 
 
 # Singleton for convenience

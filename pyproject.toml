@@ -92,10 +92,11 @@ relevance = [
     "sentence-transformers>=2.2.0",
     "numpy>=1.24.0",
 ]
-# Image compression (ML-based routing)
+# Image compression (ML-based routing + OCR)
 image = [
     "pillow>=10.0.0",
     "sentencepiece>=0.1.99",  # Required by SigLIP tokenizer (SiglipTokenizer)
+    "rapidocr-onnxruntime>=1.4.0",  # ONNX-native OCR for text extraction from images (~15MB models)
 ]
 # Report generation
 reports = [

@@ -305,3 +305,122 @@ class TestFullPipeline:
         compressor = ImageCompressor()
         msgs = [{"role": "user", "content": "Just text"}]
         assert not compressor.has_images(msgs)
+
+
+# ---------------------------------------------------------------------------
+# OCR routing tests
+# ---------------------------------------------------------------------------
+
+
+class TestOcrRouting:
+    @pytest.fixture(autouse=True)
+    def _check_ocr(self):
+        try:
+            from rapidocr_onnxruntime import RapidOCR  # noqa: F401
+        except ImportError:
+            pytest.skip("rapidocr-onnxruntime not installed")
+
+    def _make_text_image(self, lines: list[str], width: int = 800, height: int = 400) -> bytes:
+        """Create a PNG image with text content."""
+        from PIL import Image, ImageDraw
+
+        img = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(img)
+        y = 30
+        for line in lines:
+            draw.text((30, y), line, fill="black")
+            y += 40
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    def test_ocr_extracts_text(self):
+        """OCR should extract text from a text-heavy image."""
+        from headroom.image import ImageCompressor
+
+        compressor = ImageCompressor(use_siglip=False)
+        image_data = self._make_text_image(
+            [
+                "Error: connection refused",
+                "at localhost:5432",
+            ]
+        )
+        text = compressor._ocr_extract(image_data)
+        assert text is not None
+        assert len(text) > 10
+        # Should contain key words (OCR may have minor errors)
+        assert "connection" in text.lower() or "error" in text.lower()
+
+    def test_ocr_returns_none_for_blank_image(self):
+        """OCR should return None for a blank image (no text)."""
+        from headroom.image import ImageCompressor
+
+        compressor = ImageCompressor(use_siglip=False)
+        from PIL import Image
+
+        img = Image.new("RGB", (200, 200), "blue")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        text = compressor._ocr_extract(buf.getvalue())
+        assert text is None  # No text detected
+
+    def test_ocr_confidence_threshold(self):
+        """Low-confidence OCR should return None (fallback to image)."""
+        from headroom.image import ImageCompressor
+
+        compressor = ImageCompressor(use_siglip=False)
+        # Very noisy image — OCR should have low confidence
+        import numpy as np
+        from PIL import Image
+
+        noise = np.random.randint(0, 255, (200, 200, 3), dtype=np.uint8)
+        img = Image.fromarray(noise)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        text = compressor._ocr_extract(buf.getvalue(), min_confidence=0.95)
+        # Noisy image: either None (no text) or low confidence → None
+        # Either outcome is correct — we don't want to OCR noise
+        assert text is None or len(text) < 10
+
+    def test_transcode_replaces_image_with_text(self):
+        """Full pipeline: transcode technique should replace image with OCR text."""
+        from headroom.image import ImageCompressor
+        from headroom.image.trained_router import Technique
+
+        compressor = ImageCompressor(use_siglip=False)
+
+        # Create message with text-heavy image
+        image_data = self._make_text_image(
+            [
+                "Traceback (most recent call last):",
+                "  File server.py line 42",
+                "psycopg2.OperationalError",
+            ]
+        )
+        b64 = base64.b64encode(image_data).decode()
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What does the error say?"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}"},
+                    },
+                ],
+            }
+        ]
+
+        # Apply transcode directly
+        result = compressor._apply_compression(messages, Technique.TRANSCODE, "openai")
+
+        # The image block should be replaced with a text block
+        content = result[0]["content"]
+        text_blocks = [b for b in content if isinstance(b, dict) and b.get("type") == "text"]
+
+        # Should have at least 2 text blocks (original query + OCR output)
+        assert len(text_blocks) >= 2
+        # One should contain OCR output
+        ocr_blocks = [b for b in text_blocks if "[OCR from image]" in b.get("text", "")]
+        assert len(ocr_blocks) >= 1
