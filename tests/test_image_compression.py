@@ -20,6 +20,17 @@ from headroom.image.tile_optimizer import (
     optimize_images_in_messages,
 )
 
+# Tests that create images need Pillow (optional dependency)
+_HAS_PIL = False
+try:
+    from PIL import Image as _Image  # noqa: F401
+
+    _HAS_PIL = True
+except ImportError:
+    pass
+
+needs_pillow = pytest.mark.skipif(not _HAS_PIL, reason="Pillow not installed")
+
 # ---------------------------------------------------------------------------
 # Token estimation tests
 # ---------------------------------------------------------------------------
@@ -153,6 +164,7 @@ def _make_anthropic_image_message(width: int, height: int) -> list[dict]:
     ]
 
 
+@needs_pillow
 class TestMessageOptimization:
     def test_openai_message_optimized(self):
         """OpenAI message with large image gets tile-optimized."""
@@ -259,6 +271,7 @@ class TestOnnxRouter:
 # ---------------------------------------------------------------------------
 
 
+@needs_pillow
 class TestFullPipeline:
     def test_compressor_with_openai_image(self):
         """Full compressor pipeline on OpenAI format."""
@@ -312,6 +325,7 @@ class TestFullPipeline:
 # ---------------------------------------------------------------------------
 
 
+@needs_pillow
 class TestOcrRouting:
     @pytest.fixture(autouse=True)
     def _check_ocr(self):
