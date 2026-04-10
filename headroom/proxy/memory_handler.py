@@ -156,6 +156,7 @@ class MemoryHandler:
                     enable_graph=True,
                 )
                 self._backend = DirectMem0Adapter(mem0_config)
+                await self._backend.ensure_initialized()
                 logger.info(
                     f"Memory: Initialized Qdrant+Neo4j backend "
                     f"({self.config.qdrant_host}:{self.config.qdrant_port})"
@@ -1421,6 +1422,20 @@ To SAVE: create /memories/<topic>.txt "content"
     def initialized(self) -> bool:
         """Whether the backend has been initialized."""
         return self._initialized
+
+    async def ensure_initialized(self) -> None:
+        """Initialize the configured backend so readiness checks can be accurate."""
+        await self._ensure_initialized()
+
+    def health_status(self) -> dict[str, Any]:
+        """Return a lightweight health snapshot for readiness endpoints."""
+        return {
+            "enabled": self.config.enabled,
+            "backend": self.config.backend,
+            "initialized": self._initialized,
+            "native_tool": self.config.use_native_tool,
+            "bridge_enabled": self.config.bridge_enabled,
+        }
 
     async def close(self) -> None:
         """Close the memory backend."""

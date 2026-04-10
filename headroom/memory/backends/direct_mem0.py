@@ -226,6 +226,10 @@ class DirectMem0Adapter:
 
         self._initialized = True
 
+    async def ensure_initialized(self) -> None:
+        """Public initialization hook for callers that need readiness guarantees."""
+        await self._ensure_initialized()
+
     def _embed(self, text: str) -> list[float]:
         """Generate embedding for text using OpenAI."""
         response = self._openai_client.embeddings.create(
