@@ -10,7 +10,8 @@ services:
       UV_LINK_MODE: copy
       UV_PROJECT_ENVIRONMENT: /home/vscode/.venvs/headroom-memory
     volumes:
-      - ..:/workspaces/headroom:cached
+      - ..:/workspaces:cached
+      - ../../../../../../../../:/workspaces-host:cached
       - headroom-venv-memory:/home/vscode/.venvs
       - headroom-uv-cache:/home/vscode/.cache/uv
       - headroom-pip-cache:/home/vscode/.cache/pip

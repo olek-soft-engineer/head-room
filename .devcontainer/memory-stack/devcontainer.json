@@ -8,7 +8,7 @@
     "qdrant",
     "neo4j"
   ],
-  "workspaceFolder": "/workspaces/headroom",
+  "workspaceFolder": "/workspaces",
   "remoteUser": "vscode",
   "updateRemoteUserUID": true,
   "shutdownAction": "stopCompose",
@@ -50,7 +50,7 @@
     }
   },
   "postCreateCommand": "bash .devcontainer/post-create.sh memory-stack",
-  "postStartCommand": "git config --global --add safe.directory ${containerWorkspaceFolder}",
+  "postStartCommand": "bash -lc 'git rev-parse --git-dir >/dev/null 2>&1 && git config --global --add safe.directory \"${containerWorkspaceFolder}\" || true'",
   "customizations": {
     "vscode": {
       "extensions": [

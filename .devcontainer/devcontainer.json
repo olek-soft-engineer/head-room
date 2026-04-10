@@ -10,7 +10,7 @@
     },
     "ghcr.io/devcontainers/features/github-cli:1": {}
   },
-  "workspaceFolder": "/workspaces/headroom",
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
   "remoteUser": "vscode",
   "updateRemoteUserUID": true,
   "init": true,
@@ -21,12 +21,13 @@
     "UV_PROJECT_ENVIRONMENT": "/home/vscode/.venvs/headroom"
   },
   "mounts": [
-    "source=headroom-venv,target=/home/vscode/.venvs,type=volume",
+    "source=headroom-venv-${localWorkspaceFolderBasename},target=/home/vscode/.venvs,type=volume",
     "source=headroom-uv-cache,target=/home/vscode/.cache/uv,type=volume",
-    "source=headroom-pip-cache,target=/home/vscode/.cache/pip,type=volume"
+    "source=headroom-pip-cache,target=/home/vscode/.cache/pip,type=volume",
+    "source=${localWorkspaceFolder}/../../../../../../../../,target=/workspaces-host,type=bind,consistency=cached"
   ],
   "postCreateCommand": "bash .devcontainer/post-create.sh",
-  "postStartCommand": "git config --global --add safe.directory ${containerWorkspaceFolder}",
+  "postStartCommand": "bash -lc 'git rev-parse --git-dir >/dev/null 2>&1 && git config --global --add safe.directory \"${containerWorkspaceFolder}\" || true'",
   "forwardPorts": [
     8787
   ],
