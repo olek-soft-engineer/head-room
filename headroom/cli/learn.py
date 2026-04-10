@@ -8,59 +8,53 @@ from typing import TYPE_CHECKING
 import click
 
 if TYPE_CHECKING:
-    from ..learn.scanner import ConversationScanner
-    from ..learn.writer import ContextWriter
+    from ..learn.base import LearnPlugin
 
 from .main import main
+
+
+class _AgentChoice(click.ParamType):
+    """Dynamic Click type that validates against the plugin registry."""
+
+    name = "agent"
+
+    def get_metavar(self, param: click.Parameter, ctx: click.Context | None = None) -> str | None:
+        return "[auto|<agent>]"
+
+    def convert(
+        self,
+        value: str,
+        param: click.Parameter | None,
+        ctx: click.Context | None,
+    ) -> str:
+        if value == "auto":
+            return value
+        from ..learn.registry import get_registry
+
+        reg = get_registry()
+        if value.lower() not in reg:
+            available = ", ".join(sorted(reg.keys()))
+            self.fail(f"Unknown agent: {value}. Available: auto, {available}", param, ctx)
+        return value.lower()
+
+    def shell_complete(
+        self,
+        ctx: click.Context,
+        param: click.Parameter,
+        incomplete: str,
+    ) -> list[click.shell_completion.CompletionItem]:
+        from ..learn.registry import available_agent_names
+
+        names = ["auto"] + available_agent_names()
+        return [click.shell_completion.CompletionItem(n) for n in names if n.startswith(incomplete)]
+
 
 _AGENT_HELP = """Which coding agent to analyze. Auto-detects by default.
 
 \b
-Supported agents:
-  claude   Claude Code (~/.claude/)
-  codex    OpenAI Codex CLI (~/.codex/)
-  gemini   Google Gemini CLI (~/.gemini/)
-  auto     Auto-detect (check all, default)
-"""
-
-
-def _get_scanner_writer(agent: str) -> tuple[ConversationScanner, ContextWriter]:
-    """Get the appropriate scanner and writer for an agent type."""
-    from ..learn.scanner import ClaudeCodeScanner, CodexScanner
-    from ..learn.writer import ClaudeCodeWriter, CodexWriter
-
-    scanners = {
-        "claude": (ClaudeCodeScanner, ClaudeCodeWriter),
-        "codex": (CodexScanner, CodexWriter),
-        # Gemini scanner not yet implemented (protobuf sessions)
-        # Cursor scanner not yet implemented (SQLite blobs)
-    }
-
-    if agent in scanners:
-        scanner_cls, writer_cls = scanners[agent]
-        return scanner_cls(), writer_cls()
-
-    raise click.BadParameter(f"Unknown agent: {agent}. Supported: claude, codex")
-
-
-def _auto_detect_agents() -> list[tuple[str, ConversationScanner, ContextWriter]]:
-    """Auto-detect which agents have data on this machine."""
-    from ..learn.scanner import ClaudeCodeScanner, CodexScanner
-    from ..learn.writer import ClaudeCodeWriter, CodexWriter
-
-    agents: list[tuple[str, ConversationScanner, ContextWriter]] = []
-
-    # Claude Code
-    claude_dir = Path.home() / ".claude" / "projects"
-    if claude_dir.exists() and any(claude_dir.iterdir()):
-        agents.append(("claude", ClaudeCodeScanner(), ClaudeCodeWriter()))
-
-    # Codex
-    codex_dir = Path.home() / ".codex" / "sessions"
-    if codex_dir.exists() and any(codex_dir.glob("*.json")):
-        agents.append(("codex", CodexScanner(), CodexWriter()))
-
-    return agents
+Built-in: claude, codex, gemini.
+External plugins register via 'headroom.learn_plugin' entry point.
+Use 'auto' (default) to scan all detected agents."""
 
 
 @main.command()
@@ -85,7 +79,7 @@ def _auto_detect_agents() -> list[tuple[str, ConversationScanner, ContextWriter]
 )
 @click.option(
     "--agent",
-    type=click.Choice(["auto", "claude", "codex", "gemini"], case_sensitive=False),
+    type=_AgentChoice(),
     default="auto",
     help=_AGENT_HELP,
 )
@@ -109,8 +103,9 @@ def learn(
     (wrong paths, missing modules, stubborn retries) and generates context
     that prevents them from recurring.
 
-    Supports multiple coding agents: Claude Code, Codex, Gemini CLI.
-    Uses LiteLLM for provider-agnostic LLM access (100+ models).
+    Supports multiple coding agents via a plugin architecture. Built-in
+    support for Claude Code, Codex, and Gemini CLI. External plugins can
+    be installed via pip (entry point: headroom.learn_plugin).
 
     \b
     Examples:
@@ -121,6 +116,7 @@ def learn(
         headroom learn --agent codex --all    # Analyze all Codex sessions
     """
     from ..learn.analyzer import SessionAnalyzer, _detect_default_model
+    from ..learn.registry import auto_detect_plugins, get_plugin
 
     # Resolve model early to fail fast with a clear message
     try:
@@ -132,15 +128,18 @@ def learn(
     analyzer = SessionAnalyzer(model=resolved_model)
 
     # Determine which agents to scan
+    agent_configs: list[tuple[str, LearnPlugin]] = []
+
     if agent == "auto":
-        agent_configs = _auto_detect_agents()
-        if not agent_configs:
-            click.echo("No coding agent data found. Checked: ~/.claude/, ~/.codex/")
+        detected = auto_detect_plugins()
+        if not detected:
+            click.echo("No coding agent data found.")
             return
-        click.echo(f"Detected agents: {', '.join(name for name, _, _ in agent_configs)}")
+        click.echo(f"Detected agents: {', '.join(p.display_name for p in detected)}")
+        agent_configs = [(p.name, p) for p in detected]
     else:
-        scanner, writer = _get_scanner_writer(agent)
-        agent_configs = [(agent, scanner, writer)]
+        selected = get_plugin(agent)
+        agent_configs = [(selected.name, selected)]
 
     total_projects = 0
     total_failures = 0
@@ -148,11 +147,12 @@ def learn(
     matched_projects = 0
     available_projects: list[tuple[str, Path]] = []
 
-    for agent_name, scanner, writer in agent_configs:
-        all_projects = scanner.discover_projects()
+    for agent_name, plugin in agent_configs:
+        writer = plugin.create_writer()
+        all_projects = plugin.discover_projects()
         if not all_projects:
             continue
-        available_projects.extend((agent_name, p.project_path) for p in all_projects)
+        available_projects.extend((agent_name, proj.project_path) for proj in all_projects)
 
         # Filter to target project(s)
         if analyze_all:
@@ -174,8 +174,8 @@ def learn(
                 click.echo(f"No {agent_name} project data found for {cwd}")
                 click.echo("Try: headroom learn --all  or  headroom learn --project <path>")
                 click.echo(f"\nAvailable {agent_name} projects:")
-                for p in all_projects[:10]:
-                    click.echo(f"  {p.name:30s} {p.project_path}")
+                for proj_info in all_projects[:10]:
+                    click.echo(f"  {proj_info.name:30s} {proj_info.project_path}")
                 return
 
         for proj in targets:
@@ -185,7 +185,7 @@ def learn(
             click.echo(f"Path: {proj.project_path}")
             click.echo(f"{'=' * 60}")
 
-            sessions = scanner.scan_project(proj)
+            sessions = plugin.scan_project(proj)
             if not sessions:
                 click.echo("  No conversation data found.")
                 continue

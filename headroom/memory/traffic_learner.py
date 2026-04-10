@@ -149,6 +149,7 @@ class TrafficLearner:
         self,
         backend: LocalBackend | None = None,
         user_id: str = "default",
+        agent_type: str = "unknown",
         max_history: int = 20,
         dedup_window: int = 100,
         min_evidence: int = 2,
@@ -159,12 +160,15 @@ class TrafficLearner:
             backend: Memory backend to save patterns to. If None, patterns
                 are accumulated but not persisted until a backend is set.
             user_id: Default user ID for saved memories.
+            agent_type: Which coding agent is being wrapped (claude, codex, gemini, etc.).
+                Used to determine the correct output file for flushing patterns.
             max_history: Number of recent tool calls to keep for pattern matching.
             dedup_window: Number of recent pattern hashes to track for dedup.
             min_evidence: Minimum times a pattern must be seen before saving.
         """
         self._backend = backend
         self._user_id = user_id
+        self.agent_type = agent_type
         self._max_history = max_history
         self._min_evidence = min_evidence
 
@@ -186,6 +190,7 @@ class TrafficLearner:
         # Background save queue
         self._save_queue: asyncio.Queue[ExtractedPattern] = asyncio.Queue(maxsize=100)
         self._save_task: asyncio.Task[None] | None = None
+        self._stopping = False
 
     # =========================================================================
     # Public API
@@ -201,13 +206,110 @@ class TrafficLearner:
             self._save_task = asyncio.create_task(self._save_worker())
 
     async def stop(self) -> None:
-        """Stop the background save worker."""
+        """Stop the background save worker, draining the queue first."""
+        # Drain any remaining patterns in the queue before cancelling
         if self._save_task and not self._save_task.done():
+            # Signal the worker to stop by putting a sentinel
+            self._stopping = True
             self._save_task.cancel()
             try:
                 await self._save_task
             except asyncio.CancelledError:
                 pass
+
+        # Drain any patterns left in the queue (worker may have been cancelled mid-flight)
+        while not self._save_queue.empty():
+            try:
+                pattern = self._save_queue.get_nowait()
+                if self._backend is not None:
+                    await self._backend.save_memory(
+                        content=pattern.content,
+                        user_id=self._user_id,
+                        metadata={
+                            "source": "traffic_learner",
+                            "category": pattern.category.value,
+                            "evidence_count": pattern.evidence_count,
+                            **pattern.metadata,
+                        },
+                    )
+                    self._patterns_saved += 1
+            except Exception:
+                break
+
+        # Flush learned patterns to the agent-native .md file
+        await self.flush_to_file()
+
+    async def flush_to_file(self) -> None:
+        """Flush accumulated patterns to the agent-native context file.
+
+        Uses the learn plugin registry to find the correct writer for the
+        current agent_type (e.g., MEMORY.md for Claude, AGENTS.md for Codex).
+        """
+        patterns = self.get_learned_patterns()
+        if not patterns or self.agent_type == "unknown":
+            return
+
+        try:
+            from headroom.learn.models import ProjectInfo, Recommendation, RecommendationTarget
+            from headroom.learn.registry import get_plugin
+
+            plugin = get_plugin(self.agent_type)
+            writer = plugin.create_writer()
+
+            # Convert patterns to Recommendations
+            recommendations = []
+            for p in patterns:
+                recommendations.append(
+                    Recommendation(
+                        target=RecommendationTarget.CONTEXT_FILE,
+                        section="Learned Patterns (Live Traffic)",
+                        content=f"- {p.content}",
+                        confidence=p.importance,
+                        evidence_count=p.evidence_count,
+                    )
+                )
+
+            if not recommendations:
+                return
+
+            # Use cwd as project path — the proxy runs in the project directory
+            from pathlib import Path
+
+            project = ProjectInfo(
+                name=Path.cwd().name,
+                project_path=Path.cwd(),
+                data_path=Path.cwd(),
+            )
+
+            result = writer.write(recommendations, project, dry_run=False)
+            if result.files_written:
+                logger.info(
+                    "Traffic learner flushed %d patterns to %s",
+                    len(recommendations),
+                    ", ".join(str(f) for f in result.files_written),
+                )
+        except KeyError:
+            logger.debug("No learn plugin for agent_type=%s, skipping file flush", self.agent_type)
+        except Exception as e:
+            logger.warning("Traffic learner flush_to_file failed: %s", e)
+
+    def get_learned_patterns(self) -> list[ExtractedPattern]:
+        """Return all patterns that have been saved or met the evidence threshold.
+
+        Includes patterns still in the accumulator that haven't hit min_evidence
+        but have been seen at least once (for end-of-session flush).
+        """
+        patterns: list[ExtractedPattern] = []
+
+        # Patterns that met the threshold and were queued
+        # (already saved to DB, but also want them in the .md file)
+        # We track what was saved via _saved_hashes, but don't keep the content.
+        # So we collect from the accumulator — patterns still accumulating.
+        for pattern, count in self._pattern_counts.values():
+            if count >= 1:  # At shutdown, flush even single-evidence patterns
+                patterns.append(pattern)
+
+        return patterns
 
     async def on_tool_result(
         self,

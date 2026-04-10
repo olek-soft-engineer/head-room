@@ -176,6 +176,7 @@ class ProxyConfig:
     memory_db_path: str = "headroom_memory.db"
     memory_inject_tools: bool = True
     traffic_learning_enabled: bool = False
+    traffic_learning_agent_type: str = "unknown"  # Which agent is being wrapped
     memory_use_native_tool: bool = False
     memory_inject_context: bool = True
     memory_top_k: int = 10

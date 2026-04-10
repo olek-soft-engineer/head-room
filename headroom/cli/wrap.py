@@ -60,6 +60,7 @@ def _start_proxy(
     port: int,
     *,
     learn: bool = False,
+    agent_type: str = "unknown",
     backend: str | None = None,
     anyllm_provider: str | None = None,
     region: str | None = None,
@@ -100,6 +101,10 @@ def _start_proxy(
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
     proxy_env["PYTHONIOENCODING"] = "utf-8"
+
+    # Tell the proxy which agent is being wrapped (for traffic learning output)
+    if agent_type != "unknown":
+        proxy_env["HEADROOM_AGENT_TYPE"] = agent_type
 
     proc = subprocess.Popen(
         cmd,
@@ -313,6 +318,7 @@ def _ensure_proxy(
     no_proxy: bool,
     *,
     learn: bool = False,
+    agent_type: str = "unknown",
     backend: str | None = None,
     anyllm_provider: str | None = None,
     region: str | None = None,
@@ -328,6 +334,7 @@ def _ensure_proxy(
                 proc = _start_proxy(
                     port,
                     learn=learn,
+                    agent_type=agent_type,
                     backend=backend,
                     anyllm_provider=anyllm_provider,
                     region=region,
@@ -392,6 +399,7 @@ def _launch_tool(
     env_vars_display: list[str],
     *,
     learn: bool = False,
+    agent_type: str = "unknown",
     backend: str | None = None,
     anyllm_provider: str | None = None,
     region: str | None = None,
@@ -414,6 +422,7 @@ def _launch_tool(
             port,
             no_proxy,
             learn=learn,
+            agent_type=agent_type,
             backend=backend,
             anyllm_provider=anyllm_provider,
             region=region,
@@ -713,7 +722,7 @@ def claude(
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
 
-        proxy_holder[0] = _ensure_proxy(port, no_proxy, learn=learn)
+        proxy_holder[0] = _ensure_proxy(port, no_proxy, learn=learn, agent_type="claude")
 
         if not no_rtk:
             click.echo("  Setting up rtk...")
@@ -832,6 +841,7 @@ def codex(
         tool_label="CODEX",
         env_vars_display=[f"OPENAI_BASE_URL=http://127.0.0.1:{port}/v1"],
         learn=learn,
+        agent_type="codex",
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
@@ -912,6 +922,7 @@ def aider(
             f"ANTHROPIC_BASE_URL=http://127.0.0.1:{port}",
         ],
         learn=learn,
+        agent_type="aider",
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
@@ -961,7 +972,7 @@ def cursor(port: int, no_rtk: bool, no_proxy: bool, learn: bool, verbose: bool) 
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
 
-        proxy_holder[0] = _ensure_proxy(port, no_proxy, learn=learn)
+        proxy_holder[0] = _ensure_proxy(port, no_proxy, learn=learn, agent_type="cursor")
 
         # Setup rtk for Cursor (binary + .cursorrules instructions)
         if not no_rtk:

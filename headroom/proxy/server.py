@@ -447,11 +447,13 @@ class HeadroomProxy(
         # Traffic Learner (live pattern extraction from proxy traffic)
         # Only activates with --learn flag; requires --memory for backend
         self.traffic_learner: TrafficLearner | None = None
+        self.traffic_learning_agent_type: str = config.traffic_learning_agent_type
         if config.traffic_learning_enabled:
             from headroom.memory.traffic_learner import TrafficLearner
 
             self.traffic_learner = TrafficLearner(
                 user_id=os.environ.get("HEADROOM_USER_ID", os.environ.get("USER", "default")),
+                agent_type=config.traffic_learning_agent_type,
             )
 
     def _get_compression_cache(self, session_id: str) -> CompressionCache:

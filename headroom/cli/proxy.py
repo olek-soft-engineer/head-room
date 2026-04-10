@@ -269,6 +269,7 @@ def proxy(
         memory_top_k=memory_top_k,
         # Traffic Learning: only with --learn, never with --no-learn
         traffic_learning_enabled=learn and not no_learn,
+        traffic_learning_agent_type=os.environ.get("HEADROOM_AGENT_TYPE", "unknown"),
         # Backend (Anthropic direct, Bedrock, LiteLLM, or any-llm)
         backend=backend,
         bedrock_region=bedrock_region or region,
