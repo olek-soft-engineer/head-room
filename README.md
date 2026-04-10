@@ -187,7 +187,7 @@ Gives your AI tool three MCP tools: `headroom_compress`, `headroom_retrieve`, `h
 ## Demo
 
 <p align="center">
-  <img src="Headroom-2.gif" alt="Headroom Demo" width="800">
+  <img src="HeadroomDemo-Fast.gif" alt="Headroom Demo" width="800">
 </p>
 
 ---
