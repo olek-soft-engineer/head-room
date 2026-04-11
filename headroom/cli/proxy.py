@@ -82,8 +82,8 @@ from .main import main
 )
 @click.option(
     "--memory-db-path",
-    default="headroom_memory.db",
-    help="Path to memory database file (default: headroom_memory.db)",
+    default="",
+    help="Path to memory database file (default: {cwd}/.headroom/memory.db)",
 )
 @click.option("--no-memory-tools", is_flag=True, help="Disable automatic memory tool injection")
 @click.option(
@@ -371,7 +371,9 @@ Usage:
   Codex / OpenAI: OPENAI_BASE_URL=http://{config.host}:{config.port}/v1 your-app
 {memory_section}
 Endpoints:
-  GET  /health     Health check
+  GET  /livez      Process liveness
+  GET  /readyz     Traffic readiness
+  GET  /health     Aggregate health
   GET  /stats      Detailed statistics
   GET  /stats-history Durable compression history + display session
   GET  /metrics    Prometheus metrics

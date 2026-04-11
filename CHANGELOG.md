@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Proxy liveness and readiness health checks**
+  - Adds `GET /livez` for process liveness and `GET /readyz` for traffic readiness
+  - Keeps `GET /health` backward compatible while expanding it with readiness details and subsystem checks
+  - Eagerly initializes configured memory backends during proxy startup so readiness reflects real serving capability
+  - Wires `/readyz` into the Docker image `HEALTHCHECK` and the example `docker-compose.yml`
 - **Durable proxy savings history**
   - Persists proxy compression savings history locally at `~/.headroom/proxy_savings.json`
   - Supports `HEADROOM_SAVINGS_PATH` to override the storage location
