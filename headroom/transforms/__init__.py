@@ -4,6 +4,73 @@ from __future__ import annotations
 
 import importlib.util
 from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from headroom.transforms.anchor_selector import (  # noqa: F401
+        AnchorSelector,
+        AnchorStrategy,
+        AnchorWeights,
+        DataPattern,
+        calculate_information_score,
+        compute_item_hash,
+    )
+    from headroom.transforms.base import Transform  # noqa: F401
+    from headroom.transforms.cache_aligner import CacheAligner  # noqa: F401
+    from headroom.transforms.code_compressor import (  # noqa: F401
+        CodeAwareCompressor,
+        CodeCompressionResult,
+        CodeCompressorConfig,
+        CodeLanguage,
+        DocstringMode,
+        detect_language,
+        is_tree_sitter_available,
+    )
+    from headroom.transforms.content_detector import (  # noqa: F401
+        ContentType,
+        DetectionResult,
+        detect_content_type,
+    )
+    from headroom.transforms.content_router import (  # noqa: F401
+        CompressionStrategy,
+        ContentRouter,
+        ContentRouterConfig,
+        RouterCompressionResult,
+    )
+    from headroom.transforms.diff_compressor import (  # noqa: F401
+        DiffCompressionResult,
+        DiffCompressor,
+        DiffCompressorConfig,
+    )
+    from headroom.transforms.html_extractor import (  # noqa: F401
+        HTMLExtractionResult,
+        HTMLExtractor,
+        HTMLExtractorConfig,
+        is_html_content,
+    )
+    from headroom.transforms.intelligent_context import (  # noqa: F401
+        ContextStrategy,
+        IntelligentContextManager,
+    )
+    from headroom.transforms.log_compressor import (  # noqa: F401
+        LogCompressionResult,
+        LogCompressor,
+        LogCompressorConfig,
+    )
+    from headroom.transforms.pipeline import TransformPipeline  # noqa: F401
+    from headroom.transforms.rolling_window import RollingWindow  # noqa: F401
+    from headroom.transforms.scoring import (  # noqa: F401
+        EmbeddingProvider,
+        MessageScore,
+        MessageScorer,
+    )
+    from headroom.transforms.search_compressor import (  # noqa: F401
+        SearchCompressionResult,
+        SearchCompressor,
+        SearchCompressorConfig,
+    )
+    from headroom.transforms.smart_crusher import SmartCrusher, SmartCrusherConfig  # noqa: F401
+    from headroom.transforms.tool_crusher import ToolCrusher  # noqa: F401
 
 _HTML_EXTRACTOR_AVAILABLE = importlib.util.find_spec("trafilatura") is not None
 
