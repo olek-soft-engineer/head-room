@@ -1,4 +1,12 @@
-"""Model registry and shared ML model helpers."""
+"""Model registry and shared ML model helpers.
+
+Provides a centralized registry of LLM models with their capabilities,
+context limits, pricing, and provider information.
+
+Also exposes ML model helpers for sharing heavy model instances
+(sentence transformers, SIGLIP, spaCy) so the same model is not loaded
+multiple times across the process.
+"""
 
 from __future__ import annotations
 
@@ -18,6 +26,8 @@ __all__ = [
     "get_spacy",
 ]
 
+# Keep the package entrypoint lightweight so importing headroom.models does
+# not eagerly load optional ML dependencies until a specific export is used.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # LLM registry
     "ModelRegistry": ("headroom.models.registry", "ModelRegistry"),
@@ -34,6 +44,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
 
 
 def __getattr__(name: str) -> object:
+    """Resolve model exports lazily while preserving package imports."""
     if name == "__path__":
         raise AttributeError(name)
 
