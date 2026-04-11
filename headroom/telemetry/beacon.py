@@ -161,7 +161,7 @@ class TelemetryBeacon:
         session_minutes = max(1, int((time.time() - self._start_time) / 60))
 
         try:
-            from headroom import __version__ as headroom_version
+            from headroom._version import __version__ as headroom_version
         except Exception:
             headroom_version = "unknown"
 

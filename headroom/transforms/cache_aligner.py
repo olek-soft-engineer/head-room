@@ -15,17 +15,16 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from ..cache.dynamic_detector import (
-    DetectorConfig,
-    DynamicContentDetector,
-)
 from ..config import CacheAlignerConfig, CachePrefixMetrics, TransformResult
 from ..tokenizer import Tokenizer
 from ..tokenizers import EstimatingTokenCounter
 from ..utils import compute_short_hash, deep_copy_messages
 from .base import Transform
+
+if TYPE_CHECKING:
+    from ..cache.dynamic_detector import DynamicContentDetector
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +76,8 @@ class CacheAligner(Transform):
 
     def _init_dynamic_detector(self) -> None:
         """Initialize the DynamicContentDetector with configured tiers."""
+        from ..cache.dynamic_detector import DetectorConfig, DynamicContentDetector
+
         # Build detector config
         detector_config = DetectorConfig(
             tiers=list(self.config.detection_tiers),

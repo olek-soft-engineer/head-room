@@ -52,23 +52,37 @@ from .content_detector import ContentType, DetectionResult, detect_content_type
 
 logger = logging.getLogger(__name__)
 
-# Use Magika-based detector if available, fallback to regex
-_magika_detector = None
-_USE_MAGIKA = False
-try:
-    from ..compression.detector import get_detector
+_magika_detector: Any | None = None
+_magika_status: bool | None = None
 
-    _magika_detector = get_detector(prefer_magika=True)
-    _USE_MAGIKA = True
-    logger.info("ContentRouter: Using Magika ML-based content detection")
-except ImportError:
-    logger.debug("Magika not available, using regex-based detection")
+
+def _get_magika_detector() -> Any | None:
+    """Load the Magika detector only when router detection actually runs."""
+    global _magika_detector, _magika_status
+
+    if _magika_status is False:
+        return None
+    if _magika_detector is not None:
+        return _magika_detector
+
+    try:
+        from ..compression.detector import get_detector
+
+        _magika_detector = get_detector(prefer_magika=True)
+        _magika_status = True
+        logger.info("ContentRouter: Using Magika ML-based content detection")
+    except ImportError:
+        _magika_status = False
+        logger.debug("Magika not available, using regex-based detection")
+
+    return _magika_detector
 
 
 def _detect_content(content: str) -> DetectionResult:
     """Detect content type using Magika if available, else regex fallback."""
-    if _USE_MAGIKA and _magika_detector:
-        result = _magika_detector.detect(content)
+    magika_detector = _get_magika_detector()
+    if magika_detector is not None:
+        result = magika_detector.detect(content)
         # Map Magika ContentType to router's expected format
         type_map = {
             "json": ContentType.JSON_ARRAY,

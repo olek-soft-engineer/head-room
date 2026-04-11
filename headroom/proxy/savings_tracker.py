@@ -8,6 +8,7 @@ survive proxy restarts and can be shared by multiple Headroom frontends.
 from __future__ import annotations
 
 import json
+import importlib.util
 import logging
 import os
 import tempfile
@@ -28,12 +29,20 @@ DEFAULT_MAX_HISTORY_POINTS = 5000
 DEFAULT_MAX_HISTORY_AGE_DAYS = 365
 DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES = 60
 
-try:
-    import litellm
+LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 
-    LITELLM_AVAILABLE = True
-except ImportError:
-    LITELLM_AVAILABLE = False
+
+def _get_litellm_module() -> Any | None:
+    """Import LiteLLM only when cost metadata is requested."""
+    if not LITELLM_AVAILABLE:
+        return None
+
+    try:
+        import litellm
+    except ImportError:
+        return None
+
+    return litellm
 
 
 def get_default_savings_storage_path() -> str:
@@ -96,7 +105,8 @@ def _coerce_float(value: Any, default: float = 0.0) -> float:
 
 def _resolve_litellm_model(model: str) -> str:
     """Resolve model name to one LiteLLM recognizes."""
-    if not LITELLM_AVAILABLE:
+    litellm = _get_litellm_module()
+    if litellm is None:
         return model
 
     try:
@@ -131,7 +141,8 @@ def _resolve_litellm_model(model: str) -> str:
 
 def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
     """Estimate compression savings in USD from saved input tokens."""
-    if tokens_saved <= 0 or not LITELLM_AVAILABLE:
+    litellm = _get_litellm_module()
+    if tokens_saved <= 0 or litellm is None:
         return 0.0
 
     try:
@@ -159,7 +170,8 @@ def _estimate_input_cost_usd(
     otherwise falls back to list-price input tokens.
     """
     total_input_tokens = _coerce_int(input_tokens)
-    if total_input_tokens <= 0 or not LITELLM_AVAILABLE:
+    litellm = _get_litellm_module()
+    if total_input_tokens <= 0 or litellm is None:
         return 0.0
 
     cache_read = _coerce_int(cache_read_tokens)

@@ -224,7 +224,33 @@ export class ProxyManager {
 
     const specs: LaunchSpec[] = [];
 
-    // 1) PATH
+    const configuredPython = this.getConfiguredPythonCommand();
+    if (configuredPython) {
+      specs.push({
+        label: `Configured Python: ${configuredPython} -m headroom.cli`,
+        command: configuredPython,
+        args: ["-m", "headroom.cli", ...commonArgs],
+        checkCommand: configuredPython,
+        checkArgs: ["-c", HEADROOM_MODULE_DISCOVERY_SNIPPET],
+      });
+    }
+
+    // 2) Windows pyenv: resolve the real executable so we avoid shim .bat wrappers.
+    if (process.platform === "win32") {
+      const pyenvHeadroom = this.getPyenvResolvedHeadroom();
+      if (pyenvHeadroom) {
+        specs.push({
+          label: `pyenv: ${pyenvHeadroom}`,
+          command: pyenvHeadroom,
+          args: commonArgs,
+          checkCommand: pyenvHeadroom,
+          checkArgs: ["--version"],
+          useShell: false,
+        });
+      }
+    }
+
+    // 3) PATH
     specs.push({
       label: "PATH: headroom",
       command: "headroom",
@@ -237,7 +263,7 @@ export class ProxyManager {
       checkUseShell: false,
     });
 
-    // 2) Local npm install (inside plugin install path)
+    // 4) Local npm install (inside plugin install path)
     const moduleDir = dirname(fileURLToPath(import.meta.url)); // .../dist
     const packageRoot = dirname(moduleDir);
     const localBinDir = join(packageRoot, "node_modules", ".bin");
@@ -256,7 +282,7 @@ export class ProxyManager {
         });
       }
 
-    // 3) Global npm install
+    // 5) Global npm install
     const npmPrefix = this.getNpmGlobalPrefix();
     if (npmPrefix) {
       const globalBins = process.platform === "win32"
@@ -276,9 +302,10 @@ export class ProxyManager {
       }
     }
 
-    // 4) Python module fallback
+    // 6) Python module fallback
     const pythonCommands = this.getPythonCommands();
     for (const pyCmd of pythonCommands) {
+      if (configuredPython && pyCmd === configuredPython) continue;
       specs.push({
         label: `Python: ${pyCmd} -m headroom.cli`,
         command: pyCmd,
@@ -291,11 +318,34 @@ export class ProxyManager {
     return specs;
   }
 
-  private getPythonCommands(): string[] {
-    const commands: string[] = [];
+  private getConfiguredPythonCommand(): string | null {
     const configured = typeof this.config.pythonPath === "string"
       ? this.config.pythonPath.trim()
       : "";
+    return configured.length > 0 ? configured : null;
+  }
+
+  private getPyenvResolvedHeadroom(): string | null {
+    if (process.platform !== "win32") return null;
+
+    try {
+      const result = spawnSync("pyenv", ["which", "headroom"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 5000,
+      });
+      if (result.error || result.status !== 0) return null;
+      const resolved = (result.stdout ?? "").trim().split(/\r?\n/, 1)[0];
+      if (!resolved || !existsSync(resolved)) return null;
+      return resolved;
+    } catch {
+      return null;
+    }
+  }
+
+  private getPythonCommands(): string[] {
+    const commands: string[] = [];
+    const configured = this.getConfiguredPythonCommand() ?? "";
     if (configured.length > 0) {
       commands.push(configured);
     }

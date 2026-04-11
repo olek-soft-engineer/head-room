@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from ..backends.base import Backend
     from ..cache.compression_cache import CompressionCache
     from ..memory.tracker import MemoryTracker
 
@@ -55,9 +56,7 @@ except ImportError:
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from headroom import __version__
-from headroom.backends import AnyLLMBackend, LiteLLMBackend
-from headroom.backends.base import Backend
+from headroom._version import __version__
 from headroom.cache.compression_feedback import get_compression_feedback
 from headroom.cache.compression_store import get_compression_store
 from headroom.ccr import (
@@ -89,7 +88,8 @@ from headroom.observability import (
     shutdown_headroom_tracing,
     shutdown_otel_metrics,
 )
-from headroom.providers import AnthropicProvider, OpenAIProvider
+from headroom.providers.anthropic import AnthropicProvider
+from headroom.providers.openai import OpenAIProvider
 
 # =============================================================================
 # Extracted modules (re-exported for backward compatibility)
@@ -350,6 +350,8 @@ class HeadroomProxy(
             if backend == "anyllm" or backend.startswith("anyllm-"):
                 provider = config.anyllm_provider
                 try:
+                    from headroom.backends.anyllm import AnyLLMBackend
+
                     self.anthropic_backend = AnyLLMBackend(provider=provider)
                     logger.info(f"any-llm backend enabled (provider={provider})")
                 except ImportError as e:
@@ -364,6 +366,8 @@ class HeadroomProxy(
                 provider = backend.replace("litellm-", "")
 
                 try:
+                    from headroom.backends.litellm import LiteLLMBackend
+
                     self.anthropic_backend = LiteLLMBackend(
                         provider=provider,
                         region=config.bedrock_region,
