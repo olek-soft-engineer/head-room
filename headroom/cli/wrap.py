@@ -253,6 +253,13 @@ def _ensure_rtk_binary(verbose: bool = False) -> Path | None:
     return None
 
 
+def _prepare_wrap_rtk(verbose: bool = False, *, label: str | None = None) -> Path | None:
+    """Ensure rtk is present for host-bridged wrap flows without host-specific setup."""
+    if label:
+        click.echo(f"  Preparing rtk for {label}...")
+    return _ensure_rtk_binary(verbose=verbose)
+
+
 def _inject_codex_provider_config(port: int) -> None:
     """Inject a Headroom model provider into Codex's config.toml.
 
@@ -700,9 +707,16 @@ def unwrap() -> None:
     "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to MEMORY.md)"
 )
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def claude(
-    port: int, no_rtk: bool, no_proxy: bool, learn: bool, verbose: bool, claude_args: tuple
+    port: int,
+    no_rtk: bool,
+    no_proxy: bool,
+    learn: bool,
+    verbose: bool,
+    prepare_only: bool,
+    claude_args: tuple,
 ) -> None:
     """Launch Claude Code through Headroom proxy.
 
@@ -718,6 +732,11 @@ def claude(
         headroom wrap claude --port 9999    # Custom proxy port
         headroom wrap claude --no-rtk       # Skip rtk (proxy only)
     """
+    if prepare_only:
+        if not no_rtk:
+            _prepare_wrap_rtk(verbose=verbose, label="Claude")
+        return
+
     claude_bin = shutil.which("claude")
     if not claude_bin:
         click.echo("Error: 'claude' not found in PATH.")
@@ -794,6 +813,7 @@ def claude(
     "--region", default=None, help="Cloud region for Bedrock/Vertex (env: HEADROOM_REGION)"
 )
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
 def codex(
     port: int,
@@ -804,6 +824,7 @@ def codex(
     anyllm_provider: str | None,
     region: str | None,
     verbose: bool,
+    prepare_only: bool,
     codex_args: tuple,
 ) -> None:
     """Launch OpenAI Codex CLI through Headroom proxy.
@@ -821,12 +842,6 @@ def codex(
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
-    codex_bin = shutil.which("codex")
-    if not codex_bin:
-        click.echo("Error: 'codex' not found in PATH.")
-        click.echo("Install Codex CLI: npm install -g @openai/codex")
-        raise SystemExit(1)
-
     # Setup rtk for Codex (binary + AGENTS.md instructions, no hooks)
     if not no_rtk:
         click.echo("  Setting up rtk for Codex...")
@@ -839,6 +854,16 @@ def codex(
             # Also inject into global ~/.codex/AGENTS.md
             global_agents = Path.home() / ".codex" / "AGENTS.md"
             _inject_rtk_instructions(global_agents, verbose=verbose)
+
+    if prepare_only:
+        _inject_codex_provider_config(port)
+        return
+
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        click.echo("Error: 'codex' not found in PATH.")
+        click.echo("Install Codex CLI: npm install -g @openai/codex")
+        raise SystemExit(1)
 
     env = os.environ.copy()
     env["OPENAI_BASE_URL"] = f"http://127.0.0.1:{port}/v1"
@@ -880,6 +905,7 @@ def codex(
 @click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
 @click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("aider_args", nargs=-1, type=click.UNPROCESSED)
 def aider(
     port: int,
@@ -890,6 +916,7 @@ def aider(
     anyllm_provider: str | None,
     region: str | None,
     verbose: bool,
+    prepare_only: bool,
     aider_args: tuple,
 ) -> None:
     """Launch aider through Headroom proxy.
@@ -907,12 +934,6 @@ def aider(
         headroom wrap aider --no-rtk                     # Skip rtk setup
         headroom wrap aider --backend litellm-vertex --region us-central1
     """
-    aider_bin = shutil.which("aider")
-    if not aider_bin:
-        click.echo("Error: 'aider' not found in PATH.")
-        click.echo("Install aider: pip install aider-chat")
-        raise SystemExit(1)
-
     # Setup rtk for aider (binary + CONVENTIONS.md instructions)
     if not no_rtk:
         click.echo("  Setting up rtk for aider...")
@@ -921,6 +942,15 @@ def aider(
             # aider reads CONVENTIONS.md from project root
             conventions = Path.cwd() / "CONVENTIONS.md"
             _inject_rtk_instructions(conventions, verbose=verbose)
+
+    if prepare_only:
+        return
+
+    aider_bin = shutil.which("aider")
+    if not aider_bin:
+        click.echo("Error: 'aider' not found in PATH.")
+        click.echo("Install aider: pip install aider-chat")
+        raise SystemExit(1)
 
     env = os.environ.copy()
     env["OPENAI_API_BASE"] = f"http://127.0.0.1:{port}/v1"
@@ -958,7 +988,15 @@ def aider(
     "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to .cursor/rules/)"
 )
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
-def cursor(port: int, no_rtk: bool, no_proxy: bool, learn: bool, verbose: bool) -> None:
+@click.option("--prepare-only", is_flag=True, hidden=True)
+def cursor(
+    port: int,
+    no_rtk: bool,
+    no_proxy: bool,
+    learn: bool,
+    verbose: bool,
+    prepare_only: bool,
+) -> None:
     """Start Headroom proxy for use with Cursor.
 
     \b
@@ -976,6 +1014,16 @@ def cursor(port: int, no_rtk: bool, no_proxy: bool, learn: bool, verbose: bool) 
         headroom wrap cursor --no-rtk       # Proxy only, no rtk
         headroom wrap cursor --port 9999    # Custom proxy port
     """
+    if not no_rtk:
+        click.echo("  Setting up rtk for Cursor...")
+        rtk_path = _ensure_rtk_binary(verbose=verbose)
+        if rtk_path:
+            cursorrules = Path.cwd() / ".cursorrules"
+            _inject_rtk_instructions(cursorrules, verbose=verbose)
+
+    if prepare_only:
+        return
+
     proxy_holder: list[subprocess.Popen | None] = [None]
     cleanup = _make_cleanup(proxy_holder, port)
     signal.signal(signal.SIGINT, cleanup)
@@ -989,14 +1037,6 @@ def cursor(port: int, no_rtk: bool, no_proxy: bool, learn: bool, verbose: bool) 
         click.echo()
 
         proxy_holder[0] = _ensure_proxy(port, no_proxy, learn=learn, agent_type="cursor")
-
-        # Setup rtk for Cursor (binary + .cursorrules instructions)
-        if not no_rtk:
-            click.echo("  Setting up rtk for Cursor...")
-            rtk_path = _ensure_rtk_binary(verbose=verbose)
-            if rtk_path:
-                cursorrules = Path.cwd() / ".cursorrules"
-                _inject_rtk_instructions(cursorrules, verbose=verbose)
 
         click.echo()
         click.echo("  Headroom proxy is running. Configure Cursor:")
