@@ -8,7 +8,7 @@ CLI_CONTEXT_SETTINGS = {"help_option_names": ["--help", "-?"]}
 def get_version() -> str:
     """Get the current version."""
     try:
-        from headroom import __version__
+        from headroom._version import __version__
 
         return __version__
     except ImportError:

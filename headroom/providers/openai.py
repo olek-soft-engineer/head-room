@@ -6,6 +6,7 @@ Cost estimates are APPROXIMATE - always verify against your actual billing.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import os
@@ -34,12 +35,20 @@ try:
 except ImportError:
     TIKTOKEN_AVAILABLE = False
 
-try:
-    import litellm
+LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 
-    LITELLM_AVAILABLE = True
-except ImportError:
-    LITELLM_AVAILABLE = False
+
+def _get_litellm_module() -> Any | None:
+    """Import LiteLLM only when pricing/context metadata is needed."""
+    if not LITELLM_AVAILABLE:
+        return None
+
+    try:
+        import litellm
+    except ImportError:
+        return None
+
+    return litellm
 
 
 # OpenAI model to tiktoken encoding mappings
@@ -423,7 +432,8 @@ class OpenAIProvider(Provider):
         Never raises an exception - uses sensible defaults for unknown models.
         """
         # Try LiteLLM first
-        if LITELLM_AVAILABLE:
+        litellm = _get_litellm_module()
+        if litellm is not None:
             try:
                 info = litellm.get_model_info(model)
                 if info and "max_input_tokens" in info:
@@ -495,7 +505,8 @@ class OpenAIProvider(Provider):
             Estimated cost in USD, or None if pricing unknown.
         """
         # Try LiteLLM first (most up-to-date pricing)
-        if LITELLM_AVAILABLE:
+        litellm = _get_litellm_module()
+        if litellm is not None:
             try:
                 # LiteLLM uses per-token pricing, returns total cost
                 cost = litellm.completion_cost(

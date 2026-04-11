@@ -15,6 +15,7 @@ Usage:
     provider = AnthropicProvider()  # Warning: approximate counting
 """
 
+import importlib.util
 import json
 import logging
 import os
@@ -24,16 +25,22 @@ from typing import Any, cast
 
 from .base import Provider, TokenCounter
 
-# Check if LiteLLM is available for pricing and context limits
-try:
-    import litellm
-    from litellm import get_model_info as litellm_get_model_info
+LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 
-    LITELLM_AVAILABLE = True
-except ImportError:
-    LITELLM_AVAILABLE = False
-    litellm = None  # type: ignore[assignment]
-    litellm_get_model_info = None  # type: ignore[assignment]
+
+def _get_litellm_clients() -> tuple[Any | None, Any | None]:
+    """Import LiteLLM only when pricing/context metadata is needed."""
+    if not LITELLM_AVAILABLE:
+        return None, None
+
+    try:
+        import litellm
+        from litellm import get_model_info as litellm_get_model_info
+    except ImportError:
+        return None, None
+
+    return litellm, litellm_get_model_info
+
 
 logger = logging.getLogger(__name__)
 
@@ -492,7 +499,8 @@ class AnthropicProvider(Provider):
                 return limit
 
         # Try LiteLLM for context limit
-        if LITELLM_AVAILABLE and litellm_get_model_info is not None:
+        _, litellm_get_model_info = _get_litellm_clients()
+        if litellm_get_model_info is not None:
             try:
                 info = litellm_get_model_info(model)
                 if info:
@@ -559,7 +567,8 @@ class AnthropicProvider(Provider):
         Tries LiteLLM first for up-to-date pricing, falls back to manual pricing.
         """
         # Try LiteLLM first for cost estimation
-        if LITELLM_AVAILABLE and litellm is not None:
+        litellm, litellm_get_model_info = _get_litellm_clients()
+        if litellm is not None:
             try:
                 cost = litellm.completion_cost(
                     model=model,

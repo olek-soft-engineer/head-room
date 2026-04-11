@@ -204,11 +204,23 @@ describe("ProxyManager launch internals", () => {
     expect(commands).toContain("py");
   });
 
+  it("prefers configured pythonPath ahead of PATH launchers", () => {
+    const manager = new ProxyManager({ pythonPath: "C:\\Python311\\python.exe" });
+    vi.spyOn(manager as any, "getPyenvResolvedHeadroom").mockReturnValue(null);
+
+    const specs = (manager as any).buildLaunchSpecs("127.0.0.1", "8787") as Array<Record<string, unknown>>;
+
+    expect(specs[0]?.label).toContain("Configured Python:");
+    expect(specs[0]?.command).toBe("C:\\Python311\\python.exe");
+    expect(specs[0]?.args).toEqual(["-m", "headroom.cli", "proxy", "--host", "127.0.0.1", "--port", "8787"]);
+  });
+
   it("uses lightweight PATH checks instead of booting the headroom CLI", () => {
     const manager = new ProxyManager({});
     const specs = (manager as any).buildLaunchSpecs("127.0.0.1", "8787") as Array<Record<string, unknown>>;
-    const pathSpec = specs[0];
+    const pathSpec = specs.find((spec) => spec.command === "headroom");
 
+    expect(pathSpec).toBeDefined();
     expect(pathSpec.command).toBe("headroom");
     expect(pathSpec.args).toEqual(["proxy", "--host", "127.0.0.1", "--port", "8787"]);
     if (process.platform === "win32") {
@@ -219,6 +231,20 @@ describe("ProxyManager launch internals", () => {
       expect(pathSpec.checkCommand).toBe("sh");
       expect(pathSpec.checkArgs).toEqual(["-lc", "command -v headroom >/dev/null 2>&1"]);
     }
+  });
+
+  it("prefers a resolved pyenv executable on Windows before PATH shims", () => {
+    if (process.platform !== "win32") return;
+
+    const manager = new ProxyManager({});
+    vi.spyOn(manager as any, "getPyenvResolvedHeadroom").mockReturnValue("C:\\Python312\\Scripts\\headroom.exe");
+
+    const specs = (manager as any).buildLaunchSpecs("127.0.0.1", "8787") as Array<Record<string, unknown>>;
+
+    expect(specs[0]?.label).toContain("pyenv:");
+    expect(specs[0]?.command).toBe("C:\\Python312\\Scripts\\headroom.exe");
+    expect(specs[0]?.useShell).toBe(false);
+    expect(specs[1]?.command).toBe("headroom");
   });
 
   it("passes through fast-fail launch flags when configured", () => {

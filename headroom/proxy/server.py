@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from ..backends.base import Backend
     from ..cache.compression_cache import CompressionCache
     from ..memory.tracker import MemoryTracker
 
@@ -55,9 +56,7 @@ except ImportError:
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from headroom import __version__
-from headroom.backends import AnyLLMBackend, LiteLLMBackend
-from headroom.backends.base import Backend
+from headroom._version import __version__
 from headroom.cache.compression_feedback import get_compression_feedback
 from headroom.cache.compression_store import get_compression_store
 from headroom.ccr import (
@@ -89,7 +88,8 @@ from headroom.observability import (
     shutdown_headroom_tracing,
     shutdown_otel_metrics,
 )
-from headroom.providers import AnthropicProvider, OpenAIProvider
+from headroom.providers.anthropic import AnthropicProvider
+from headroom.providers.openai import OpenAIProvider
 
 # =============================================================================
 # Extracted modules (re-exported for backward compatibility)
@@ -98,10 +98,10 @@ from headroom.proxy.cost import (
     _CACHE_ECONOMICS,  # noqa: F401
     CostTracker,  # noqa: F401
     _summarize_transforms,  # noqa: F401
+    build_prefix_cache_stats,  # noqa: F401
+    build_session_summary,  # noqa: F401
+    merge_cost_stats,  # noqa: F401
 )
-from headroom.proxy.cost import build_prefix_cache_stats as _build_prefix_cache_stats  # noqa: F401
-from headroom.proxy.cost import build_session_summary as _build_session_summary  # noqa: F401
-from headroom.proxy.cost import merge_cost_stats as _merge_cost_stats  # noqa: F401
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,  # noqa: F401
     MAX_COMPRESSION_CACHE_SESSIONS,  # noqa: F401
@@ -144,10 +144,19 @@ from headroom.transforms import (
     is_tree_sitter_available,
 )
 
+_build_prefix_cache_stats = build_prefix_cache_stats
+_build_session_summary = build_session_summary
+_merge_cost_stats = merge_cost_stats
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("headroom.proxy")
+
+# Preserve module-level backend symbols for tests and patch-based integrations
+# while still importing the actual backend implementations lazily at runtime.
+AnyLLMBackend = None
+LiteLLMBackend = None
 
 # Always-on file logging to ~/.headroom/logs/ for `headroom perf` analysis
 _setup_file_logging()
@@ -350,6 +359,12 @@ class HeadroomProxy(
             if backend == "anyllm" or backend.startswith("anyllm-"):
                 provider = config.anyllm_provider
                 try:
+                    global AnyLLMBackend
+                    if AnyLLMBackend is None:
+                        from headroom.backends.anyllm import AnyLLMBackend as ImportedAnyLLMBackend
+
+                        AnyLLMBackend = ImportedAnyLLMBackend
+
                     self.anthropic_backend = AnyLLMBackend(provider=provider)
                     logger.info(f"any-llm backend enabled (provider={provider})")
                 except ImportError as e:
@@ -364,6 +379,14 @@ class HeadroomProxy(
                 provider = backend.replace("litellm-", "")
 
                 try:
+                    global LiteLLMBackend
+                    if LiteLLMBackend is None:
+                        from headroom.backends.litellm import (
+                            LiteLLMBackend as ImportedLiteLLMBackend,
+                        )
+
+                        LiteLLMBackend = ImportedLiteLLMBackend
+
                     self.anthropic_backend = LiteLLMBackend(
                         provider=provider,
                         region=config.bedrock_region,

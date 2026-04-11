@@ -8,6 +8,7 @@ Extracted from server.py for maintainability.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 from collections import deque
 from datetime import datetime, timedelta
@@ -18,13 +19,27 @@ from headroom.proxy.modes import PROXY_MODE_CACHE
 if TYPE_CHECKING:
     from headroom.proxy.prometheus_metrics import PrometheusMetrics
 
-# Try to import LiteLLM for pricing
-try:
-    import litellm
+LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
+litellm: Any | None = None
 
-    LITELLM_AVAILABLE = True
-except ImportError:
-    LITELLM_AVAILABLE = False
+
+def _get_litellm_module() -> Any | None:
+    """Import LiteLLM only when pricing data is actually requested."""
+    global litellm
+
+    if not LITELLM_AVAILABLE:
+        return None
+    if litellm is not None:
+        return litellm
+
+    try:
+        import litellm as imported_litellm
+    except ImportError:
+        return None
+
+    litellm = imported_litellm
+    return litellm
+
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -472,7 +487,8 @@ class CostTracker:
     @staticmethod
     def _resolve_litellm_model_uncached(model: str) -> str:
         """Uncached resolution — called once per unique model name."""
-        if not LITELLM_AVAILABLE:
+        litellm = _get_litellm_module()
+        if litellm is None:
             return model
 
         # Try as-is first
@@ -522,7 +538,8 @@ class CostTracker:
             cache_read_tokens: Tokens served from cache (~10% of input rate)
             cache_write_tokens: Tokens written to cache (~125% of input rate)
         """
-        if not LITELLM_AVAILABLE:
+        litellm = _get_litellm_module()
+        if litellm is None:
             logger.warning("LiteLLM not available - cannot calculate costs")
             return None
 
@@ -631,7 +648,8 @@ class CostTracker:
 
     def _get_list_price(self, model: str) -> float | None:
         """Get list input price per 1M tokens for a model."""
-        if not LITELLM_AVAILABLE:
+        litellm = _get_litellm_module()
+        if litellm is None:
             return None
         try:
             resolved = self._resolve_litellm_model(model)
@@ -647,7 +665,8 @@ class CostTracker:
         Returns (cache_read, cache_write, uncached) per-token costs, or None
         if pricing is unavailable. Uses LiteLLM's native cache pricing data.
         """
-        if not LITELLM_AVAILABLE:
+        litellm = _get_litellm_module()
+        if litellm is None:
             return None
         try:
             resolved = self._resolve_litellm_model(model)
