@@ -98,10 +98,10 @@ from headroom.proxy.cost import (
     _CACHE_ECONOMICS,  # noqa: F401
     CostTracker,  # noqa: F401
     _summarize_transforms,  # noqa: F401
+    build_prefix_cache_stats,  # noqa: F401
+    build_session_summary,  # noqa: F401
+    merge_cost_stats,  # noqa: F401
 )
-from headroom.proxy.cost import build_prefix_cache_stats as _build_prefix_cache_stats  # noqa: F401
-from headroom.proxy.cost import build_session_summary as _build_session_summary  # noqa: F401
-from headroom.proxy.cost import merge_cost_stats as _merge_cost_stats  # noqa: F401
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,  # noqa: F401
     MAX_COMPRESSION_CACHE_SESSIONS,  # noqa: F401
@@ -143,6 +143,10 @@ from headroom.transforms import (
     TransformPipeline,
     is_tree_sitter_available,
 )
+
+_build_prefix_cache_stats = build_prefix_cache_stats
+_build_session_summary = build_session_summary
+_merge_cost_stats = merge_cost_stats
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -377,7 +381,9 @@ class HeadroomProxy(
                 try:
                     global LiteLLMBackend
                     if LiteLLMBackend is None:
-                        from headroom.backends.litellm import LiteLLMBackend as ImportedLiteLLMBackend
+                        from headroom.backends.litellm import (
+                            LiteLLMBackend as ImportedLiteLLMBackend,
+                        )
 
                         LiteLLMBackend = ImportedLiteLLMBackend
 

@@ -8,8 +8,8 @@ Extracted from server.py for maintainability.
 
 from __future__ import annotations
 
-import logging
 import importlib.util
+import logging
 from collections import deque
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -39,6 +39,7 @@ def _get_litellm_module() -> Any | None:
 
     litellm = imported_litellm
     return litellm
+
 
 logger = logging.getLogger("headroom.proxy")
 

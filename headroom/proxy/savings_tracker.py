@@ -7,8 +7,8 @@ survive proxy restarts and can be shared by multiple Headroom frontends.
 
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
 import logging
 import os
 import tempfile
