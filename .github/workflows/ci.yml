@@ -101,6 +101,66 @@ jobs:
         run: |
           pytest tests/test_integrations/agno/ -v
 
+  docker-native-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build local Headroom image
+        run: |
+          docker build -t headroom-native-e2e:latest .
+
+      - name: Run Docker-native installer e2e
+        env:
+          HEADROOM_DOCKER_IMAGE: headroom-native-e2e:latest
+        run: |
+          bash e2e/docker-native-install.sh
+
+  windows-native-wrapper:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Run native installer wrapper tests
+        run: |
+          pytest tests/test_install/test_native_installers.py -q
+
+  macos-native-wrapper:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install bash and test dependencies
+        run: |
+          brew install bash
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Run native installer wrapper tests
+        run: |
+          export PATH="$(brew --prefix bash)/bin:$PATH"
+          pytest tests/test_install/test_native_installers.py -q
+
   build:
     runs-on: ubuntu-latest
     steps:

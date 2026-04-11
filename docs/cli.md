@@ -22,7 +22,7 @@ This page is the authoritative reference for the **Python Headroom CLI** exposed
 
 | Command | Purpose | Docker-native parity |
 |---|---|---|
-| `headroom install ...` | Install and manage persistent deployments | **python-native / compose-managed Docker** |
+| `headroom install ...` | Install and manage persistent deployments | **python-native; Docker-native wrapper supports `persistent-docker` lifecycle subset** |
 | `headroom proxy` | Run the Headroom proxy server | **native in container** |
 | `headroom learn` | Learn from past tool-call failures | **native in container** |
 | `headroom perf` | Summarize recent proxy performance | **native in container** |
@@ -30,7 +30,7 @@ This page is the authoritative reference for the **Python Headroom CLI** exposed
 | `headroom memory ...` | Inspect and manage stored memories | **native in container** |
 | `headroom mcp ...` | Install, inspect, remove, or serve MCP integration | **native in container** |
 | `headroom wrap claude` | Start proxy and launch Claude Code | **host-bridged** |
-| `headroom wrap copilot` | Start proxy and launch GitHub Copilot CLI | **host-bridged** |
+| `headroom wrap copilot` | Start proxy and launch GitHub Copilot CLI | **python-native only** |
 | `headroom wrap codex` | Start proxy and launch Codex CLI | **host-bridged** |
 | `headroom wrap aider` | Start proxy and launch Aider | **host-bridged** |
 | `headroom wrap cursor` | Start proxy and print Cursor config guidance | **host-bridged** |
@@ -630,6 +630,8 @@ headroom install apply --preset persistent-docker --scope user
 
 `apply` stores a manifest under `~/.headroom/deploy/<profile>/manifest.json`, applies managed tool configuration, starts the chosen runtime, and waits for `readyz`.
 
+Docker-native host wrappers expose a narrower `headroom install` subset for `persistent-docker` only: `apply`, `status`, `start`, `stop`, `restart`, and `remove`. Those wrapper flows preserve the same port and manifest behavior, but they intentionally reject `persistent-service`, `persistent-task`, and provider mutation flags like `--scope`, `--providers`, and `--target`.
+
 ### `headroom install status`
 
 ```bash
@@ -852,9 +854,9 @@ Legend:
 | `headroom mcp uninstall` | native | native in container | full |
 | `headroom mcp status` | native | native in container | full |
 | `headroom mcp serve` | native | native in container | full |
-| `headroom install ...` | native | compose-managed persistent Docker path | partial |
+| `headroom install apply|status|start|stop|restart|remove` | native | Docker-native wrapper for `persistent-docker`; compose remains an alternative | partial |
 | `headroom wrap claude` | native | host-bridged | partial |
-| `headroom wrap copilot` | native | host-bridged | partial |
+| `headroom wrap copilot` | native | not implemented in Docker-native wrapper | none |
 | `headroom wrap codex` | native | host-bridged | partial |
 | `headroom wrap aider` | native | host-bridged | partial |
 | `headroom wrap cursor` | native | host-bridged | partial |

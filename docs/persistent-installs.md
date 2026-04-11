@@ -2,7 +2,7 @@
 
 Headroom can now be installed as a durable local runtime instead of only being started ad hoc with `headroom proxy` or `headroom wrap ...`.
 
-Use `headroom install` when you want supported tools to keep talking to an always-on proxy at `http://127.0.0.1:8787` and have `wrap` reuse or recover that deployment instead of starting a second ephemeral proxy.
+Use the Python-native `headroom install` CLI when you want supported tools to keep talking to an always-on proxy at `http://127.0.0.1:8787` and have `wrap` reuse or recover that deployment instead of starting a second ephemeral proxy.
 
 ## Runtime matrix
 
@@ -43,7 +43,7 @@ headroom install apply --preset persistent-docker --scope user --providers auto
 
 This uses Docker's restart policy instead of an OS supervisor.
 
-If you are using the Docker-native host wrapper instead of a Python install, use the compose-managed path documented in [Docker-Native Install](docker-install.md).
+If you are using the Docker-native host wrapper instead of a Python install, you can now use `headroom install apply|status|start|stop|restart|remove` for the `persistent-docker` preset directly from the installed wrapper. Service/task installs and provider/user/system mutation flows still belong to the Python-native CLI.
 
 ## Command surface
 
@@ -125,14 +125,16 @@ Persistent deployments publish the same `readyz` and `health` endpoints as ad ho
 }
 ```
 
-`headroom wrap ...` checks for a matching persistent deployment on the requested port before it starts a new ephemeral proxy. If an installed deployment exists but is stopped or unhealthy, `wrap` attempts to recover it first.
+The Python-native `headroom wrap ...` flow checks for a matching persistent deployment on the requested port before it starts a new ephemeral proxy. If an installed deployment exists but is stopped or unhealthy, it attempts to recover it first.
+
+The Docker-native host wrapper does **not** yet reuse or recover persistent profiles automatically; it still starts a fresh proxy container unless you opt into `--no-proxy`.
 
 ## Docker-native relationship
 
 The Docker-native host wrapper and the Python install CLI solve different layers of the runtime story:
 
-- [Docker-Native Install](docker-install.md) -> containerized on-demand CLI and wrapped host-tool flows
-- `headroom install ...` -> persistent service, task, and native Docker lifecycle management
+- [Docker-Native Install](docker-install.md) -> containerized on-demand CLI, wrapped host-tool flows, and Docker-native `persistent-docker` lifecycle commands
+- `headroom install ...` -> full persistent service, task, and Docker lifecycle management, including provider/user/system mutation
 
 For a no-Python persistent Docker workflow, use the compose-managed proxy path from `docker/docker-compose.native.yml`:
 
