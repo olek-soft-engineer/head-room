@@ -76,6 +76,9 @@ from typing import Any
 from ._version import __version__  # noqa: F401
 from .compress import CompressResult, compress
 
+# Keep a real callable bound for the one-function compression API so
+# `from headroom import compress` is never shadowed by the submodule object.
+
 __all__ = [
     # Main client
     "HeadroomClient",
@@ -175,6 +178,8 @@ __all__ = [
     "SharedContext",
 ]
 
+# Keep package-level imports lightweight so `import headroom` does not eagerly
+# load provider SDKs, ML stacks, or optional proxy/runtime integrations.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # Main client
     "HeadroomClient": ("headroom.client", "HeadroomClient"),
@@ -266,7 +271,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "SharedContext": ("headroom.shared_context", "SharedContext"),
 }
 
-# Memory module - optional (requires numpy, hnswlib, etc.)
+# Memory remains optional and preserves the long-standing behavior of exposing
+# `None` when the extra dependencies are not installed.
 _OPTIONAL_EXPORTS = {
     "with_memory": ("headroom.memory", "with_memory"),
     "Memory": ("headroom.memory", "Memory"),
@@ -278,6 +284,7 @@ _OPTIONAL_EXPORTS = {
 
 
 def __getattr__(name: str) -> Any:
+    """Resolve package exports lazily while preserving legacy import paths."""
     module_attr = _LAZY_EXPORTS.get(name)
     if module_attr is not None:
         module_name, attr_name = module_attr
