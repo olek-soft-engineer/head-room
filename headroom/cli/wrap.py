@@ -537,7 +537,7 @@ def _launch_tool(
     *,
     learn: bool = False,
     agent_type: str = "unknown",
-    no_code_graph: bool = False,
+    code_graph: bool = False,
     backend: str | None = None,
     anyllm_provider: str | None = None,
     region: str | None = None,
@@ -566,7 +566,7 @@ def _launch_tool(
             region=region,
         )
 
-        if not no_code_graph:
+        if code_graph:
             _setup_code_graph(verbose=False)
 
         click.echo()
@@ -857,7 +857,9 @@ def unwrap() -> None:
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
 @click.option("--no-rtk", is_flag=True, help="Skip rtk installation and hook registration")
 @click.option(
-    "--no-code-graph", is_flag=True, help="Skip code graph indexing (codebase-memory-mcp)"
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -869,7 +871,7 @@ def unwrap() -> None:
 def claude(
     port: int,
     no_rtk: bool,
-    no_code_graph: bool,
+    code_graph: bool,
     no_proxy: bool,
     learn: bool,
     verbose: bool,
@@ -887,7 +889,7 @@ def claude(
         headroom wrap claude                    # Start everything
         headroom wrap claude --resume <id>      # Resume a session
         headroom wrap claude -- -p              # Claude in print mode
-        headroom wrap claude --no-code-graph    # Skip code graph
+        headroom wrap claude --code-graph        # With code graph intelligence
         headroom wrap claude --no-rtk           # Skip rtk (proxy only)
     """
     if prepare_only:
@@ -922,10 +924,8 @@ def claude(
         elif verbose:
             click.echo("  Skipping rtk (--no-rtk)")
 
-        if not no_code_graph:
+        if code_graph:
             _setup_code_graph(verbose=verbose)
-        elif verbose:
-            click.echo("  Skipping code graph (--no-code-graph)")
 
         click.echo()
         click.echo("  Launching Claude Code (API routed through Headroom)...")
@@ -1106,7 +1106,9 @@ def copilot(
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
 @click.option("--no-rtk", is_flag=True, help="Skip rtk installation and AGENTS.md injection")
 @click.option(
-    "--no-code-graph", is_flag=True, help="Skip code graph indexing (codebase-memory-mcp)"
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -1131,7 +1133,7 @@ def copilot(
 def codex(
     port: int,
     no_rtk: bool,
-    no_code_graph: bool,
+    code_graph: bool,
     no_proxy: bool,
     learn: bool,
     backend: str | None,
@@ -1197,7 +1199,7 @@ def codex(
         env_vars_display=[f"OPENAI_BASE_URL=http://127.0.0.1:{port}/v1"],
         learn=learn,
         agent_type="codex",
-        no_code_graph=no_code_graph,
+        code_graph=code_graph,
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
@@ -1213,7 +1215,9 @@ def codex(
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
 @click.option("--no-rtk", is_flag=True, help="Skip rtk installation and conventions injection")
 @click.option(
-    "--no-code-graph", is_flag=True, help="Skip code graph indexing (codebase-memory-mcp)"
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
@@ -1228,7 +1232,7 @@ def codex(
 def aider(
     port: int,
     no_rtk: bool,
-    no_code_graph: bool,
+    code_graph: bool,
     no_proxy: bool,
     learn: bool,
     backend: str | None,
@@ -1288,7 +1292,7 @@ def aider(
         ],
         learn=learn,
         agent_type="aider",
-        no_code_graph=no_code_graph,
+        code_graph=code_graph,
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,

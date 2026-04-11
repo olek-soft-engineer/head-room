@@ -151,9 +151,10 @@ headroom wrap cursor              # Starts proxy + prints Cursor config
 headroom wrap openclaw            # Installs + configures OpenClaw plugin
 headroom wrap claude --memory     # With persistent cross-agent memory
 headroom wrap codex --memory      # Shares the same memory store
+headroom wrap claude --code-graph # With code graph intelligence (codebase-memory-mcp)
 ```
 
-Headroom starts a proxy, points your tool at it, and compresses everything automatically. Add `--memory` for persistent memory that's shared across agents.
+Headroom starts a proxy, points your tool at it, and compresses everything automatically. Add `--memory` for persistent memory that's shared across agents. Add `--code-graph` for code intelligence via [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) — indexes your codebase into a knowledge graph for call-chain traversal, impact analysis, and architectural queries.
 
 In Docker-native mode, Headroom still runs in Docker while wrapped tools run on the host. `wrap claude`, `wrap codex`, `wrap aider`, `wrap cursor`, and OpenClaw plugin setup (`wrap openclaw` / `unwrap openclaw`) are host-managed through the installed wrapper.
 
