@@ -1,4 +1,28 @@
-"""Headroom cache optimization exports."""
+"""Headroom Cache Optimization Module.
+
+This module provides a plugin-based architecture for cache optimization
+across different LLM providers. Each provider has different caching
+mechanisms and this module abstracts those differences.
+
+Provider Caching Differences:
+- Anthropic: Explicit cache_control blocks, 90% savings, 5-min TTL
+- OpenAI: Automatic prefix caching, 50% savings, no user control
+- Google: Separate CachedContent API, 75% savings + storage costs
+
+Usage:
+    from headroom.cache import CacheOptimizerRegistry, SemanticCacheLayer
+
+    # Get provider-specific optimizer
+    optimizer = CacheOptimizerRegistry.get("anthropic")
+    result = optimizer.optimize(messages, context)
+
+    # With semantic caching layer
+    semantic = SemanticCacheLayer(optimizer, similarity_threshold=0.95)
+    result = semantic.process(messages, context)
+
+    # Register custom optimizer
+    CacheOptimizerRegistry.register("my-provider", MyOptimizer)
+"""
 
 from __future__ import annotations
 
@@ -6,6 +30,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    # Expose concrete types to static analysis while keeping runtime imports lazy.
     from headroom.cache.anthropic import AnthropicCacheOptimizer  # noqa: F401
     from headroom.cache.base import (  # noqa: F401
         BaseCacheOptimizer,

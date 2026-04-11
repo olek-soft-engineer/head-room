@@ -131,7 +131,7 @@ __all__ = [
     "GoogleCacheOptimizer",
     "SemanticCache",
     "SemanticCacheLayer",
-    # Relevance scoring
+    # Relevance scoring - BM25 always available, embeddings require sentence-transformers
     "RelevanceScore",
     "RelevanceScorer",
     "BM25Scorer",
@@ -157,21 +157,21 @@ __all__ = [
     "get_otel_metrics_status",
     "reset_headroom_tracing",
     "reset_otel_metrics",
-    # Memory - hierarchical memory system
+    # Memory - optional hierarchical memory system
     "with_memory",  # Main user-facing API
     "Memory",
     "ScopeLevel",
     "HierarchicalMemory",
     "MemoryConfig",
     "EmbedderBackend",
-    # One-function API
+    # One-function compression API
     "compress",
     "CompressResult",
     # Hooks
     "CompressionHooks",
     "CompressContext",
     "CompressEvent",
-    # Shared context
+    # Shared context for multi-agent workflows
     "SharedContext",
 ]
 
@@ -266,6 +266,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "SharedContext": ("headroom.shared_context", "SharedContext"),
 }
 
+# Memory module - optional (requires numpy, hnswlib, etc.)
 _OPTIONAL_EXPORTS = {
     "with_memory": ("headroom.memory", "with_memory"),
     "Memory": ("headroom.memory", "Memory"),

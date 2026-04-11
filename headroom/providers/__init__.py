@@ -1,4 +1,17 @@
-"""Provider abstractions for Headroom SDK."""
+"""Provider abstractions for Headroom SDK.
+
+Providers encapsulate model-specific behavior like tokenization,
+context limits, and cost estimation.
+
+Supported Providers:
+- OpenAIProvider: Native OpenAI models (GPT-4o, o1, etc.)
+- AnthropicProvider: Claude models
+- GoogleProvider: Google Gemini models
+- CohereProvider: Cohere Command models
+- OpenAICompatibleProvider: Universal provider for any OpenAI-compatible API
+  (Ollama, vLLM, Together, Groq, Fireworks, LM Studio, etc.)
+- LiteLLMProvider: Universal provider via LiteLLM (100+ providers)
+"""
 
 from __future__ import annotations
 
@@ -6,6 +19,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    # Expose concrete types to static analysis while keeping runtime imports lazy.
     from headroom.providers.anthropic import AnthropicProvider
     from headroom.providers.base import Provider, TokenCounter
     from headroom.providers.cohere import CohereProvider

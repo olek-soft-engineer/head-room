@@ -7,6 +7,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    # Expose concrete types to static analysis while keeping runtime imports lazy.
     from headroom.transforms.anchor_selector import (  # noqa: F401
         AnchorSelector,
         AnchorStrategy,
@@ -89,7 +90,7 @@ __all__ = [
     "ToolCrusher",
     "SmartCrusher",
     "SmartCrusherConfig",
-    # Text compression
+    # Text compression (coding tasks)
     "ContentType",
     "DetectionResult",
     "detect_content_type",
@@ -102,7 +103,7 @@ __all__ = [
     "DiffCompressor",
     "DiffCompressorConfig",
     "DiffCompressionResult",
-    # Code-aware compression
+    # Code-aware compression (AST-based)
     "CodeAwareCompressor",
     "CodeCompressorConfig",
     "CodeCompressionResult",
@@ -118,16 +119,17 @@ __all__ = [
     # Other transforms
     "CacheAligner",
     "RollingWindow",
-    # Intelligent context
+    # Intelligent context management
     "IntelligentContextManager",
     "ContextStrategy",
     "MessageScorer",
     "MessageScore",
     "EmbeddingProvider",
-    # HTML extraction
+    # HTML extraction (optional)
     "_HTML_EXTRACTOR_AVAILABLE",
 ]
 
+# Conditionally add HTML extractor exports
 if _HTML_EXTRACTOR_AVAILABLE:
     __all__.extend(
         [
@@ -156,7 +158,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ToolCrusher": ("headroom.transforms.tool_crusher", "ToolCrusher"),
     "SmartCrusher": ("headroom.transforms.smart_crusher", "SmartCrusher"),
     "SmartCrusherConfig": ("headroom.transforms.smart_crusher", "SmartCrusherConfig"),
-    # Text compression
+    # Text compression (coding tasks)
     "ContentType": ("headroom.transforms.content_detector", "ContentType"),
     "DetectionResult": ("headroom.transforms.content_detector", "DetectionResult"),
     "detect_content_type": ("headroom.transforms.content_detector", "detect_content_type"),
@@ -178,7 +180,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "headroom.transforms.diff_compressor",
         "DiffCompressionResult",
     ),
-    # Code-aware compression
+    # Code-aware compression (AST-based)
     "CodeAwareCompressor": ("headroom.transforms.code_compressor", "CodeAwareCompressor"),
     "CodeCompressorConfig": ("headroom.transforms.code_compressor", "CodeCompressorConfig"),
     "CodeCompressionResult": (
@@ -203,7 +205,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # Other transforms
     "CacheAligner": ("headroom.transforms.cache_aligner", "CacheAligner"),
     "RollingWindow": ("headroom.transforms.rolling_window", "RollingWindow"),
-    # Intelligent context
+    # Intelligent context management
     "IntelligentContextManager": (
         "headroom.transforms.intelligent_context",
         "IntelligentContextManager",
@@ -212,7 +214,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "MessageScorer": ("headroom.transforms.scoring", "MessageScorer"),
     "MessageScore": ("headroom.transforms.scoring", "MessageScore"),
     "EmbeddingProvider": ("headroom.transforms.scoring", "EmbeddingProvider"),
-    # HTML extraction
+    # HTML extraction (optional dependency - requires trafilatura)
     "HTMLExtractor": ("headroom.transforms.html_extractor", "HTMLExtractor"),
     "HTMLExtractorConfig": ("headroom.transforms.html_extractor", "HTMLExtractorConfig"),
     "HTMLExtractionResult": ("headroom.transforms.html_extractor", "HTMLExtractionResult"),
