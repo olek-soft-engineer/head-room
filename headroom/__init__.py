@@ -71,6 +71,7 @@ For more examples, see https://github.com/headroom-sdk/headroom/tree/main/exampl
 from __future__ import annotations
 
 from importlib import import_module
+from typing import Any
 
 from ._version import __version__  # noqa: F401
 from .compress import CompressResult, compress
@@ -275,7 +276,7 @@ _OPTIONAL_EXPORTS = {
 }
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     module_attr = _LAZY_EXPORTS.get(name)
     if module_attr is not None:
         module_name, attr_name = module_attr

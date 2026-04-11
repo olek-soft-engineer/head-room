@@ -3,6 +3,38 @@
 from __future__ import annotations
 
 from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from headroom.cache.anthropic import AnthropicCacheOptimizer  # noqa: F401
+    from headroom.cache.base import (  # noqa: F401
+        BaseCacheOptimizer,
+        CacheBreakpoint,
+        CacheConfig,
+        CacheMetrics,
+        CacheOptimizer,
+        CacheResult,
+        CacheStrategy,
+        OptimizationContext,
+    )
+    from headroom.cache.compression_cache import CompressionCache  # noqa: F401
+    from headroom.cache.dynamic_detector import (  # noqa: F401
+        DetectorConfig,
+        DynamicCategory,
+        DynamicContentDetector,
+        DynamicSpan,
+        detect_dynamic_content,
+    )
+    from headroom.cache.google import GoogleCacheOptimizer  # noqa: F401
+    from headroom.cache.openai import OpenAICacheOptimizer  # noqa: F401
+    from headroom.cache.prefix_tracker import (  # noqa: F401
+        FreezeStats,
+        PrefixCacheTracker,
+        PrefixFreezeConfig,
+        SessionTrackerStore,
+    )
+    from headroom.cache.registry import CacheOptimizerRegistry  # noqa: F401
+    from headroom.cache.semantic import SemanticCache, SemanticCacheLayer  # noqa: F401
 
 __all__ = [
     # Base types
