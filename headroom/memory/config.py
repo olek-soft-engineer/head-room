@@ -43,7 +43,8 @@ class TextBackend(Enum):
 class EmbedderBackend(Enum):
     """Supported embedder backends."""
 
-    LOCAL = "local"  # sentence-transformers
+    LOCAL = "local"  # sentence-transformers (requires torch ~2GB)
+    ONNX = "onnx"  # ONNX Runtime (no torch, ~86MB, recommended)
     OPENAI = "openai"
     OLLAMA = "ollama"
 

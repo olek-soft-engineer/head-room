@@ -268,6 +268,129 @@ class LocalEmbedder:
 
 
 # =============================================================================
+# OnnxLocalEmbedder - ONNX Runtime (no torch/sentence-transformers needed)
+# =============================================================================
+
+
+class OnnxLocalEmbedder:
+    """Local embedding using ONNX Runtime — no torch dependency.
+
+    Uses the same all-MiniLM-L6-v2 model as LocalEmbedder, but loaded
+    via ONNX Runtime (~86 MB) instead of sentence-transformers + PyTorch (~2 GB).
+
+    Dependencies: onnxruntime, tokenizers, huggingface_hub (all in proxy extras).
+    Model auto-downloaded from HuggingFace on first use.
+
+    Usage:
+        embedder = OnnxLocalEmbedder()
+        embedding = await embedder.embed("Hello world")
+    """
+
+    DEFAULT_DIMENSION = 384
+    DEFAULT_MAX_TOKENS = 256
+    ONNX_REPO = "Qdrant/all-MiniLM-L6-v2-onnx"
+
+    def __init__(self, max_length: int = 256) -> None:
+        self._max_length = max_length
+        self._session: Any = None
+        self._tokenizer: Any = None
+        self._input_names: list[str] = []
+        self._lock = asyncio.Lock()
+
+    def _load_model(self) -> None:
+        """Lazy-load the ONNX model and tokenizer."""
+        if self._session is not None:
+            return
+
+        import onnxruntime as ort
+        from huggingface_hub import hf_hub_download
+        from tokenizers import Tokenizer
+
+        logger.info("Loading ONNX embedding model (all-MiniLM-L6-v2, ~86MB)...")
+
+        model_path = hf_hub_download(self.ONNX_REPO, "model.onnx")
+        tok_path = hf_hub_download(self.ONNX_REPO, "tokenizer.json")
+
+        self._session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        self._tokenizer = Tokenizer.from_file(tok_path)
+        self._tokenizer.enable_truncation(max_length=self._max_length)
+        self._tokenizer.enable_padding(length=self._max_length)
+        self._input_names = [inp.name for inp in self._session.get_inputs()]
+
+        logger.info("ONNX embedding model loaded (384-dim, no torch)")
+
+    def _embed_single(self, text: str) -> np.ndarray:
+        """Embed a single text string."""
+        assert self._session is not None
+        assert self._tokenizer is not None
+
+        if not text or not text.strip():
+            return np.zeros(self.DEFAULT_DIMENSION, dtype=np.float32)
+
+        encoded = self._tokenizer.encode(text)
+        input_ids = np.array([encoded.ids], dtype=np.int64)
+        attention_mask = np.array([encoded.attention_mask], dtype=np.int64)
+        token_type_ids = np.zeros_like(input_ids, dtype=np.int64)
+
+        feeds: dict[str, np.ndarray] = {}
+        for name in self._input_names:
+            if "input_ids" in name:
+                feeds[name] = input_ids
+            elif "attention_mask" in name:
+                feeds[name] = attention_mask
+            elif "token_type_ids" in name:
+                feeds[name] = token_type_ids
+
+        outputs = self._session.run(None, feeds)
+        token_embeddings = outputs[0]  # (1, seq_len, 384)
+
+        # Mean pooling over non-padding tokens
+        mask_expanded = attention_mask[:, :, np.newaxis].astype(np.float32)
+        summed = np.sum(token_embeddings * mask_expanded, axis=1)
+        counts = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
+        embedding = summed / counts
+
+        return _normalize_embedding(embedding[0])
+
+    async def embed(self, text: str) -> np.ndarray:
+        """Generate an embedding for a single text."""
+        async with self._lock:
+            if self._session is None:
+                await asyncio.get_event_loop().run_in_executor(None, self._load_model)
+
+        return await asyncio.get_event_loop().run_in_executor(None, self._embed_single, text)
+
+    async def embed_batch(self, texts: list[str]) -> list[np.ndarray]:
+        """Generate embeddings for multiple texts."""
+        async with self._lock:
+            if self._session is None:
+                await asyncio.get_event_loop().run_in_executor(None, self._load_model)
+
+        results = []
+        for text in texts:
+            emb = await asyncio.get_event_loop().run_in_executor(None, self._embed_single, text)
+            results.append(emb)
+        return results
+
+    @property
+    def dimension(self) -> int:
+        return self.DEFAULT_DIMENSION
+
+    @property
+    def model_name(self) -> str:
+        return "all-MiniLM-L6-v2-onnx"
+
+    @property
+    def max_tokens(self) -> int:
+        return self._max_length
+
+    async def close(self) -> None:
+        """Close resources."""
+        self._session = None
+        self._tokenizer = None
+
+
+# =============================================================================
 # OpenAIEmbedder - OpenAI API
 # =============================================================================
 

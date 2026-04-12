@@ -140,36 +140,28 @@ class MemoryHandler:
             return
 
         if self.config.backend == "local":
-            import os
-
             from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
 
-            # Auto-detect embedder: prefer OpenAI API (no torch/sentence-transformers needed)
-            # if OPENAI_API_KEY is available, else fall back to local embedder
-            embedder_backend = "local"
+            # Auto-detect embedder: ONNX (default, ~86MB, no torch) → local (if torch available)
+            embedder_backend = "onnx"
             embedder_model = "all-MiniLM-L6-v2"
             vector_dimension = 384
-            openai_api_key = os.environ.get("OPENAI_API_KEY")
 
-            if openai_api_key:
-                # Check if sentence-transformers is actually available
-                try:
-                    import sentence_transformers  # noqa: F401
-                except ImportError:
-                    # sentence-transformers not installed — use OpenAI embeddings
-                    embedder_backend = "openai"
-                    embedder_model = "text-embedding-3-small"
-                    vector_dimension = 1536
-                    logger.info(
-                        "Memory: Using OpenAI embeddings (sentence-transformers not available)"
-                    )
+            # Check if ONNX runtime is available (should be — it's in proxy deps)
+            try:
+                import onnxruntime  # noqa: F401
+            except ImportError:
+                # Fall back to sentence-transformers (requires torch)
+                embedder_backend = "local"
+                logger.info(
+                    "Memory: onnxruntime not available, falling back to sentence-transformers"
+                )
 
             backend_config = LocalBackendConfig(
                 db_path=self.config.db_path,
                 embedder_backend=embedder_backend,
                 embedder_model=embedder_model,
                 vector_dimension=vector_dimension,
-                openai_api_key=openai_api_key if embedder_backend == "openai" else None,
             )
             self._backend = LocalBackend(backend_config)
             await self._backend._ensure_initialized()

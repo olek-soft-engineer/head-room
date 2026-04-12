@@ -108,6 +108,11 @@ def _create_embedder(config: MemoryConfig) -> Embedder:
 
         return LocalEmbedder(model_name=config.embedder_model)
 
+    if config.embedder_backend == EmbedderBackend.ONNX:
+        from headroom.memory.adapters.embedders import OnnxLocalEmbedder
+
+        return OnnxLocalEmbedder()
+
     if config.embedder_backend == EmbedderBackend.OPENAI:
         from headroom.memory.adapters.embedders import OpenAIEmbedder
 

@@ -131,6 +131,7 @@ class LocalBackend:
             # Map string embedder_backend to enum
             embedder_backend_map = {
                 "local": EmbedderBackend.LOCAL,
+                "onnx": EmbedderBackend.ONNX,
                 "openai": EmbedderBackend.OPENAI,
                 "ollama": EmbedderBackend.OLLAMA,
             }
