@@ -311,7 +311,13 @@ class OnnxLocalEmbedder:
         model_path = hf_hub_download(self.ONNX_REPO, "model.onnx")
         tok_path = hf_hub_download(self.ONNX_REPO, "tokenizer.json")
 
-        self._session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        # Set thread count to avoid pthread_setaffinity_np errors in Docker containers
+        sess_options = ort.SessionOptions()
+        sess_options.intra_op_num_threads = 1
+        sess_options.inter_op_num_threads = 1
+        self._session = ort.InferenceSession(
+            model_path, sess_options, providers=["CPUExecutionProvider"]
+        )
         self._tokenizer = Tokenizer.from_file(tok_path)
         self._tokenizer.enable_truncation(max_length=self._max_length)
         self._tokenizer.enable_padding(length=self._max_length)

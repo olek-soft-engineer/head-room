@@ -148,14 +148,21 @@ def _create_vector_index(config: MemoryConfig) -> VectorIndex:
     """
     backend = config.vector_backend
 
-    # AUTO: prefer SQLITE_VEC if available, else HNSW
+    # AUTO: prefer SQLITE_VEC → HNSW → fail with helpful message
     if backend == VectorBackend.AUTO:
-        from headroom.memory.adapters import SQLITE_VEC_AVAILABLE
+        from headroom.memory.adapters import HNSW_AVAILABLE, SQLITE_VEC_AVAILABLE
 
         if SQLITE_VEC_AVAILABLE:
             backend = VectorBackend.SQLITE_VEC
-        else:
+        elif HNSW_AVAILABLE:
             backend = VectorBackend.HNSW
+        else:
+            raise ValueError(
+                "No vector index backend available for memory. Install one:\n"
+                "  pip install sqlite-vec   (recommended, lightweight)\n"
+                "  pip install hnswlib      (alternative)\n"
+                "Or install the full proxy bundle: pip install headroom-ai[proxy]"
+            )
 
     if backend == VectorBackend.SQLITE_VEC:
         from headroom.memory.adapters import SQLITE_VEC_AVAILABLE
