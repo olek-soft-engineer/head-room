@@ -1093,7 +1093,10 @@ class ContentRouter(Transform):
             if compressor:
                 try:
                     result = compressor.compress(
-                        text_to_compress, context=context, question=question
+                        text_to_compress,
+                        context=context,
+                        question=question,
+                        target_ratio=getattr(self, "_runtime_target_ratio", None),
                     )
                     compressed = result.compressed
                     compressed_tokens = result.compressed_tokens
@@ -1446,6 +1449,18 @@ class ContentRouter(Transform):
             lifecycle_transforms = []
             lifecycle_ccr_hashes = []
 
+        # Runtime overrides from CompressConfig (via kwargs from compress())
+        # These override self.config defaults for this call only.
+        skip_user = (
+            kwargs.get("compress_user_messages") is not True and self.config.skip_user_messages
+        )
+        protect_recent = kwargs.get("protect_recent", self.config.protect_recent_code)
+        protect_analysis = kwargs.get(
+            "protect_analysis_context", self.config.protect_analysis_context
+        )
+        # Store target_ratio on self for access by _route_and_compress_block
+        self._runtime_target_ratio: float | None = kwargs.get("target_ratio")
+
         tokens_before = sum(tokenizer.count_text(str(m.get("content", ""))) for m in messages)
         context = kwargs.get("context", "")
         hook_biases: dict[int, float] = kwargs.get("biases") or {}
@@ -1611,8 +1626,8 @@ class ContentRouter(Transform):
                 tool_name = tool_name_map.get(tool_call_id, "")
                 bias = self._get_tool_bias(tool_name) if tool_name else 1.0
 
-            # Protection 1: Never compress user messages
-            if self.config.skip_user_messages and role == "user":
+            # Protection 1: Never compress user messages (unless overridden)
+            if skip_user and role == "user":
                 result_slots[i] = message
                 transforms_applied.append("router:protected:user_message")
                 route_counts["user_msg"] += 1
@@ -1630,18 +1645,14 @@ class ContentRouter(Transform):
 
             # Protection 2: Don't compress recent CODE
             messages_from_end = num_messages - i
-            if (
-                self.config.protect_recent_code > 0
-                and messages_from_end <= self.config.protect_recent_code
-                and is_code
-            ):
+            if protect_recent > 0 and messages_from_end <= protect_recent and is_code:
                 result_slots[i] = message
                 transforms_applied.append("router:protected:recent_code")
                 route_counts["recent_code"] += 1
                 continue
 
             # Protection 3: Don't compress CODE when analysis intent detected
-            if analysis_intent and is_code:
+            if protect_analysis and analysis_intent and is_code:
                 result_slots[i] = message
                 transforms_applied.append("router:protected:analysis_context")
                 route_counts["analysis_ctx"] += 1

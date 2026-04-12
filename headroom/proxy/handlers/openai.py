@@ -1546,10 +1546,27 @@ class OpenAIHandlerMixin:
                 if token_budget and isinstance(token_budget, int)
                 else self.openai_provider.get_context_limit(model)
             )
+            # Extract CompressConfig options from request body
+            compress_config = body.get("config", {})
+            compress_user_messages = compress_config.get("compress_user_messages", False)
+            target_ratio = compress_config.get("target_ratio")
+            protect_recent = compress_config.get("protect_recent")
+            protect_analysis_context = compress_config.get("protect_analysis_context")
+
+            pipeline_kwargs: dict = {"model_limit": context_limit}
+            if compress_user_messages:
+                pipeline_kwargs["compress_user_messages"] = True
+            if target_ratio is not None:
+                pipeline_kwargs["target_ratio"] = float(target_ratio)
+            if protect_recent is not None:
+                pipeline_kwargs["protect_recent"] = int(protect_recent)
+            if protect_analysis_context is not None:
+                pipeline_kwargs["protect_analysis_context"] = bool(protect_analysis_context)
+
             result = self.openai_pipeline.apply(
                 messages=messages,
                 model=model,
-                model_limit=context_limit,
+                **pipeline_kwargs,
             )
 
             return JSONResponse(

@@ -74,7 +74,7 @@ from importlib import import_module
 from typing import Any
 
 from ._version import __version__  # noqa: F401
-from .compress import CompressResult, compress
+from .compress import CompressConfig, CompressResult, compress
 
 # Keep a real callable bound for the one-function compression API so
 # `from headroom import compress` is never shadowed by the submodule object.
@@ -169,6 +169,7 @@ __all__ = [
     "EmbedderBackend",
     # One-function compression API
     "compress",
+    "CompressConfig",
     "CompressResult",
     # Hooks
     "CompressionHooks",

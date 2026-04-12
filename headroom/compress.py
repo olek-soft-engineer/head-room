@@ -73,6 +73,55 @@ _pipeline_lock = threading.Lock()
 
 
 @dataclass
+class CompressConfig:
+    """User-facing compression options.
+
+    Controls what gets compressed, how aggressively, and with which model.
+    Pass to ``compress()`` or any integration that uses headroom.
+
+    Examples::
+
+        # Coding agent (default — skip user messages, protect recent)
+        compress(messages, model="gpt-4o")
+
+        # Financial document (compress everything, keep 50%)
+        compress(messages, model="claude-opus-4-20250514",
+            compress_user_messages=True,
+            target_ratio=0.5,
+            protect_recent=0,
+        )
+
+        # Aggressive (logs, search results)
+        compress(messages, model="gpt-4o", target_ratio=0.2)
+    """
+
+    # What to compress
+    compress_user_messages: bool = False
+    """Compress user messages too (default: skip them for coding agents).
+    Set True for document compression, RAG pipelines, or when user messages
+    contain large tool outputs."""
+
+    protect_recent: int = 4
+    """Don't compress the last N messages (they're the active conversation).
+    Set 0 to compress everything."""
+
+    protect_analysis_context: bool = True
+    """Detect 'analyze'/'review' intent and protect code from compression."""
+
+    # How aggressive
+    target_ratio: float | None = None
+    """Keep ratio for Kompress. None = model decides (~15% kept, aggressive).
+    0.5 = keep 50% (safe for documents). 0.7 = keep 70% (conservative).
+    Only affects Kompress (text compression). SmartCrusher (JSON) has its
+    own logic based on array dedup."""
+
+    # Model variant
+    kompress_model: str | None = None
+    """Kompress model variant. None = default ModernBERT. Future: 'finance'
+    for number-preserving compression on financial documents."""
+
+
+@dataclass
 class CompressResult:
     """Result of compressing messages.
 
@@ -99,6 +148,8 @@ def compress(
     model_limit: int = 200000,
     optimize: bool = True,
     hooks: Any = None,
+    config: CompressConfig | None = None,
+    **kwargs: Any,
 ) -> CompressResult:
     """Compress messages using Headroom's full compression pipeline.
 
@@ -111,12 +162,35 @@ def compress(
         model_limit: Model's context window size in tokens.
         optimize: Whether to actually compress (False = passthrough for A/B testing).
         hooks: Optional CompressionHooks instance for custom behavior.
+        config: Compression options (CompressConfig). Overrides defaults.
+        **kwargs: Shorthand for CompressConfig fields. These override config:
+            compress_user_messages, target_ratio, protect_recent,
+            protect_analysis_context, kompress_model.
 
     Returns:
         CompressResult with compressed messages and metrics.
+
+    Examples::
+
+        # Default (coding agent)
+        result = compress(messages, model="gpt-4o")
+
+        # Financial document (keep 50%, compress everything)
+        result = compress(messages, model="claude-opus-4-20250514",
+            compress_user_messages=True,
+            target_ratio=0.5,
+            protect_recent=0,
+        )
     """
     if not messages or not optimize:
         return CompressResult(messages=messages)
+
+    # Build config from explicit config + kwargs
+    cfg = config or CompressConfig()
+    config_fields = {f.name for f in cfg.__dataclass_fields__.values()}
+    for key, value in kwargs.items():
+        if key in config_fields:
+            setattr(cfg, key, value)
 
     pipeline = _get_pipeline()
 
@@ -141,6 +215,11 @@ def compress(
             model_limit=model_limit,
             context=context,
             biases=biases,
+            # Pass CompressConfig options through to transforms
+            compress_user_messages=cfg.compress_user_messages,
+            target_ratio=cfg.target_ratio,
+            protect_recent=cfg.protect_recent,
+            protect_analysis_context=cfg.protect_analysis_context,
         )
 
         tokens_before = result.tokens_before
