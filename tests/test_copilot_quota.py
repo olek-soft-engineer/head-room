@@ -150,11 +150,7 @@ class TestParseCopilotQuota:
         assert snap.categories["chat"].remaining == 75
 
     def test_unlimited_category(self):
-        data = {
-            "quota_snapshots": {
-                "completions": {"unlimited": True}
-            }
-        }
+        data = {"quota_snapshots": {"completions": {"unlimited": True}}}
         snap = parse_copilot_quota(data)
         assert snap.categories["completions"].unlimited is True
 
@@ -207,31 +203,56 @@ class TestParseCopilotQuota:
 
 class TestDiscoverGithubToken:
     def test_returns_none_when_no_env_vars(self, monkeypatch):
-        for var in ["GITHUB_COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN", "GITHUB_COPILOT_API_TOKEN"]:
+        for var in [
+            "GITHUB_COPILOT_GITHUB_TOKEN",
+            "GITHUB_TOKEN",
+            "COPILOT_GITHUB_TOKEN",
+            "GITHUB_COPILOT_API_TOKEN",
+        ]:
             monkeypatch.delenv(var, raising=False)
         assert discover_github_token() is None
 
     def test_picks_up_github_token(self, monkeypatch):
-        for var in ["GITHUB_COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN", "GITHUB_COPILOT_API_TOKEN"]:
+        for var in [
+            "GITHUB_COPILOT_GITHUB_TOKEN",
+            "GITHUB_TOKEN",
+            "COPILOT_GITHUB_TOKEN",
+            "GITHUB_COPILOT_API_TOKEN",
+        ]:
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_testtoken123")
         assert discover_github_token() == "ghp_testtoken123"
 
     def test_prefers_copilot_specific_token(self, monkeypatch):
-        for var in ["GITHUB_COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN", "GITHUB_COPILOT_API_TOKEN"]:
+        for var in [
+            "GITHUB_COPILOT_GITHUB_TOKEN",
+            "GITHUB_TOKEN",
+            "COPILOT_GITHUB_TOKEN",
+            "GITHUB_COPILOT_API_TOKEN",
+        ]:
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("GITHUB_COPILOT_GITHUB_TOKEN", "ghp_copilot_specific")
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_generic")
         assert discover_github_token() == "ghp_copilot_specific"
 
     def test_falls_through_to_next_env_var(self, monkeypatch):
-        for var in ["GITHUB_COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN", "GITHUB_COPILOT_API_TOKEN"]:
+        for var in [
+            "GITHUB_COPILOT_GITHUB_TOKEN",
+            "GITHUB_TOKEN",
+            "COPILOT_GITHUB_TOKEN",
+            "GITHUB_COPILOT_API_TOKEN",
+        ]:
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "ghp_copilot")
         assert discover_github_token() == "ghp_copilot"
 
     def test_ignores_empty_strings(self, monkeypatch):
-        for var in ["GITHUB_COPILOT_GITHUB_TOKEN", "GITHUB_TOKEN", "COPILOT_GITHUB_TOKEN", "GITHUB_COPILOT_API_TOKEN"]:
+        for var in [
+            "GITHUB_COPILOT_GITHUB_TOKEN",
+            "GITHUB_TOKEN",
+            "COPILOT_GITHUB_TOKEN",
+            "GITHUB_COPILOT_API_TOKEN",
+        ]:
             monkeypatch.delenv(var, raising=False)
         monkeypatch.setenv("GITHUB_COPILOT_GITHUB_TOKEN", "")
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_valid")

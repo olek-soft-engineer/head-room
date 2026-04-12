@@ -276,7 +276,9 @@ class _CopilotQuotaTracker:
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.get(
+                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
                     if resp.status == 401:
                         with self._lock:
                             self._state.last_error = "unauthorized — check GITHUB_TOKEN"
