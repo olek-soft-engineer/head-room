@@ -127,6 +127,7 @@ from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
+from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
 from headroom.subscription.tracker import (
     configure_subscription_tracker,
     get_subscription_tracker,
@@ -152,6 +153,12 @@ from headroom.transforms import (
 _build_prefix_cache_stats = build_prefix_cache_stats
 _build_session_summary = build_session_summary
 _merge_cost_stats = merge_cost_stats
+
+
+def _get_codex_rate_limit_stats() -> dict | None:
+    """Return the latest Codex rate-limit snapshot for the /stats endpoint."""
+    return get_codex_rate_limit_state().get_stats()
+
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -1393,6 +1400,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "subscription_window": get_subscription_tracker().state
             if get_subscription_tracker()
             else None,
+            "codex_rate_limits": _get_codex_rate_limit_stats(),
         }
 
     @app.get("/stats-history")

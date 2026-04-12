@@ -297,6 +297,79 @@
                 </template>
             </div>
         </template>
+        <!-- Codex Rate-Limit Window -->
+        <template x-if="stats.codex_rate_limits && stats.codex_rate_limits.primary">
+            <div class="bg-surface rounded-lg p-4 border border-border mb-6">
+                <div class="flex justify-between items-center mb-3">
+                    <div class="text-sm font-medium text-gray-300">OpenAI Codex Rate-Limit Window</div>
+                    <div class="flex items-center gap-2">
+                        <template x-if="stats.codex_rate_limits.limit_name">
+                            <span class="text-xs text-gray-500 font-mono" x-text="stats.codex_rate_limits.limit_name"></span>
+                        </template>
+                        <template x-if="stats.codex_rate_limits.credits">
+                            <span class="text-xs font-mono"
+                                  :class="stats.codex_rate_limits.credits.unlimited ? 'text-purple-400' : stats.codex_rate_limits.credits.has_credits ? 'text-emerald-400' : 'text-red-400'"
+                                  x-text="stats.codex_rate_limits.credits.unlimited ? '∞ Unlimited' : stats.codex_rate_limits.credits.balance ? stats.codex_rate_limits.credits.balance : (stats.codex_rate_limits.credits.has_credits ? 'Credits' : 'No Credits')"></span>
+                        </template>
+                    </div>
+                </div>
+                <!-- Primary window -->
+                <div class="mb-3">
+                    <div class="flex justify-between items-center mb-1">
+                        <div class="flex items-center gap-2">
+                            <span class="text-xs text-gray-500">Primary</span>
+                            <template x-if="stats.codex_rate_limits.primary.window_label">
+                                <span class="text-xs text-gray-600 font-mono"
+                                      x-text="'(' + stats.codex_rate_limits.primary.window_label + ' window)'"></span>
+                            </template>
+                        </div>
+                        <span class="text-sm font-mono font-semibold"
+                              :class="(stats.codex_rate_limits.primary.used_percent||0) > 80 ? 'text-red-400' : (stats.codex_rate_limits.primary.used_percent||0) > 60 ? 'text-amber-400' : 'text-emerald-400'"
+                              x-text="(stats.codex_rate_limits.primary.used_percent||0).toFixed(1) + '%'"></span>
+                    </div>
+                    <div class="w-full bg-gray-700 rounded-full h-2">
+                        <div class="h-2 rounded-full transition-all duration-500"
+                             :class="(stats.codex_rate_limits.primary.used_percent||0) > 80 ? 'bg-red-500' : (stats.codex_rate_limits.primary.used_percent||0) > 60 ? 'bg-amber-500' : 'bg-emerald-500'"
+                             :style="'width: ' + Math.min(stats.codex_rate_limits.primary.used_percent||0, 100) + '%'"></div>
+                    </div>
+                    <template x-if="stats.codex_rate_limits.primary.seconds_until_reset !== null">
+                        <div class="text-xs text-gray-500 mt-1"
+                             x-text="'Resets in ' + formatResetTime(stats.codex_rate_limits.primary.seconds_until_reset)"></div>
+                    </template>
+                </div>
+                <!-- Secondary window (if present) -->
+                <template x-if="stats.codex_rate_limits.secondary">
+                    <div class="mb-3">
+                        <div class="flex justify-between items-center mb-1">
+                            <div class="flex items-center gap-2">
+                                <span class="text-xs text-gray-500">Secondary</span>
+                                <template x-if="stats.codex_rate_limits.secondary.window_label">
+                                    <span class="text-xs text-gray-600 font-mono"
+                                          x-text="'(' + stats.codex_rate_limits.secondary.window_label + ' window)'"></span>
+                                </template>
+                            </div>
+                            <span class="text-sm font-mono font-semibold"
+                                  :class="(stats.codex_rate_limits.secondary.used_percent||0) > 80 ? 'text-red-400' : (stats.codex_rate_limits.secondary.used_percent||0) > 60 ? 'text-amber-400' : 'text-emerald-400'"
+                                  x-text="(stats.codex_rate_limits.secondary.used_percent||0).toFixed(1) + '%'"></span>
+                        </div>
+                        <div class="w-full bg-gray-700 rounded-full h-2">
+                            <div class="h-2 rounded-full transition-all duration-500"
+                                 :class="(stats.codex_rate_limits.secondary.used_percent||0) > 80 ? 'bg-red-500' : (stats.codex_rate_limits.secondary.used_percent||0) > 60 ? 'bg-amber-500' : 'bg-emerald-500'"
+                                 :style="'width: ' + Math.min(stats.codex_rate_limits.secondary.used_percent||0, 100) + '%'"></div>
+                        </div>
+                        <template x-if="stats.codex_rate_limits.secondary.seconds_until_reset !== null">
+                            <div class="text-xs text-gray-500 mt-1"
+                                 x-text="'Resets in ' + formatResetTime(stats.codex_rate_limits.secondary.seconds_until_reset)"></div>
+                        </template>
+                    </div>
+                </template>
+                <!-- Promo message -->
+                <template x-if="stats.codex_rate_limits.promo_message">
+                    <div class="mt-2 text-xs text-blue-400 italic"
+                         x-text="stats.codex_rate_limits.promo_message"></div>
+                </template>
+            </div>
+        </template>
         <template x-if="(stats.prefix_cache?.totals?.requests || 0) > 0">
             <div class="bg-surface rounded-lg p-4 border border-border mb-6">
                 <div class="flex justify-between items-center mb-3">
