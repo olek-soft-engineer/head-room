@@ -6,10 +6,11 @@ import { createGenerator } from 'fumadocs-typescript';
 import { TypeTable } from 'fumadocs-ui/components/type-table';
 import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
 import {
-  LiveStats,
   KeyFeatures,
   FrameworkIntegrations,
 } from './marketing';
+import { LiveStats } from './live-stats';
+import { CommunityStatsHeader } from './community-stats-header';
 import { StatsSection } from './stats';
 import { CommunityCharts } from './community-charts';
 
@@ -27,6 +28,7 @@ export function getMDXComponents(components?: MDXComponents) {
     Tabs,
     StatsSection,
     CommunityCharts,
+    CommunityStatsHeader,
     LiveStats,
     KeyFeatures,
     FrameworkIntegrations,
