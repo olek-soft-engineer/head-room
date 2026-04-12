@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 import subprocess
 import threading
 import time
@@ -113,7 +112,14 @@ class CodeGraphWatcher:
     ) -> None:
         self.project_dir = str(project_dir)
         self.debounce_seconds = debounce_seconds
-        self.cbm_binary = cbm_binary or shutil.which("codebase-memory-mcp")
+        self.cbm_binary: str | None = None
+        if cbm_binary:
+            self.cbm_binary = cbm_binary
+        else:
+            from headroom.graph.installer import get_cbm_path
+
+            path = get_cbm_path()
+            self.cbm_binary = str(path) if path else None
         self._observer: object | None = None
         self._debounce_timer: threading.Timer | None = None
         self._lock = threading.Lock()

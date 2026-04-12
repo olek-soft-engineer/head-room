@@ -199,15 +199,19 @@ def _setup_code_graph(verbose: bool = False) -> bool:
 
     Returns True if graph is ready, False if setup failed.
     """
-    cbm_bin = shutil.which("codebase-memory-mcp")
-    if not cbm_bin:
-        if verbose:
-            click.echo("  Code graph: codebase-memory-mcp not found, skipping")
-            click.echo(
-                "  Install: curl -fsSL https://raw.githubusercontent.com/"
-                "DeusData/codebase-memory-mcp/main/install.sh | sh"
-            )
-        return False
+    from headroom.graph.installer import ensure_cbm, get_cbm_path
+
+    cbm_path = get_cbm_path()
+    if not cbm_path:
+        click.echo("  Code graph: downloading codebase-memory-mcp...")
+        cbm_path = ensure_cbm()
+        if cbm_path:
+            click.echo(f"  Code graph: installed at {cbm_path}")
+        else:
+            click.echo("  Code graph: download failed — skipping")
+            return False
+
+    cbm_bin = str(cbm_path)
 
     # Index current project (fast — ~1s for most repos, idempotent)
     project_dir = str(Path.cwd())
