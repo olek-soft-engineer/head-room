@@ -78,6 +78,7 @@ def _start_proxy(
     *,
     learn: bool = False,
     agent_type: str = "unknown",
+    code_graph: bool = False,
     backend: str | None = None,
     anyllm_provider: str | None = None,
     region: str | None = None,
@@ -98,6 +99,10 @@ def _start_proxy(
     # Forward --learn flag to proxy subprocess
     if learn:
         cmd.append("--learn")
+
+    # Forward --code-graph flag to proxy subprocess (live file watcher)
+    if code_graph:
+        cmd.append("--code-graph")
 
     # Forward backend configuration to proxy subprocess
     _backend = backend or os.environ.get("HEADROOM_BACKEND")
@@ -508,6 +513,7 @@ def _ensure_proxy(
     *,
     learn: bool = False,
     agent_type: str = "unknown",
+    code_graph: bool = False,
     backend: str | None = None,
     anyllm_provider: str | None = None,
     region: str | None = None,
@@ -537,6 +543,7 @@ def _ensure_proxy(
                     port,
                     learn=learn,
                     agent_type=agent_type,
+                    code_graph=code_graph,
                     backend=backend,
                     anyllm_provider=anyllm_provider,
                     region=region,
@@ -626,6 +633,7 @@ def _launch_tool(
             no_proxy,
             learn=learn,
             agent_type=agent_type,
+            code_graph=code_graph,
             backend=backend,
             anyllm_provider=anyllm_provider,
             region=region,
@@ -981,7 +989,9 @@ def claude(
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
 
-        proxy_holder[0] = _ensure_proxy(port, no_proxy, learn=learn, agent_type="claude")
+        proxy_holder[0] = _ensure_proxy(
+            port, no_proxy, learn=learn, agent_type="claude", code_graph=code_graph
+        )
 
         if not no_rtk:
             click.echo("  Setting up rtk...")

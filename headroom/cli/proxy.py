@@ -67,8 +67,12 @@ from .main import main
     envvar="HEADROOM_BUDGET",
     help="Daily budget limit in USD (env: HEADROOM_BUDGET)",
 )
-# Code-aware compression (ON by default if installed)
-@click.option("--no-code-aware", is_flag=True, help="Disable AST-based code compression")
+# Code graph: indexes project + watches files for live reindex via codebase-memory-mcp
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph intelligence (indexes project, watches files for live reindex via codebase-memory-mcp)",
+)
 # Read lifecycle (ON by default: compresses stale/superseded Read outputs)
 @click.option(
     "--no-read-lifecycle",
@@ -188,7 +192,7 @@ def proxy(
     connect_timeout_seconds: int | None,
     log_file: str | None,
     budget: float | None,
-    no_code_aware: bool,
+    code_graph: bool,
     no_read_lifecycle: bool,
     no_intelligent_context: bool,
     no_intelligent_scoring: bool,
@@ -270,8 +274,8 @@ def proxy(
         else 10,
         log_file=log_file,
         budget_limit_usd=budget,
-        # Code-aware: ON by default (use --no-code-aware to disable)
-        code_aware_enabled=not no_code_aware,
+        # Code graph: live file watcher for incremental reindexing
+        code_graph_watcher=code_graph,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
         read_lifecycle=not no_read_lifecycle,
         # Intelligent Context: ON by default (use --no-intelligent-context to disable)

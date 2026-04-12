@@ -113,6 +113,9 @@ class ProxyConfig:
     # Code-aware compression (disabled by default — use code graph tools instead)
     code_aware_enabled: bool = False
 
+    # Code graph live watcher (triggers incremental reindex on file changes)
+    code_graph_watcher: bool = False
+
     # Per-tool compression profiles
     tool_profiles: dict[str, Any] | None = None
 

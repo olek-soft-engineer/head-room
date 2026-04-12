@@ -511,6 +511,17 @@ class HeadroomProxy(
                 agent_type=config.traffic_learning_agent_type,
             )
 
+        # Code graph file watcher (live reindex on file changes)
+        self.code_graph_watcher: CodeGraphWatcher | None = None  # type: ignore[annotation-unchecked]
+        if config.code_graph_watcher:
+            from headroom.graph.watcher import CodeGraphWatcher
+
+            self.code_graph_watcher = CodeGraphWatcher(project_dir=Path.cwd())
+            if self.code_graph_watcher.start():
+                logger.info("Code graph: file watcher started")
+            else:
+                self.code_graph_watcher = None
+
     def _get_compression_cache(self, session_id: str) -> CompressionCache:
         """Get or create a CompressionCache for a session."""
         if session_id not in self._compression_caches:
@@ -1006,6 +1017,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 await proxy.usage_reporter.stop()
             if proxy.traffic_learner:
                 await proxy.traffic_learner.stop()
+            if proxy.code_graph_watcher:
+                proxy.code_graph_watcher.stop()
             await proxy.shutdown()
             shutdown_headroom_tracing()
             shutdown_otel_metrics()
