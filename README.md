@@ -110,9 +110,17 @@ headroom install apply --preset persistent-docker
 ```python
 from headroom import compress
 
+# Default (coding agents — protects user messages, compresses tool outputs)
 result = compress(messages, model="claude-sonnet-4-5-20250929")
 response = client.messages.create(model="claude-sonnet-4-5-20250929", messages=result.messages)
 print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
+
+# Document compression (financial, legal, clinical — compress everything, keep 50%)
+result = compress(messages, model="claude-opus-4-20250514",
+    compress_user_messages=True,   # Compress user messages too
+    target_ratio=0.5,              # Keep 50% (preserves numbers/entities)
+    protect_recent=0,              # Don't protect recent messages
+)
 ```
 
 **TypeScript:**
@@ -124,7 +132,7 @@ const response = await openai.chat.completions.create({ model: 'gpt-4o', message
 console.log(`Saved ${result.tokensSaved} tokens`);
 ```
 
-Works with any LLM client — Anthropic, OpenAI, LiteLLM, Bedrock, Vercel AI SDK, or your own code.
+Works with any LLM client — Anthropic, OpenAI, LiteLLM, Bedrock, Vercel AI SDK, or your own code. Full options via `CompressConfig`: `compress_user_messages`, `target_ratio`, `protect_recent`, `protect_analysis_context`.
 
 ### Any agent — proxy (zero code changes)
 
