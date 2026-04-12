@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,10 +18,10 @@ from headroom.subscription.models import (
     WindowTokens,
 )
 
-
 # ---------------------------------------------------------------------------
 # RateLimitWindow
 # ---------------------------------------------------------------------------
+
 
 class TestRateLimitWindow:
     def test_from_api_dict_full(self):
@@ -69,13 +67,14 @@ class TestRateLimitWindow:
 # ExtraUsage
 # ---------------------------------------------------------------------------
 
+
 class TestExtraUsage:
     def test_from_api_dict_with_cents(self):
         eu = ExtraUsage.from_api_dict(
             {
                 "is_enabled": True,
-                "monthly_limit": 5000,   # $50.00
-                "used_credits": 123,     # $1.23
+                "monthly_limit": 5000,  # $50.00
+                "used_credits": 123,  # $1.23
                 "utilization": 2.46,
             }
         )
@@ -103,6 +102,7 @@ class TestExtraUsage:
 # ---------------------------------------------------------------------------
 # SubscriptionSnapshot
 # ---------------------------------------------------------------------------
+
 
 class TestSubscriptionSnapshot:
     def test_from_api_response_all_fields(self):
@@ -154,6 +154,7 @@ class TestSubscriptionSnapshot:
 # HeadroomContribution
 # ---------------------------------------------------------------------------
 
+
 class TestHeadroomContribution:
     def test_efficiency_pct_no_savings(self):
         c = HeadroomContribution(tokens_submitted=100)
@@ -188,6 +189,7 @@ class TestHeadroomContribution:
 # ---------------------------------------------------------------------------
 # SubscriptionState
 # ---------------------------------------------------------------------------
+
 
 class TestSubscriptionState:
     def test_is_active_recent(self):
@@ -224,9 +226,11 @@ class TestSubscriptionState:
 # SubscriptionTracker — unit tests with mocked client
 # ---------------------------------------------------------------------------
 
+
 class TestSubscriptionTrackerNotifyActive:
     def _make_tracker(self, tmp_path: Path):
         from headroom.subscription.tracker import SubscriptionTracker
+
         return SubscriptionTracker(
             poll_interval_s=30,
             active_window_s=60,
@@ -281,6 +285,7 @@ class TestSubscriptionTrackerNotifyActive:
 # ---------------------------------------------------------------------------
 # SubscriptionTracker — poll loop integration test
 # ---------------------------------------------------------------------------
+
 
 class TestSubscriptionTrackerPollLoop:
     @pytest.mark.asyncio
@@ -339,6 +344,7 @@ class TestSubscriptionTrackerPollLoop:
 # Anomaly detection
 # ---------------------------------------------------------------------------
 
+
 class TestAnomalyDetection:
     def test_surge_pricing_detection(self):
         from headroom.subscription.tracker import _detect_discrepancies
@@ -351,9 +357,7 @@ class TestAnomalyDetection:
         )
         # Simulate API limit known; weighted tokens imply only 50% should be used
         snap.five_hour.limit = 1000
-        window_tokens = WindowTokens(
-            input=300, output=100, weighted_token_equivalent=500.0
-        )
+        window_tokens = WindowTokens(input=300, output=100, weighted_token_equivalent=500.0)
 
         discrepancies = _detect_discrepancies(snap, window_tokens)
         kinds = [d.kind for d in discrepancies]
@@ -400,6 +404,7 @@ class TestAnomalyDetection:
 # ---------------------------------------------------------------------------
 # Persistence round-trip
 # ---------------------------------------------------------------------------
+
 
 class TestPersistence:
     @pytest.mark.asyncio
