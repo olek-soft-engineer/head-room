@@ -701,6 +701,13 @@ class OpenAIHandlerMixin:
                         tokens_saved,
                     )
 
+                # Capture Codex rate-limit window data from response headers
+                from headroom.subscription.codex_rate_limits import (
+                    get_codex_rate_limit_state,
+                )
+
+                get_codex_rate_limit_state().update_from_headers(dict(response.headers))
+
                 await self.metrics.record_request(
                     provider="openai",
                     model=model,
@@ -993,6 +1000,13 @@ class OpenAIHandlerMixin:
                 )
 
                 logger.info(f"[{request_id}] /v1/responses {model}: {total_input_tokens:,} tokens")
+
+                # Capture Codex rate-limit window data from response headers
+                from headroom.subscription.codex_rate_limits import (
+                    get_codex_rate_limit_state,
+                )
+
+                get_codex_rate_limit_state().update_from_headers(dict(response.headers))
 
                 # Remove compression headers
                 response_headers = dict(response.headers)
