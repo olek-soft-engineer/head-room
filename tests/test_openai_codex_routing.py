@@ -133,6 +133,7 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.openai_provider = SimpleNamespace()
         self.anthropic_backend = None
         self.cost_tracker = None
+        self.memory_handler = None
         self.captured_request: tuple[str, str, dict, dict] | None = None
 
     async def _next_request_id(self) -> str:

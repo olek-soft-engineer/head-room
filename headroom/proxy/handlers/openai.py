@@ -857,6 +857,14 @@ class OpenAIHandlerMixin:
         headers.pop("content-length", None)
         tags = self._extract_tags(headers)
 
+        # Memory: Get user ID when memory is enabled
+        memory_user_id: str | None = None
+        if self.memory_handler:
+            memory_user_id = headers.get(
+                "x-headroom-user-id",
+                os.environ.get("USER", os.environ.get("USERNAME", "default")),
+            )
+
         # Rate limiting
         if self.rate_limiter:
             rate_key = headers.get("authorization", "default")[:20]
@@ -936,6 +944,39 @@ class OpenAIHandlerMixin:
 
             body["input"] = messages_to_responses_items(opt_msgs, original_items, preserved_indices)
 
+        # Memory: inject context and tools for Responses API requests
+        if self.memory_handler and memory_user_id:
+            try:
+                # Inject memory context into instructions (Responses API system prompt)
+                if self.memory_handler.config.inject_context:
+                    memory_context = await self.memory_handler.search_and_format_context(
+                        memory_user_id, optimized_messages
+                    )
+                    if memory_context:
+                        existing_instructions = body.get("instructions") or ""
+                        if existing_instructions:
+                            body["instructions"] = f"{existing_instructions}\n\n{memory_context}"
+                        else:
+                            body["instructions"] = memory_context
+                        logger.info(
+                            f"[{request_id}] Memory: Injected {len(memory_context)} chars "
+                            f"of context into instructions for user {memory_user_id}"
+                        )
+
+                # Inject memory tools
+                if self.memory_handler.config.inject_tools:
+                    resp_tools = body.get("tools") or []
+                    resp_tools, mem_tools_injected = self.memory_handler.inject_tools(
+                        resp_tools, "openai"
+                    )
+                    if mem_tools_injected:
+                        body["tools"] = resp_tools
+                        logger.info(
+                            f"[{request_id}] Memory: Injected memory tools (openai/responses)"
+                        )
+            except Exception as e:
+                logger.warning(f"[{request_id}] Memory injection failed (responses): {e}")
+
         # /v1/responses is OpenAI-specific (Codex) — always routes direct.
         # LiteLLM/AnyLLM backends use /v1/chat/completions or /v1/messages.
         if self.anthropic_backend is not None:
@@ -969,6 +1010,7 @@ class OpenAIHandlerMixin:
                     transforms_applied,
                     tags,
                     optimization_latency,
+                    memory_user_id=memory_user_id,
                 )
             else:
                 response = await self._retry_request("POST", url, headers, body)
@@ -985,6 +1027,27 @@ class OpenAIHandlerMixin:
                     logger.debug(
                         f"[{request_id}] Failed to extract cached tokens from OpenAI passthrough response: {e}"
                     )
+
+                # Memory: handle memory tool calls in Responses API response
+                if (
+                    self.memory_handler
+                    and memory_user_id
+                    and resp_json
+                    and response.status_code == 200
+                    and self.memory_handler.has_memory_tool_calls(resp_json, "openai")
+                ):
+                    try:
+                        tool_results = await self.memory_handler.handle_memory_tool_calls(
+                            resp_json, memory_user_id, "openai"
+                        )
+                        logger.info(
+                            f"[{request_id}] Memory: Handled {len(tool_results)} "
+                            f"tool call(s) for user {memory_user_id} (responses)"
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[{request_id}] Memory tool handling failed (responses): {e}"
+                        )
 
                 if self.cost_tracker:
                     self.cost_tracker.record_tokens(model, tokens_saved, total_input_tokens)
