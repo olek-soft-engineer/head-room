@@ -77,6 +77,7 @@ def _start_proxy(
     port: int,
     *,
     learn: bool = False,
+    memory: bool = False,
     agent_type: str = "unknown",
     code_graph: bool = False,
     backend: str | None = None,
@@ -99,6 +100,10 @@ def _start_proxy(
     # Forward --learn flag to proxy subprocess
     if learn:
         cmd.append("--learn")
+
+    # Forward --memory flag to proxy subprocess
+    if memory:
+        cmd.append("--memory")
 
     # Forward --code-graph flag to proxy subprocess (live file watcher)
     if code_graph:
@@ -516,6 +521,7 @@ def _ensure_proxy(
     no_proxy: bool,
     *,
     learn: bool = False,
+    memory: bool = False,
     agent_type: str = "unknown",
     code_graph: bool = False,
     backend: str | None = None,
@@ -546,6 +552,7 @@ def _ensure_proxy(
                 proc = _start_proxy(
                     port,
                     learn=learn,
+                    memory=memory,
                     agent_type=agent_type,
                     code_graph=code_graph,
                     backend=backend,
@@ -612,6 +619,7 @@ def _launch_tool(
     env_vars_display: list[str],
     *,
     learn: bool = False,
+    memory: bool = False,
     agent_type: str = "unknown",
     code_graph: bool = False,
     backend: str | None = None,
@@ -636,6 +644,7 @@ def _launch_tool(
             port,
             no_proxy,
             learn=learn,
+            memory=memory,
             agent_type=agent_type,
             code_graph=code_graph,
             backend=backend,
@@ -942,6 +951,7 @@ def unwrap() -> None:
 @click.option(
     "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to MEMORY.md)"
 )
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
@@ -951,6 +961,7 @@ def claude(
     code_graph: bool,
     no_proxy: bool,
     learn: bool,
+    memory: bool,
     verbose: bool,
     prepare_only: bool,
     claude_args: tuple,
@@ -964,6 +975,7 @@ def claude(
     \b
     Examples:
         headroom wrap claude                    # Start everything
+        headroom wrap claude --memory           # With persistent memory
         headroom wrap claude --resume <id>      # Resume a session
         headroom wrap claude -- -p              # Claude in print mode
         headroom wrap claude --code-graph        # With code graph intelligence
@@ -994,7 +1006,7 @@ def claude(
         click.echo()
 
         proxy_holder[0] = _ensure_proxy(
-            port, no_proxy, learn=learn, agent_type="claude", code_graph=code_graph
+            port, no_proxy, learn=learn, memory=memory, agent_type="claude", code_graph=code_graph
         )
 
         if not no_rtk:
@@ -1068,6 +1080,7 @@ def claude(
     default=None,
     help="OpenAI-compatible Copilot wire API. Defaults to 'completions' when provider-type resolves to openai.",
 )
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.argument("copilot_args", nargs=-1, type=click.UNPROCESSED)
 def copilot(
@@ -1079,6 +1092,7 @@ def copilot(
     region: str | None,
     provider_type: str,
     wire_api: str | None,
+    memory: bool,
     verbose: bool,
     copilot_args: tuple[str, ...],
 ) -> None:
@@ -1169,6 +1183,7 @@ def copilot(
         tool_label="COPILOT",
         env_vars_display=env_vars_display,
         learn=False,
+        memory=memory,
         agent_type="copilot",
         backend=backend,
         anyllm_provider=anyllm_provider,
@@ -1206,6 +1221,7 @@ def copilot(
 @click.option(
     "--region", default=None, help="Cloud region for Bedrock/Vertex (env: HEADROOM_REGION)"
 )
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
@@ -1215,6 +1231,7 @@ def codex(
     code_graph: bool,
     no_proxy: bool,
     learn: bool,
+    memory: bool,
     backend: str | None,
     anyllm_provider: str | None,
     region: str | None,
@@ -1277,6 +1294,7 @@ def codex(
         tool_label="CODEX",
         env_vars_display=[f"OPENAI_BASE_URL=http://127.0.0.1:{port}/v1"],
         learn=learn,
+        memory=memory,
         agent_type="codex",
         code_graph=code_graph,
         backend=backend,
@@ -1300,6 +1318,7 @@ def codex(
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option(
     "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
 )
@@ -1314,6 +1333,7 @@ def aider(
     code_graph: bool,
     no_proxy: bool,
     learn: bool,
+    memory: bool,
     backend: str | None,
     anyllm_provider: str | None,
     region: str | None,
@@ -1370,6 +1390,7 @@ def aider(
             f"ANTHROPIC_BASE_URL=http://127.0.0.1:{port}",
         ],
         learn=learn,
+        memory=memory,
         agent_type="aider",
         code_graph=code_graph,
         backend=backend,
@@ -1390,6 +1411,7 @@ def aider(
 @click.option(
     "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to .cursor/rules/)"
 )
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 def cursor(
@@ -1397,6 +1419,7 @@ def cursor(
     no_rtk: bool,
     no_proxy: bool,
     learn: bool,
+    memory: bool,
     verbose: bool,
     prepare_only: bool,
 ) -> None:
@@ -1439,7 +1462,9 @@ def cursor(
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
 
-        proxy_holder[0] = _ensure_proxy(port, no_proxy, learn=learn, agent_type="cursor")
+        proxy_holder[0] = _ensure_proxy(
+            port, no_proxy, learn=learn, memory=memory, agent_type="cursor"
+        )
 
         click.echo()
         click.echo("  Headroom proxy is running. Configure Cursor:")
