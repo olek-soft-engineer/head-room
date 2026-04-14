@@ -121,7 +121,8 @@ def _load_sync_state(state_path: Path) -> dict[str, Any]:
     """Load sync state from disk."""
     if state_path.exists():
         try:
-            return json.loads(state_path.read_text())
+            result: dict[str, Any] = json.loads(state_path.read_text())
+            return result
         except (json.JSONDecodeError, OSError):
             pass
     return {}
@@ -366,7 +367,7 @@ def main() -> None:
                 get_claude_memory_dir,
             )
 
-            adapter = ClaudeCodeAdapter(get_claude_memory_dir())
+            adapter: ClaudeCodeAdapter | Any = ClaudeCodeAdapter(get_claude_memory_dir())
         elif args.agent == "codex":
             from headroom.memory.sync_adapters.codex_agent import CodexAdapter
 
