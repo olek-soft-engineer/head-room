@@ -1370,6 +1370,20 @@ def copilot(
     env["COPILOT_PROVIDER_TYPE"] = effective_provider_type
     env.pop("COPILOT_PROVIDER_WIRE_API", None)
 
+    # Copilot BYOK requires COPILOT_PROVIDER_API_KEY — propagate from the
+    # user's existing provider key so they don't have to set it twice.
+    # Note: `headroom wrap copilot` uses Copilot's BYOK mode, which bypasses
+    # GitHub's Copilot API and talks directly to the model provider through
+    # the Headroom proxy. This requires the provider's own API key — a GitHub
+    # Copilot subscription alone is not sufficient for BYOK mode.
+    if not env.get("COPILOT_PROVIDER_API_KEY"):
+        if effective_provider_type == "anthropic":
+            _key = env.get("ANTHROPIC_API_KEY", "")
+        else:
+            _key = env.get("OPENAI_API_KEY", "")
+        if _key:
+            env["COPILOT_PROVIDER_API_KEY"] = _key
+
     env_vars_display: list[str]
     if effective_provider_type == "anthropic":
         env["COPILOT_PROVIDER_BASE_URL"] = f"http://127.0.0.1:{port}"
@@ -1386,6 +1400,19 @@ def copilot(
             f"COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:{port}/v1",
             f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
         ]
+
+    if not env.get("COPILOT_PROVIDER_API_KEY"):
+        src = "ANTHROPIC_API_KEY" if effective_provider_type == "anthropic" else "OPENAI_API_KEY"
+        click.echo(
+            f"\n  Error: Copilot BYOK mode requires a provider API key.\n"
+            f"  `headroom wrap copilot` uses Copilot's BYOK mode, which bypasses GitHub's\n"
+            f"  Copilot API and routes requests directly to the model provider through the\n"
+            f"  Headroom proxy. A GitHub Copilot subscription alone is not sufficient.\n\n"
+            f"  Set one of:\n"
+            f"    export {src}=sk-...          # recommended\n"
+            f"    export COPILOT_PROVIDER_API_KEY=sk-...  # also works\n"
+        )
+        raise SystemExit(1)
 
     if not _copilot_model_configured(copilot_args, env):
         click.echo(
