@@ -12,6 +12,7 @@ env:
 permissions:
   contents: read
   packages: write
+  id-token: write # For cosign keyless signing via Sigstore OIDC
 
 jobs:
   docker-variant-tags:
@@ -81,3 +82,19 @@ jobs:
           set: |
             *.cache-from=type=gha
             *.cache-to=type=gha,mode=max
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign images with cosign (keyless via Sigstore OIDC)
+        env:
+          BAKE_META: ${{ steps.bake.outputs.metadata }}
+        run: |
+          # Extract all pushed image digests from bake metadata and sign each
+          echo "$BAKE_META" | jq -r '
+            to_entries[].value."containerimage.digest" // empty
+          ' | while read -r digest; do
+            image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${digest}"
+            echo "Signing ${image}"
+            cosign sign --yes "${image}"
+          done
