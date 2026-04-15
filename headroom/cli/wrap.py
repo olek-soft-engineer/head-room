@@ -192,12 +192,50 @@ def _setup_rtk(verbose: bool = False) -> Path | None:
     return rtk_path
 
 
+_CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
+
+
+def _register_cbm_mcp_server(cbm_bin: str) -> None:
+    """Register codebase-memory-mcp as an MCP server in Claude Code.
+
+    Uses ``claude mcp add`` so the tools appear in ``/mcp`` automatically.
+    Idempotent — skips if already registered.
+    """
+    claude_cli = shutil.which("claude")
+    if not claude_cli:
+        return
+
+    # Check if already registered
+    check = subprocess.run(
+        [claude_cli, "mcp", "get", _CBM_MCP_SERVER_NAME],
+        capture_output=True,
+        text=True,
+    )
+    if check.returncode == 0:
+        return  # Already registered
+
+    result = subprocess.run(
+        [claude_cli, "mcp", "add", _CBM_MCP_SERVER_NAME, "-s", "user", "--", cbm_bin],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        click.echo(f"  Code graph: registered {_CBM_MCP_SERVER_NAME} MCP server")
+    else:
+        pass  # Non-critical — tools won't appear in /mcp but graph still works
+
+
 def _setup_code_graph(verbose: bool = False) -> bool:
-    """Ensure codebase-memory-mcp is installed and project is indexed.
+    """Ensure codebase-memory-mcp is installed, registered as MCP server, and project is indexed.
 
     codebase-memory-mcp builds a knowledge graph of the codebase using
     tree-sitter, enabling the LLM to query code structure (call chains,
     function definitions, impact analysis) instead of reading entire files.
+
+    Steps:
+    1. Download the binary if not already present.
+    2. Register as an MCP server in Claude Code (``claude mcp add``).
+    3. Index the current project (fast, idempotent).
 
     With Claude Code's MCP Tool Search, the 14 graph tools add ~200 tokens
     overhead per request (not the full ~1,915) — they're lazy-loaded.
@@ -217,6 +255,9 @@ def _setup_code_graph(verbose: bool = False) -> bool:
             return False
 
     cbm_bin = str(cbm_path)
+
+    # Register as MCP server so tools appear in /mcp
+    _register_cbm_mcp_server(cbm_bin)
 
     # Index current project (fast — ~1s for most repos, idempotent)
     project_dir = str(Path.cwd())
