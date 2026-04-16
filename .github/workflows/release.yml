@@ -188,6 +188,7 @@ jobs:
 
       - name: Verify changelog exists
         run: |
+          pwd
           ls -la .changelog.md
           cat .changelog.md
 
@@ -196,6 +197,7 @@ jobs:
         with:
           name: changelog
           path: .changelog.md
+          if-no-files-found: error
 
       - name: Build Python package
         run: python -m pip install build wheel && python -m build
