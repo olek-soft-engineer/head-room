@@ -192,12 +192,50 @@ def _setup_rtk(verbose: bool = False) -> Path | None:
     return rtk_path
 
 
+_CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
+
+
+def _register_cbm_mcp_server(cbm_bin: str) -> None:
+    """Register codebase-memory-mcp as an MCP server in Claude Code.
+
+    Uses ``claude mcp add`` so the tools appear in ``/mcp`` automatically.
+    Idempotent — skips if already registered.
+    """
+    claude_cli = shutil.which("claude")
+    if not claude_cli:
+        return
+
+    # Check if already registered
+    check = subprocess.run(
+        [claude_cli, "mcp", "get", _CBM_MCP_SERVER_NAME],
+        capture_output=True,
+        text=True,
+    )
+    if check.returncode == 0:
+        return  # Already registered
+
+    result = subprocess.run(
+        [claude_cli, "mcp", "add", _CBM_MCP_SERVER_NAME, "-s", "user", "--", cbm_bin],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        click.echo(f"  Code graph: registered {_CBM_MCP_SERVER_NAME} MCP server")
+    else:
+        pass  # Non-critical — tools won't appear in /mcp but graph still works
+
+
 def _setup_code_graph(verbose: bool = False) -> bool:
-    """Ensure codebase-memory-mcp is installed and project is indexed.
+    """Ensure codebase-memory-mcp is installed, registered as MCP server, and project is indexed.
 
     codebase-memory-mcp builds a knowledge graph of the codebase using
     tree-sitter, enabling the LLM to query code structure (call chains,
     function definitions, impact analysis) instead of reading entire files.
+
+    Steps:
+    1. Download the binary if not already present.
+    2. Register as an MCP server in Claude Code (``claude mcp add``).
+    3. Index the current project (fast, idempotent).
 
     With Claude Code's MCP Tool Search, the 14 graph tools add ~200 tokens
     overhead per request (not the full ~1,915) — they're lazy-loaded.
@@ -217,6 +255,9 @@ def _setup_code_graph(verbose: bool = False) -> bool:
             return False
 
     cbm_bin = str(cbm_path)
+
+    # Register as MCP server so tools appear in /mcp
+    _register_cbm_mcp_server(cbm_bin)
 
     # Index current project (fast — ~1s for most repos, idempotent)
     project_dir = str(Path.cwd())
@@ -320,6 +361,11 @@ rtk pip list            rtk pnpm install        rtk npm run <script>
 # Marker used to detect if instructions are already injected
 _RTK_MARKER = "<!-- headroom:rtk-instructions -->"
 
+# Memory MCP markers
+_MEMORY_MCP_MARKER = "# --- Headroom memory MCP (auto-injected) ---"
+_MEMORY_MCP_END = "# --- end Headroom memory ---"
+_MEMORY_AGENTS_MARKER = "<!-- headroom:memory-instructions -->"
+
 
 def _ensure_rtk_binary(verbose: bool = False) -> Path | None:
     """Ensure rtk binary is installed (download if needed). No hook registration."""
@@ -364,11 +410,12 @@ def _inject_codex_provider_config(port: int) -> None:
     config_dir = Path.home() / ".codex"
     config_file = config_dir / "config.toml"
 
-    headroom_section = (
-        f"\n# --- Headroom proxy (auto-injected by headroom wrap codex) ---\n"
-        f'model_provider = "headroom"\n'
-        f"\n"
-        f"[model_providers.headroom]\n"
+    # model_provider must be a top-level TOML key (before any [section]).
+    # The [model_providers.headroom] table can go at the end.
+    top_level_marker = "# --- Headroom proxy (auto-injected by headroom wrap codex) ---"
+    top_level_block = f'{top_level_marker}\nmodel_provider = "headroom"\n'
+    provider_section = (
+        f"\n[model_providers.headroom]\n"
         f'name = "OpenAI via Headroom proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         f'env_key = "OPENAI_API_KEY"\n'
@@ -377,7 +424,7 @@ def _inject_codex_provider_config(port: int) -> None:
         f"# --- end Headroom ---\n"
     )
 
-    marker = "# --- Headroom proxy (auto-injected by headroom wrap codex) ---"
+    marker = top_level_marker
     end_marker = "# --- end Headroom ---"
 
     try:
@@ -386,14 +433,20 @@ def _inject_codex_provider_config(port: int) -> None:
         if config_file.exists():
             content = config_file.read_text()
             if marker in content:
-                # Replace existing section
+                # Remove existing Headroom blocks entirely
                 start = content.index(marker)
                 end = content.index(end_marker) + len(end_marker)
-                content = content[:start].rstrip() + headroom_section + content[end:].lstrip("\n")
-            else:
-                content = content.rstrip() + "\n" + headroom_section
+                content = content[:start].rstrip("\n") + content[end:].lstrip("\n")
+
+            # Strip any stale top-level model_provider left behind
+            import re
+
+            content = re.sub(r'\nmodel_provider\s*=\s*"headroom"\n', "\n", content)
+
+            # Place top-level key at the very beginning, provider table at the end
+            content = top_level_block + "\n" + content.strip() + "\n" + provider_section
         else:
-            content = headroom_section
+            content = top_level_block + "\n" + provider_section
 
         config_file.write_text(content)
         click.echo(f"  Codex config: injected Headroom provider (WS + HTTP) into {config_file}")
@@ -421,6 +474,81 @@ def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
         file_path.write_text(RTK_INSTRUCTIONS_BLOCK)
 
     click.echo(f"  rtk instructions injected into {file_path}")
+    return True
+
+
+def _inject_memory_mcp_config(db_path: str, user_id: str) -> None:
+    """Register headroom memory as an MCP server in Codex's config.toml.
+
+    Idempotent — replaces existing section if present.
+    """
+    import sys
+
+    config_dir = Path.home() / ".codex"
+    config_file = config_dir / "config.toml"
+
+    # Use forward slashes in TOML paths (works on all platforms, avoids
+    # backslash escaping issues on Windows)
+    python_bin = sys.executable.replace("\\", "/")
+    db_path_toml = db_path.replace("\\", "/")
+    mcp_section = (
+        f"\n{_MEMORY_MCP_MARKER}\n"
+        f"[mcp_servers.headroom_memory]\n"
+        f'command = "{python_bin}"\n'
+        f'args = ["-m", "headroom.memory.mcp_server", "--db", "{db_path_toml}", "--user", "{user_id}"]\n'
+        f"startup_timeout_sec = 30\n"
+        f"tool_timeout_sec = 30\n"
+        f"{_MEMORY_MCP_END}\n"
+    )
+
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+
+        if config_file.exists():
+            content = config_file.read_text()
+            if _MEMORY_MCP_MARKER in content:
+                start = content.index(_MEMORY_MCP_MARKER)
+                end = content.index(_MEMORY_MCP_END) + len(_MEMORY_MCP_END)
+                content = content[:start].rstrip("\n") + mcp_section + content[end:].lstrip("\n")
+            else:
+                content = content.rstrip() + "\n" + mcp_section
+        else:
+            content = mcp_section
+
+        config_file.write_text(content)
+        click.echo(f"  Memory MCP: registered in {config_file}")
+    except Exception as e:
+        click.echo(f"  Warning: could not register memory MCP: {e}")
+
+
+def _inject_memory_agents_md(file_path: Path) -> bool:
+    """Inject memory usage guidance into AGENTS.md.
+
+    Idempotent — skips if marker already present.
+    """
+    memory_block = (
+        f"{_MEMORY_AGENTS_MARKER}\n"
+        "## Memory\n\n"
+        "Use the `headroom_memory` MCP server for persistent cross-session knowledge.\n\n"
+        "**Before** answering questions about prior decisions, conventions, project context,\n"
+        "architecture, user preferences, org info, codenames, debugging history, or anything\n"
+        "from past sessions — call `memory_search` first.\n\n"
+        "**After** making durable decisions, discovering conventions, or learning important\n"
+        "facts — call `memory_save` to persist them for future sessions.\n\n"
+        "Memory is your first source of truth for anything not visible in the current conversation.\n"
+    )
+
+    if file_path.exists():
+        existing = file_path.read_text()
+        if _MEMORY_AGENTS_MARKER in existing:
+            return True  # Already injected
+        with open(file_path, "a") as f:
+            f.write("\n\n" + memory_block)
+    else:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(memory_block)
+
+    click.echo(f"  Memory guidance injected into {file_path.name}")
     return True
 
 
@@ -1088,6 +1216,48 @@ def claude(
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
 
+    # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
+    if memory:
+        try:
+            import subprocess as _sp
+
+            mem_dir = Path.cwd() / ".headroom"
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            _sync_db = str(mem_dir / "memory.db")
+            _sync_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
+
+            click.echo(f"  Syncing memory (user={_sync_user})...")
+            sync_result = _sp.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "headroom.memory.sync",
+                    "--db",
+                    _sync_db,
+                    "--user",
+                    _sync_user,
+                    "--agent",
+                    "claude",
+                    "--force",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if sync_result.returncode == 0 and sync_result.stdout.strip():
+                import json as _json
+
+                stats = _json.loads(sync_result.stdout.strip().split("\n")[-1])
+                imp, exp, ms = stats["imported"], stats["exported"], stats["ms"]
+                if imp or exp:
+                    click.echo(f"  Memory synced: {imp} imported, {exp} exported ({ms}ms)")
+                else:
+                    click.echo(f"  Memory: up to date ({ms}ms)")
+            elif sync_result.returncode != 0:
+                click.echo(f"  Warning: memory sync error: {sync_result.stderr[-200:]}")
+        except Exception as e:
+            click.echo(f"  Warning: memory sync failed: {e}")
+
     try:
         click.echo()
         click.echo("  ╔═══════════════════════════════════════════════╗")
@@ -1241,6 +1411,20 @@ def copilot(
     env["COPILOT_PROVIDER_TYPE"] = effective_provider_type
     env.pop("COPILOT_PROVIDER_WIRE_API", None)
 
+    # Copilot BYOK requires COPILOT_PROVIDER_API_KEY — propagate from the
+    # user's existing provider key so they don't have to set it twice.
+    # Note: `headroom wrap copilot` uses Copilot's BYOK mode, which bypasses
+    # GitHub's Copilot API and talks directly to the model provider through
+    # the Headroom proxy. This requires the provider's own API key — a GitHub
+    # Copilot subscription alone is not sufficient for BYOK mode.
+    if not env.get("COPILOT_PROVIDER_API_KEY"):
+        if effective_provider_type == "anthropic":
+            _key = env.get("ANTHROPIC_API_KEY", "")
+        else:
+            _key = env.get("OPENAI_API_KEY", "")
+        if _key:
+            env["COPILOT_PROVIDER_API_KEY"] = _key
+
     env_vars_display: list[str]
     if effective_provider_type == "anthropic":
         env["COPILOT_PROVIDER_BASE_URL"] = f"http://127.0.0.1:{port}"
@@ -1257,6 +1441,19 @@ def copilot(
             f"COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:{port}/v1",
             f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
         ]
+
+    if not env.get("COPILOT_PROVIDER_API_KEY"):
+        src = "ANTHROPIC_API_KEY" if effective_provider_type == "anthropic" else "OPENAI_API_KEY"
+        click.echo(
+            f"\n  Error: Copilot BYOK mode requires a provider API key.\n"
+            f"  `headroom wrap copilot` uses Copilot's BYOK mode, which bypasses GitHub's\n"
+            f"  Copilot API and routes requests directly to the model provider through the\n"
+            f"  Headroom proxy. A GitHub Copilot subscription alone is not sufficient.\n\n"
+            f"  Set one of:\n"
+            f"    export {src}=sk-...          # recommended\n"
+            f"    export COPILOT_PROVIDER_API_KEY=sk-...  # also works\n"
+        )
+        raise SystemExit(1)
 
     if not _copilot_model_configured(copilot_args, env):
         click.echo(
@@ -1357,6 +1554,49 @@ def codex(
             global_agents = Path.home() / ".codex" / "AGENTS.md"
             _inject_rtk_instructions(global_agents, verbose=verbose)
 
+    # Setup memory MCP server for Codex (native tool integration)
+    if memory:
+        click.echo("  Setting up memory for Codex...")
+        mem_dir = Path.cwd() / ".headroom"
+        mem_dir.mkdir(parents=True, exist_ok=True)
+        db_path = str(mem_dir / "memory.db")
+        mem_user = os.environ.get("USER", os.environ.get("USERNAME", "default"))
+
+        # Register MCP server in Codex config
+        _inject_memory_mcp_config(db_path, mem_user)
+
+        # Inject memory guidance into project AGENTS.md
+        agents_md = Path.cwd() / "AGENTS.md"
+        _inject_memory_agents_md(agents_md)
+
+        # Sync Claude's memories → DB so MCP search finds them
+        try:
+            import asyncio
+
+            from headroom.memory.backends.local import LocalBackend, LocalBackendConfig
+            from headroom.memory.sync import sync_import
+            from headroom.memory.sync_adapters.claude_code import (
+                ClaudeCodeAdapter,
+                get_claude_memory_dir,
+            )
+
+            claude_memory_dir = get_claude_memory_dir()
+
+            async def _import_claude_memories() -> int:
+                config = LocalBackendConfig(db_path=db_path)
+                backend = LocalBackend(config)
+                await backend._ensure_initialized()
+                adapter = ClaudeCodeAdapter(claude_memory_dir)
+                count = await sync_import(backend, adapter, mem_user)
+                await backend.close()
+                return count
+
+            imported = asyncio.run(_import_claude_memories())
+            if imported:
+                click.echo(f"  Memory: imported {imported} memories from Claude")
+        except Exception as e:
+            click.echo(f"  Warning: Claude memory import failed: {e}")
+
     if prepare_only:
         _inject_codex_provider_config(port)
         return
@@ -1373,7 +1613,15 @@ def codex(
     # Inject Headroom provider into Codex config so WebSocket traffic also
     # routes through the proxy.  Codex ignores OPENAI_BASE_URL for its WS
     # transport unless a custom provider declares supports_websockets = true.
+    # NOTE: this must run BEFORE _inject_memory_mcp_config because it rewrites
+    # the config file.  Re-inject MCP config after if memory is enabled.
     _inject_codex_provider_config(port)
+    if memory:
+        mem_dir = Path.cwd() / ".headroom"
+        _inject_memory_mcp_config(
+            str(mem_dir / "memory.db"),
+            os.environ.get("USER", os.environ.get("USERNAME", "default")),
+        )
 
     _launch_tool(
         binary=codex_bin,
