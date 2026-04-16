@@ -76,6 +76,7 @@ pytest_cache/
 # Environments
 .env
 .env.*
+!.env.act.example
 .venv
 env/
 venv/
@@ -198,3 +199,7 @@ docs/superpowers/
 
 # Managed platform (separate private repo)
 headroom-managed/
+
+# Local act testing (never commit test tokens)
+/.env.act
+.actrc.local
