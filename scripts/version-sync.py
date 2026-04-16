@@ -56,6 +56,18 @@ def update_package_json(file_path: Path, version: str) -> None:
         f.write("\n")
 
 
+def update_openclaw_package_json(file_path: Path, version: str, sdk_version: str) -> None:
+    """Update openclaw package.json version and headroom-ai dependency range."""
+    with open(file_path, encoding="utf-8") as f:
+        data = json.load(f)
+    data["version"] = version
+    if "dependencies" in data and "headroom-ai" in data["dependencies"]:
+        data["dependencies"]["headroom-ai"] = f"^{sdk_version}"
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
 def update_pyproject_version(root: Path, version: str) -> None:
     """Update pyproject.toml version."""
     pyproject_path = root / "pyproject.toml"
@@ -113,7 +125,9 @@ def main() -> None:
     # Update all versioned files
     update_pyproject_version(args.root, version)
     update_version_py(args.root, version)
-    update_package_json(args.root / "plugins" / "openclaw" / "package.json", version)
+    update_openclaw_package_json(
+        args.root / "plugins" / "openclaw" / "package.json", version, version
+    )
     update_package_json(args.root / "sdk" / "typescript" / "package.json", version)
     write_release_metadata(args.root, version)
 

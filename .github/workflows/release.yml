@@ -209,6 +209,7 @@ jobs:
     if: github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
     environment: pypi  # NOTE: environment name must be a literal; update here if the GitHub environment name changes
     runs-on: ubuntu-latest
+    permissions: id-token: write  # Required for OIDC trusted publishing
     steps:
       - name: Download dist artifact
         uses: actions/download-artifact@v4
@@ -246,6 +247,7 @@ jobs:
         run: |
           cd sdk/typescript
           npm install
+          npm run build
           npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version
           npm publish --access public
 
@@ -255,6 +257,7 @@ jobs:
         run: |
           cd plugins/openclaw
           npm install
+          npm run build
           npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version
           npm publish --access public
 
@@ -285,8 +288,9 @@ jobs:
         run: |
           cd plugins/openclaw
           npm install
+          npm run build
           npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version
-          npm publish --access public
+          npm publish --access public --registry ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}
 
   create-release:
     needs: [detect-version, build]
