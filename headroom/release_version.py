@@ -95,9 +95,10 @@ def compute_release_version(
     """Compute the next release version from the canonical version and existing tags."""
 
     if manual_version:
+        manual = str(SemVer.parse(manual_version))
         return ReleaseVersionInfo(
-            version=manual_version,
-            npm_version=manual_version,
+            version=manual,
+            npm_version=manual,
             canonical=canonical_version,
             height="0",
             bump="manual",

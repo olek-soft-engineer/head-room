@@ -16,9 +16,10 @@ COMMIT_PATTERN = re.compile(
     r"^(feat|fix|ci|chore|perf|refactor|docs|style|test)(\(.+\))?(!)?:\s*(.+)$"
 )
 BREAKING_CHANGE_PATTERN = re.compile(r"^BREAKING CHANGE:\s*(.+)$", re.MULTILINE)
-# Pattern to match each commit entry: subject, optional body, |, hash
-# %s%n%b|%H format: "subject\nbody|hash" or "subject|hash" if no body
 COMMIT_ENTRY_PATTERN = re.compile(r"^(.+?)(?:\n(.+))?\|(\w+)$", re.MULTILINE)
+FIELD_SEP = "\x1f"
+RECORD_SEP = "\x1e"
+GIT_LOG_FORMAT = "%s%x1f%b%x1f%h%x1e"
 
 TYPE_LABELS: dict[str, str] = {
     "feat": "Features",
@@ -30,6 +31,7 @@ TYPE_LABELS: dict[str, str] = {
     "docs": "Documentation",
     "style": "Styles",
     "test": "Tests",
+    "other": "Other Changes",
 }
 
 
@@ -41,33 +43,93 @@ class ParsedCommit(NamedTuple):
     hash: str
 
 
+def iter_commit_entries(log_output: str) -> list[tuple[str, str, str]]:
+    """Split raw git log output into (subject, body, hash) tuples."""
+
+    if not log_output.strip():
+        return []
+
+    if RECORD_SEP in log_output and FIELD_SEP in log_output:
+        entries: list[tuple[str, str, str]] = []
+        for raw_entry in log_output.split(RECORD_SEP):
+            if not raw_entry:
+                continue
+            if FIELD_SEP not in raw_entry:
+                continue
+            subject, body_and_hash = raw_entry.split(FIELD_SEP, 1)
+            if FIELD_SEP not in body_and_hash:
+                continue
+            body, commit_hash = body_and_hash.rsplit(FIELD_SEP, 1)
+            entries.append((subject.strip(), body.strip(), commit_hash.strip()))
+        return entries
+
+    return [
+        (
+            match.group(1).strip(),
+            (match.group(2) or "").strip(),
+            match.group(3).strip(),
+        )
+        for match in COMMIT_ENTRY_PATTERN.finditer(log_output)
+    ]
+
+
+def get_merge_summary(subject: str, body: str) -> str:
+    """Return the first meaningful summary line for a merge commit."""
+
+    if not subject.startswith("Merge "):
+        return ""
+
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
 def parse_commits(log_output: str) -> list[ParsedCommit]:
     """Parse git log output into structured commits."""
+
     commits: list[ParsedCommit] = []
 
-    for match in COMMIT_ENTRY_PATTERN.finditer(log_output):
-        subject = match.group(1)
-        body = match.group(2) or ""
-        commit_hash = match.group(3)
-
+    for subject, body, commit_hash in iter_commit_entries(log_output):
         is_breaking = bool(BREAKING_CHANGE_PATTERN.search(body))
-        commit_match = COMMIT_PATTERN.match(subject)
-        if commit_match:
-            commit_type = commit_match.group(1)
+        merge_summary = get_merge_summary(subject, body)
+        candidates = [subject]
+        if merge_summary:
+            candidates.insert(0, merge_summary)
+
+        for candidate in candidates:
+            commit_match = COMMIT_PATTERN.match(candidate)
+            if not commit_match:
+                continue
+
             scope = commit_match.group(2)
             if scope:
-                scope = scope[1:-1]  # Remove parentheses
-            is_breaking = is_breaking or bool(commit_match.group(3))  # ! in subject
-            message = commit_match.group(4)
+                scope = scope[1:-1]
             commits.append(
                 ParsedCommit(
-                    type=commit_type,
+                    type=commit_match.group(1),
                     scope=scope,
-                    breaking=is_breaking,
-                    message=message,
+                    breaking=is_breaking or bool(commit_match.group(3)),
+                    message=commit_match.group(4),
                     hash=commit_hash,
                 )
             )
+            break
+        else:
+            fallback_message = merge_summary or subject
+            if not fallback_message or fallback_message.startswith("Merge "):
+                continue
+            commits.append(
+                ParsedCommit(
+                    type="other",
+                    scope=None,
+                    breaking=is_breaking,
+                    message=fallback_message,
+                    hash=commit_hash,
+                )
+            )
+
     return commits
 
 
@@ -109,7 +171,7 @@ def generate_changelog(version: str, commits: list[ParsedCommit]) -> str:
 
 def run_git_log(since: str | None, cwd: Path) -> str:
     """Run git log command and return output."""
-    cmd = ["git", "log", "--pretty=format:%s%n%b|%H"]
+    cmd = ["git", "log", "--first-parent", f"--pretty=format:{GIT_LOG_FORMAT}"]
     if since:
         cmd.append(f"{since}..HEAD")
     else:

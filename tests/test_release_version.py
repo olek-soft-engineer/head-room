@@ -1,6 +1,12 @@
 """Tests for release version normalization and bumping."""
 
-from headroom.release_version import compute_release_version, normalize_release_tag
+import pytest
+
+from headroom.release_version import (
+    compute_release_version,
+    find_latest_release_tag,
+    normalize_release_tag,
+)
 
 
 def test_normalize_release_tag_preserves_three_part_tag() -> None:
@@ -61,3 +67,17 @@ def test_manual_version_override_uses_single_semver() -> None:
     assert info.npm_version == "0.6.0"
     assert info.previous_tag == ""
     assert info.bump == "manual"
+
+
+def test_manual_version_override_rejects_legacy_four_part_version() -> None:
+    with pytest.raises(ValueError, match="Invalid semantic version"):
+        compute_release_version(
+            canonical_version="0.5.25",
+            level="patch",
+            tags=["v0.5.25.2"],
+            manual_version="0.5.25.3",
+        )
+
+
+def test_find_latest_release_tag_prefers_highest_normalized_version() -> None:
+    assert find_latest_release_tag(["v0.5.25.2", "v0.5.27", "not-a-tag"]) == "v0.5.27"
