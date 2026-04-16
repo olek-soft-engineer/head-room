@@ -1,0 +1,203 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Manual version override"
+        required: false
+      dry_run:
+        description: "Skip publish"
+        type: boolean
+        default: false
+
+jobs:
+  detect-version:
+    runs-on: ubuntu-latest
+    outputs:
+      level: ${{ steps.bump.outputs.level }}
+      version: ${{ steps.ver.outputs.version }}
+      is_release: ${{ steps.ver.outputs.is_release }}
+      previous_tag: ${{ steps.bump.outputs.previous_tag }}
+      commit_message: ${{ steps.bump.outputs.commit_message }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect bump level
+        id: bump
+        shell: bash
+        run: |
+          msg=$(git log -1 --format=%s)
+          body=$(git log -1 --format=%B)
+          previous_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "commit_message=$msg" >> $GITHUB_OUTPUT
+          echo "previous_tag=$previous_tag" >> $GITHUB_OUTPUT
+          if [[ "$msg" =~ ^feat!.* ]] || [[ "$msg" =~ ^feat: && "$body" =~ BREAKING\ CHANGE ]]; then
+            echo "level=major" >> $GITHUB_OUTPUT
+          elif [[ "$msg" =~ ^feat: ]]; then
+            echo "level=minor" >> $GITHUB_OUTPUT
+          else
+            echo "level=patch" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          version=$(python - <<'PYEOF'
+          import os, re, tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              data = tomllib.load(f)
+          current = data["project"]["version"]
+          major, minor, patch = map(int, re.match(r"(\d+)\.(\d+)\.(\d+)", current).groups())
+
+          level = os.environ.get("LEVEL", "patch")
+          if level == "major":
+              new_ver = f"{major + 1}.0.0"
+          elif level == "minor":
+              new_ver = f"{major}.{minor + 1}.0"
+          else:
+              new_ver = f"{major}.{minor}.{patch + 1}"
+
+          manual = os.environ.get("MANUAL_VER", "")
+          if manual:
+              new_ver = manual
+
+          print(new_ver)
+          PYEOF
+          )
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "is_release=true" >> $GITHUB_OUTPUT
+        env:
+          LEVEL: ${{ steps.bump.outputs.level }}
+          MANUAL_VER: ${{ github.event.inputs.version }}
+
+  build:
+    needs: [detect-version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run version sync
+        run: |
+          python scripts/version-sync.py --version ${{ needs.detect-version.outputs.version }}
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: bump version to ${{ needs.detect-version.outputs.version }}"
+
+      - name: Run changelog generation
+        run: |
+          python scripts/changelog-gen.py \
+            --version ${{ needs.detect-version.outputs.version }} \
+            --since ${{ needs.detect-version.outputs.previous_tag }}
+
+      - name: Show changelog
+        run: cat .changelog.md
+
+      - name: Upload changelog artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelog
+          path: .changelog.md
+
+      - name: Build Python package
+        run: python -m build
+
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish-pypi:
+    needs: [build]
+    if: github.event.inputs.dry_run != 'true'
+    environment:
+      name: pypi
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-npm:
+    needs: [build]
+    if: github.event.inputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: https://registry.npmjs.org
+
+      - name: Download dist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish sdk/typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd sdk/typescript
+          npm install
+          npm version ${{ needs.detect-version.outputs.version }} --no-git-tag-version
+          npm publish --access public
+
+      - name: Publish plugins/openclaw
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd plugins/openclaw
+          npm install
+          npm version ${{ needs.detect-version.outputs.version }} --no-git-tag-version
+          npm publish --access public
+
+  create-release:
+    needs: [detect-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download changelog artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: changelog
+          path: .
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create v${{ needs.detect-version.outputs.version }} \
+            --title "Release v${{ needs.detect-version.outputs.version }}" \
+            --notes-file .changelog.md
