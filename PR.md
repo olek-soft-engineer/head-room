@@ -47,6 +47,7 @@ Fixes #(issue number)
 
 - `.github/workflows/ci.yml` — Added `commitlint` job to enforce conventional commits
 - `.github/workflows/publish.yml` — Changed from `release` trigger to `workflow_dispatch` only (superseded by `release.yml`)
+- `.github/workflows/release.yml` — **Rewritten** with canonical+commit-height algorithm (no more commit loop)
 - `.gitignore` — Added `!scripts/version-sync.py`, `!scripts/changelog-gen.py`, `!scripts/verify-versions.py`, `!scripts/tests/`, `.env.act`, `.actrc.local`
 
 ## Testing
@@ -57,7 +58,15 @@ Fixes #(issue number)
 - [x] Linting passes (`ruff check .`)
 - [ ] Type checking passes (`mypy headroom`) — pre-existing issue in `headroom/cli/wrap.py:487` (unrelated)
 - [x] New tests added for new functionality
-- [x] Workflow tested with `act` (dry-run passes all jobs through build step)
+- [x] Workflow tested with `act` (dry-run passes all jobs through build step — no infinite loop)
+
+## Algorithm Validation
+
+The canonical+commit-height algorithm was validated with test cases:
+- Canonical `0.5.25`, no prior tag, `feat:` commit → git tag `v0.6.0.0`, npm `0.6.0` ✅
+- Canonical `0.5.25`, tag `v0.5.25.2`, `fix:` commit → git tag `v0.5.25.3`, npm `0.5.26` ✅
+- Canonical `0.5.25`, no prior tag, `fix:` commit → git tag `v0.5.25.0`, npm `0.5.25` ✅
+- Manual override `1.2.3` → git tag `v1.2.3`, npm `1.2.3` ✅
 
 ## Test Output
 
@@ -81,11 +90,15 @@ scripts/tests/test_changelog_gen.py .......................
 
 ### Version Bump Logic
 
-| Commit | Bump | Example |
-|--------|------|---------|
-| `fix:`, `ci:`, `chore:`, `perf:`, `refactor:` | patch | 0.5.25 → 0.5.26 |
-| `feat:` | minor | 0.5.26 → 0.6.0 |
-| `feat!:` or `feat:` + `BREAKING CHANGE` body | major | 0.6.0 → 1.0.0 |
+**Canonical + Commit Height Algorithm** — The workflow NEVER commits back to the repo. `pyproject.toml` is the canonical source of truth, updated manually before merging.
+
+| Commit | Bump | Git Tag | npm Version |
+|--------|------|---------|-------------|
+| `fix:`, `ci:`, `chore:`, `perf:`, `refactor:` | patch | `v0.5.25.3` | `0.5.26` |
+| `feat:` | minor | `v0.6.0.0` | `0.6.0` |
+| `feat!:` or `feat:` + `BREAKING CHANGE` body | major | `v1.0.0.0` | `1.0.0` |
+
+The git tag uses `v{canonical}.{height}` (e.g., `v0.5.25.3` = 3 commits since canonical `0.5.25`). npm versions use 3-part semver, bumped from canonical.
 
 ### Package Publishing Targets
 
@@ -112,6 +125,7 @@ Set in: **GitHub repo → Settings → Variables → Actions Variables**.
 
 - **Auto:** On push to `main` — analyzes latest commit, bumps version, builds, publishes, creates GitHub Release
 - **Manual:** `workflow_dispatch` with optional `version` override and `dry_run` flag
+- **Paths ignore:** Skips runs when only `docs/`, `.github/workflows/ci.yml`, `.github/workflows/publish.yml`, `scripts/`, `.commitlintrc.json`, `.actrc`, `.github/act/`, or `.env.act.example` change
 
 ### Local Testing
 
@@ -137,7 +151,9 @@ PyPI uses trusted publisher OIDC — no secret required, only the `pypi` GitHub 
 
 ### First Release Note
 
-The TypeScript packages are currently at `0.1.0` while Python is at `0.5.25`. The first release will align all three to the same version. Use `workflow_dispatch` with a manual `version` input to set the target explicitly.
+The TypeScript packages are currently at `0.1.0` while Python is at `0.5.25`. The first release will align all three to the same version. Update `pyproject.toml` to the desired canonical version before merging, then use `workflow_dispatch` with a manual `version` input to set the target explicitly.
+
+After each release, update `pyproject.toml` to match the published version to keep the canonical current and ensure unique git tags.
 
 ### Parameterized Configuration
 

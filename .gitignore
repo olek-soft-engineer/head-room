@@ -203,3 +203,6 @@ headroom-managed/
 # Local act testing (never commit test tokens)
 /.env.act
 .actrc.local
+
+# Release metadata artifact
+.releaseetadata

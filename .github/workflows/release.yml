@@ -27,6 +27,16 @@ env:
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/publish.yml"
+      - "scripts/**"
+      - ".commitlintrc.json"
+      - ".actrc"
+      - ".actrc.local.example"
+      - ".env.act.example"
+      - ".github/act/**"
   workflow_dispatch:
     inputs:
       version:
@@ -41,10 +51,12 @@ jobs:
   detect-version:
     runs-on: ubuntu-latest
     outputs:
-      level: ${{ steps.bump.outputs.level }}
       version: ${{ steps.ver.outputs.version }}
-      is_release: ${{ steps.ver.outputs.is_release }}
-      previous_tag: ${{ steps.bump.outputs.previous_tag }}
+      npm_version: ${{ steps.ver.outputs.npm_version }}
+      canonical: ${{ steps.ver.outputs.canonical }}
+      height: ${{ steps.ver.outputs.height }}
+      bump: ${{ steps.ver.outputs.bump }}
+      previous_tag: ${{ steps.ver.outputs.previous_tag }}
       commit_message: ${{ steps.bump.outputs.commit_message }}
     steps:
       - uses: actions/checkout@v4
@@ -55,56 +67,91 @@ jobs:
         id: bump
         run: |
           python - <<'PYEOF'
-          import subprocess, os, re, tomllib, sys
+          import subprocess, os, re
 
-          # Get latest commit message and body
           msg = subprocess.run(["git", "log", "-1", "--format=%s"], capture_output=True, text=True, check=False).stdout.strip()
           body = subprocess.run(["git", "log", "-1", "--format=%B"], capture_output=True, text=True, check=False).stdout.strip()
 
-          # Get previous tag, fall back to version from pyproject.toml
-          tag_result = subprocess.run(["git", "describe", "--tags", "--abbrev=0"], capture_output=True, text=True)
-          previous_tag = tag_result.stdout.strip() if tag_result.returncode == 0 else ""
-          if not previous_tag:
-              with open("pyproject.toml", "rb") as f:
-                  previous_tag = "v" + tomllib.load(f)["project"]["version"]
-
-          # Determine bump level
           is_major = bool(re.search(r'^feat!', msg)) or "BREAKING CHANGE" in body
           is_minor = bool(re.search(r'^feat:', msg)) and not is_major
           level = "major" if is_major else ("minor" if is_minor else "patch")
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"commit_message={msg}\n")
-              f.write(f"previous_tag={previous_tag}\n")
               f.write(f"level={level}\n")
           PYEOF
 
-      - name: Compute version
+      - name: Compute version from canonical + commit height
         id: ver
         run: |
           python - <<'PYEOF'
-          import os, re, tomllib
+          import subprocess, os, re, tomllib
 
           with open("pyproject.toml", "rb") as f:
               data = tomllib.load(f)
-          current = data["project"]["version"]
-          major, minor, patch = map(int, re.match(r"(\d+)\.(\d+)\.(\d+)", current).groups())
+          canonical = data["project"]["version"]
+          major, minor, patch = map(int, re.match(r"(\d+)\.(\d+)\.(\d+)", canonical).groups()
 
           level = os.environ.get("LEVEL", "patch")
-          if level == "major":
-              new_ver = f"{major + 1}.0.0"
-          elif level == "minor":
-              new_ver = f"{major}.{minor + 1}.0"
-          else:
-              new_ver = f"{major}.{minor}.{patch + 1}"
-
           manual = os.environ.get("MANUAL_VER", "")
+
           if manual:
               new_ver = manual
+              bump = "manual"
+          else:
+              # Find last tag matching v{canonical}.*
+              tag_prefix = f"v{canonical}."
+              tag_result = subprocess.run(
+                  ["git", "tag", "-l", f"{tag_prefix}*"],
+                  capture_output=True, text=True, check=False
+              )
+              tags = [t.strip() for t in tag_result.stdout.strip().split("\n") if t.strip()]
+
+              if tags:
+                  # Sort by version number, get highest
+                  def parse_tag(t):
+                      v = t.lstrip("v")
+                      parts = re.match(r"(\d+)\.(\d+)\.(\d+)\.(\d+)", v)
+                      return tuple(int(x) for x in parts.groups()) if parts else (0, 0, 0, 0)
+                  tags.sort(key=parse_tag, reverse=True)
+                  last_tag = tags[0]
+                  prev_height = int(last_tag.rsplit(".", 1)[-1])
+
+                  # Count commits since the last tagged release
+                  count_result = subprocess.run(
+                      ["git", "rev-list", f"{last_tag}..HEAD", "--count"],
+                      capture_output=True, text=True, check=False
+                  )
+                  height = int(count_result.stdout.strip())
+              else:
+                  # No prior tag at this canonical level — height = 0
+                  prev_height = 0
+                  height = 0
+
+              # Determine bump
+              if level == "major":
+                  new_ver = f"{major + 1}.0.0.0"
+                  npm_ver = f"{major + 1}.0.0"
+              elif level == "minor":
+                  new_ver = f"{major}.{minor + 1}.0.0"
+                  npm_ver = f"{major}.{minor + 1}.0"
+              else:  # patch
+                  if prev_height > 0:
+                      new_ver = f"{canonical}.{prev_height}"
+                      npm_ver = f"{major}.{minor}.{patch + 1}"
+                  else:
+                      new_ver = f"{canonical}.0"
+                      npm_ver = canonical
+
+              bump = level
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"version={new_ver}\n")
-              f.write("is_release=true\n")
+              f.write(f"npm_version={npm_ver}\n")
+              f.write(f"canonical={canonical}\n")
+              f.write(f"height={height}\n")
+              f.write(f"bump={bump}\n")
+              f.write(f"previous_tag={last_tag if tags else ''}\n")
           PYEOF
         env:
           LEVEL: ${{ needs.detect-version.outputs.level }}
@@ -123,34 +170,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run version sync
+      - name: Sync version to package files
         run: |
-          python scripts/version-sync.py --version ${{ needs.detect-version.outputs.version }}
-
-      - name: Commit version bump
-        run: |
-          python - <<'PYEOF'
-          import subprocess, os
-
-          ver = os.environ["VERSION"]
-
-          def run(cmd, **kwargs):
-              result = subprocess.run(cmd, **kwargs)
-              if result.returncode != 0:
-                  print(f"WARNING: {' '.join(cmd)} exited {result.returncode}", file=os.sys.stderr)
-              return result
-
-          run(["git", "config", "user.name", "github-actions[bot]"])
-          run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"])
-          run(["git", "add", "-A"])
-          result = run(["git", "commit", "-m", f"chore: bump version to {ver}"], capture_output=True)
-          if result.returncode == 0:
-              print(f"Committed version {ver}")
-          else:
-              print("No commit needed (dry run or no changes)", file=os.sys.stderr)
-          PYEOF
-        env:
-          VERSION: ${{ needs.detect-version.outputs.version }}
+          python scripts/version-sync.py --version ${{ needs.detect-version.outputs.npm_version }}
 
       - name: Run changelog generation
         run: |
@@ -165,7 +187,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: changelog
-          path: ${{ github.workspace }}/.changelog.md
+          path: .changelog.md
 
       - name: Build Python package
         run: python -m pip install build wheel && python -m build
@@ -174,7 +196,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: dist
-          path: ${{ github.workspace }}/dist/
+          path: dist/
 
   publish-pypi:
     needs: [build]
@@ -218,7 +240,7 @@ jobs:
         run: |
           cd sdk/typescript
           npm install
-          npm version ${{ needs.detect-version.outputs.version }} --no-git-tag-version
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version
           npm publish --access public
 
       - name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org
@@ -227,7 +249,7 @@ jobs:
         run: |
           cd plugins/openclaw
           npm install
-          npm version ${{ needs.detect-version.outputs.version }} --no-git-tag-version
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version
           npm publish --access public
 
   publish-github-packages:
@@ -257,11 +279,11 @@ jobs:
         run: |
           cd plugins/openclaw
           npm install
-          npm version ${{ needs.detect-version.outputs.version }} --no-git-tag-version
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version
           npm publish --access public
 
   create-release:
-    needs: [detect-version, build, publish-npm, publish-github-packages]
+    needs: [detect-version, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
