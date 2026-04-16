@@ -352,9 +352,8 @@ class TestUnloadKompressModel:
         import headroom.transforms.kompress_compressor as kmod
         from headroom.transforms.kompress_compressor import unload_kompress_model
 
-        # Ensure no model is loaded (previous tests may have set the global)
-        kmod._kompress_model = None
-        kmod._kompress_tokenizer = None
+        # Ensure no model is loaded (previous tests may have set the cache)
+        kmod._kompress_cache.clear()
 
         # Should return False when no model is loaded
         assert unload_kompress_model() is False

@@ -12,6 +12,9 @@ scripts/*
 # Swift SDK (separate repo)
 swift/
 
+# Local planning docs (never commit)
+ENTERPRISE_HARDENING.md
+
 # Audit/scan outputs (contain security findings — never commit)
 bandit_result.txt
 pip_audit_result.txt

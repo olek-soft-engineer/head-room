@@ -90,7 +90,7 @@ jobs:
           with open("pyproject.toml", "rb") as f:
               data = tomllib.load(f)
           canonical = data["project"]["version"]
-          major, minor, patch = map(int, re.match(r"(\d+)\.(\d+)\.(\d+)", canonical).groups()
+          major, minor, patch = map(int, re.match(r"(\d+)\.(\d+)\.(\d+)", canonical).groups())
 
           level = os.environ.get("LEVEL", "patch")
           manual = os.environ.get("MANUAL_VER", "")
@@ -98,6 +98,10 @@ jobs:
           if manual:
               new_ver = manual
               bump = "manual"
+              npm_ver = manual
+              canonical_out = ""
+              height_out = "0"
+              previous_tag_out = ""
           else:
               # Find last tag matching v{canonical}.*
               tag_prefix = f"v{canonical}."
@@ -136,25 +140,21 @@ jobs:
                   new_ver = f"{major}.{minor + 1}.0.0"
                   npm_ver = f"{major}.{minor + 1}.0"
               else:  # patch
-                  if prev_height > 0:
-                      new_ver = f"{canonical}.{prev_height}"
-                      npm_ver = f"{major}.{minor}.{patch + 1}"
-                  else:
-                      new_ver = f"{canonical}.0"
-                      npm_ver = canonical
+                  new_ver = f"{canonical}.{prev_height + 1}"
+                  npm_ver = f"{major}.{minor}.{patch + 1}"
 
               bump = level
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"version={new_ver}\n")
               f.write(f"npm_version={npm_ver}\n")
-              f.write(f"canonical={canonical}\n")
-              f.write(f"height={height}\n")
+              f.write(f"canonical={canonical_out if manual else canonical}\n")
+              f.write(f"height={height_out if manual else height}\n")
               f.write(f"bump={bump}\n")
-              f.write(f"previous_tag={last_tag if tags else ''}\n")
+              f.write(f"previous_tag={previous_tag_out if manual else (last_tag if tags else '')}\n")
           PYEOF
         env:
-          LEVEL: ${{ needs.detect-version.outputs.level }}
+          LEVEL: ${{ steps.bump.outputs.level }}
           MANUAL_VER: ${{ github.event.inputs.version }}
 
   build:
@@ -176,9 +176,15 @@ jobs:
 
       - name: Run changelog generation
         run: |
-          python scripts/changelog-gen.py \
-            --version ${{ needs.detect-version.outputs.version }} \
-            --since ${{ needs.detect-version.outputs.previous_tag }}
+          PREV_TAG="${{ needs.detect-version.outputs.previous_tag }}"
+          if [ -n "$PREV_TAG" ]; then
+            python scripts/changelog-gen.py \
+              --version ${{ needs.detect-version.outputs.version }} \
+              --since "$PREV_TAG"
+          else
+            python scripts/changelog-gen.py \
+              --version ${{ needs.detect-version.outputs.version }}
+          fi
 
       - name: Show changelog
         run: cat .changelog.md
