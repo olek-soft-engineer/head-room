@@ -1,0 +1,192 @@
+---
+title: Releases & CI/CD
+description: Automated release pipeline with semantic versioning, multi-package publishing, and changelog generation.
+---
+
+## Overview
+
+Headroom uses a unified GitHub Actions workflow (`.github/workflows/release.yml`) that automatically publishes all three packages, generates changelogs from conventional commits, and creates GitHub Releases.
+
+## Packages & Registries
+
+| Package | Type | Registry | Environment Variable |
+|---------|------|----------|----------------------|
+| `headroom-ai` | Python | PyPI | `PYPI_PACKAGE` |
+| `headroom-ai` | TypeScript SDK | npmjs.org | `NPM_SDK_PACKAGE` |
+| `headroom-openclaw` | TypeScript plugin | npmjs.org | `NPM_OPENCLAW_PACKAGE` |
+| `headroom-openclaw` | TypeScript plugin | GitHub Package Registry | — |
+
+## Version Strategy
+
+Versions are **synchronized** across all packages from a single source of truth in `pyproject.toml`. All four version files are updated on every release:
+
+- `pyproject.toml` — `[project].version`
+- `headroom/_version.py` — `__version__`
+- `plugins/openclaw/package.json` — `version`
+- `sdk/typescript/package.json` — `version`
+
+## Conventional Commits & Semantic Bumping
+
+The workflow analyzes the latest commit message to determine the version bump:
+
+| Commit | Bump | Example |
+|--------|------|---------|
+| `fix:`, `ci:`, `chore:`, `perf:`, `refactor:` | patch | `0.5.25` → `0.5.26` |
+| `feat:` | minor | `0.5.26` → `0.6.0` |
+| `feat!:` or `feat:` + `BREAKING CHANGE` in body | major | `0.6.0` → `1.0.0` |
+
+Commits are linted in CI via `commitlint` using `@commitlint/config-conventional`.
+
+## Release Workflow
+
+The `release.yml` workflow runs on every push to `main` and consists of five jobs:
+
+```
+detect-version → build → publish-pypi
+                        → publish-npm
+                        → publish-github-packages → create-release
+```
+
+### detect-version
+Parses the latest commit message, determines bump level, reads current version from `pyproject.toml`, computes the new version, and identifies the previous tag for changelog generation.
+
+### build
+1. Syncs version across all four package files via `scripts/version-sync.py`
+2. Commits the version bump as `chore: bump version to X.Y.Z`
+3. Generates changelog via `scripts/changelog-gen.py`
+4. Builds the Python package (`python -m build`)
+5. Uploads artifacts (dist + changelog)
+
+### publish-pypi
+Downloads the Python dist artifact and publishes to PyPI via `pypa/gh-action-pypi-publish@release/v1` (trusted publisher).
+
+### publish-npm
+Publishes both TypeScript packages to npmjs.org:
+- `sdk/typescript/` as `headroom-ai`
+- `plugins/openclaw/` as `headroom-openclaw`
+
+### publish-github-packages
+Publishes `plugins/openclaw/` to GitHub Package Registry (`npm.pkg.github.com`).
+
+### create-release
+Creates a GitHub Release with the generated changelog as release notes, tagged as `vX.Y.Z`.
+
+## Configuration
+
+All package names, registry URLs, and environment names are defined as top-level `env` constants:
+
+```yaml
+env:
+  PYPI_PACKAGE: headroom-ai
+  PYPI_ENVIRONMENT: pypi
+  NPM_REGISTRY_URL: https://registry.npmjs.org
+  NPM_SDK_PACKAGE: headroom-ai
+  NPM_OPENCLAW_PACKAGE: headroom-openclaw
+  GITHUB_PACKAGES_REGISTRY_URL: https://npm.pkg.github.com
+```
+
+To rename a package, update the corresponding constant — all references throughout the workflow update automatically.
+
+## Safety Gates
+
+Each publish job requires **both** of the following to be false:
+
+```yaml
+if: github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
+```
+
+To skip a publish target, set the corresponding GitHub Actions variable:
+
+| Variable | Effect |
+|----------|--------|
+| `PYPI_SKIP=true` | Skip PyPI publish |
+| `NPM_SKIP=true` | Skip both npm publishes |
+| `GITHUB_PKG_SKIP=true` | Skip GitHub Package Registry publish |
+
+Set these in: **GitHub repo → Settings → Variables → Actions Variables → New repository variable**.
+
+## Manual Triggers
+
+The workflow also responds to `workflow_dispatch` for manual control:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Manual version override (e.g. 0.6.0)"
+        required: false
+      dry_run:
+        description: "Skip publish"
+        type: boolean
+        default: false
+```
+
+- **No version input:** auto-detected from commits (normal flow)
+- **`dry_run: true`:** runs all jobs except publish steps — useful for testing
+
+## Local Testing with `act`
+
+### Prerequisites
+
+```bash
+# Install act
+winget install act
+
+# Optional: install actionlint for schema validation
+winget install actionlint
+```
+
+### Dry-run Test
+
+```bash
+act -W .github/workflows/release.yml -e .github/act/dry-run.json
+```
+
+This runs the full workflow end-to-end with `dry_run=true`, skipping all publish steps.
+
+### Test a Specific Commit Type
+
+```bash
+act -W .github/workflows/release.yml -e .github/act/push-feat.json
+```
+
+The `push-feat.json` event file simulates a `feat:` commit on `main`.
+
+### Local Secrets
+
+```bash
+cp .env.act.example .env.act
+# Edit .env.act and add your test tokens
+```
+
+`act` automatically reads `.env` and passes values as workflow secrets.
+
+## Workflow Files Reference
+
+| File | Purpose |
+|------|---------|
+| `.github/workflows/release.yml` | Main release pipeline |
+| `.github/workflows/ci.yml` | CI — lint, test, commitlint |
+| `.github/workflows/publish.yml` | Manual-only PyPI fallback (superseded by `release.yml`) |
+| `.commitlintrc.json` | Conventional commit rules |
+| `scripts/version-sync.py` | Sync version across all packages |
+| `scripts/changelog-gen.py` | Generate changelog from git log |
+| `scripts/verify-versions.py` | Pre-release version alignment check |
+| `.github/act/dry-run.json` | `act` event file for dry-run testing |
+| `.github/act/push-feat.json` | `act` event file for feat commit testing |
+| `.actrc` | Default `act` flags (Ubuntu runner, reuse, quiet) |
+| `.actrc.local.example` | Local `act` override template |
+
+## Required GitHub Secrets
+
+| Secret | Purpose | Where to Get |
+|--------|---------|--------------|
+| `NPM_TOKEN` | Publishing to npmjs.org | npmjs.com → Account → Access Tokens |
+| `GITHUB_TOKEN` | GitHub Package Registry (auto-provided) | Automatically available in GitHub Actions |
+
+The PyPI publish uses trusted publisher OIDC — no secret required, only the `pypi` GitHub Environment must be configured with your PyPI project.
+
+## First Release Note
+
+TypeScript packages (`headroom-ai` SDK and `headroom-openclaw`) start at version `0.1.0`, while Python `headroom-ai` is at `0.5.25`. The first release triggered by this workflow will align all three to the same version. Use `workflow_dispatch` with a manual `version` input to set the target version explicitly.
