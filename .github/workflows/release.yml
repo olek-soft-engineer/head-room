@@ -307,6 +307,9 @@ jobs:
           name: changelog
           path: .
 
+      - name: Show changelog
+        run: cat .changelog.md
+
       - name: Create GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
