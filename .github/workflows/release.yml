@@ -1,14 +1,21 @@
 name: Release
 
 # ─── Package Registry Configuration ────────────────────────────────────────────
-# Edit these constants to change package names across all jobs.
-# They appear inline below — search "headroom-ai" or "headroom-openclaw" to update.
-#
-#   PyPI:           headroom-ai
-#   npm (SDK):      headroom-ai
-#   npm (openclaw): headroom-openclaw
-#   GitHub pkg:     JerrettDavis/headroom-openclaw
-#
+# Edit these constants to change package names, environments, and registries.
+# All values are referenced via ${{ env.VAR }} throughout the workflow.
+env:
+  # PyPI
+  PYPI_PACKAGE: headroom-ai
+  PYPI_ENVIRONMENT: pypi
+
+  # npm (npmjs.org)
+  NPM_REGISTRY_URL: https://registry.npmjs.org
+  NPM_SDK_PACKAGE: headroom-ai
+  NPM_OPENCLAW_PACKAGE: headroom-openclaw
+
+  # GitHub Package Registry
+  GITHUB_PACKAGES_REGISTRY_URL: https://npm.pkg.github.com
+
 on:
   push:
     branches: [main]
@@ -138,7 +145,7 @@ jobs:
     needs: [build]
     if: github.event.inputs.dry_run != 'true'
     environment:
-      name: pypi
+      name: ${{ env.PYPI_ENVIRONMENT }}
     runs-on: ubuntu-latest
     steps:
       - name: Download dist artifact
@@ -147,7 +154,7 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Publish to PyPI
+      - name: Publish ${{ env.PYPI_PACKAGE }} to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
 
   publish-npm:
@@ -163,7 +170,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          registry-url: https://registry.npmjs.org
+          registry-url: ${{ env.NPM_REGISTRY_URL }}
 
       - name: Download dist artifact
         uses: actions/download-artifact@v4
@@ -171,7 +178,7 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Publish headroom-ai (TypeScript SDK) to npmjs.org
+      - name: Publish ${{ env.NPM_SDK_PACKAGE }} (TypeScript SDK) to npmjs.org
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -180,7 +187,7 @@ jobs:
           npm version ${{ needs.detect-version.outputs.version }} --no-git-tag-version
           npm publish --access public
 
-      - name: Publish headroom-openclaw to npmjs.org
+      - name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to npmjs.org
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -202,7 +209,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          registry-url: https://npm.pkg.github.com
+          registry-url: ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}
 
       - name: Download dist artifact
         uses: actions/download-artifact@v4
@@ -210,7 +217,7 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Publish headroom-openclaw to GitHub Package Registry
+      - name: Publish ${{ env.NPM_OPENCLAW_PACKAGE }} to GitHub Package Registry
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
