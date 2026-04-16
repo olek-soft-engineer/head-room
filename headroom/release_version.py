@@ -130,8 +130,8 @@ def get_canonical_version(root: Path) -> str:
         import tomli as tomllib
 
     with open(root / "pyproject.toml", "rb") as file:
-        data = tomllib.load(file)
-    return data["project"]["version"]
+        project = tomllib.load(file)["project"]
+    return str(project["version"])
 
 
 def list_release_tags(root: Path) -> list[str]:
