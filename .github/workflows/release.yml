@@ -186,8 +186,10 @@ jobs:
               --version ${{ needs.detect-version.outputs.version }}
           fi
 
-      - name: Show changelog
-        run: cat .changelog.md
+      - name: Verify changelog exists
+        run: |
+          ls -la .changelog.md
+          cat .changelog.md
 
       - name: Upload changelog artifact
         uses: actions/upload-artifact@v4
