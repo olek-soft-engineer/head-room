@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from headroom.telemetry.context import detect_install_mode, detect_stack
+from headroom.telemetry.context import (
+    MAX_DISTINCT_STACKS,
+    detect_install_mode,
+    detect_stack,
+    normalize_stack,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -92,3 +97,73 @@ class TestDetectStack:
         monkeypatch.setenv("HEADROOM_STACK", "wrap_claude")
         stats = {"requests": {"by_stack": {"adapter_ts_openai": 100}}}
         assert detect_stack(stats) == "wrap_claude"
+
+    def test_invalid_env_falls_through_to_proxy(self, monkeypatch):
+        # Garbage env var → normalize_stack rejects → falls back to default
+        monkeypatch.setenv("HEADROOM_STACK", "bad slug with spaces!")
+        assert detect_stack() == "proxy"
+
+    def test_invalid_env_allows_agent_type_fallback(self, monkeypatch):
+        monkeypatch.setenv("HEADROOM_STACK", "Has-Dashes-And-Caps")
+        monkeypatch.setenv("HEADROOM_AGENT_TYPE", "claude")
+        assert detect_stack() == "wrap_claude"
+
+
+class TestNormalizeStack:
+    def test_empty_and_none(self):
+        assert normalize_stack(None) is None
+        assert normalize_stack("") is None
+        assert normalize_stack("   ") is None
+
+    def test_lowercases_and_strips(self):
+        assert normalize_stack("  Wrap_Claude  ") == "wrap_claude"
+
+    def test_rejects_invalid_charset(self):
+        assert normalize_stack("has-dashes") is None
+        assert normalize_stack("has spaces") is None
+        assert normalize_stack("has.dots") is None
+        assert normalize_stack("has/slashes") is None
+        assert normalize_stack("1_starts_with_digit") is None
+
+    def test_accepts_valid_slugs(self):
+        for slug in ("proxy", "wrap_claude", "adapter_ts_openai", "a", "a1_2_3"):
+            assert normalize_stack(slug) == slug
+
+    def test_rejects_over_64_chars(self):
+        assert normalize_stack("a" * 64) == "a" * 64
+        assert normalize_stack("a" * 65) is None
+
+
+class TestRecordStackValidation:
+    """PrometheusMetrics.record_stack must route through normalize_stack and
+    respect the cardinality cap."""
+
+    def _metrics(self):
+        from headroom.proxy.prometheus_metrics import PrometheusMetrics
+
+        return PrometheusMetrics()
+
+    def test_ignores_invalid_slug(self):
+        m = self._metrics()
+        m.record_stack("bad slug!")
+        m.record_stack("has-dashes")
+        m.record_stack("")
+        m.record_stack(None)
+        assert dict(m.requests_by_stack) == {}
+
+    def test_counts_valid_slug(self):
+        m = self._metrics()
+        m.record_stack("wrap_claude")
+        m.record_stack("WRAP_CLAUDE")
+        assert m.requests_by_stack["wrap_claude"] == 2
+
+    def test_cardinality_cap_rejects_new_slugs(self):
+        m = self._metrics()
+        for i in range(MAX_DISTINCT_STACKS):
+            m.record_stack(f"slug_{i}")
+        assert len(m.requests_by_stack) == MAX_DISTINCT_STACKS
+        m.record_stack("slug_overflow")
+        assert "slug_overflow" not in m.requests_by_stack
+        # but existing slugs still increment
+        m.record_stack("slug_0")
+        assert m.requests_by_stack["slug_0"] == 2

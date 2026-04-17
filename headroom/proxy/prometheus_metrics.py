@@ -199,13 +199,19 @@ class PrometheusMetrics:
 
         ``stack`` is the ``X-Headroom-Stack`` header value (e.g.
         ``adapter_ts_openai``). Called once per inbound request from the
-        proxy's stack middleware; a no-op when the header is absent.
+        proxy's stack middleware; a no-op when the header is absent, fails
+        validation, or would exceed the cardinality cap.
         """
 
-        if not stack:
+        from headroom.telemetry.context import MAX_DISTINCT_STACKS, normalize_stack
+
+        slug = normalize_stack(stack)
+        if not slug:
             return
-        slug = stack.strip().lower()
-        if not slug or len(slug) > 64:
+        if (
+            slug not in self.requests_by_stack
+            and len(self.requests_by_stack) >= MAX_DISTINCT_STACKS
+        ):
             return
         self.requests_by_stack[slug] += 1
 
