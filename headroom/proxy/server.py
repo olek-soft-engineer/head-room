@@ -976,7 +976,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         sdk=os.environ.get("HEADROOM_SDK", "proxy").strip() or "proxy",
         backend=config.backend if hasattr(config, "backend") else "anthropic",
     )
-    _beacon_lock_path = Path.home() / ".headroom" / f".beacon_lock_{config.port}"
+    from headroom import paths as _hr_paths
+
+    _beacon_lock_path = _hr_paths.beacon_lock_path(config.port)
     _beacon_lock_fd: list = [None]  # mutable holder for the lock file descriptor
     _beacon_is_owner: list = [False]
 
