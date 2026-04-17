@@ -1,5 +1,10 @@
 """Tests for release version normalization and bumping."""
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 from headroom.release_version import (
@@ -8,6 +13,8 @@ from headroom.release_version import (
     normalize_release_tag,
     parse_release_tag,
 )
+
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_normalize_release_tag_preserves_three_part_tag() -> None:
@@ -92,3 +99,32 @@ def test_parse_release_tag_preserves_legacy_height_for_sorting() -> None:
     tag = parse_release_tag("v0.5.25.3")
     assert str(tag.version) == "0.5.25"
     assert tag.legacy_height == 3
+
+
+def test_release_version_script_runs_directly_without_importing_headroom_package(
+    tmp_path: Path,
+) -> None:
+    output_path = tmp_path / "github-output.txt"
+    env = os.environ.copy()
+    env["GITHUB_OUTPUT"] = str(output_path)
+    env["LEVEL"] = "patch"
+    env["MANUAL_VER"] = "0.6.0"
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "headroom" / "release_version.py")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert output_path.read_text(encoding="utf-8").splitlines() == [
+        "version=0.6.0",
+        "npm_version=0.6.0",
+        "canonical=0.5.25",
+        "height=0",
+        "bump=manual",
+        "previous_tag=",
+    ]
