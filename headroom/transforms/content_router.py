@@ -1484,10 +1484,12 @@ class ContentRouter(Transform):
         skip_user = (
             kwargs.get("compress_user_messages") is not True and self.config.skip_user_messages
         )
+        skip_system = kwargs.get("compress_system_messages") is False
         protect_recent = kwargs.get("protect_recent", self.config.protect_recent_code)
         protect_analysis = kwargs.get(
             "protect_analysis_context", self.config.protect_analysis_context
         )
+        min_tokens = kwargs.get("min_tokens_to_compress", 50)
         # Store runtime options on self for access by _route_and_compress_block
         self._runtime_target_ratio: float | None = kwargs.get("target_ratio")
         self._runtime_kompress_model: str | None = kwargs.get("kompress_model")
@@ -1664,7 +1666,15 @@ class ContentRouter(Transform):
                 route_counts["user_msg"] += 1
                 continue
 
-            if not content or len(content.split()) < 50:
+            # Protection 1b: Never compress system messages (when disabled)
+            if skip_system and role == "system":
+                result_slots[i] = message
+                transforms_applied.append("router:protected:system_message")
+                route_counts.setdefault("system_msg", 0)
+                route_counts["system_msg"] += 1
+                continue
+
+            if not content or len(content.split()) < min_tokens:
                 # Skip small content
                 result_slots[i] = message
                 route_counts["small"] += 1
