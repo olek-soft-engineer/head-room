@@ -1000,7 +1000,7 @@ class OpenAIHandlerMixin:
                             ),
                             timeout=RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS,
                         )
-                    except TimeoutError:
+                    except asyncio.TimeoutError:
                         memory_context = None
                         logger.info(
                             f"[{request_id}] Memory context lookup exceeded "
@@ -1506,7 +1506,7 @@ class OpenAIHandlerMixin:
                                     ),
                                     timeout=RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS,
                                 )
-                        except TimeoutError:
+                        except asyncio.TimeoutError:
                             memory_context = None
                             logger.info(
                                 f"[{request_id}] WS Memory: Context lookup exceeded "
