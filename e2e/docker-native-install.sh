@@ -69,6 +69,39 @@ if apply_error="$("${WRAPPER}" install apply --scope user 2>&1)"; then
 fi
 grep -Fq "does not support provider/user/system mutation flags" <<<"${apply_error}"
 
+# issue-175: prove the canonical filesystem-contract env vars reached the
+# running container. Unit tests lock install-time forwarding; this asserts
+# the runtime view. We inspect before stopping because `install stop` tears
+# the container down.
+CONTAINER_NAME="headroom-${PROFILE}"
+expected_workspace_dir="/tmp/headroom-home/.headroom"
+expected_config_dir="/tmp/headroom-home/.headroom/config"
+
+container_env="$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "${CONTAINER_NAME}")"
+printf '%s\n' "${container_env}"
+
+if ! grep -Fxq "HEADROOM_WORKSPACE_DIR=${expected_workspace_dir}" <<<"${container_env}"; then
+  echo "HEADROOM_WORKSPACE_DIR missing from ${CONTAINER_NAME} env (expected=${expected_workspace_dir})" >&2
+  exit 1
+fi
+if ! grep -Fxq "HEADROOM_CONFIG_DIR=${expected_config_dir}" <<<"${container_env}"; then
+  echo "HEADROOM_CONFIG_DIR missing from ${CONTAINER_NAME} env (expected=${expected_config_dir})" >&2
+  exit 1
+fi
+
+# Belt-and-suspenders: also assert via `docker exec` so we prove the vars are
+# visible to a process running inside the container (not just in the static
+# Config.Env snapshot).
+exec_env="$(docker exec "${CONTAINER_NAME}" env)"
+if ! grep -Fxq "HEADROOM_WORKSPACE_DIR=${expected_workspace_dir}" <<<"${exec_env}"; then
+  echo "HEADROOM_WORKSPACE_DIR not visible to docker exec in ${CONTAINER_NAME}" >&2
+  exit 1
+fi
+if ! grep -Fxq "HEADROOM_CONFIG_DIR=${expected_config_dir}" <<<"${exec_env}"; then
+  echo "HEADROOM_CONFIG_DIR not visible to docker exec in ${CONTAINER_NAME}" >&2
+  exit 1
+fi
+
 "${WRAPPER}" install stop --profile "${PROFILE}"
 stopped_output="$("${WRAPPER}" install status --profile "${PROFILE}")"
 printf '%s\n' "${stopped_output}"
@@ -85,11 +118,3 @@ curl --fail --silent "http://127.0.0.1:${PORT}/readyz" >/dev/null
 
 "${WRAPPER}" install remove --profile "${PROFILE}"
 [[ ! -e "${HOME}/.headroom/deploy/${PROFILE}" ]]
-
-# TODO(issue-175): verify HEADROOM_WORKSPACE_DIR / HEADROOM_CONFIG_DIR make it
-# into the container's env. The wrapper test installs and tears down so the
-# container is gone by the time we could `docker exec`. A follow-up change
-# should assert on the `docker inspect` env list after `install apply` but
-# before `install stop`. Unit tests in tests/test_install/test_runtime.py and
-# tests/test_install/test_native_installers.py already lock the install-time
-# env-forwarding; this e2e hop is nice-to-have, not blocking.
