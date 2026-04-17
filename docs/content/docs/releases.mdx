@@ -7,6 +7,8 @@ description: Automated release pipeline with semantic versioning, multi-package 
 
 Headroom uses a unified GitHub Actions workflow (`.github/workflows/release.yml`) that automatically publishes all three packages, generates changelogs from conventional commits, and creates GitHub Releases.
 
+Publishing a GitHub Release also triggers `.github/workflows/docker.yml`, which builds GHCR images tagged with the same semantic version and syncs the image contents to that exact release version before build.
+
 ## Packages & Registries
 
 | Package | Type | Registry | Environment Variable |
@@ -15,6 +17,7 @@ Headroom uses a unified GitHub Actions workflow (`.github/workflows/release.yml`
 | `headroom-ai` | TypeScript SDK | npmjs.org | `NPM_SDK_PACKAGE` |
 | `headroom-openclaw` | TypeScript plugin | npmjs.org | `NPM_OPENCLAW_PACKAGE` |
 | `headroom-openclaw` | TypeScript plugin | GitHub Package Registry | — |
+| `ghcr.io/chopratejas/headroom` | Docker image | GitHub Container Registry | — |
 
 ## Version Strategy
 
