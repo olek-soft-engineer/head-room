@@ -22,17 +22,23 @@ _spec.loader.exec_module(_changelog_gen)
 
 COMMIT_PATTERN = _changelog_gen.COMMIT_PATTERN
 BREAKING_CHANGE_PATTERN = _changelog_gen.BREAKING_CHANGE_PATTERN
+FIELD_SEP = _changelog_gen.FIELD_SEP
+RECORD_SEP = _changelog_gen.RECORD_SEP
 ParsedCommit = _changelog_gen.ParsedCommit
 generate_changelog = _changelog_gen.generate_changelog
+iter_commit_entries = _changelog_gen.iter_commit_entries
 parse_commits = _changelog_gen.parse_commits
+
+
+def make_log_entry(subject: str, commit_hash: str, body: str = "") -> str:
+    return f"{subject}{FIELD_SEP}{body}{FIELD_SEP}{commit_hash}{RECORD_SEP}"
 
 
 class TestParseCommits:
     """Tests for parse_commits function."""
 
     def test_parses_feat_commit(self) -> None:
-        # Format: subject|hash
-        log_output = "feat(core): add feature|abc1234"
+        log_output = make_log_entry("feat(core): add feature", "abc1234")
         commits = parse_commits(log_output)
         assert len(commits) == 1
         assert commits[0].type == "feat"
@@ -42,7 +48,7 @@ class TestParseCommits:
         assert commits[0].breaking is False
 
     def test_parses_fix_commit(self) -> None:
-        log_output = "fix(ui): fix bug|def5678"
+        log_output = make_log_entry("fix(ui): fix bug", "def5678")
         commits = parse_commits(log_output)
         assert len(commits) == 1
         assert commits[0].type == "fix"
@@ -51,7 +57,7 @@ class TestParseCommits:
         assert commits[0].hash == "def5678"
 
     def test_parses_ci_commit(self) -> None:
-        log_output = "ci: update github actions|xyz789"
+        log_output = make_log_entry("ci: update github actions", "xyz789")
         commits = parse_commits(log_output)
         assert len(commits) == 1
         assert commits[0].type == "ci"
@@ -60,63 +66,104 @@ class TestParseCommits:
         assert commits[0].hash == "xyz789"
 
     def test_parses_chore_commit(self) -> None:
-        log_output = "chore: cleanup|xyz999"
+        log_output = make_log_entry("chore: cleanup", "xyz999")
         commits = parse_commits(log_output)
         assert len(commits) == 1
         assert commits[0].type == "chore"
         assert commits[0].scope is None
 
     def test_parses_perf_commit(self) -> None:
-        log_output = "perf(dashboard): improve performance|abc111"
+        log_output = make_log_entry("perf(dashboard): improve performance", "abc111")
         commits = parse_commits(log_output)
         assert len(commits) == 1
         assert commits[0].type == "perf"
         assert commits[0].scope == "dashboard"
 
     def test_parses_refactor_commit(self) -> None:
-        log_output = "refactor(api): refactor endpoint|abc222"
+        log_output = make_log_entry("refactor(api): refactor endpoint", "abc222")
         commits = parse_commits(log_output)
         assert len(commits) == 1
         assert commits[0].type == "refactor"
         assert commits[0].scope == "api"
 
     def test_parses_docs_commit(self) -> None:
-        log_output = "docs: update readme|abc333"
+        log_output = make_log_entry("docs: update readme", "abc333")
         commits = parse_commits(log_output)
         assert len(commits) == 1
         assert commits[0].type == "docs"
 
     def test_parses_style_commit(self) -> None:
-        log_output = "style: format code|abc444"
+        log_output = make_log_entry("style: format code", "abc444")
         commits = parse_commits(log_output)
         assert len(commits) == 1
         assert commits[0].type == "style"
 
     def test_parses_test_commit(self) -> None:
-        log_output = "test: add tests for feature|abc555"
+        log_output = make_log_entry("test: add tests for feature", "abc555")
         commits = parse_commits(log_output)
         assert len(commits) == 1
         assert commits[0].type == "test"
 
     def test_detects_breaking_change_in_body(self) -> None:
-        # Format: subject\nbody|hash
-        log_output = "feat(core): add feature\nBREAKING CHANGE: api changed|abc666"
+        log_output = make_log_entry(
+            "feat(core): add feature",
+            "abc666",
+            "BREAKING CHANGE: api changed",
+        )
         commits = parse_commits(log_output)
         assert len(commits) == 1
         assert commits[0].breaking is True
 
     def test_detects_breaking_change_exclamation(self) -> None:
-        log_output = "feat(core)!: api changed|abc777"
+        log_output = make_log_entry("feat(core)!: api changed", "abc777")
         commits = parse_commits(log_output)
         assert len(commits) == 1
         assert commits[0].breaking is True
 
     def test_no_scope_no_problem(self) -> None:
-        log_output = "feat: simple feature|abc888"
+        log_output = make_log_entry("feat: simple feature", "abc888")
         commits = parse_commits(log_output)
         assert len(commits) == 1
         assert commits[0].scope is None
         assert commits[0].message == "simple feature"
+
+    def test_uses_pr_title_from_merge_commit_body(self) -> None:
+        log_output = make_log_entry(
+            "Merge pull request #173 from JerrettDavis/fix/pipeline-permissions-and-docs",
+            "73f6673",
+            "fix: repair release and docs pipelines",
+        )
+        commits = parse_commits(log_output)
+        assert len(commits) == 1
+        assert commits[0].type == "fix"
+        assert commits[0].message == "repair release and docs pipelines"
+
+    def test_falls_back_to_other_changes_for_non_conventional_merge(self) -> None:
+        log_output = make_log_entry(
+            "Merge pull request #186 from skorokithakis/patch-1",
+            "1e80ee3",
+            "Add support for custom Anthropic API URL",
+        )
+        commits = parse_commits(log_output)
+        assert len(commits) == 1
+        assert commits[0].type == "other"
+        assert commits[0].message == "Add support for custom Anthropic API URL"
+
+    def test_iter_commit_entries_parses_real_git_log_delimiters(self) -> None:
+        log_output = make_log_entry(
+            "fix: patch release flow", "abc1234", "BREAKING CHANGE: no"
+        ) + make_log_entry("docs: update readme", "def5678")
+        assert iter_commit_entries(log_output) == [
+            ("fix: patch release flow", "BREAKING CHANGE: no", "abc1234"),
+            ("docs: update readme", "", "def5678"),
+        ]
+
+    def test_iter_commit_entries_keeps_field_separator_inside_body(self) -> None:
+        body = f"line one{FIELD_SEP}line two"
+        log_output = make_log_entry("fix: patch release flow", "abc1234", body)
+        assert iter_commit_entries(log_output) == [
+            ("fix: patch release flow", body, "abc1234"),
+        ]
 
 
 class TestGenerateChangelog:
@@ -178,19 +225,33 @@ class TestGenerateChangelog:
         result = generate_changelog("0.6.0", commits)
         assert "Breaking Changes" not in result
 
+    def test_includes_other_changes_section(self) -> None:
+        commits = [
+            ParsedCommit(
+                type="other",
+                scope=None,
+                breaking=False,
+                message="Add support for custom Anthropic API URL",
+                hash="abc123",
+            )
+        ]
+        result = generate_changelog("0.6.0", commits)
+        assert "### Other Changes" in result
+        assert "- Add support for custom Anthropic API URL (abc123)" in result
+
 
 class TestIntegrationWithMock:
     """Integration tests with mocked subprocess.run."""
 
     def test_full_flow_with_mocked_git(self) -> None:
-        # Simulate git log output with format: subject|hash
-        # Breaking change in body: subject\nbody lines|hash
         log_output = (
-            "feat(core): add new feature|abc1234\n"
-            "fix(ui): fix bug|def5678\n"
-            "ci: update github actions|xyz789\n"
-            "feat(outer): breaking change\nBREAKING CHANGE: this is breaking|bbb111\n"
-            "chore: cleanup|yyy999"
+            make_log_entry("feat(core): add new feature", "abc1234")
+            + make_log_entry("fix(ui): fix bug", "def5678")
+            + make_log_entry("ci: update github actions", "xyz789")
+            + make_log_entry(
+                "feat(outer): breaking change", "bbb111", "BREAKING CHANGE: this is breaking"
+            )
+            + make_log_entry("chore: cleanup", "yyy999")
         )
         commits = parse_commits(log_output)
 
