@@ -41,6 +41,8 @@ The wrapper keeps Headroom inside Docker and mounts host state back into the con
 
 Port `8787` stays the default, so `http://localhost:8787` works the same way as a native install.
 
+Published releases also push versioned GHCR tags such as `ghcr.io/chopratejas/headroom:0.5.26`, and those images are built with the same synced package version used for the matching PyPI and npm release.
+
 ## How the wrapper behaves
 
 ### Native Headroom commands
