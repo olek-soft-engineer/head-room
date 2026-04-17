@@ -198,8 +198,7 @@ CLAUDE.md
 .vitals/
 
 # Superpowers working files (plans, specs, brainstorming)
-# docs/superpowers/    (moved to specify/ for versioning)
-# specify/             (NOTE: not ignored - tracked in git)
+# docs/spec/           (lives in git - git-versioned living specification)
 
 # Managed platform (separate private repo)
 headroom-managed/
