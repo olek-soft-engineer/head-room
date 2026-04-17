@@ -28,7 +28,6 @@ import asyncio
 import json
 import logging
 import os
-import random
 import sys
 import time
 from datetime import datetime, timezone
@@ -113,6 +112,7 @@ from headroom.proxy.helpers import (
     _read_request_json,  # noqa: F401
     _setup_file_logging,  # noqa: F401
     is_anthropic_auth,  # noqa: F401
+    jitter_delay_ms,
 )
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
@@ -962,11 +962,11 @@ class HeadroomProxy(
                     raise
 
                 # Exponential backoff with jitter
-                delay = min(
-                    self.config.retry_base_delay_ms * (2**attempt),
+                delay_with_jitter = jitter_delay_ms(
+                    self.config.retry_base_delay_ms,
                     self.config.retry_max_delay_ms,
+                    attempt,
                 )
-                delay_with_jitter = delay * (0.5 + random.random())
 
                 logger.warning(
                     f"Request failed (attempt {attempt + 1}), retrying in {delay_with_jitter:.0f}ms: {e}"
