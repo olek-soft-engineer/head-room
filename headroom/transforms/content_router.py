@@ -1666,6 +1666,7 @@ class ContentRouter(Transform):
                 route_counts["user_msg"] += 1
                 continue
 
+            # Protection 1b: Never compress system messages (when disabled)
             if skip_system and role == "system":
                 result_slots[i] = message
                 transforms_applied.append("router:protected:system_message")

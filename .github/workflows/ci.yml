@@ -238,6 +238,7 @@ jobs:
       - name: Install act
         run: |
           curl -fsSL https://raw.githubusercontent.com/nektos/act/master/install.sh | sudo bash
+          sudo install ./bin/act /usr/local/bin/act
 
       - name: Validate workflow files
         run: |

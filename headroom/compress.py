@@ -103,8 +103,8 @@ class CompressConfig:
 
     compress_system_messages: bool = True
     """Compress system messages (default: True).
-    Set False to preserve system prompts exactly as-is when they must remain
-    byte-for-byte stable."""
+    Set False to preserve system prompts exactly as-is. Useful for voice
+    agents where tool definitions and instructions must not be altered."""
 
     protect_recent: int = 4
     """Don't compress the last N messages (they're the active conversation).
@@ -121,7 +121,9 @@ class CompressConfig:
     own logic based on array dedup."""
 
     min_tokens_to_compress: int = 250
-    """Minimum token count before a message is eligible for compression."""
+    """Minimum token count for a message to be compressed.
+    Messages shorter than this are left unchanged. Default 250.
+    Set lower for voice agents where turns are short."""
 
     # Model variant
     kompress_model: str | None = None
@@ -229,9 +231,9 @@ def compress(
             compress_user_messages=cfg.compress_user_messages,
             compress_system_messages=cfg.compress_system_messages,
             target_ratio=cfg.target_ratio,
-            min_tokens_to_compress=cfg.min_tokens_to_compress,
             protect_recent=cfg.protect_recent,
             protect_analysis_context=cfg.protect_analysis_context,
+            min_tokens_to_compress=cfg.min_tokens_to_compress,
             kompress_model=cfg.kompress_model,
         )
 
