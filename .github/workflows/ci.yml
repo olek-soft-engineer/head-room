@@ -183,7 +183,8 @@ jobs:
 
       - name: Run native installer wrapper tests
         run: |
-          export PATH="$(brew --prefix bash)/bin:$PATH"
+          BASH_PREFIX="$(brew --prefix bash)"
+          export PATH="$BASH_PREFIX/bin:$PATH"
           pytest tests/test_install/test_native_installers.py -q
 
   build:

@@ -22,7 +22,7 @@ env:
   # Locally via act: pass -e event.yml or set in .actrc.local (see .actrc.example).
   PYPI_SKIP: "false"
   NPM_SKIP: "false"
-  GITHUB_PKG_SKIP: "false"
+  GH_PACKAGES_SKIP: "false"
 
 on:
   push:
@@ -189,7 +189,7 @@ jobs:
           echo "::notice::PyPI publish skipped — OIDC trusted publisher not configured for this repo. See: https://pypi.org/trusted-publishers/ — Set PYPI_SKIP=true in repo Variables to suppress this notice."
 
   publish-npm:
-    needs: [build]
+    needs: [detect-version, build]
     if: github.event.inputs.dry_run != 'true' && vars.NPM_SKIP != 'true'
     runs-on: ubuntu-latest
     steps:
@@ -239,8 +239,8 @@ jobs:
           echo "::notice::One or more npm publishes failed. Set NPM_SKIP=true in repo Variables to skip both npm publishes if tokens are not configured."
 
   publish-github-packages:
-    needs: [build]
-    if: github.event.inputs.dry_run != 'true' && vars.GITHUB_PKG_SKIP != 'true'
+    needs: [detect-version, build]
+    if: github.event.inputs.dry_run != 'true' && vars.GH_PACKAGES_SKIP != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -274,7 +274,7 @@ jobs:
       - name: GPR publish notice
         if: steps.gpr-publish.outcome == 'failure'
         run: |
-          echo "::notice::GitHub Package Registry publish failed. Check GITHUB_TOKEN permissions and registry configuration. Set GITHUB_PKG_SKIP=true to skip."
+          echo "::notice::GitHub Package Registry publish failed. Check GITHUB_TOKEN permissions and registry configuration. Set GH_PACKAGES_SKIP=true to skip."
 
   publish-docker:
     needs: [detect-version]

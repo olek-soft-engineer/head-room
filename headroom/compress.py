@@ -101,6 +101,11 @@ class CompressConfig:
     Set True for document compression, RAG pipelines, or when user messages
     contain large tool outputs."""
 
+    compress_system_messages: bool = True
+    """Compress system messages (default: True).
+    Set False to preserve system prompts exactly as-is when they must remain
+    byte-for-byte stable."""
+
     protect_recent: int = 4
     """Don't compress the last N messages (they're the active conversation).
     Set 0 to compress everything."""
@@ -114,6 +119,9 @@ class CompressConfig:
     0.5 = keep 50% (safe for documents). 0.7 = keep 70% (conservative).
     Only affects Kompress (text compression). SmartCrusher (JSON) has its
     own logic based on array dedup."""
+
+    min_tokens_to_compress: int = 250
+    """Minimum token count before a message is eligible for compression."""
 
     # Model variant
     kompress_model: str | None = None
@@ -219,7 +227,9 @@ def compress(
             biases=biases,
             # Pass CompressConfig options through to transforms
             compress_user_messages=cfg.compress_user_messages,
+            compress_system_messages=cfg.compress_system_messages,
             target_ratio=cfg.target_ratio,
+            min_tokens_to_compress=cfg.min_tokens_to_compress,
             protect_recent=cfg.protect_recent,
             protect_analysis_context=cfg.protect_analysis_context,
             kompress_model=cfg.kompress_model,
