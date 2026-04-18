@@ -481,8 +481,12 @@ class AnthropicHandlerMixin:
     
             # Subscription tracker: notify on OAuth requests (not API-key requests)
             _auth_header = headers.get("authorization", "")
-            if _auth_header.startswith("Bearer ") and not _auth_header.startswith("Bearer sk-ant-api"):
-                from headroom.subscription.tracker import get_subscription_tracker as _get_sub_tracker
+            if _auth_header.startswith("Bearer ") and not _auth_header.startswith(
+                "Bearer sk-ant-api"
+            ):
+                from headroom.subscription.tracker import (
+                    get_subscription_tracker as _get_sub_tracker,
+                )
     
                 _sub_tracker = _get_sub_tracker()
                 if _sub_tracker is not None:
@@ -1285,7 +1289,9 @@ class AnthropicHandlerMixin:
                         and response.status_code == 200
                         and self.ccr_response_handler.has_ccr_tool_calls(resp_json, "anthropic")
                     ):
-                        logger.info(f"[{request_id}] CCR: Detected retrieval tool call, handling...")
+                        logger.info(
+                            f"[{request_id}] CCR: Detected retrieval tool call, handling..."
+                        )
     
                         # Create API call function for continuation
                         # Use a fresh client to avoid potential decompression state issues
@@ -1387,7 +1393,9 @@ class AnthropicHandlerMixin:
                         and response.status_code == 200
                         and self.memory_handler.has_memory_tool_calls(resp_json, "anthropic")
                     ):
-                        logger.info(f"[{request_id}] Memory: Detected memory tool call, handling...")
+                        logger.info(
+                            f"[{request_id}] Memory: Detected memory tool call, handling..."
+                        )
     
                         try:
                             # Execute memory tool calls
@@ -1406,7 +1414,10 @@ class AnthropicHandlerMixin:
                                     "content": tool_results,
                                 }
     
-                                continuation_messages = optimized_messages + [assistant_msg, user_msg]
+                                continuation_messages = optimized_messages + [
+                                    assistant_msg,
+                                    user_msg,
+                                ]
     
                                 # Make continuation API call
                                 continuation_body = {**body, "messages": continuation_messages}
@@ -1580,7 +1591,9 @@ class AnthropicHandlerMixin:
                     # Remove compression headers since httpx already decompressed the response
                     response_headers = dict(response.headers)
                     response_headers.pop("content-encoding", None)
-                    response_headers.pop("content-length", None)  # Length changed after decompression
+                    response_headers.pop(
+                        "content-length", None
+                    )  # Length changed after decompression
     
                     # Inject Headroom compression metrics (for SaaS metering)
                     response_headers["x-headroom-tokens-before"] = str(original_tokens)
@@ -1609,7 +1622,9 @@ class AnthropicHandlerMixin:
                                 headers=response_headers,
                             )
                         except Exception as sec_err:
-                            logger.warning(f"[{request_id}] Security response scan error: {sec_err}")
+                            logger.warning(
+                                f"[{request_id}] Security response scan error: {sec_err}"
+                            )
     
                     return Response(
                         content=response.content,
@@ -1658,7 +1673,6 @@ class AnthropicHandlerMixin:
             # deep-copy) would otherwise leak the pre-upstream semaphore
             # permanently. The emit function is idempotent.
             await _finalize_pre_upstream()
-
     async def handle_anthropic_batch_create(
         self,
         request: Request,
