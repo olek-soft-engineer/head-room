@@ -7,7 +7,7 @@
 [![CI](https://github.com/chopratejas/headroom/actions/workflows/ci.yml/badge.svg)](https://github.com/chopratejas/headroom/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/headroom-ai.svg)](https://pypi.org/project/headroom-ai/)
 [![npm](https://img.shields.io/npm/v/headroom-ai.svg)](https://www.npmjs.com/package/headroom-ai)
-[![Model: Kompress-base](https://img.shields.io/badge/model-Kompress--base-yellow.svg)](https://huggingface.co/headroom-ai/Kompress-base)
+[![Model: Kompress-base](https://img.shields.io/badge/model-Kompress--base-yellow.svg)](https://huggingface.co/chopratejas/kompress-base)
 [![Tokens saved: 60B+](https://img.shields.io/badge/tokens%20saved-60B%2B-2ea44f)](https://headroomlabs.ai/dashboard)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-online-blue.svg)](https://chopratejas.github.io/headroom/)
@@ -71,7 +71,7 @@ OPENAI_BASE_URL=http://localhost:8787/v1 your-app
 
 - **Accuracy-preserving.** GSM8K **0.870 → 0.870** (±0.000). TruthfulQA **+0.030**. SQuAD v2 and BFCL both **97%** accuracy after compression. Validated on public OSS benchmarks you can rerun yourself.
 - **Runs on your machine.** No cloud API, no data egress. Compression latency is milliseconds — faster end-to-end for Sonnet / Opus / GPT-4 class models than a hosted service round-trip.
-- **[Kompress-base](https://huggingface.co/headroom-ai/Kompress-base) on HuggingFace.** Our open-source text compressor, fine-tuned on real agentic traces — tool outputs, logs, RAG chunks, code. Install with `pip install "headroom-ai[ml]"`.
+- **[Kompress-base](https://huggingface.co/chopratejas/kompress-base) on HuggingFace.** Our open-source text compressor, fine-tuned on real agentic traces — tool outputs, logs, RAG chunks, code. Install with `pip install "headroom-ai[ml]"`.
 - **Cross-agent memory and learning.** Claude Code saves a fact, Codex reads it back. `headroom learn` mines failed sessions and writes corrections straight to `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` — reliability compounds over time.
 - **Reversible (CCR).** Compression is not deletion. The model can always call `headroom_retrieve` to pull the original bytes. Nothing is thrown away.
 
@@ -101,7 +101,7 @@ Bundles the [RTK](https://github.com/rtk-ai/rtk) binary for shell-output rewriti
  LLM provider  (Anthropic · OpenAI · Bedrock · …)
 ```
 
-→ [Architecture](https://chopratejas.github.io/headroom/docs/architecture) · [CCR reversible compression](https://chopratejas.github.io/headroom/docs/ccr) · [Kompress-base model card](https://huggingface.co/headroom-ai/Kompress-base)
+→ [Architecture](https://chopratejas.github.io/headroom/docs/architecture) · [CCR reversible compression](https://chopratejas.github.io/headroom/docs/ccr) · [Kompress-base model card](https://huggingface.co/chopratejas/kompress-base)
 
 ---
 
@@ -259,7 +259,7 @@ Devcontainers in `.devcontainer/` (default + `memory-stack` with Qdrant & Neo4j)
 
 - **[Live leaderboard](https://headroomlabs.ai/dashboard)** — 60B+ tokens saved and counting.
 - **[Discord](https://discord.gg/yRmaUNpsPJ)** — questions, feedback, war stories.
-- **[Kompress-base on HuggingFace](https://huggingface.co/headroom-ai/Kompress-base)** — the model behind our text compression.
+- **[Kompress-base on HuggingFace](https://huggingface.co/chopratejas/kompress-base)** — the model behind our text compression.
 
 ## License
 
