@@ -10,7 +10,7 @@
 [![Model: Kompress-base](https://img.shields.io/badge/model-Kompress--base-yellow.svg)](https://huggingface.co/chopratejas/kompress-base)
 [![Tokens saved: 60B+](https://img.shields.io/badge/tokens%20saved-60B%2B-2ea44f)](https://headroomlabs.ai/dashboard)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-online-blue.svg)](https://chopratejas.github.io/headroom/)
+[![Docs](https://img.shields.io/badge/docs-online-blue.svg)](https://headroom-docs.vercel.app/docs)
 
 <img src="HeadroomDemo-Fast.gif" alt="Headroom in action" width="820">
 
@@ -101,7 +101,7 @@ Bundles the [RTK](https://github.com/rtk-ai/rtk) binary for shell-output rewriti
  LLM provider  (Anthropic · OpenAI · Bedrock · …)
 ```
 
-→ [Architecture](https://chopratejas.github.io/headroom/docs/architecture) · [CCR reversible compression](https://chopratejas.github.io/headroom/docs/ccr) · [Kompress-base model card](https://huggingface.co/chopratejas/kompress-base)
+→ [Architecture](https://headroom-docs.vercel.app/docs/architecture) · [CCR reversible compression](https://headroom-docs.vercel.app/docs/ccr) · [Kompress-base model card](https://huggingface.co/chopratejas/kompress-base)
 
 ---
 
@@ -140,7 +140,7 @@ python -m headroom.evals suite --tier 1
   <p><b><a href="https://headroomlabs.ai/dashboard">60B+ tokens saved by the community in the last 20 days — live leaderboard →</a></b></p>
 </div>
 
-→ [Full benchmarks & methodology](https://chopratejas.github.io/headroom/docs/benchmarks)
+→ [Full benchmarks & methodology](https://headroom-docs.vercel.app/docs/benchmarks)
 
 ---
 
@@ -177,7 +177,7 @@ MCP-native too — `headroom mcp install` exposes `headroom_compress`, `headroom
 | LiteLLM                 | `litellm.callbacks = [HeadroomCallback()]`                       |
 | LangChain               | `HeadroomChatModel(your_llm)`                                    |
 | Agno                    | `HeadroomAgnoModel(your_model)`                                  |
-| Strands                 | [Strands guide](https://chopratejas.github.io/headroom/docs/strands) |
+| Strands                 | [Strands guide](https://headroom-docs.vercel.app/docs/strands) |
 | ASGI apps               | `app.add_middleware(CompressionMiddleware)`                      |
 | Multi-agent             | `SharedContext().put / .get`                                     |
 | MCP clients             | `headroom mcp install`                                           |
@@ -212,7 +212,7 @@ docker pull ghcr.io/chopratejas/headroom:latest
 
 Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-base), `[agno]`, `[langchain]`, `[evals]`. Requires **Python 3.10+**.
 
-→ [Installation guide](https://chopratejas.github.io/headroom/docs/installation) — Docker tags, persistent service, PowerShell, devcontainers.
+→ [Installation guide](https://headroom-docs.vercel.app/docs/installation) — Docker tags, persistent service, PowerShell, devcontainers.
 
 ---
 
@@ -220,12 +220,12 @@ Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-base), `[agno]`, `[langcha
 
 | Start here                                                              | Go deeper                                                              |
 |-------------------------------------------------------------------------|------------------------------------------------------------------------|
-| [Quickstart](https://chopratejas.github.io/headroom/docs/quickstart)    | [Architecture](https://chopratejas.github.io/headroom/docs/architecture) |
-| [Proxy](https://chopratejas.github.io/headroom/docs/proxy)              | [How compression works](https://chopratejas.github.io/headroom/docs/how-compression-works) |
-| [MCP tools](https://chopratejas.github.io/headroom/docs/mcp)            | [CCR — reversible compression](https://chopratejas.github.io/headroom/docs/ccr) |
-| [Memory](https://chopratejas.github.io/headroom/docs/memory)            | [Cache optimization](https://chopratejas.github.io/headroom/docs/cache-optimization) |
-| [Failure learning](https://chopratejas.github.io/headroom/docs/failure-learning) | [Benchmarks](https://chopratejas.github.io/headroom/docs/benchmarks) |
-| [Configuration](https://chopratejas.github.io/headroom/docs/configuration) | [Limitations](https://chopratejas.github.io/headroom/docs/limitations) |
+| [Quickstart](https://headroom-docs.vercel.app/docs/quickstart)    | [Architecture](https://headroom-docs.vercel.app/docs/architecture) |
+| [Proxy](https://headroom-docs.vercel.app/docs/proxy)              | [How compression works](https://headroom-docs.vercel.app/docs/how-compression-works) |
+| [MCP tools](https://headroom-docs.vercel.app/docs/mcp)            | [CCR — reversible compression](https://headroom-docs.vercel.app/docs/ccr) |
+| [Memory](https://headroom-docs.vercel.app/docs/memory)            | [Cache optimization](https://headroom-docs.vercel.app/docs/cache-optimization) |
+| [Failure learning](https://headroom-docs.vercel.app/docs/failure-learning) | [Benchmarks](https://headroom-docs.vercel.app/docs/benchmarks) |
+| [Configuration](https://headroom-docs.vercel.app/docs/configuration) | [Limitations](https://headroom-docs.vercel.app/docs/limitations) |
 
 ---
 
