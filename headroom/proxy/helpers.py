@@ -144,6 +144,16 @@ def _get_rtk_stats() -> dict[str, Any] | None:
     }
 
 
+def is_anthropic_auth(headers: dict[str, str]) -> bool:
+    """Detect Anthropic auth signals in request headers."""
+    if headers.get("x-api-key") or headers.get("anthropic-version"):
+        return True
+    auth = headers.get("authorization", "")
+    if auth.startswith("Bearer sk-ant-"):
+        return True
+    return False
+
+
 async def _read_request_json(request: Request) -> dict[str, Any]:
     """Read and parse JSON from a request, handling compressed bodies.
 

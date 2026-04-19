@@ -399,6 +399,10 @@ class AnthropicHandlerMixin:
         # Rate limiting
         if self.rate_limiter:
             api_key = headers.get("x-api-key", "")
+            if not api_key:
+                auth = headers.get("authorization", "")
+                if auth.startswith("Bearer "):
+                    api_key = auth[7:]
             client_ip = request.client.host if request.client else "unknown"
             rate_key = f"{api_key[:16]}:{client_ip}" if api_key else client_ip
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)

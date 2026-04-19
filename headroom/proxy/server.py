@@ -112,6 +112,7 @@ from headroom.proxy.helpers import (
     _get_rtk_stats,  # noqa: F401
     _read_request_json,  # noqa: F401
     _setup_file_logging,  # noqa: F401
+    is_anthropic_auth,  # noqa: F401
 )
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
@@ -2173,10 +2174,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def list_models(request: Request):
         """List models - route based on auth header.
 
-        - x-api-key header present -> Anthropic
-        - Authorization: Bearer header -> OpenAI
+        - x-api-key / anthropic-version / Bearer sk-ant-* -> Anthropic
+        - Otherwise -> OpenAI
         """
-        if request.headers.get("x-api-key"):
+        if is_anthropic_auth(dict(request.headers)):
             return await proxy.handle_passthrough(
                 request, proxy.ANTHROPIC_API_URL, "models", "anthropic"
             )
@@ -2186,10 +2187,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def get_model(request: Request, model_id: str):
         """Get model details - route based on auth header.
 
-        - x-api-key header present -> Anthropic
-        - Authorization: Bearer header -> OpenAI
+        - x-api-key / anthropic-version / Bearer sk-ant-* -> Anthropic
+        - Otherwise -> OpenAI
         """
-        if request.headers.get("x-api-key"):
+        if is_anthropic_auth(dict(request.headers)):
             return await proxy.handle_passthrough(
                 request, proxy.ANTHROPIC_API_URL, "models", "anthropic"
             )
@@ -2319,8 +2320,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         if custom_base:
             return await proxy.handle_passthrough(request, custom_base.rstrip("/"))
 
-        # Anthropic: sends anthropic-version header and x-api-key
-        if request.headers.get("anthropic-version") or request.headers.get("x-api-key"):
+        # Anthropic: x-api-key, anthropic-version, or Bearer sk-ant-* token
+        if is_anthropic_auth(dict(request.headers)):
             base_url = proxy.ANTHROPIC_API_URL
         # Gemini: sends x-goog-api-key
         elif request.headers.get("x-goog-api-key"):
