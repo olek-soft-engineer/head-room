@@ -143,13 +143,13 @@ jobs:
           cd sdk/typescript
           npm install
           npm run build
-          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
           npm pack --pack-destination ../../release-assets
 
           cd ../../plugins/openclaw
           npm install
           npm run build
-          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
           npm pack --pack-destination ../../release-assets
 
       - name: Upload dist artifact
@@ -217,7 +217,7 @@ jobs:
           cd sdk/typescript
           npm install
           npm run build
-          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
           npm publish --access public
         continue-on-error: true
 
@@ -229,7 +229,7 @@ jobs:
           cd plugins/openclaw
           npm install
           npm run build
-          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
           npm publish --access public
         continue-on-error: true
 
@@ -267,7 +267,7 @@ jobs:
           cd plugins/openclaw
           npm install
           npm run build
-          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version
+          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
           npm publish --access public --registry ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}
         continue-on-error: true
 
