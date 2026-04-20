@@ -32,7 +32,7 @@ import random
 import statistics
 import sys
 import time
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +44,33 @@ try:
     from websockets.asyncio.client import connect as ws_connect
 except ImportError:  # pragma: no cover - older websockets fallback
     from websockets.client import connect as ws_connect  # type: ignore[no-redef]
+
+# asyncio.timeout was added in Python 3.11; provide a thin shim for 3.10.
+if sys.version_info >= (3, 11):
+    _asyncio_timeout = asyncio.timeout
+else:
+
+    @asynccontextmanager
+    async def _asyncio_timeout(delay: float | None):  # type: ignore[no-redef]
+        """Minimal shim that mimics ``asyncio.timeout`` using ``wait_for``."""
+        # For the single call-site we have, wrapping the entire body in a task
+        # and cancelling it on timeout is sufficient.  We yield control, and if
+        # the caller's block exceeds *delay* seconds the enclosing task is
+        # cancelled.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + delay if delay is not None else None
+        task = asyncio.current_task()
+        handle = None
+        if deadline is not None and task is not None:
+            handle = loop.call_at(deadline, task.cancel)
+        try:
+            yield
+        except asyncio.CancelledError:
+            raise asyncio.TimeoutError() from None
+        finally:
+            if handle is not None:
+                handle.cancel()
+
 
 from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
 
@@ -165,7 +192,7 @@ async def warmup_probe(
     frame_sent = False
     note = "unknown"
     try:
-        async with asyncio.timeout(timeout_s):
+        async with _asyncio_timeout(timeout_s):
             async with ws_connect(
                 ws_url,
                 additional_headers={"Authorization": "Bearer repro-harness"},
