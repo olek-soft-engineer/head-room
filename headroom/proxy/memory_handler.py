@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from dataclasses import dataclass, field
@@ -130,6 +131,22 @@ class MemoryHandler:
             self._init_lock = asyncio.Lock()
         return self._init_lock
 
+    async def _close_backend_instance(self, backend: Any, *, reason: str) -> None:
+        """Best-effort close for a partially initialized backend."""
+        close = getattr(backend, "close", None)
+        if not callable(close):
+            return
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning(
+                "Memory: failed to close backend during %s cleanup: %s",
+                reason,
+                exc,
+            )
+
     def _init_native_memory_dir(self) -> None:
         """Initialize native memory directory."""
         if self.config.native_memory_dir:
@@ -190,7 +207,11 @@ class MemoryHandler:
             # was cancelled by wait_for. Callers that do
             # ``if self.memory_handler._backend:`` must not see a
             # truthy-but-broken backend.
+            existing_backend = self._backend
+            if existing_backend is not None:
+                await self._close_backend_instance(existing_backend, reason="timeout")
             self._backend = None
+            self._initialized = False
             logger.error(
                 "Memory: backend initialization timed out after "
                 f"{STARTUP_INIT_TIMEOUT_SECONDS}s "
@@ -205,6 +226,9 @@ class MemoryHandler:
             # blocks don't either, so it propagates unconditionally.
             # Reset state so any later retry starts clean, then re-raise:
             # cancellation is a signal, not an error to swallow.
+            existing_backend = self._backend
+            if existing_backend is not None:
+                await self._close_backend_instance(existing_backend, reason="cancellation")
             self._backend = None
             self._initialized = False
             logger.info(f"Memory: backend initialization cancelled (backend={self.config.backend})")
@@ -1714,8 +1738,8 @@ To SAVE: create /memories/<topic>.txt "content"
 
     async def close(self) -> None:
         """Close the memory backend."""
-        if self._backend and hasattr(self._backend, "close"):
-            await self._backend.close()
+        if self._backend is not None:
+            await self._close_backend_instance(self._backend, reason="handler close")
         self._backend = None
         self._initialized = False
         logger.info("Memory: Handler closed")

@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -47,6 +48,17 @@ def test_readyz_reports_core_subsystem_checks(client):
     assert data["checks"]["cache"]["status"] == "disabled"
     assert data["checks"]["rate_limiter"]["status"] == "disabled"
     assert data["checks"]["memory"]["status"] == "disabled"
+    runtime = data["runtime"]
+    assert runtime["anthropic_pre_upstream"]["resolved_concurrency"] == max(
+        2, min(8, os.cpu_count() or 4)
+    )
+    assert runtime["anthropic_pre_upstream"]["source"] == "auto"
+    assert runtime["anthropic_pre_upstream"]["acquire_timeout_seconds"] == 15.0
+    assert runtime["anthropic_pre_upstream"]["compression_timeout_seconds"] == 30.0
+    assert runtime["anthropic_pre_upstream"]["memory_context_timeout_seconds"] == 2.0
+    assert runtime["anthropic_pre_upstream"]["codex_ws_gated"] is False
+    assert runtime["websocket_sessions"]["active_sessions"] == 0
+    assert runtime["websocket_sessions"]["active_relay_tasks"] == 0
 
 
 def test_health_preserves_backwards_compatible_config_payload(client):

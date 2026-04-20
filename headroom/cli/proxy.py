@@ -73,6 +73,30 @@ from .main import main
         "Env: HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY."
     ),
 )
+@click.option(
+    "--anthropic-pre-upstream-acquire-timeout-seconds",
+    type=float,
+    default=None,
+    envvar="HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS",
+    help=(
+        "Fail-fast timeout for waiting on the Anthropic pre-upstream semaphore "
+        "before returning 503 + Retry-After. "
+        "Default: 15.0 seconds. "
+        "Env: HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
+    "--anthropic-pre-upstream-memory-context-timeout-seconds",
+    type=float,
+    default=None,
+    envvar="HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS",
+    help=(
+        "Fail-open timeout for Anthropic memory-context lookup while the request "
+        "still holds a pre-upstream slot. "
+        "Default: 2.0 seconds. "
+        "Env: HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS."
+    ),
+)
 @click.option("--log-file", default=None, help="Path to JSONL log file")
 @click.option(
     "--budget",
@@ -217,6 +241,8 @@ def proxy(
     retry_max_attempts: int | None,
     connect_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
+    anthropic_pre_upstream_acquire_timeout_seconds: float | None,
+    anthropic_pre_upstream_memory_context_timeout_seconds: float | None,
     log_file: str | None,
     budget: float | None,
     code_graph: bool,
@@ -352,6 +378,16 @@ def proxy(
         # Precedence: CLI > env > auto-compute (click's ``envvar``
         # handles the env-var fallback).
         anthropic_pre_upstream_concurrency=anthropic_pre_upstream_concurrency,
+        anthropic_pre_upstream_acquire_timeout_seconds=(
+            anthropic_pre_upstream_acquire_timeout_seconds
+            if anthropic_pre_upstream_acquire_timeout_seconds is not None
+            else 15.0
+        ),
+        anthropic_pre_upstream_memory_context_timeout_seconds=(
+            anthropic_pre_upstream_memory_context_timeout_seconds
+            if anthropic_pre_upstream_memory_context_timeout_seconds is not None
+            else 2.0
+        ),
     )
 
     memory_status = "DISABLED"

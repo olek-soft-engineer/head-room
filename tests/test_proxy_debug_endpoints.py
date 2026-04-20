@@ -293,8 +293,11 @@ def test_debug_warmup_reports_registry_slots(client):
     assert "magika" in data
     assert "memory_backend" in data
     assert "memory_embedder" in data
+    assert "runtime" in data
     # Each slot has at least a status field.
     assert "status" in data["memory_backend"]
+    assert data["runtime"]["anthropic_pre_upstream"]["resolved_concurrency"] >= 0
+    assert data["runtime"]["websocket_sessions"]["active_relay_tasks"] == 0
 
 
 def test_debug_ws_sessions_reports_live_session(app_and_client):

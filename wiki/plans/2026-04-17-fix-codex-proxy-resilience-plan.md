@@ -60,6 +60,7 @@ Without stage timings, active-task introspection, or session bookkeeping, the ne
 - **OpenTelemetry / metrics exporter wiring**: the counters added here expose `prometheus_metrics` entries; OTLP export belongs in a follow-up.
 - **External watchdog in the LaunchAgent**: a plist-level `WatchPaths`/`ThrottleInterval` revision belongs in the `.dotfiles` repo (see origin §"Important External Files"), not here. This plan only adds the in-process signal the watchdog would consume (§Unit 5).
 - **Quantifying multi-agent reconnect budget**: tuning the `Unit 4` semaphore default via load testing is work for after merge.
+- **Dedicated Codex WS-side cap**: `/v1/responses` remains intentionally ungated by the Anthropic HTTP semaphore. The current plan surfaces `active_relay_tasks` on `/readyz` so operators can see WS pressure early; add a separate WS-side cap only if those counters show the threat model has shifted.
 
 ## Context & Research
 
