@@ -174,6 +174,11 @@ from .main import main
     help="Custom Gemini API URL for passthrough endpoints (env: GEMINI_TARGET_API_URL)",
 )
 @click.option(
+    "--cloudcode-api-url",
+    default=None,
+    help="Custom Cloud Code Assist API URL for compatibility endpoints (env: CLOUDCODE_TARGET_API_URL)",
+)
+@click.option(
     "--region",
     default="us-west-2",
     help="Cloud region for Bedrock/Vertex/etc (default: us-west-2)",
@@ -231,6 +236,7 @@ def proxy(
     anthropic_api_url: str | None,
     openai_api_url: str | None,
     gemini_api_url: str | None,
+    cloudcode_api_url: str | None,
     region: str,
     bedrock_region: str | None,
     bedrock_profile: str | None,
@@ -265,6 +271,7 @@ def proxy(
     effective_anthropic_api_url = anthropic_api_url or os.environ.get("ANTHROPIC_TARGET_API_URL")
     effective_openai_api_url = openai_api_url or os.environ.get("OPENAI_TARGET_API_URL")
     effective_gemini_api_url = gemini_api_url or os.environ.get("GEMINI_TARGET_API_URL")
+    effective_cloudcode_api_url = cloudcode_api_url or os.environ.get("CLOUDCODE_TARGET_API_URL")
 
     # Resolve anyllm provider: env var takes precedence over CLI default (matches argparse path)
     effective_anyllm_provider = os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
@@ -299,6 +306,7 @@ def proxy(
         anthropic_api_url=effective_anthropic_api_url,
         openai_api_url=effective_openai_api_url,
         gemini_api_url=effective_gemini_api_url,
+        cloudcode_api_url=effective_cloudcode_api_url,
         mode=effective_mode,
         optimize=not no_optimize,
         cache_enabled=not no_cache,
@@ -356,6 +364,7 @@ def proxy(
 
     anthropic_url = config.anthropic_api_url or "https://api.anthropic.com"
     openai_url = config.openai_api_url or "https://api.openai.com"
+    cloudcode_url = config.cloudcode_api_url or "https://cloudcode-pa.googleapis.com"
     backend_section = ""
 
     if config.backend == "anyllm" or config.backend.startswith("anyllm-"):
@@ -436,9 +445,10 @@ Starting proxy server...
 {stateless_line}{telemetry_line}
 {backend_section}
 Routing:
-  /v1/messages         → {anthropic_url}
-  /v1/chat/completions → {openai_url}
-  /v1/responses        → {openai_url}  (HTTP + WebSocket)
+  /v1/messages                    → {anthropic_url}
+  /v1/chat/completions            → {openai_url}
+  /v1/responses                   → {openai_url}  (HTTP + WebSocket)
+  /v1internal:streamGenerateContent → {cloudcode_url}
 
 Usage:
   Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude
