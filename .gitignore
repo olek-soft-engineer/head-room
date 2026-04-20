@@ -1,4 +1,4 @@
-# Private scripts (contain credentials)
+# Private scripts (contain credentials). Allowlist checked-in helpers below.
 scripts/
 !scripts/
 scripts/*
@@ -8,6 +8,10 @@ scripts/*
 !scripts/changelog-gen.py
 !scripts/verify-versions.py
 !scripts/tests/
+!scripts/README.md
+!scripts/repro_codex_replay.py
+!scripts/fixtures/
+!scripts/fixtures/*.json
 
 # Swift SDK (separate repo)
 swift/
@@ -198,7 +202,7 @@ CLAUDE.md
 .vitals/
 
 # Superpowers working files (plans, specs, brainstorming)
-docs/superpowers/
+# docs/spec/           (lives in git - git-versioned living specification)
 
 # Managed platform (separate private repo)
 headroom-managed/

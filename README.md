@@ -1,547 +1,246 @@
-<p align="center">
-  <h1 align="center">Headroom</h1>
-  <p align="center">
-    <strong>Compress everything your AI agent reads. Same answers, fraction of the tokens.</strong>
-  </p>
-  <p align="center">
-    Every tool call, DB query, file read, and RAG retrieval your agent makes is 70-95% boilerplate.<br>
-    Headroom compresses it away before it hits the model.<br><br>
-    Works with <b>any agent</b> — coding agents (Claude Code, Codex, Cursor, Aider), custom agents<br>
-    (LangChain, LangGraph, Agno, Strands, OpenClaw), or your own Python and TypeScript code.
-  </p>
-</p>
+<div align="center">
 
-<p align="center">
-  <a href="https://github.com/chopratejas/headroom/actions/workflows/ci.yml">
-    <img src="https://github.com/chopratejas/headroom/actions/workflows/ci.yml/badge.svg" alt="CI">
-  </a>
-  <a href="https://pypi.org/project/headroom-ai/">
-    <img src="https://img.shields.io/pypi/v/headroom-ai.svg" alt="PyPI">
-  </a>
-  <a href="https://pypi.org/project/headroom-ai/">
-    <img src="https://img.shields.io/pypi/pyversions/headroom-ai.svg" alt="Python">
-  </a>
-  <a href="https://pypistats.org/packages/headroom-ai">
-    <img src="https://img.shields.io/pypi/dm/headroom-ai.svg" alt="Downloads">
-  </a>
-  <a href="https://www.npmjs.com/package/headroom-ai">
-    <img src="https://img.shields.io/npm/v/headroom-ai.svg" alt="npm">
-  </a>
-  <a href="https://github.com/chopratejas/headroom/blob/main/LICENSE">
-    <img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License">
-  </a>
-  <a href="https://chopratejas.github.io/headroom/">
-    <img src="https://img.shields.io/badge/docs-GitHub%20Pages-blue.svg" alt="Documentation">
-  </a>
-  <a href="https://discord.gg/yRmaUNpsPJ">
-    <img src="https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white" alt="Discord">
-  </a>
-</p>
+# Headroom
+
+**Compress everything your AI agent reads. Same answers, fraction of the tokens.**
+
+[![CI](https://github.com/chopratejas/headroom/actions/workflows/ci.yml/badge.svg)](https://github.com/chopratejas/headroom/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/headroom-ai.svg)](https://pypi.org/project/headroom-ai/)
+[![npm](https://img.shields.io/npm/v/headroom-ai.svg)](https://www.npmjs.com/package/headroom-ai)
+[![Model: Kompress-base](https://img.shields.io/badge/model-Kompress--base-yellow.svg)](https://huggingface.co/chopratejas/kompress-base)
+[![Tokens saved: 60B+](https://img.shields.io/badge/tokens%20saved-60B%2B-2ea44f)](https://headroomlabs.ai/dashboard)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Docs](https://img.shields.io/badge/docs-online-blue.svg)](https://headroom-docs.vercel.app/docs)
+
+<img src="HeadroomDemo-Fast.gif" alt="Headroom in action" width="820">
+
+</div>
 
 ---
 
-## Where Headroom Fits
+Every tool call, log line, DB read, RAG chunk, and file your agent injects into a prompt is mostly boilerplate. Headroom strips the noise and keeps the signal — **losslessly, locally, and without touching accuracy.**
 
-```
-Your Agent / App
-  (coding agents, customer support bots, RAG pipelines,
-   data analysis agents, research agents, any LLM app)
-      │
-      │  tool calls, logs, DB reads, RAG results, file reads, API responses
-      ▼
-   Headroom  ← proxy, Python/TypeScript SDK, or framework integration
-      │
-      ▼
- LLM Provider  (OpenAI, Anthropic, Google, Bedrock, 100+ via LiteLLM)
-```
-
-Headroom sits between your application and the LLM provider. It intercepts requests, compresses the context, and forwards an optimized prompt. Use it as a transparent proxy (zero code changes), a Python function (`compress()`), or a framework integration (LangChain, LiteLLM, Agno).
-
-### What gets compressed
-
-Headroom optimizes any data your agent injects into a prompt:
-
-- **Tool outputs** — shell commands, API calls, search results
-- **Database queries** — SQL results, key-value lookups
-- **RAG retrievals** — document chunks, embeddings results
-- **File reads** — code, logs, configs, CSVs
-- **API responses** — JSON, XML, HTML
-- **Conversation history** — long agent sessions with repetitive context
+> **100 logs. One FATAL error buried at position 67. Both runs found it.**
+> Baseline **10,144 tokens** → Headroom **1,260 tokens** — **87% fewer, identical answer.**
+> `python examples/needle_in_haystack_test.py`
 
 ---
 
-## Quick Start
+## Quick start
 
-**Python:**
+Works with Anthropic, OpenAI, Google, Bedrock, Vertex, Azure, OpenRouter, and 100+ models via LiteLLM.
+
+**Wrap your coding agent — one command:**
+
 ```bash
 pip install "headroom-ai[all]"
+
+headroom wrap claude      # Claude Code
+headroom wrap codex       # Codex
+headroom wrap cursor      # Cursor
+headroom wrap aider       # Aider
+headroom wrap copilot     # GitHub Copilot CLI
 ```
 
-**TypeScript / Node.js:**
-```bash
-npm install headroom-ai
-```
+**Drop it into your own code — Python or TypeScript:**
 
-**Docker-native (no Python or Node on host):**
-```bash
-curl -fsSL https://raw.githubusercontent.com/chopratejas/headroom/main/scripts/install.sh | bash
-```
-
-macOS uses Bash 4.3+, so run the installer with a newer Bash such as Homebrew's `bash`.
-
-PowerShell:
-```powershell
-irm https://raw.githubusercontent.com/chopratejas/headroom/main/scripts/install.ps1 | iex
-```
-
-**Persistent local runtime (Python-native service/task flow):**
-```bash
-headroom install apply --preset persistent-service --providers auto
-```
-
-**Persistent local runtime (Docker-native wrapper / compose flow):**
-```bash
-headroom install apply --preset persistent-docker
-```
-
-### Any agent — one function
-
-**Python:**
 ```python
 from headroom import compress
 
-# Default (coding agents — protects user messages, compresses tool outputs)
-result = compress(messages, model="claude-sonnet-4-5-20250929")
-response = client.messages.create(model="claude-sonnet-4-5-20250929", messages=result.messages)
+result = compress(messages, model="claude-sonnet-4-5")
+response = client.messages.create(model="claude-sonnet-4-5", messages=result.messages)
 print(f"Saved {result.tokens_saved} tokens ({result.compression_ratio:.0%})")
-
-# Document compression (financial, legal, clinical — compress everything, keep 50%)
-result = compress(messages, model="claude-opus-4-20250514",
-    compress_user_messages=True,   # Compress user messages too
-    target_ratio=0.5,              # Keep 50% (preserves numbers/entities)
-    protect_recent=0,              # Don't protect recent messages
-)
 ```
 
-**TypeScript:**
 ```typescript
 import { compress } from 'headroom-ai';
-
 const result = await compress(messages, { model: 'gpt-4o' });
-const response = await openai.chat.completions.create({ model: 'gpt-4o', messages: result.messages });
-console.log(`Saved ${result.tokensSaved} tokens`);
 ```
 
-Works with any LLM client — Anthropic, OpenAI, LiteLLM, Bedrock, Vercel AI SDK, or your own code. Full options via `CompressConfig`: `compress_user_messages`, `target_ratio`, `protect_recent`, `protect_analysis_context`.
-
-### Any agent — proxy (zero code changes)
+**Or run it as a proxy — zero code changes, any language:**
 
 ```bash
 headroom proxy --port 8787
-```
-
-```bash
-# Run mode (default: token)
-headroom proxy --mode token   # maximize compression
-headroom proxy --mode cache   # preserve Anthropic/OpenAI prefix cache stability
-```
-
-```bash
-# Point any LLM client at the proxy
 ANTHROPIC_BASE_URL=http://localhost:8787 your-app
 OPENAI_BASE_URL=http://localhost:8787/v1 your-app
 ```
 
-Use `token` mode for short/medium sessions where raw compression savings matter most.
-Use `cache` mode for long-running chats where preserving prior-turn bytes improves provider cache reuse.
+---
 
-Works with any language, any tool, any framework. **[Proxy docs](docs/content/docs/proxy.mdx)**
+## Why Headroom
 
-Prefer Docker as the runtime provider? See **[Installation — Docker](docs/content/docs/installation.mdx)**.
+- **Accuracy-preserving.** GSM8K **0.870 → 0.870** (±0.000). TruthfulQA **+0.030**. SQuAD v2 and BFCL both **97%** accuracy after compression. Validated on public OSS benchmarks you can rerun yourself.
+- **Runs on your machine.** No cloud API, no data egress. Compression latency is milliseconds — faster end-to-end for Sonnet / Opus / GPT-4 class models than a hosted service round-trip.
+- **[Kompress-base](https://huggingface.co/chopratejas/kompress-base) on HuggingFace.** Our open-source text compressor, fine-tuned on real agentic traces — tool outputs, logs, RAG chunks, code. Install with `pip install "headroom-ai[ml]"`.
+- **Cross-agent memory and learning.** Claude Code saves a fact, Codex reads it back. `headroom learn` mines failed sessions and writes corrections straight to `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` — reliability compounds over time.
+- **Reversible (CCR).** Compression is not deletion. The model can always call `headroom_retrieve` to pull the original bytes. Nothing is thrown away.
 
-### Coding agents — one command
-
-```bash
-headroom wrap claude              # Starts proxy + launches Claude Code
-headroom wrap copilot -- --model claude-sonnet-4-20250514
-                                   # Starts proxy + launches GitHub Copilot CLI
-headroom wrap codex               # Starts proxy + launches OpenAI Codex CLI
-headroom wrap aider               # Starts proxy + launches Aider
-headroom wrap cursor              # Starts proxy + prints Cursor config
-headroom wrap openclaw            # Installs + configures OpenClaw plugin
-headroom wrap claude --memory     # With persistent cross-agent memory
-headroom wrap codex --memory      # Shares the same memory store
-headroom wrap claude --code-graph # With code graph intelligence (codebase-memory-mcp)
-```
-
-Headroom starts a proxy, points your tool at it, and compresses everything automatically. Add `--memory` for persistent memory that's shared across agents. Add `--code-graph` for code intelligence via [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) — indexes your codebase into a knowledge graph for call-chain traversal, impact analysis, and architectural queries. `wrap copilot` is part of the Python-native CLI; the Docker-native wrapper currently supports `claude`, `codex`, `aider`, `cursor`, and `openclaw`.
-
-In Docker-native mode, Headroom still runs in Docker while wrapped tools run on the host. `wrap claude`, `wrap codex`, `wrap aider`, `wrap cursor`, and OpenClaw plugin setup (`wrap openclaw` / `unwrap openclaw`) are host-managed through the installed wrapper.
-
-### Multi-agent — SharedContext
-
-```python
-from headroom import SharedContext
-
-ctx = SharedContext()
-ctx.put("research", big_agent_output)      # Agent A stores (compressed)
-summary = ctx.get("research")               # Agent B reads (~80% smaller)
-full = ctx.get("research", full=True)       # Agent B gets original if needed
-```
-
-Compress what moves between agents — any framework. **[SharedContext Guide](docs/content/docs/shared-context.mdx)**
-
-### MCP Tools (Claude Code, Cursor)
-
-```bash
-headroom mcp install && claude
-```
-
-Gives your AI tool three MCP tools: `headroom_compress`, `headroom_retrieve`, `headroom_stats`. **[MCP Guide](docs/content/docs/mcp.mdx)**
-
-### Drop into your existing stack
-
-| Your setup | Add Headroom | One-liner |
-|------------|-------------|-----------|
-| **Any Python app** | `compress()` | `result = compress(messages, model="gpt-4o")` |
-| **Any TypeScript app** | `compress()` | `const result = await compress(messages, { model: 'gpt-4o' })` |
-| **Vercel AI SDK** | Middleware | `wrapLanguageModel({ model, middleware: headroomMiddleware() })` |
-| **OpenAI Node SDK** | Wrap client | `const client = withHeadroom(new OpenAI())` |
-| **Anthropic TS SDK** | Wrap client | `const client = withHeadroom(new Anthropic())` |
-| **Multi-agent** | SharedContext | `ctx = SharedContext(); ctx.put("key", data)` |
-| **LiteLLM** | Callback | `litellm.callbacks = [HeadroomCallback()]` |
-| **Any Python proxy** | ASGI Middleware | `app.add_middleware(CompressionMiddleware)` |
-| **Agno agents** | Wrap model | `HeadroomAgnoModel(your_model)` |
-| **LangChain** | Wrap model | `HeadroomChatModel(your_llm)` |
-| **OpenClaw** | One-command wrap/unwrap | `headroom wrap openclaw` / `headroom unwrap openclaw` |
-| **Claude Code** | Wrap | `headroom wrap claude` |
-| **GitHub Copilot CLI** | Wrap | `headroom wrap copilot -- --model claude-sonnet-4-20250514` |
-| **Codex / Aider** | Wrap | `headroom wrap codex` or `headroom wrap aider` |
-| **Always-on local proxy** | Persistent install | `headroom install apply --preset persistent-service --providers auto` |
-
-**[Full Integration Guide](docs/content/docs/index.mdx)**
+Bundles the [RTK](https://github.com/rtk-ai/rtk) binary for shell-output rewriting — full [attribution below](#compared-to).
 
 ---
 
-## Demo
+## How it fits
 
-<p align="center">
-  <img src="HeadroomDemo-Fast.gif" alt="Headroom Demo" width="800">
-</p>
+```
+ Your agent / app
+   (Claude Code, Cursor, Codex, LangChain, Agno, Strands, your own code…)
+        │   prompts · tool outputs · logs · RAG results · files
+        ▼
+    ┌────────────────────────────────────────────────────┐
+    │  Headroom   (runs locally — your data stays here)  │
+    │  ───────────────────────────────────────────────   │
+    │  CacheAligner  →  ContentRouter  →  CCR             │
+    │                    ├─ SmartCrusher   (JSON)         │
+    │                    ├─ CodeCompressor (AST)          │
+    │                    └─ Kompress-base  (text, HF)     │
+    │                                                     │
+    │  Cross-agent memory  ·  headroom learn  ·  MCP      │
+    └────────────────────────────────────────────────────┘
+        │   compressed prompt  +  retrieval tool
+        ▼
+ LLM provider  (Anthropic · OpenAI · Bedrock · …)
+```
+
+→ [Architecture](https://headroom-docs.vercel.app/docs/architecture) · [CCR reversible compression](https://headroom-docs.vercel.app/docs/ccr) · [Kompress-base model card](https://huggingface.co/chopratejas/kompress-base)
 
 ---
 
-## Does It Actually Work?
+## Proof
 
-**100 production log entries. One critical error buried at position 67.**
+**Savings on real agent workloads:**
 
-|  | Baseline | Headroom |
-|--|----------|----------|
-| Input tokens | 10,144 | 1,260 |
-| Correct answers | **4/4** | **4/4** |
+| Workload                      | Before | After  | Savings |
+|-------------------------------|-------:|-------:|--------:|
+| Code search (100 results)     | 17,765 |  1,408 | **92%** |
+| SRE incident debugging        | 65,694 |  5,118 | **92%** |
+| GitHub issue triage           | 54,174 | 14,761 | **73%** |
+| Codebase exploration          | 78,502 | 41,254 | **47%** |
 
-Both responses: *"payment-gateway, error PG-5523, fix: Increase max_connections to 500, 1,847 transactions affected."*
+**Accuracy preserved on standard benchmarks:**
 
-**87.6% fewer tokens. Same answer.** Run it: `python examples/needle_in_haystack_test.py`
+| Benchmark  | Category | N   | Baseline | Headroom | Delta     |
+|------------|----------|----:|---------:|---------:|----------:|
+| GSM8K      | Math     | 100 |    0.870 |    0.870 | **±0.000**|
+| TruthfulQA | Factual  | 100 |    0.530 |    0.560 | **+0.030**|
+| SQuAD v2   | QA       | 100 |        — |  **97%** | 19% compression |
+| BFCL       | Tools    | 100 |        — |  **97%** | 32% compression |
 
-<details>
-<summary><b>What Headroom kept</b></summary>
-
-From 100 log entries, SmartCrusher kept 6: first 3 (boundary), the FATAL error at position 67 (anomaly detection), and last 2 (recency). The error was automatically preserved — not by keyword matching, but by statistical analysis of field variance.
-</details>
-
-### Real Workloads
-
-| Scenario | Before | After | Savings |
-|----------|--------|-------|---------|
-| Code search (100 results) | 17,765 | 1,408 | **92%** |
-| SRE incident debugging | 65,694 | 5,118 | **92%** |
-| Codebase exploration | 78,502 | 41,254 | **47%** |
-| GitHub issue triage | 54,174 | 14,761 | **73%** |
-
-### Accuracy Benchmarks
-
-Compression preserves accuracy — tested on real OSS benchmarks.
-
-**Standard Benchmarks** — Baseline (direct to API) vs Headroom (through proxy):
-
-| Benchmark | Category | N | Baseline | Headroom | Delta |
-|-----------|----------|---|----------|----------|-------|
-| [GSM8K](https://huggingface.co/datasets/openai/gsm8k) | Math | 100 | 0.870 | 0.870 | **0.000** |
-| [TruthfulQA](https://huggingface.co/datasets/truthfulqa/truthful_qa) | Factual | 100 | 0.530 | 0.560 | **+0.030** |
-
-**Compression Benchmarks** — Accuracy after full compression stack:
-
-| Benchmark | Category | N | Accuracy | Compression | Method |
-|-----------|----------|---|----------|-------------|--------|
-| [SQuAD v2](https://huggingface.co/datasets/rajpurkar/squad_v2) | QA | 100 | **97%** | 19% | Before/After |
-| [BFCL](https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard) | Tool/Function | 100 | **97%** | 32% | LLM-as-Judge |
-| Tool Outputs (built-in) | Agent | 8 | **100%** | 20% | Before/After |
-| CCR Needle Retention | Lossless | 50 | **100%** | 77% | Exact Match |
-
-Run it yourself:
+Reproduce:
 
 ```bash
-# Quick smoke test (8 cases, ~10s)
-python -m headroom.evals quick -n 8 --provider openai --model gpt-4o-mini
-
-# Full Tier 1 suite (~$3, ~15 min)
-python -m headroom.evals suite --tier 1 -o eval_results/
-
-# CI mode (exit 1 on regression)
-python -m headroom.evals suite --tier 1 --ci
+python -m headroom.evals suite --tier 1
 ```
 
-Full methodology: [Benchmarks](docs/content/docs/benchmarks.mdx) | [Evals Framework](headroom/evals/README.md)
+**Community, live:**
+
+<div align="center">
+  <a href="https://headroomlabs.ai/dashboard">
+    <img src="headroom-savings.png" alt="60B+ tokens saved — community leaderboard" width="820">
+  </a>
+  <p><b><a href="https://headroomlabs.ai/dashboard">60B+ tokens saved by the community in the last 20 days — live leaderboard →</a></b></p>
+</div>
+
+→ [Full benchmarks & methodology](https://headroom-docs.vercel.app/docs/benchmarks)
 
 ---
 
-## Key Capabilities
+## Built for coding agents
 
-### Lossless Compression
+| Agent              | One-command wrap                   | Notes                                                            |
+|--------------------|------------------------------------|------------------------------------------------------------------|
+| **Claude Code**    | `headroom wrap claude`             | `--memory` for cross-agent memory, `--code-graph` for codebase intel |
+| **Codex**          | `headroom wrap codex --memory`     | Shares the same memory store as Claude                           |
+| **Cursor**         | `headroom wrap cursor`             | Prints Cursor config — paste once, done                          |
+| **Aider**          | `headroom wrap aider`              | Starts proxy, launches Aider                                     |
+| **Copilot CLI**    | `headroom wrap copilot`            | Starts proxy, launches Copilot                                   |
+| **OpenClaw**       | `headroom wrap openclaw`           | Installs Headroom as ContextEngine plugin                        |
 
-Headroom never throws data away. It compresses aggressively, stores the originals, and gives the LLM a tool to retrieve full details when needed. When it compresses 500 items to 20, it tells the model *what was omitted* ("87 passed, 2 failed, 1 error") so the model knows when to ask for more.
+MCP-native too — `headroom mcp install` exposes `headroom_compress`, `headroom_retrieve`, and `headroom_stats` to any MCP client.
 
-### Smart Content Detection
-
-Auto-detects what's in your context — JSON arrays, code, logs, plain text — and routes each to the best compressor. JSON goes to SmartCrusher, code goes through AST-aware compression (Python, JS, Go, Rust, Java, C++), text goes to Kompress (ModernBERT-based, with `[ml]` extra).
-
-### Cache Optimization
-
-Stabilizes message prefixes so your provider's KV cache actually works. Claude offers a 90% read discount on cached prefixes — but almost no framework takes advantage of it. Headroom does.
-
-### Cross-Agent Memory
-
-```bash
-headroom wrap claude --memory    # Claude with persistent memory
-headroom wrap codex --memory     # Codex shares the SAME memory store
-```
-
-Claude saves a fact, Codex reads it back. All agents sharing one proxy share one memory — project-scoped, user-isolated, with agent provenance tracking and automatic deduplication. No SDK changes needed. **[Memory docs](docs/content/docs/memory.mdx)**
-
-### Failure Learning
-
-```bash
-headroom learn                        # Auto-detect agent (Claude, Codex, Gemini)
-headroom learn --apply                # Write learnings to agent-native files
-headroom learn --agent codex --all    # Analyze all Codex sessions
-```
-
-Plugin-based: reads conversation history from Claude Code, Codex, or Gemini CLI. Finds failure patterns, correlates with successes, writes corrections to CLAUDE.md / AGENTS.md / GEMINI.md. External plugins via entry points. **[Learn docs](docs/content/docs/failure-learning.mdx)**
-
-<p align="center">
-  <img src="headroom_learn.gif" alt="headroom learn demo" width="800">
-</p>
-
-### Image Compression
-
-40-90% token reduction via trained ML router. Automatically selects the right resize/quality tradeoff per image.
-
-<details>
-<summary><b>All features</b></summary>
-
-| Feature | What it does |
-|---------|-------------|
-| **Content Router** | Auto-detects content type, routes to optimal compressor |
-| **SmartCrusher** | Universal JSON compression — arrays of dicts, strings, numbers, mixed types, nested objects |
-| **CodeCompressor** | AST-aware compression for Python, JS, Go, Rust, Java, C++ |
-| **Kompress** | ModernBERT token compression (replaces LLMLingua-2) |
-| **CCR** | Reversible compression — LLM retrieves originals when needed |
-| **Compression Summaries** | Tells the LLM what was omitted ("3 errors, 12 failures") |
-| **CacheAligner** | Stabilizes prefixes for provider KV cache hits |
-| **IntelligentContext** | Score-based context management with learned importance |
-| **Image Compression** | 40-90% token reduction via trained ML router |
-| **Memory** | Cross-agent persistent memory — Claude saves, Codex reads it back. Agent provenance + auto-dedup |
-| **Compression Hooks** | Customize compression with pre/post hooks |
-| **Read Lifecycle** | Detects stale/superseded Read outputs, replaces with CCR markers |
-| **`headroom learn`** | Plugin-based failure learning for Claude Code, Codex, Gemini CLI (extensible via entry points) |
-| **`headroom wrap`** | One-command setup for Claude Code, GitHub Copilot CLI, Codex, Aider, Cursor |
-| **SharedContext** | Compressed inter-agent context sharing for multi-agent workflows |
-| **MCP Tools** | headroom_compress, headroom_retrieve, headroom_stats for Claude Code/Cursor |
-
-</details>
-
----
-
-## Headroom vs Alternatives
-
-Context compression is a new space. Here's how the approaches differ:
-
-| | Approach | Scope | Deploy as | Framework integrations | Data stays local? | Reversible |
-|---|---|---|---|---|---|---|
-| **Headroom** | Multi-algorithm compression | All context (tool outputs, DB reads, RAG, files, logs, history) | Proxy, Python library, ASGI middleware, or callback | LangChain, LangGraph, Agno, Strands, LiteLLM, MCP | Yes (OSS) | Yes (CCR) |
-| **[RTK](https://github.com/rtk-ai/rtk)** | CLI command rewriter | Shell command outputs | CLI wrapper | None | Yes (OSS) | No |
-| **[Compresr](https://compresr.ai)** | Cloud compression API | Text sent to their API | API call | None | No | No |
-| **[Token Company](https://thetokencompany.ai)** | Cloud compression API | Text sent to their API | API call | None | No | No |
-
-**Use it however you want.** Headroom works as a standalone proxy (`headroom proxy`), a one-function Python library (`compress()`), ASGI middleware, or a LiteLLM callback. Already using LiteLLM, LangChain, or Agno? Drop Headroom in without replacing anything.
-
-**Headroom + RTK work well together.** RTK rewrites CLI commands (`git show` → `git show --short`), Headroom compresses everything else (JSON arrays, code, logs, RAG results, conversation history). Use both.
-
-**Headroom vs cloud APIs.** Compresr and Token Company are hosted services — you send your context to their servers, they compress and return it. Headroom runs locally. Your data never leaves your machine. You also get lossless compression (CCR): the LLM can retrieve the full original when it needs more detail.
-
----
-
-## How It Works Inside
-
-```
-  Your prompt
-      │
-      ▼
-  1. CacheAligner            Stabilize prefix for KV cache
-      │
-      ▼
-  2. ContentRouter           Route each content type:
-      │                         → SmartCrusher    (JSON)
-      │                         → CodeCompressor  (code)
-      │                         → Kompress        (text, with [ml])
-      ▼
-  3. IntelligentContext      Score-based token fitting
-      │
-      ▼
-  LLM Provider
-
-  Needs full details? LLM calls headroom_retrieve.
-  Originals are in the Compressed Store — nothing is thrown away.
-```
-
-**Overhead**: 15-200ms compression latency (net positive for Sonnet/Opus). Full data: [Benchmarks](docs/content/docs/benchmarks.mdx)
+<div align="center">
+  <img src="headroom_learn.gif" alt="headroom learn in action" width="720">
+</div>
 
 ---
 
 ## Integrations
 
-| Integration | Status | Docs |
-|-------------|--------|------|
-| `headroom wrap claude/copilot/codex/aider/cursor` | **Stable** | [Proxy Docs](docs/content/docs/proxy.mdx) |
-| `compress()` — one function | **Stable** | [Integration Guide](docs/content/docs/index.mdx) |
-| `SharedContext` — multi-agent | **Stable** | [SharedContext Guide](docs/content/docs/shared-context.mdx) |
-| LiteLLM callback | **Stable** | [LiteLLM Guide](docs/content/docs/litellm.mdx) |
-| ASGI middleware | **Stable** | [Integration Guide](docs/content/docs/index.mdx) |
-| Proxy server | **Stable** | [Proxy Docs](docs/content/docs/proxy.mdx) |
-| Agno | **Stable** | [Agno Guide](docs/content/docs/agno.mdx) |
-| MCP (Claude Code, Cursor, etc.) | **Stable** | [MCP Guide](docs/content/docs/mcp.mdx) |
-| Strands | **Stable** | [Strands Guide](docs/content/docs/strands.mdx) |
-| LangChain | **Stable** | [LangChain Guide](docs/content/docs/langchain.mdx) |
-| **OpenClaw** | **Stable** | [OpenClaw plugin](#openclaw-plugin) |
+<details>
+<summary><b>Drop Headroom into any stack</b></summary>
+
+| Your setup              | Hook in with                                                     |
+|-------------------------|------------------------------------------------------------------|
+| Any Python app          | `compress(messages, model=…)`                                    |
+| Any TypeScript app      | `await compress(messages, { model })`                            |
+| Anthropic / OpenAI SDK  | `withHeadroom(new Anthropic())` · `withHeadroom(new OpenAI())`   |
+| Vercel AI SDK           | `wrapLanguageModel({ model, middleware: headroomMiddleware() })` |
+| LiteLLM                 | `litellm.callbacks = [HeadroomCallback()]`                       |
+| LangChain               | `HeadroomChatModel(your_llm)`                                    |
+| Agno                    | `HeadroomAgnoModel(your_model)`                                  |
+| Strands                 | [Strands guide](https://headroom-docs.vercel.app/docs/strands) |
+| ASGI apps               | `app.add_middleware(CompressionMiddleware)`                      |
+| Multi-agent             | `SharedContext().put / .get`                                     |
+| MCP clients             | `headroom mcp install`                                           |
+
+</details>
+
+<details>
+<summary><b>What's inside</b></summary>
+
+- **SmartCrusher** — universal JSON: arrays of dicts, nested objects, mixed types.
+- **CodeCompressor** — AST-aware for Python, JS, Go, Rust, Java, C++.
+- **Kompress-base** — our HuggingFace model, trained on agentic traces.
+- **Image compression** — 40–90% reduction via trained ML router.
+- **CacheAligner** — stabilizes prefixes so Anthropic/OpenAI KV caches actually hit.
+- **IntelligentContext** — score-based context fitting with learned importance.
+- **CCR** — reversible compression; LLM retrieves originals on demand.
+- **Cross-agent memory** — shared store, agent provenance, auto-dedup.
+- **SharedContext** — compressed context passing across multi-agent workflows.
+- **`headroom learn`** — plugin-based failure mining for Claude, Codex, Gemini.
+
+</details>
 
 ---
 
-## OpenClaw Plugin
-
-The [`@headroom-ai/openclaw`](plugins/openclaw) plugin integrates Headroom as a ContextEngine for [OpenClaw](https://github.com/openclaw/openclaw). It compresses tool outputs, code, logs, and structured data inline — 70-90% token savings with zero LLM calls. The plugin can connect to a local or remote Headroom proxy and will auto-start one locally if needed.
-
-### Install
+## Install
 
 ```bash
-pip install "headroom-ai[proxy]"
-openclaw plugins install --dangerously-force-unsafe-install headroom-ai/openclaw
+pip install "headroom-ai[all]"          # Python, everything
+npm  install headroom-ai                # TypeScript / Node
+docker pull ghcr.io/chopratejas/headroom:latest
 ```
 
-> **Why `--dangerously-force-unsafe-install`?** The plugin auto-starts `headroom proxy` as a subprocess when no running proxy is detected. OpenClaw blocks process-launching plugins by default, so this flag is required to permit that behavior.
+Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-base), `[agno]`, `[langchain]`, `[evals]`. Requires **Python 3.10+**.
 
-Once installed, assign Headroom as the context engine in your OpenClaw config:
-
-```json
-{
-  "plugins": {
-    "entries": { "headroom": { "enabled": true } },
-    "slots": { "contextEngine": "headroom" }
-  }
-}
-```
-
-The plugin auto-detects and auto-starts the proxy — no manual proxy management needed. See the [plugin README](plugins/openclaw/README.md) for full configuration options, local development setup, and launcher details.
-
----
-
-## Cloud Providers
-
-```bash
-headroom proxy --backend bedrock --region us-east-1     # AWS Bedrock
-headroom proxy --backend vertex_ai --region us-central1 # Google Vertex
-headroom proxy --backend azure                          # Azure OpenAI
-headroom proxy --backend openrouter                     # OpenRouter (400+ models)
-```
-
----
-
-## Installation
-
-```bash
-pip install headroom-ai                # Core library
-pip install "headroom-ai[all]"         # Everything including evals (recommended)
-pip install "headroom-ai[proxy]"       # Proxy server + MCP tools
-pip install "headroom-ai[mcp]"         # MCP tools only (no proxy)
-pip install "headroom-ai[ml]"          # ML compression (Kompress, requires torch)
-pip install "headroom-ai[agno]"        # Agno integration
-pip install "headroom-ai[langchain]"   # LangChain (experimental)
-pip install "headroom-ai[evals]"       # Evaluation framework only
-```
-
-### Container images (GHCR tags)
-
-- supported platforms: `linux/amd64`, `linux/arm64`
-- tags `:code` - image with Code-Aware Compression (AST-based) i.e. `pip install "headroom-ai[proxy,code]"`
-- tags `:slim` - image with distorless base
-
-| Tag                 |                                                      | Extras       | Docker Bake target          |
-|---------------------|------------------------------------------------------|--------------|-----------------------------|
-| `<version>`         | ```ghcr.io/chopratejas/headroom:<version>```         | `proxy`      | `runtime`                   |
-| `latest`            | ```ghcr.io/chopratejas/headroom:latest```            | `proxy`      | `runtime`                   |
-| `nonroot`           | ```ghcr.io/chopratejas/headroom:nonroot```           | `proxy`      | `runtime-nonroot`           |
-| `code`              | ```ghcr.io/chopratejas/headroom:code```              | `proxy,code` | `runtime-code`              |
-| `code-nonroot`      | ```ghcr.io/chopratejas/headroom:code-nonroot```      | `proxy,code` | `runtime-code-nonroot`      |
-| `slim`              | ```ghcr.io/chopratejas/headroom:slim```              | `proxy`      | `runtime-slim`              |
-| `slim-nonroot`      | ```ghcr.io/chopratejas/headroom:slim-nonroot```      | `proxy`      | `runtime-slim-nonroot`      |
-| `code-slim`         | ```ghcr.io/chopratejas/headroom:code-slim```         | `proxy,code` | `runtime-code-slim`         |
-| `code-slim-nonroot` | ```ghcr.io/chopratejas/headroom:code-slim-nonroot``` | `proxy,code` | `runtime-code-slim-nonroot` |
-
-### Docker Bake
-
-```bash
-# List all available build targets
-docker buildx bake --list targets
-
-# Build default image locally (proxy + nonroot)
-docker buildx bake runtime-default
-
-# Build one variant and load to local Docker image store
-docker buildx bake runtime-code-slim-nonroot \
-  --set runtime-code-slim-nonroot.platform=linux/amd64 \
-  --set runtime-code-slim-nonroot.tags=headroom:local \
-  --load
-```
-
-Python 3.10+
+→ [Installation guide](https://headroom-docs.vercel.app/docs/installation) — Docker tags, persistent service, PowerShell, devcontainers.
 
 ---
 
 ## Documentation
 
-| | |
-|---|---|
-| [Integration Guide](docs/content/docs/index.mdx) | LiteLLM, ASGI, compress(), proxy |
-| [Proxy Docs](docs/content/docs/proxy.mdx) | Proxy server configuration |
-| [Architecture](docs/content/docs/architecture.mdx) | How the pipeline works |
-| [CCR Guide](docs/content/docs/ccr.mdx) | Reversible compression |
-| [Benchmarks](docs/content/docs/benchmarks.mdx) | Accuracy validation |
-| [Limitations](docs/content/docs/limitations.mdx) | When compression helps, when it doesn't |
-| [Evals Framework](headroom/evals/README.md) | Prove compression preserves accuracy |
-| [Memory](docs/content/docs/memory.mdx) | Cross-agent persistent memory with provenance + dedup |
-| [Agno](docs/content/docs/agno.mdx) | Agno agent framework |
-| [MCP](docs/content/docs/mcp.mdx) | Context engineering toolkit (compress, retrieve, stats) |
-| [SharedContext](docs/content/docs/shared-context.mdx) | Compressed inter-agent context sharing |
-| [Learn](docs/content/docs/failure-learning.mdx) | Plugin-based failure learning (Claude, Codex, Gemini, extensible) |
-| [Installation](docs/content/docs/installation.mdx) | pip, npm, Docker install methods |
-| [Configuration](docs/content/docs/configuration.mdx) | All options |
-| [Filesystem Contract](wiki/filesystem-contract.md) | `HEADROOM_CONFIG_DIR` / `HEADROOM_WORKSPACE_DIR` and per-resource path overrides |
+| Start here                                                              | Go deeper                                                              |
+|-------------------------------------------------------------------------|------------------------------------------------------------------------|
+| [Quickstart](https://headroom-docs.vercel.app/docs/quickstart)    | [Architecture](https://headroom-docs.vercel.app/docs/architecture) |
+| [Proxy](https://headroom-docs.vercel.app/docs/proxy)              | [How compression works](https://headroom-docs.vercel.app/docs/how-compression-works) |
+| [MCP tools](https://headroom-docs.vercel.app/docs/mcp)            | [CCR — reversible compression](https://headroom-docs.vercel.app/docs/ccr) |
+| [Memory](https://headroom-docs.vercel.app/docs/memory)            | [Cache optimization](https://headroom-docs.vercel.app/docs/cache-optimization) |
+| [Failure learning](https://headroom-docs.vercel.app/docs/failure-learning) | [Benchmarks](https://headroom-docs.vercel.app/docs/benchmarks) |
+| [Configuration](https://headroom-docs.vercel.app/docs/configuration) | [Limitations](https://headroom-docs.vercel.app/docs/limitations) |
 
 ---
 
-## Community
+## Compared to
 
-Questions, feedback, or just want to follow along? **[Join us on Discord](https://discord.gg/yRmaUNpsPJ)**
+Headroom runs **locally**, covers **every** content type (not just CLI or text), works with every major framework, and is **reversible**.
+
+|                                  | Scope                                           | Deploy                              | Local | Reversible |
+|----------------------------------|-------------------------------------------------|-------------------------------------|:-----:|:----------:|
+| **Headroom**                     | All context — tools, RAG, logs, files, history  | Proxy · library · middleware · MCP  |  Yes  |    Yes     |
+| [RTK](https://github.com/rtk-ai/rtk) | CLI command outputs                         | CLI wrapper                         |  Yes  |    No      |
+| [Compresr](https://compresr.ai), [Token Co.](https://thetokencompany.ai) | Text sent to their API | Hosted API call         |  No   |    No      |
+| OpenAI Compaction                | Conversation history                            | Provider-native                     |  No   |    No      |
+
+> **Attribution.** Headroom ships with the excellent [RTK](https://github.com/rtk-ai/rtk) binary for shell-output rewriting — `git show` → `git show --short`, noisy `ls` → scoped, chatty installers → summarized. Huge thanks to the RTK team; their tool is a first-class part of our stack, and Headroom compresses everything downstream of it.
 
 ---
 
@@ -552,10 +251,16 @@ git clone https://github.com/chopratejas/headroom.git && cd headroom
 pip install -e ".[dev]" && pytest
 ```
 
-Prefer a containerized setup? Open the repo in **`.devcontainer/devcontainer.json`** for the default Python/uv workflow, or **`.devcontainer/memory-stack/devcontainer.json`** when you need local Qdrant + Neo4j services and the locked `memory-stack` extra for the `qdrant-neo4j` memory backend. Inside that container, use `qdrant:6333` and `neo4j://neo4j:7687` instead of `localhost`.
+Devcontainers in `.devcontainer/` (default + `memory-stack` with Qdrant & Neo4j). See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
+## Community
+
+- **[Live leaderboard](https://headroomlabs.ai/dashboard)** — 60B+ tokens saved and counting.
+- **[Discord](https://discord.gg/yRmaUNpsPJ)** — questions, feedback, war stories.
+- **[Kompress-base on HuggingFace](https://huggingface.co/chopratejas/kompress-base)** — the model behind our text compression.
+
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](LICENSE).

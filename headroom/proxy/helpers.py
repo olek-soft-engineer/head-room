@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +35,18 @@ COMPRESSION_TIMEOUT_SECONDS = 30
 
 # Maximum compression cache sessions (prevents unbounded memory growth)
 MAX_COMPRESSION_CACHE_SESSIONS = 500
+
+
+def jitter_delay_ms(base_ms: int, max_ms: int, attempt: int) -> float:
+    """Exponential backoff with 50-150% jitter.
+
+    Returns ``min(base_ms * 2**attempt, max_ms) * (0.5 + random())`` — the
+    canonical formula used across proxy retry loops. Extracted so every
+    retry site shares one implementation.
+    """
+    capped: float = min(base_ms * (2**attempt), max_ms)
+    return capped * (0.5 + random.random())
+
 
 # Image compression (lazy-loaded to avoid heavy dependencies at startup)
 _image_compressor = None
@@ -142,6 +155,16 @@ def _get_rtk_stats() -> dict[str, Any] | None:
         "tokens_saved": 0,
         "avg_savings_pct": 0.0,
     }
+
+
+def is_anthropic_auth(headers: dict[str, str]) -> bool:
+    """Detect Anthropic auth signals in request headers."""
+    if headers.get("x-api-key") or headers.get("anthropic-version"):
+        return True
+    auth = headers.get("authorization", "")
+    if auth.startswith("Bearer sk-ant-"):
+        return True
+    return False
 
 
 async def _read_request_json(request: Request) -> dict[str, Any]:

@@ -28,7 +28,6 @@ import asyncio
 import json
 import logging
 import os
-import random
 import sys
 import time
 from datetime import datetime, timezone
@@ -45,7 +44,7 @@ import httpx
 
 try:
     import uvicorn
-    from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
+    from fastapi import Depends, FastAPI, HTTPException, Request, Response, WebSocket
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
@@ -112,6 +111,8 @@ from headroom.proxy.helpers import (
     _get_rtk_stats,  # noqa: F401
     _read_request_json,  # noqa: F401
     _setup_file_logging,  # noqa: F401
+    is_anthropic_auth,  # noqa: F401
+    jitter_delay_ms,
 )
 from headroom.proxy.memory_handler import MemoryConfig, MemoryHandler
 
@@ -127,6 +128,8 @@ from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
+from headroom.proxy.warmup import WarmupRegistry
+from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 from headroom.subscription.base import get_quota_registry, reset_quota_registry
 from headroom.subscription.codex_rate_limits import get_codex_rate_limit_state
 from headroom.subscription.copilot_quota import get_copilot_quota_tracker
@@ -383,6 +386,40 @@ class HeadroomProxy(
         # HTTP client
         self.http_client: httpx.AsyncClient | None = None
 
+        # Shared cold-start warmup registry (populated by startup()).
+        # Holds typed slots with loaded / loading / null / error status for
+        # each preloaded heavy asset. Exposed as ``proxy.warmup`` and
+        # serialized by the /debug/warmup route (Unit 5).
+        self.warmup: WarmupRegistry = WarmupRegistry()
+        # Unit 3: live registry of Codex WS sessions. Populated by
+        # ``handle_openai_responses_ws`` on accept; drained in its
+        # outermost ``finally``. Consumed by ``/debug/ws-sessions``.
+        self.ws_sessions: WebSocketSessionRegistry = WebSocketSessionRegistry()
+
+        # Unit 4: bounded pre-upstream concurrency for the Anthropic HTTP
+        # path. Caps how many ``handle_anthropic_messages`` calls may be
+        # running deep-copy / first-stage compression / memory-context
+        # lookup / upstream connect concurrently. ``/livez``, ``/readyz``,
+        # ``/health``, ``/metrics``, ``/stats``, and the Codex WS path are
+        # intentionally NOT gated by this semaphore.
+        #
+        # A value of ``0`` or negative disables the semaphore (unbounded
+        # mode); this is useful for the Unit 6 counter-factual where we
+        # deliberately reproduce the original starvation. The default is
+        # ``max(2, min(8, os.cpu_count() or 4))``.
+        _pre_upstream_cfg = config.anthropic_pre_upstream_concurrency
+        if _pre_upstream_cfg is None:
+            _pre_upstream_resolved = max(2, min(8, os.cpu_count() or 4))
+        else:
+            _pre_upstream_resolved = _pre_upstream_cfg
+        self.anthropic_pre_upstream_concurrency: int = _pre_upstream_resolved
+        if _pre_upstream_resolved > 0:
+            self.anthropic_pre_upstream_sem: asyncio.Semaphore | None = asyncio.Semaphore(
+                _pre_upstream_resolved
+            )
+        else:
+            self.anthropic_pre_upstream_sem = None
+
         # Backend for Anthropic API (direct, LiteLLM, or any-llm)
         # Supports: "anthropic" (direct), "bedrock", "vertex", "litellm-<provider>", or "anyllm"
         self.anthropic_backend: Backend | None = None
@@ -635,6 +672,20 @@ class HeadroomProxy(
             f"http2={'ENABLED' if self.config.http2 else 'DISABLED'}"
         )
 
+        # Unit 4 pre-upstream concurrency announcement. Report the resolved
+        # value (auto-detected vs. explicit) so operators can correlate
+        # ``pre_upstream_wait_ms`` log lines with the configured cap.
+        if self.anthropic_pre_upstream_sem is None:
+            logger.info("Anthropic pre-upstream concurrency: unbounded (explicitly disabled)")
+        else:
+            _explicit = self.config.anthropic_pre_upstream_concurrency
+            _origin = "auto-detected" if _explicit is None else "explicit"
+            logger.info(
+                "Anthropic pre-upstream concurrency: %d (%s)",
+                self.anthropic_pre_upstream_concurrency,
+                _origin,
+            )
+
         # Smart routing status
         if self.config.smart_routing:
             logger.info("Smart Routing: ENABLED (intelligent content detection)")
@@ -642,16 +693,42 @@ class HeadroomProxy(
             logger.info("Smart Routing: DISABLED (legacy sequential mode)")
 
         # Eagerly load ALL compressors, parsers, and detectors at startup
-        # This eliminates cold-start latency spikes on first requests
+        # This eliminates cold-start latency spikes on first requests.
+        # Iterate BOTH pipelines (Anthropic + OpenAI) and dedupe transforms
+        # by id() so shared-transform instances never load twice. The
+        # resulting status dict is merged into ``self.warmup`` so /debug/warmup
+        # (Unit 5) and /readyz have a single source of truth.
         self._kompress_status = "not installed"
         eager_status: dict[str, str] = {}
 
         if self.config.optimize:
             logger.info("Pre-loading compressors and parsers...")
-            for transform in self.anthropic_pipeline.transforms:
-                if hasattr(transform, "eager_load_compressors"):
-                    eager_status = transform.eager_load_compressors()
-                    break
+            seen_transform_ids: set[int] = set()
+            pipelines = (self.anthropic_pipeline, self.openai_pipeline)
+            for pipeline in pipelines:
+                for transform in pipeline.transforms:
+                    if id(transform) in seen_transform_ids:
+                        continue
+                    seen_transform_ids.add(id(transform))
+                    if not hasattr(transform, "eager_load_compressors"):
+                        continue
+                    try:
+                        transform_status = transform.eager_load_compressors()
+                    except Exception as exc:
+                        logger.warning(
+                            "Eager preload failed for %s: %s",
+                            type(transform).__name__,
+                            exc,
+                        )
+                        continue
+                    if not isinstance(transform_status, dict):
+                        continue
+                    # Merge: later writers win only if the key wasn't set.
+                    # Preload a transform ONCE — if another pipeline also has
+                    # ``eager_load_compressors`` it contributes only new keys.
+                    for key, value in transform_status.items():
+                        eager_status.setdefault(key, value)
+                    self.warmup.merge_transform_status(transform_status)
 
         # Update internal status from eager loading results
         if eager_status.get("kompress") == "enabled":
@@ -682,8 +759,33 @@ class HeadroomProxy(
             logger.info("Magika: ENABLED (ML content detection)")
 
         if self.memory_handler:
-            await self.memory_handler.ensure_initialized()
+            self.warmup.memory_backend.mark_loading()
+            try:
+                await self.memory_handler.ensure_initialized()
+            except Exception as exc:  # pragma: no cover - defensive
+                self.warmup.memory_backend.mark_error(str(exc))
+                logger.warning("Memory: backend initialization failed (startup continues): %s", exc)
             memory_status = self.memory_handler.health_status()
+            if memory_status.get("initialized"):
+                self.warmup.memory_backend.mark_loaded(
+                    handle=self.memory_handler,
+                    backend=memory_status.get("backend"),
+                )
+                # Force one embed call so the ONNX graph is compiled now,
+                # not lazily during the first request. Best-effort — any
+                # failure is swallowed inside warmup_embedder.
+                self.warmup.memory_embedder.mark_loading()
+                warmed = await self.memory_handler.warmup_embedder()
+                if warmed:
+                    self.warmup.memory_embedder.mark_loaded()
+                else:
+                    # Not an error — e.g. qdrant-neo4j has no embedder slot
+                    # we can reach, or the backend simply exposes no handle.
+                    self.warmup.memory_embedder.mark_null()
+            else:
+                if self.warmup.memory_backend.status != "error":
+                    self.warmup.memory_backend.mark_null()
+                self.warmup.memory_embedder.mark_null()
             logger.info(
                 "Memory: ENABLED "
                 f"(backend={memory_status['backend']}, initialized={memory_status['initialized']})"
@@ -889,11 +991,11 @@ class HeadroomProxy(
                     raise
 
                 # Exponential backoff with jitter
-                delay = min(
-                    self.config.retry_base_delay_ms * (2**attempt),
+                delay_with_jitter = jitter_delay_ms(
+                    self.config.retry_base_delay_ms,
                     self.config.retry_max_delay_ms,
+                    attempt,
                 )
-                delay_with_jitter = delay * (0.5 + random.random())
 
                 logger.warning(
                     f"Request failed (attempt {attempt + 1}), retrying in {delay_with_jitter:.0f}ms: {e}"
@@ -1205,6 +1307,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Third-party proxy extensions (Enterprise, custom plugins). Discovered via
+    # the `headroom.proxy_extension` entry-point group. An extension that raises
+    # from its install() is a deliberate fail-closed signal and aborts startup.
+    from headroom.proxy.extensions import install_all as _install_extensions
+
+    _install_extensions(app, config)
+
     # Health & Metrics
     @app.get("/livez")
     async def livez():
@@ -1228,6 +1337,40 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     @app.get("/health")
     async def health():
         payload = _health_payload(include_config=True)
+        return JSONResponse(status_code=200, content=payload)
+
+    # Loopback-only debug introspection (Unit 5). A remote IP gets 404 —
+    # debug endpoints are invisible to external scanners.
+    from headroom.proxy.debug_introspection import (
+        collect_tasks as _collect_tasks,
+    )
+    from headroom.proxy.loopback_guard import require_loopback as _require_loopback
+
+    @app.get("/debug/tasks", dependencies=[Depends(_require_loopback)])
+    async def debug_tasks(stack: bool = False):
+        """Enumerate running asyncio tasks.
+
+        Default is cheap — ``stack_depth`` is ``null`` in every entry so
+        a storm snapshot does not walk 50+ coroutine frames synchronously.
+        Pass ``?stack=true`` to compute ``stack_depth`` for each task
+        (useful for single-shot human debugging).
+        """
+        ws_registry = getattr(proxy, "ws_sessions", None)
+        return JSONResponse(
+            status_code=200,
+            content=_collect_tasks(ws_registry, with_stack_depth=stack),
+        )
+
+    @app.get("/debug/ws-sessions", dependencies=[Depends(_require_loopback)])
+    async def debug_ws_sessions():
+        ws_registry = getattr(proxy, "ws_sessions", None)
+        snapshot = ws_registry.snapshot() if ws_registry is not None else []
+        return JSONResponse(status_code=200, content=snapshot)
+
+    @app.get("/debug/warmup", dependencies=[Depends(_require_loopback)])
+    async def debug_warmup():
+        warmup_registry = getattr(proxy, "warmup", None)
+        payload = warmup_registry.to_dict() if warmup_registry is not None else {}
         return JSONResponse(status_code=200, content=payload)
 
     @app.get("/dashboard", response_class=HTMLResponse)
@@ -2218,10 +2361,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def list_models(request: Request):
         """List models - route based on auth header.
 
-        - x-api-key header present -> Anthropic
-        - Authorization: Bearer header -> OpenAI
+        - x-api-key / anthropic-version / Bearer sk-ant-* -> Anthropic
+        - Otherwise -> OpenAI
         """
-        if request.headers.get("x-api-key"):
+        if is_anthropic_auth(dict(request.headers)):
             return await proxy.handle_passthrough(
                 request, proxy.ANTHROPIC_API_URL, "models", "anthropic"
             )
@@ -2231,10 +2374,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def get_model(request: Request, model_id: str):
         """Get model details - route based on auth header.
 
-        - x-api-key header present -> Anthropic
-        - Authorization: Bearer header -> OpenAI
+        - x-api-key / anthropic-version / Bearer sk-ant-* -> Anthropic
+        - Otherwise -> OpenAI
         """
-        if request.headers.get("x-api-key"):
+        if is_anthropic_auth(dict(request.headers)):
             return await proxy.handle_passthrough(
                 request, proxy.ANTHROPIC_API_URL, "models", "anthropic"
             )
@@ -2364,8 +2507,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         if custom_base:
             return await proxy.handle_passthrough(request, custom_base.rstrip("/"))
 
-        # Anthropic: sends anthropic-version header and x-api-key
-        if request.headers.get("anthropic-version") or request.headers.get("x-api-key"):
+        # Anthropic: x-api-key, anthropic-version, or Bearer sk-ant-* token
+        if is_anthropic_auth(dict(request.headers)):
             base_url = proxy.ANTHROPIC_API_URL
         # Gemini: sends x-goog-api-key
         elif request.headers.get("x-goog-api-key"):
@@ -2492,6 +2635,12 @@ def run_server(
         log_level="warning",
         workers=workers if workers > 1 else None,  # None = single process (default)
         limit_concurrency=limit_concurrency,
+        # Defense-in-depth: the loopback guard for /debug/* endpoints trusts
+        # request.client.host. uvicorn's ProxyHeadersMiddleware rewrites that
+        # from X-Forwarded-For when FORWARDED_ALLOW_IPS is broader than the
+        # default. Disabling proxy_headers here guarantees the guard sees the
+        # real peer address regardless of env.
+        proxy_headers=False,
     )
 
 
