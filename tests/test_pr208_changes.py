@@ -273,3 +273,358 @@ class TestLatencyHistogram:
         summary = h.as_summary()
         assert summary["p50"] <= summary["p95"] <= summary["p99"] <= summary["max"]
         assert summary["count"] == 10
+
+    def test_percentile_boundary_zero(self) -> None:
+        LatencyHistogram = self._get_histogram_class()
+        h = LatencyHistogram()
+        for v in [10.0, 20.0, 30.0]:
+            h.record(v)
+        assert h.percentile(0) == 10.0
+
+    def test_percentile_boundary_hundred(self) -> None:
+        LatencyHistogram = self._get_histogram_class()
+        h = LatencyHistogram()
+        for v in [10.0, 20.0, 30.0]:
+            h.record(v)
+        assert h.percentile(100) == 30.0
+
+
+# ---------------------------------------------------------------------------
+# is_anthropic_auth tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsAnthropicAuth:
+    """Tests for headroom.proxy.helpers.is_anthropic_auth."""
+
+    def test_detects_x_api_key(self) -> None:
+        from headroom.proxy.helpers import is_anthropic_auth
+
+        assert is_anthropic_auth({"x-api-key": "sk-ant-abc123"}) is True
+
+    def test_detects_anthropic_version_header(self) -> None:
+        from headroom.proxy.helpers import is_anthropic_auth
+
+        assert is_anthropic_auth({"anthropic-version": "2023-06-01"}) is True
+
+    def test_detects_bearer_sk_ant_prefix(self) -> None:
+        from headroom.proxy.helpers import is_anthropic_auth
+
+        assert is_anthropic_auth({"authorization": "Bearer sk-ant-abc123"}) is True
+
+    def test_rejects_openai_bearer_token(self) -> None:
+        from headroom.proxy.helpers import is_anthropic_auth
+
+        assert is_anthropic_auth({"authorization": "Bearer sk-openai-xyz"}) is False
+
+    def test_rejects_empty_headers(self) -> None:
+        from headroom.proxy.helpers import is_anthropic_auth
+
+        assert is_anthropic_auth({}) is False
+
+    def test_rejects_non_anthropic_auth(self) -> None:
+        from headroom.proxy.helpers import is_anthropic_auth
+
+        assert is_anthropic_auth({"authorization": "Bearer some-token"}) is False
+
+
+# ---------------------------------------------------------------------------
+# _setup_file_logging tests
+# ---------------------------------------------------------------------------
+
+
+class TestSetupFileLogging:
+    """Tests for _setup_file_logging using the new _headroom_log_dir path."""
+
+    def test_setup_file_logging_creates_log_dir(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from headroom.proxy.helpers import _setup_file_logging
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+        # Clear any cached handlers to allow fresh registration
+        import logging
+        from logging.handlers import RotatingFileHandler
+
+        headroom_logger = logging.getLogger("headroom")
+        headroom_logger.handlers = [
+            h for h in headroom_logger.handlers if not isinstance(h, RotatingFileHandler)
+        ]
+
+        _setup_file_logging()
+
+        # Verify a RotatingFileHandler was added
+        has_rotating = any(isinstance(h, RotatingFileHandler) for h in headroom_logger.handlers)
+        assert has_rotating, "Expected a RotatingFileHandler to be registered"
+
+    def test_setup_file_logging_handles_oserror(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """_setup_file_logging should not raise on OSError."""
+        from headroom.proxy.helpers import _setup_file_logging
+
+        # Monkey-patch _headroom_log_dir to return a path that will cause OSError
+        def _bad_log_dir():
+            return Path("/nonexistent/deeply/nested/path/that/cannot/exist/___test___")
+
+        import headroom.proxy.helpers as helpers_mod
+
+        monkeypatch.setattr(helpers_mod, "_headroom_log_dir", _bad_log_dir)
+        # Should not raise
+        _setup_file_logging()
+
+
+# ---------------------------------------------------------------------------
+# Repro script URL helpers and stats tests
+# ---------------------------------------------------------------------------
+
+
+class TestReproScriptHelpers:
+    """Tests for helper functions in scripts/repro_codex_replay.py."""
+
+    def _import_repro(self):
+        scripts_dir = ROOT / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        import repro_codex_replay
+
+        return repro_codex_replay
+
+    def test_http_to_ws_url_http(self) -> None:
+        mod = self._import_repro()
+        result = mod._http_to_ws_url("http://127.0.0.1:8787", "/v1/responses")
+        assert result == "ws://127.0.0.1:8787/v1/responses"
+
+    def test_http_to_ws_url_https(self) -> None:
+        mod = self._import_repro()
+        result = mod._http_to_ws_url("https://example.com:443", "/v1/responses")
+        assert result == "wss://example.com:443/v1/responses"
+
+    def test_http_to_ws_url_normalizes_path(self) -> None:
+        mod = self._import_repro()
+        result = mod._http_to_ws_url("http://localhost:9000", "v1/responses")
+        assert result == "ws://localhost:9000/v1/responses"
+
+    def test_http_to_ws_url_empty_path(self) -> None:
+        mod = self._import_repro()
+        result = mod._http_to_ws_url("http://localhost:9000", "")
+        assert result == "ws://localhost:9000"
+
+    def test_classify_exit_proxy_unreachable(self) -> None:
+        mod = self._import_repro()
+        result = {"reason": "proxy_unreachable"}
+        assert mod._classify_exit(result) == mod.EXIT_PROXY_UNREACHABLE
+
+    def test_classify_exit_warmup_failed(self) -> None:
+        mod = self._import_repro()
+        result = {"warmup": {"skipped": False, "success": False}, "ok": False}
+        assert mod._classify_exit(result) == mod.EXIT_WARMUP_FAILED
+
+    def test_classify_exit_livez_threshold(self) -> None:
+        mod = self._import_repro()
+        result = {
+            "warmup": {"skipped": True},
+            "livez": {"threshold_ok": False},
+            "ok": False,
+        }
+        assert mod._classify_exit(result) == mod.EXIT_LIVEZ_THRESHOLD
+
+    def test_classify_exit_ok(self) -> None:
+        mod = self._import_repro()
+        result = {
+            "warmup": {"skipped": True},
+            "livez": {"threshold_ok": True},
+            "ok": True,
+        }
+        assert mod._classify_exit(result) == mod.EXIT_OK
+
+    def test_classify_exit_crash(self) -> None:
+        mod = self._import_repro()
+        result = {
+            "warmup": {"skipped": True},
+            "livez": {"threshold_ok": True},
+            "ok": False,
+        }
+        assert mod._classify_exit(result) == mod.EXIT_CRASH
+
+    def test_format_summary_proxy_unreachable(self) -> None:
+        mod = self._import_repro()
+        result = {
+            "reason": "proxy_unreachable",
+            "url": "http://127.0.0.1:8787",
+            "detail": "ConnectionRefusedError: ...",
+        }
+        output = mod.format_summary(result)
+        assert "unreachable" in output.lower()
+        assert "127.0.0.1:8787" in output
+
+    def test_format_summary_full_result(self) -> None:
+        mod = self._import_repro()
+        result = {
+            "ok": True,
+            "warmup": {"skipped": False, "success": True, "elapsed_ms": 50.0, "note": "ok"},
+            "storm": {
+                "ws_clients": 8,
+                "anthropic_clients": 4,
+                "requested_duration_s": 30,
+                "actual_duration_s": 30.5,
+            },
+            "livez": {
+                "count": 100,
+                "p50": 5.0,
+                "p95": 10.0,
+                "p99": 15.0,
+                "max": 20.0,
+                "threshold_ms": 500,
+                "threshold_ok": True,
+            },
+            "codex_ws": {"opened": 8, "response_completed": 4, "errors": {}},
+            "anthropic_http": {
+                "attempted": 4,
+                "ok_2xx": 4,
+                "non_2xx": 0,
+                "timed_out": 0,
+                "errors": 0,
+                "avg_first_byte_ms": 25.0,
+            },
+        }
+        output = mod.format_summary(result)
+        assert "OK" in output
+        assert "ws_clients=8" in output
+
+    def test_format_summary_warmup_skipped(self) -> None:
+        mod = self._import_repro()
+        result = {
+            "ok": True,
+            "warmup": {"skipped": True},
+            "storm": {
+                "ws_clients": 2,
+                "anthropic_clients": 1,
+                "requested_duration_s": 5,
+                "actual_duration_s": 5.1,
+            },
+            "livez": {
+                "count": 20,
+                "p50": 2.0,
+                "p95": 5.0,
+                "p99": 8.0,
+                "max": 10.0,
+                "threshold_ms": 500,
+                "threshold_ok": True,
+            },
+            "codex_ws": {"opened": 2, "response_completed": 0, "errors": {}},
+            "anthropic_http": {
+                "attempted": 1,
+                "ok_2xx": 1,
+                "non_2xx": 0,
+                "timed_out": 0,
+                "errors": 0,
+                "avg_first_byte_ms": 10.0,
+            },
+        }
+        output = mod.format_summary(result)
+        assert "skipped" in output.lower()
+
+    def test_build_parser_defaults(self) -> None:
+        mod = self._import_repro()
+        parser = mod.build_parser()
+        args = parser.parse_args([])
+        assert args.url == "http://127.0.0.1:8787"
+        assert args.ws_clients == 8
+        assert args.anthropic_clients == 4
+        assert args.duration == 30.0
+        assert args.livez_threshold_ms == 500.0
+        assert args.no_warmup is False
+        assert args.json is False
+
+    def test_build_parser_custom_args(self) -> None:
+        mod = self._import_repro()
+        parser = mod.build_parser()
+        args = parser.parse_args(
+            [
+                "--url",
+                "http://localhost:9999",
+                "--ws-clients",
+                "2",
+                "--anthropic-clients",
+                "1",
+                "--duration",
+                "10",
+                "--no-warmup",
+                "--json",
+            ]
+        )
+        assert args.url == "http://localhost:9999"
+        assert args.ws_clients == 2
+        assert args.anthropic_clients == 1
+        assert args.duration == 10.0
+        assert args.no_warmup is True
+        assert args.json is True
+
+
+# ---------------------------------------------------------------------------
+# Repro script stats dataclass tests
+# ---------------------------------------------------------------------------
+
+
+class TestReproScriptStats:
+    """Tests for stat tracking dataclasses in the repro harness."""
+
+    def _import_repro(self):
+        scripts_dir = ROOT / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        import repro_codex_replay
+
+        return repro_codex_replay
+
+    def test_codex_ws_stats_record_error(self) -> None:
+        mod = self._import_repro()
+        stats = mod.CodexWsStats()
+        stats.record_error("connect:OSError")
+        stats.record_error("connect:OSError")
+        stats.record_error("ws:InvalidStatus")
+        assert stats.errors == {"connect:OSError": 2, "ws:InvalidStatus": 1}
+
+    def test_anthropic_http_stats_avg_first_byte(self) -> None:
+        mod = self._import_repro()
+        stats = mod.AnthropicHttpStats()
+        assert stats.avg_first_byte_ms == 0.0
+        stats.first_byte_latency_ms = [10.0, 20.0, 30.0]
+        assert stats.avg_first_byte_ms == 20.0
+
+    def test_anthropic_http_stats_initial_state(self) -> None:
+        mod = self._import_repro()
+        stats = mod.AnthropicHttpStats()
+        assert stats.attempted == 0
+        assert stats.ok_2xx == 0
+        assert stats.non_2xx == 0
+        assert stats.timed_out == 0
+        assert stats.errors == 0
+
+
+# ---------------------------------------------------------------------------
+# wrap.py _get_log_path using paths module
+# ---------------------------------------------------------------------------
+
+
+class TestWrapGetLogPath:
+    """Tests for _get_log_path in wrap.py using headroom.paths."""
+
+    def test_get_log_path_returns_proxy_log(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from headroom.cli.wrap import _get_log_path
+
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+        result = _get_log_path()
+        assert result.name == "proxy.log"
+        assert str(tmp_path) in str(result)
+
+    def test_get_log_path_creates_directory(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from headroom.cli.wrap import _get_log_path
+
+        log_subdir = tmp_path / "custom_logs"
+        monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(log_subdir))
+        result = _get_log_path()
+        assert result.parent.exists()
