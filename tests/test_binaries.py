@@ -294,6 +294,31 @@ def test_sha256_match_passes(monkeypatch, fake_urlopen):
 # -------- status() ------------------------------------------------------- #
 
 
+def test_ensure_tools_survives_readonly_cache_dir(monkeypatch, tmp_path):
+    """Containerized / read-only home dirs must not crash proxy startup.
+
+    Regression test for PermissionError not being caught in ensure_tools().
+    """
+    _set_platform(monkeypatch, sys_plat="linux", machine="x86_64", musl=False)
+    monkeypatch.setattr(binaries.shutil, "which", lambda _name: None)
+
+    # Point the cache at a path we can't create under (readonly parent).
+    readonly_parent = tmp_path / "readonly"
+    readonly_parent.mkdir()
+    readonly_parent.chmod(0o500)  # r-x: can't create children
+    monkeypatch.setenv("HEADROOM_BINARIES_CACHE", str(readonly_parent / "cache"))
+
+    try:
+        # Must return a dict, not raise.
+        result = binaries.ensure_tools(quiet=True)
+        # Fetched tools couldn't write to cache → None. ast-grep is PyPI-only
+        # so its entry depends on PATH, which is not what this test exercises.
+        assert result.get("difft") is None
+        assert result.get("scc") is None
+    finally:
+        readonly_parent.chmod(0o700)  # so pytest tmp cleanup succeeds
+
+
 def test_ensure_tools_partial_failure_proxy_still_starts(monkeypatch):
     """If one tool fails to fetch, others still install and ensure_tools returns."""
     _set_platform(monkeypatch, sys_plat="darwin", machine="arm64")

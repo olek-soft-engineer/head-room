@@ -470,7 +470,16 @@ def ensure_tools(quiet: bool = False) -> dict[str, Path | None]:
                 out[name] = _path_lookup(name)
                 continue
             out[name] = resolve(name)
-        except (PlatformNotSupported, OfflineError, BinaryFetchError, Sha256Mismatch) as e:
+        except (
+            PlatformNotSupported,
+            OfflineError,
+            BinaryFetchError,
+            Sha256Mismatch,
+            # Catch readonly / sandboxed filesystems (e.g. containerized
+            # home dirs) so proxy startup never fails because the cache dir
+            # can't be created. The interceptor fall back to no-op.
+            OSError,
+        ) as e:
             out[name] = None
             if not quiet:
                 print(f"headroom: skipping {name}: {e}", file=sys.stderr)

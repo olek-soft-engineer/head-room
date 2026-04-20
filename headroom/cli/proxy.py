@@ -276,19 +276,15 @@ def proxy(
         click.echo(f"Details: {e}")
         raise SystemExit(1) from None
 
-    # Ensure bundled CLI tools (ast-grep, difftastic, scc) are present before
-    # the proxy starts accepting traffic. Never happens inside a live request —
-    # tools are downloaded once at startup if missing, then cached per-user.
-    from headroom.binaries import ensure_tools
-
-    resolved_tools = ensure_tools()
-
     # Opt-in: turn on tool_result interceptors (ast-grep Read outline, etc.).
-    # The TransformPipeline reads this env var at construction time.
+    # Only fetch the bundled CLI tool binaries when the feature is enabled —
+    # otherwise we'd pay a network round-trip and risk a readonly-FS failure
+    # for capabilities the user hasn't asked for. The TransformPipeline reads
+    # this env var at construction time.
     if intercept_tool_results:
-        # Validate each interceptor's critical tool actually installed. Today
-        # only the ast-grep Read outliner is wired; add entries here as
-        # interceptors gain dependencies.
+        from headroom.binaries import ensure_tools
+
+        resolved_tools = ensure_tools()
         critical_tools = ["ast-grep"]
         missing = [t for t in critical_tools if not resolved_tools.get(t)]
         if missing:
