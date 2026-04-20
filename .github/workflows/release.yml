@@ -147,6 +147,7 @@ jobs:
           npm pack --pack-destination ../../release-assets
 
           cd ../../plugins/openclaw
+          npm install ../../release-assets/headroom-ai-${{ needs.detect-version.outputs.npm_version }}.tgz
           npm install
           npm run build
           npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
