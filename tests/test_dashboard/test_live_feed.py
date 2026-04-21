@@ -1,4 +1,20 @@
 import pytest
+from playwright.sync_api import sync_playwright
+
+pytest.importorskip("playwright", reason="Playwright not installed — dashboard E2E tests skipped")
+
+
+@pytest.fixture(scope="module")
+def browser():
+    with sync_playwright() as p:
+        b = p.chromium.launch()
+        yield b
+        b.close()
+
+
+@pytest.fixture
+def page(browser):
+    return browser.new_page()
 
 
 @pytest.fixture
