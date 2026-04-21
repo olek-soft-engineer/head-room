@@ -484,7 +484,10 @@ def test_savings_tracker_rollups_preserve_spend_and_input_history(tmp_path, monk
         "monthly",
     ]
 
-def test_stats_history_defaults_to_compact_history_but_can_return_full_history(tmp_path, monkeypatch):
+
+def test_stats_history_defaults_to_compact_history_but_can_return_full_history(
+    tmp_path, monkeypatch
+):
     path = tmp_path / "proxy_savings.json"
     tracker = SavingsTracker(
         path=str(path),
