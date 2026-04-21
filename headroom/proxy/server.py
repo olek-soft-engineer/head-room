@@ -1346,6 +1346,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         allow_headers=["*"],
     )
 
+    # X-Headroom-Stack: SDK adapters (TS openai/anthropic/etc.) tag their
+    # requests so telemetry can segment by integration surface. Registered
+    # before extension middleware so any extension-level auth/guards run
+    # outermost and we don't count requests they reject.
+    @app.middleware("http")
+    async def _record_headroom_stack(request, call_next):
+        if request.url.path.startswith("/v1/"):
+            stack = request.headers.get("x-headroom-stack")
+            if stack:
+                try:
+                    proxy.metrics.record_stack(stack)
+                except Exception:
+                    logger.debug("record_stack failed", exc_info=True)
+        return await call_next(request)
+
     # Third-party proxy extensions (Enterprise, custom plugins). Discovered via
     # the `headroom.proxy_extension` entry-point group. An extension that raises
     # from its install() is a deliberate fail-closed signal and aborts startup.
@@ -1556,6 +1571,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "failed": m.requests_failed,
                 "by_provider": dict(m.requests_by_provider),
                 "by_model": dict(m.requests_by_model),
+                "by_stack": dict(m.requests_by_stack),
             },
             "tokens": {
                 "input": m.tokens_input_total,
