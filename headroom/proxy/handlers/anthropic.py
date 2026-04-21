@@ -411,8 +411,7 @@ class AnthropicHandlerMixin:
                         "error": {
                             "type": "service_unavailable",
                             "message": (
-                                "Anthropic pre-upstream queue is saturated. "
-                                "Please retry shortly."
+                                "Anthropic pre-upstream queue is saturated. Please retry shortly."
                             ),
                         },
                     },

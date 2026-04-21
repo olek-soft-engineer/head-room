@@ -692,8 +692,7 @@ class HeadroomProxy(
                 _origin,
             )
         logger.info(
-            "Anthropic pre-upstream timeouts: acquire=%.1fs compression=%.1fs "
-            "memory_context=%.1fs",
+            "Anthropic pre-upstream timeouts: acquire=%.1fs compression=%.1fs memory_context=%.1fs",
             self.anthropic_pre_upstream_acquire_timeout_seconds,
             float(COMPRESSION_TIMEOUT_SECONDS),
             self.anthropic_pre_upstream_memory_context_timeout_seconds,
