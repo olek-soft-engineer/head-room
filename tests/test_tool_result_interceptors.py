@@ -628,6 +628,69 @@ def test_transform_adapter_respects_frozen_message_count(tokenizer):
     assert "outlined by ast-grep" in result.messages[3]["content"][0]["content"]
 
 
+def test_progressive_disclosure_respects_frozen_prefix_history(tokenizer):
+    """If a file was Read in the frozen prefix, re-reading it in the mutable
+    tail passes through — even though apply_to_messages only sees the tail
+    for rewriting, it pre-scans the frozen prefix to seed `fired` keys.
+    """
+    transform = ToolResultInterceptorTransform()
+    messages = [
+        # Frozen prefix: first Read of payments.py. This is cached, so we
+        # don't outline it; but it counts as "already disclosed."
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "frozen-read",
+                    "name": "Read",
+                    "input": {"file_path": "/repo/payments.py"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "frozen-read",
+                    "content": _PY_FIXTURE,
+                }
+            ],
+        },
+        # Mutable tail: model reads payments.py again — should pass through
+        # because the frozen prefix already served it.
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "tail-read",
+                    "name": "Read",
+                    "input": {"file_path": "/repo/payments.py"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tail-read",
+                    "content": _PY_FIXTURE,
+                }
+            ],
+        },
+    ]
+    result = transform.apply(messages, tokenizer, frozen_message_count=2)
+    # Tail re-read preserved (not outlined) because the frozen prefix
+    # already exposed the file.
+    tail_content = result.messages[3]["content"][0]["content"]
+    assert "outlined by ast-grep" not in tail_content
+    assert "def process_payment" in tail_content
+    assert "subtotal = compute_subtotal(items)" in tail_content
+
+
 def test_transform_adapter_tokens_before_is_baseline_not_reconstruction(tokenizer):
     """tokens_before must reflect the real original messages, not back-calc."""
     transform = ToolResultInterceptorTransform()

@@ -111,7 +111,11 @@ class AstGrepReadOutline:
             return None
         try:
             exe = binaries.resolve("ast-grep")
-        except binaries.PlatformNotSupported:
+        except (binaries.BinaryError, KeyError, OSError) as e:
+            # Covers PlatformNotSupported, OfflineError, BinaryFetchError,
+            # Sha256Mismatch, unknown-tool KeyError, and FS permission errors.
+            # Any of these means the interceptor simply passes through.
+            logger.debug("ast-grep unavailable: %s", e)
             return None
 
         matches = _run_ast_grep(exe, lang, tool_output)
@@ -177,8 +181,11 @@ def _run_ast_grep(
     tmp_dir = Path(tempfile.mkdtemp(prefix="headroom-sg-"))
     try:
         os.chmod(tmp_dir, 0o700)
-    except OSError:
-        pass  # best-effort on Windows / restricted FS
+    except OSError as e:
+        # On Windows / restricted FS chmod has no effect, but silently
+        # swallowing means a shared-tmp system may leave untrusted content
+        # world-readable without any indication. Log so the miss is visible.
+        logger.debug("chmod 0700 failed for %s: %s (hardening skipped)", tmp_dir, e)
     tmp_path = tmp_dir / f"src{ext}"
     tmp_path.write_text(source, encoding="utf-8")
 

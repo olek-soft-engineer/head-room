@@ -77,12 +77,15 @@ class TransformPipeline:
 
         # 0. Tool-result interceptors (ast-grep Read outline, etc.) run first
         # so downstream compressors operate on the already-shrunk content.
-        # OPT-IN: enable with HEADROOM_INTERCEPT_ENABLED=1 or `headroom proxy
-        # --intercept-tool-results`. Off by default while this ships — lets
+        # OPT-IN: enable via HeadroomConfig.intercept_tool_results, or for
+        # non-config callers (CLI / SDK / tests) the env var
+        # HEADROOM_INTERCEPT_ENABLED=1. Off by default while this ships — lets
         # users try it and compare before we make it the default.
         import os as _os
 
-        if _os.environ.get("HEADROOM_INTERCEPT_ENABLED"):
+        if getattr(self.config, "intercept_tool_results", False) or _os.environ.get(
+            "HEADROOM_INTERCEPT_ENABLED"
+        ):
             from headroom.proxy.interceptors import ToolResultInterceptorTransform
 
             transforms.append(ToolResultInterceptorTransform())

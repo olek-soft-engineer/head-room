@@ -1,6 +1,7 @@
 """Proxy server CLI commands."""
 
 import os
+import sys
 
 import click
 
@@ -288,13 +289,17 @@ def proxy(
         critical_tools = ["ast-grep"]
         missing = [t for t in critical_tools if not resolved_tools.get(t)]
         if missing:
+            # User explicitly opted in — fail fast rather than silently starting
+            # with non-functional interceptors. They can retry with the tool
+            # installed, or drop the flag if they want pass-through behavior.
             click.secho(
-                f"warning: --intercept-tool-results set but tool(s) unavailable: {missing}. "
-                "Interceptors depending on them will silently pass through. "
-                "Run `headroom tools doctor` to diagnose.",
-                fg="yellow",
+                f"error: --intercept-tool-results requires tool(s) that could not "
+                f"be installed: {missing}. Run `headroom tools doctor` to diagnose, "
+                "or omit the flag to start the proxy without interceptors.",
+                fg="red",
                 err=True,
             )
+            sys.exit(1)
         os.environ["HEADROOM_INTERCEPT_ENABLED"] = "1"
 
     # Resolve API URL overrides: CLI flag > env var > None

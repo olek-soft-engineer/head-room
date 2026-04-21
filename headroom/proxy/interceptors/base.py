@@ -154,7 +154,16 @@ def _build_tool_use_index(
                 if isinstance(raw_args, str):
                     try:
                         args = json.loads(raw_args)
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as e:
+                        # Empty dict means range-key checks fail for this call
+                        # (interceptor may outline despite an explicit line range).
+                        # Log so the miss is diagnosable.
+                        logger.debug(
+                            "tool_call %s arguments failed to JSON-decode: %s; "
+                            "proceeding with empty args (range-key checks disabled)",
+                            cid,
+                            e,
+                        )
                         args = {}
                 elif isinstance(raw_args, dict):
                     args = raw_args
@@ -183,8 +192,16 @@ def _tool_use_id_for_message(msg: dict[str, Any]) -> str | None:
 def apply_to_messages(
     messages: list[dict[str, Any]],
     tokenizer: Tokenizer,
+    *,
+    frozen_count: int = 0,
 ) -> InterceptionResult:
     """Run every registered interceptor against every tool_result in `messages`.
+
+    `frozen_count`: leading messages in the provider's prefix cache that
+    MUST be passed through verbatim. Their tool_uses are still scanned so
+    that progressive disclosure works across the prefix / tail boundary —
+    e.g., a file first Read in the frozen prefix won't be re-outlined when
+    the model Reads it again in the mutable tail.
 
     Returns the (possibly) rewritten message list and a list of spans that
     actually saved tokens.
@@ -192,18 +209,46 @@ def apply_to_messages(
     if not INTERCEPTORS:
         return InterceptionResult(messages=messages, spans=[])
 
-    new_messages: list[dict[str, Any]] = []
     spans: list[TransformSpan] = []
     # Progressive disclosure: per-interceptor set of keys already rewritten
     # earlier in this message list. Prevents the second Read of the same
     # file from being outlined again — the model evidently came back for
     # more, so give it the raw content.
     fired: dict[str, set[str]] = {}
-    # Build O(1) tool_use lookup index once per request — prior implementation
-    # was O(n²) on long conversations.
+    # Build O(1) tool_use lookup index once per request (over ALL messages,
+    # including the frozen prefix, so keys resolve correctly even when the
+    # tool_use lives in the frozen part).
     tool_use_index = _build_tool_use_index(messages)
 
-    for msg in messages:
+    # Pre-seed `fired` from the frozen prefix so that any file already Read
+    # in the cached prefix counts as "already disclosed" for subsequent reads.
+    for msg in messages[:frozen_count]:
+        if not _is_tool_result_message(msg):
+            continue
+        frozen_tuid = _tool_use_id_for_message(msg)
+        if not frozen_tuid:
+            continue
+        f_tool_name, f_tool_input = tool_use_index.get(frozen_tuid, (None, {}))
+        for interceptor in INTERCEPTORS:
+            key_fn = getattr(interceptor, "progressive_disclosure_key", None)
+            if not callable(key_fn):
+                continue
+            try:
+                k = key_fn(f_tool_name, f_tool_input)
+            except Exception as e:  # noqa: BLE001
+                logger.debug(
+                    "interceptor %s key() failed on frozen prefix: %s",
+                    interceptor.name,
+                    e,
+                )
+                continue
+            if k:
+                fired.setdefault(interceptor.name, set()).add(k)
+
+    # Pass frozen messages through verbatim; only the mutable tail is
+    # considered for rewriting.
+    new_messages: list[dict[str, Any]] = list(messages[:frozen_count])
+    for msg in messages[frozen_count:]:
         if not _is_tool_result_message(msg):
             new_messages.append(msg)
             continue
@@ -231,7 +276,12 @@ def apply_to_messages(
                 try:
                     key = key_fn(tool_name, tool_input)
                 except Exception as e:  # noqa: BLE001
-                    logger.warning("interceptor %s key() failed: %s", interceptor.name, e)
+                    logger.warning(
+                        "interceptor %s key() failed: %s",
+                        interceptor.name,
+                        e,
+                        exc_info=True,
+                    )
                     _record_failure(interceptor.name)
                     # Skip this interceptor entirely rather than firing
                     # without progressive-disclosure protection — a broken
@@ -245,7 +295,12 @@ def apply_to_messages(
                     continue
                 rewritten = interceptor.transform(tool_name, tool_input, current)
             except Exception as e:  # noqa: BLE001 — never crash a request
-                logger.warning("interceptor %s failed: %s", interceptor.name, e)
+                logger.warning(
+                    "interceptor %s failed: %s",
+                    interceptor.name,
+                    e,
+                    exc_info=True,
+                )
                 _record_failure(interceptor.name)
                 continue
             if not rewritten or rewritten == current:
@@ -296,19 +351,15 @@ class ToolResultInterceptorTransform(Transform):
         # overhead that spans don't track.
         tokens_before = tokenizer.count_messages(messages)
 
-        # Honor the frozen prefix: never touch cached messages.
+        # `apply_to_messages` handles the frozen/mutable split internally
+        # and pre-seeds progressive-disclosure state from the frozen prefix
+        # so a file already Read there isn't re-outlined in the tail.
         frozen = int(kwargs.get("frozen_message_count") or 0)
-        if frozen > 0:
-            frozen_msgs, mutable_msgs = messages[:frozen], messages[frozen:]
-        else:
-            frozen_msgs, mutable_msgs = [], messages
-
-        result = apply_to_messages(mutable_msgs, tokenizer)
-        out_messages = frozen_msgs + result.messages
-        tokens_after = tokenizer.count_messages(out_messages)
+        result = apply_to_messages(messages, tokenizer, frozen_count=frozen)
+        tokens_after = tokenizer.count_messages(result.messages)
         transforms_applied = [f"interceptor:{s.tool}" for s in result.spans] if result.spans else []
         return TransformResult(
-            messages=out_messages,
+            messages=result.messages,
             tokens_before=tokens_before,
             tokens_after=tokens_after,
             transforms_applied=transforms_applied,
