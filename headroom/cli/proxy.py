@@ -1,6 +1,7 @@
 """Proxy server CLI commands."""
 
 import os
+import sys
 
 import click
 
@@ -42,6 +43,14 @@ from .main import main
         "Optimization mode: token (prioritize compression) or cache "
         "(freeze prior turns for prefix-cache stability). "
         "Legacy aliases are accepted. Default: token. Env: HEADROOM_MODE"
+    ),
+)
+@click.option(
+    "--intercept-tool-results",
+    is_flag=True,
+    help=(
+        "Opt in to tool_result interceptors (ast-grep Read outliner, etc.). "
+        "Off by default while this feature ships."
     ),
 )
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
@@ -235,6 +244,7 @@ def proxy(
     mode: str | None,
     host: str,
     port: int,
+    intercept_tool_results: bool,
     no_optimize: bool,
     no_cache: bool,
     no_rate_limit: bool,
@@ -292,6 +302,31 @@ def proxy(
         click.echo("Error: Proxy dependencies not installed. Run: pip install headroom[proxy]")
         click.echo(f"Details: {e}")
         raise SystemExit(1) from None
+
+    # Opt-in: turn on tool_result interceptors (ast-grep Read outline, etc.).
+    # Only fetch the bundled CLI tool binaries when the feature is enabled —
+    # otherwise we'd pay a network round-trip and risk a readonly-FS failure
+    # for capabilities the user hasn't asked for. The TransformPipeline reads
+    # this env var at construction time.
+    if intercept_tool_results:
+        from headroom.binaries import ensure_tools
+
+        resolved_tools = ensure_tools()
+        critical_tools = ["ast-grep"]
+        missing = [t for t in critical_tools if not resolved_tools.get(t)]
+        if missing:
+            # User explicitly opted in — fail fast rather than silently starting
+            # with non-functional interceptors. They can retry with the tool
+            # installed, or drop the flag if they want pass-through behavior.
+            click.secho(
+                f"error: --intercept-tool-results requires tool(s) that could not "
+                f"be installed: {missing}. Run `headroom tools doctor` to diagnose, "
+                "or omit the flag to start the proxy without interceptors.",
+                fg="red",
+                err=True,
+            )
+            sys.exit(1)
+        os.environ["HEADROOM_INTERCEPT_ENABLED"] = "1"
 
     # Resolve API URL overrides: CLI flag > env var > None
     effective_anthropic_api_url = anthropic_api_url or os.environ.get("ANTHROPIC_TARGET_API_URL")

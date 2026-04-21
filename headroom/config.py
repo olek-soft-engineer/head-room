@@ -629,6 +629,10 @@ class HeadroomConfig:
         default_factory=lambda: IntelligentContextConfig(enabled=False)
     )
 
+    # Tool-result interceptors (ast-grep Read outline, etc.). Opt-in for now.
+    # Env var HEADROOM_INTERCEPT_ENABLED=1 also enables (for CLI `--intercept-tool-results`).
+    intercept_tool_results: bool = False
+
     # Debugging - opt-in diff artifact generation
     generate_diff_artifact: bool = False  # Enable to get detailed transform diffs
 
