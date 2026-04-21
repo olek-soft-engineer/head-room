@@ -1,7 +1,7 @@
 import pytest
-from playwright.sync_api import sync_playwright
 
-pytest.importorskip("playwright", reason="Playwright not installed — dashboard E2E tests skipped")
+pytest.importorskip("playwright")
+from playwright.sync_api import sync_playwright
 
 
 @pytest.fixture(scope="module")
