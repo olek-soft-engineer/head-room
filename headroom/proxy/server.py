@@ -413,6 +413,12 @@ class HeadroomProxy(
         else:
             _pre_upstream_resolved = _pre_upstream_cfg
         self.anthropic_pre_upstream_concurrency: int = _pre_upstream_resolved
+        self.anthropic_pre_upstream_acquire_timeout_seconds = float(
+            config.anthropic_pre_upstream_acquire_timeout_seconds
+        )
+        self.anthropic_pre_upstream_memory_context_timeout_seconds = float(
+            config.anthropic_pre_upstream_memory_context_timeout_seconds
+        )
         if _pre_upstream_resolved > 0:
             self.anthropic_pre_upstream_sem: asyncio.Semaphore | None = asyncio.Semaphore(
                 _pre_upstream_resolved
@@ -685,6 +691,12 @@ class HeadroomProxy(
                 self.anthropic_pre_upstream_concurrency,
                 _origin,
             )
+        logger.info(
+            "Anthropic pre-upstream timeouts: acquire=%.1fs compression=%.1fs memory_context=%.1fs",
+            self.anthropic_pre_upstream_acquire_timeout_seconds,
+            float(COMPRESSION_TIMEOUT_SECONDS),
+            self.anthropic_pre_upstream_memory_context_timeout_seconds,
+        )
 
         # Smart routing status
         if self.config.smart_routing:
@@ -1264,6 +1276,32 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             ),
         }
 
+    def _runtime_payload() -> dict[str, Any]:
+        ws_registry = getattr(proxy, "ws_sessions", None)
+        ws_active_sessions = ws_registry.active_count() if ws_registry is not None else 0
+        ws_active_relay_tasks = (
+            ws_registry.active_relay_task_count() if ws_registry is not None else 0
+        )
+        return {
+            "anthropic_pre_upstream": {
+                "enabled": proxy.anthropic_pre_upstream_sem is not None,
+                "resolved_concurrency": proxy.anthropic_pre_upstream_concurrency,
+                "source": (
+                    "auto" if config.anthropic_pre_upstream_concurrency is None else "explicit"
+                ),
+                "acquire_timeout_seconds": proxy.anthropic_pre_upstream_acquire_timeout_seconds,
+                "compression_timeout_seconds": float(COMPRESSION_TIMEOUT_SECONDS),
+                "memory_context_timeout_seconds": (
+                    proxy.anthropic_pre_upstream_memory_context_timeout_seconds
+                ),
+                "codex_ws_gated": False,
+            },
+            "websocket_sessions": {
+                "active_sessions": ws_active_sessions,
+                "active_relay_tasks": ws_active_relay_tasks,
+            },
+        }
+
     def _health_payload(*, include_config: bool) -> dict[str, Any]:
         checks = _health_checks()
         ready = all(check["ready"] for check in checks.values())
@@ -1275,6 +1313,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "timestamp": _iso_utc_now(),
             "uptime_seconds": _uptime_seconds(),
             "checks": checks,
+            "runtime": _runtime_payload(),
         }
         deployment_profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE")
         if deployment_profile:
@@ -1371,6 +1410,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def debug_warmup():
         warmup_registry = getattr(proxy, "warmup", None)
         payload = warmup_registry.to_dict() if warmup_registry is not None else {}
+        payload["runtime"] = _runtime_payload()
         return JSONResponse(status_code=200, content=payload)
 
     @app.get("/dashboard", response_class=HTMLResponse)

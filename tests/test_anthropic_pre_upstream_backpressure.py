@@ -9,6 +9,8 @@ Covers:
 - N+1 contention (only the (N+1)th waiter records ``pre_upstream_wait`` > 0)
 - strict serialization under concurrency=1
 - unbounded mode (``anthropic_pre_upstream_concurrency=0`` -> no semaphore)
+- acquire timeout fails fast with ``503`` + ``Retry-After``
+- memory-context timeout fails open without leaking the semaphore
 - exception-safety (semaphore released when the critical section raises)
 - ``/livez`` unaffected under Anthropic backpressure
 - compression is not bypassed (the Unit 4 gate is additive, not a shortcut)
@@ -156,9 +158,11 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *a, **k: "sess-1",
             get_or_create=lambda *a, **k: SimpleNamespace(
+                _cached_token_count=0,
                 get_frozen_message_count=lambda: 0,
                 get_last_original_messages=lambda: [],
                 get_last_forwarded_messages=lambda: [],
+                update_from_response=lambda *a, **k: None,
                 record_request=lambda *a, **k: None,
             ),
         )
@@ -449,6 +453,84 @@ def test_exception_inside_critical_section_releases_semaphore():
         anyio.run(_run)
 
 
+def test_acquire_timeout_returns_503_with_retry_after(stage_log_capture):
+    async def _run() -> None:
+        sem = asyncio.Semaphore(1)
+        await sem.acquire()
+        handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=sem)
+        handler.config.anthropic_pre_upstream_acquire_timeout_seconds = 0.01
+        req = _build_request(
+            {
+                "model": "claude-3-5-sonnet-latest",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            {"authorization": "Bearer sk-ant-api-test"},
+        )
+        try:
+            response = await handler.handle_anthropic_messages(req)
+            assert response.status_code == 503
+            assert response.headers["retry-after"] == "1"
+            body = json.loads(response.body)
+            assert body["error"]["type"] == "service_unavailable"
+            assert sem._value == 0
+        finally:
+            sem.release()
+        assert sem._value == 1
+
+    with _tokenizer_patch():
+        anyio.run(_run)
+
+    payloads = _parse_all_stage_logs(stage_log_capture)
+    assert len(payloads) == 1
+    assert payloads[0]["stages"]["pre_upstream_wait"] >= 10.0
+
+
+def test_memory_context_timeout_fails_open_and_releases_semaphore():
+    class _MemoryHandler:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(inject_context=True, inject_tools=False)
+            self.initialized = False
+            self.backend = None
+
+        async def search_and_format_context(self, _user_id, _messages):
+            await asyncio.sleep(5.0)
+            return "should-timeout"
+
+        def inject_tools(self, tools, _provider):
+            return tools, False
+
+        def get_beta_headers(self) -> dict[str, str]:
+            return {}
+
+        def has_memory_tool_calls(self, _response, _provider) -> bool:
+            return False
+
+        async def handle_memory_tool_calls(self, _response, _user_id, _provider):
+            return []
+
+    async def _run() -> None:
+        sem = asyncio.Semaphore(1)
+        handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=sem)
+        handler.memory_handler = _MemoryHandler()
+        handler.config.anthropic_pre_upstream_memory_context_timeout_seconds = 0.01
+        req = _build_request(
+            {
+                "model": "claude-3-5-sonnet-latest",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            {
+                "authorization": "Bearer sk-ant-api-test",
+                "x-headroom-user-id": "user-1",
+            },
+        )
+        response = await handler.handle_anthropic_messages(req)
+        assert response.status_code == 200
+        assert sem._value == 1
+
+    with _tokenizer_patch():
+        anyio.run(_run)
+
+
 # --------------------------------------------------------------------------- #
 # /livez stays fast under Anthropic pre-upstream contention.                   #
 # --------------------------------------------------------------------------- #
@@ -600,6 +682,34 @@ def test_cli_flag_overrides_env_var():
     env = {"HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY": "4"}
     config = _run_cli_capture(["--anthropic-pre-upstream-concurrency", "7"], env=env)
     assert config.anthropic_pre_upstream_concurrency == 7
+
+
+def test_cli_env_sets_pre_upstream_timeouts():
+    env = {
+        "HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS": "9.5",
+        "HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS": "3.25",
+    }
+    config = _run_cli_capture([], env=env)
+    assert config.anthropic_pre_upstream_acquire_timeout_seconds == pytest.approx(9.5)
+    assert config.anthropic_pre_upstream_memory_context_timeout_seconds == pytest.approx(3.25)
+
+
+def test_cli_flags_override_pre_upstream_timeout_env_vars():
+    env = {
+        "HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS": "9.5",
+        "HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS": "3.25",
+    }
+    config = _run_cli_capture(
+        [
+            "--anthropic-pre-upstream-acquire-timeout-seconds",
+            "4.5",
+            "--anthropic-pre-upstream-memory-context-timeout-seconds",
+            "1.5",
+        ],
+        env=env,
+    )
+    assert config.anthropic_pre_upstream_acquire_timeout_seconds == pytest.approx(4.5)
+    assert config.anthropic_pre_upstream_memory_context_timeout_seconds == pytest.approx(1.5)
 
 
 # --------------------------------------------------------------------------- #

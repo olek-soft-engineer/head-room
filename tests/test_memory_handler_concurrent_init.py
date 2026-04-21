@@ -150,6 +150,8 @@ async def test_ensure_initialized_timeout_nulls_partially_initialized_backend(
     ``if self.memory_handler._backend:`` see a truthy-but-broken backend.
     """
 
+    close_hits = {"n": 0}
+
     class SlowBackend:
         def __init__(self, config):
             self.config = config
@@ -159,7 +161,7 @@ async def test_ensure_initialized_timeout_nulls_partially_initialized_backend(
             await asyncio.sleep(5.0)
 
         async def close(self) -> None:
-            pass
+            close_hits["n"] += 1
 
     import headroom.memory.backends.local as local_mod
 
@@ -175,6 +177,7 @@ async def test_ensure_initialized_timeout_nulls_partially_initialized_backend(
     # Both must be consistent after timeout.
     assert handler._initialized is False
     assert handler._backend is None
+    assert close_hits["n"] == 1
 
 
 @pytest.mark.asyncio
@@ -182,6 +185,8 @@ async def test_ensure_initialized_cancellation_propagates_and_resets_state(tmp_p
     """External cancellation of an in-flight ``_ensure_initialized`` must
     propagate (CancelledError is BaseException — not a swallowable error)
     and leave the handler in a clean state."""
+
+    close_hits = {"n": 0}
 
     class HangingBackend:
         def __init__(self, config):
@@ -191,7 +196,7 @@ async def test_ensure_initialized_cancellation_propagates_and_resets_state(tmp_p
             await asyncio.Event().wait()
 
         async def close(self) -> None:
-            pass
+            close_hits["n"] += 1
 
     import headroom.memory.backends.local as local_mod
 
@@ -210,6 +215,7 @@ async def test_ensure_initialized_cancellation_propagates_and_resets_state(tmp_p
 
     assert handler._initialized is False
     assert handler._backend is None
+    assert close_hits["n"] == 1
 
 
 # -------------------------------------------------------------------

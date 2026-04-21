@@ -343,23 +343,6 @@ class AnthropicHandlerMixin:
                 _pre_upstream_sem_acquired = False
                 pre_upstream_sem.release()
 
-        if pre_upstream_sem is not None:
-            _wait_started_at = time.perf_counter()
-            await pre_upstream_sem.acquire()
-            _pre_upstream_sem_acquired = True
-            _wait_ms = (time.perf_counter() - _wait_started_at) * 1000.0
-            stage_timer.record("pre_upstream_wait", _wait_ms)
-            if _wait_ms > 100.0:
-                logger.info(
-                    "[%s] pre_upstream_wait_ms=%.2f session_id=%s "
-                    "(anthropic pre-upstream semaphore contention)",
-                    request_id,
-                    _wait_ms,
-                    trace_session_id,
-                )
-        else:
-            stage_timer.record("pre_upstream_wait", 0.0)
-
         async def _finalize_pre_upstream() -> None:
             """Release the pre-upstream semaphore and emit stage-timing metrics.
 
@@ -399,6 +382,53 @@ class AnthropicHandlerMixin:
                 ),
                 metrics=getattr(self, "metrics", None),
             )
+
+        if pre_upstream_sem is not None:
+            _wait_started_at = time.perf_counter()
+            _acquire_timeout_seconds = self.config.anthropic_pre_upstream_acquire_timeout_seconds
+            try:
+                await asyncio.wait_for(
+                    pre_upstream_sem.acquire(),
+                    timeout=_acquire_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                _wait_ms = (time.perf_counter() - _wait_started_at) * 1000.0
+                stage_timer.record("pre_upstream_wait", _wait_ms)
+                logger.warning(
+                    "[%s] Anthropic pre-upstream queue saturated after %.2f ms "
+                    "(timeout=%.1fs, session_id=%s)",
+                    request_id,
+                    _wait_ms,
+                    _acquire_timeout_seconds,
+                    trace_session_id,
+                )
+                await _finalize_pre_upstream()
+                return JSONResponse(
+                    status_code=503,
+                    headers={"Retry-After": str(max(1, int(_acquire_timeout_seconds) + 1))},
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "service_unavailable",
+                            "message": (
+                                "Anthropic pre-upstream queue is saturated. Please retry shortly."
+                            ),
+                        },
+                    },
+                )
+            _pre_upstream_sem_acquired = True
+            _wait_ms = (time.perf_counter() - _wait_started_at) * 1000.0
+            stage_timer.record("pre_upstream_wait", _wait_ms)
+            if _wait_ms > 100.0:
+                logger.info(
+                    "[%s] pre_upstream_wait_ms=%.2f session_id=%s "
+                    "(anthropic pre-upstream semaphore contention)",
+                    request_id,
+                    _wait_ms,
+                    trace_session_id,
+                )
+        else:
+            stage_timer.record("pre_upstream_wait", 0.0)
 
         try:
             # Check request body size
@@ -980,9 +1010,22 @@ class AnthropicHandlerMixin:
                 if self.memory_handler.config.inject_context:
                     try:
                         async with stage_timer.measure("memory_context"):
-                            memory_context = await self.memory_handler.search_and_format_context(
-                                memory_user_id, optimized_messages
+                            memory_context = await asyncio.wait_for(
+                                self.memory_handler.search_and_format_context(
+                                    memory_user_id, optimized_messages
+                                ),
+                                timeout=(
+                                    self.config.anthropic_pre_upstream_memory_context_timeout_seconds
+                                ),
                             )
+                    except asyncio.TimeoutError:
+                        memory_context = None
+                        logger.info(
+                            f"[{request_id}] Memory: Context lookup exceeded "
+                            f"{self.config.anthropic_pre_upstream_memory_context_timeout_seconds:.1f}s; "
+                            "continuing without it"
+                        )
+                    try:
                         if memory_context:
                             if is_cache_mode(self.config.mode):
                                 logger.info(
