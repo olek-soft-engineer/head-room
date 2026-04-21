@@ -101,6 +101,11 @@ class CompressConfig:
     Set True for document compression, RAG pipelines, or when user messages
     contain large tool outputs."""
 
+    compress_system_messages: bool = True
+    """Compress system messages (default: True).
+    Set False to preserve system prompts exactly as-is. Useful for voice
+    agents where tool definitions and instructions must not be altered."""
+
     protect_recent: int = 4
     """Don't compress the last N messages (they're the active conversation).
     Set 0 to compress everything."""
@@ -115,10 +120,17 @@ class CompressConfig:
     Only affects Kompress (text compression). SmartCrusher (JSON) has its
     own logic based on array dedup."""
 
+    min_tokens_to_compress: int = 250
+    """Minimum token count for a message to be compressed.
+    Messages shorter than this are left unchanged. Default 250.
+    Set lower for voice agents where turns are short."""
+
     # Model variant
     kompress_model: str | None = None
-    """Kompress model variant. None = default ModernBERT. Future: 'finance'
-    for number-preserving compression on financial documents."""
+    """Kompress model ID. None = default (chopratejas/kompress-base).
+    Set to a HuggingFace model ID for domain-specific compression.
+    Set to 'disabled' to skip ML compression entirely
+    (only SmartCrusher + CacheAligner will run)."""
 
 
 @dataclass
@@ -217,9 +229,12 @@ def compress(
             biases=biases,
             # Pass CompressConfig options through to transforms
             compress_user_messages=cfg.compress_user_messages,
+            compress_system_messages=cfg.compress_system_messages,
             target_ratio=cfg.target_ratio,
             protect_recent=cfg.protect_recent,
             protect_analysis_context=cfg.protect_analysis_context,
+            min_tokens_to_compress=cfg.min_tokens_to_compress,
+            kompress_model=cfg.kompress_model,
         )
 
         tokens_before = result.tokens_before

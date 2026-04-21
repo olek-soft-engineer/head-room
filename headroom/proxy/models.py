@@ -48,6 +48,14 @@ class RequestLog:
     response_content: str | None = None
     error: str | None = None
 
+    # NOTE (Unit 2 follow-up): stage timings and session_id were briefly
+    # added here but are now emitted exclusively through
+    # ``emit_stage_timings_log`` (structured log line) and Prometheus.
+    # They were never populated on ``RequestLog`` instances, so the
+    # fields were removed to avoid confusing readers who expect
+    # them to be set. If a JSONL consumer needs them, have the consumer
+    # merge ``stage_timings`` log lines by ``request_id``.
+
 
 @dataclass
 class CacheEntry:
@@ -79,6 +87,7 @@ class ProxyConfig:
     anthropic_api_url: str | None = None  # Custom Anthropic API URL override
     openai_api_url: str | None = None  # Custom OpenAI API URL override
     gemini_api_url: str | None = None  # Custom Gemini API URL override
+    cloudcode_api_url: str | None = None  # Custom Cloud Code Assist API URL override
 
     # Backend: "anthropic" (direct API), "litellm-*" (via LiteLLM), or "anyllm" (via any-llm)
     backend: str = "anthropic"
@@ -210,3 +219,30 @@ class ProxyConfig:
 
     # Stateless mode — disable all filesystem writes for read-only / container deployments
     stateless: bool = False
+
+    # Unit 4: Bounded pre-upstream concurrency for Anthropic replay storms.
+    #
+    # Caps the number of simultaneous requests allowed to run the
+    # pre-upstream phase of ``handle_anthropic_messages`` (request JSON
+    # read → deep-copy → first compression stage → memory-context lookup
+    # → first upstream connect). Prevents cold-start replay storms from
+    # monopolising the event loop / thread pool and starving ``/livez``,
+    # ``/readyz``, and new Codex WS opens. Compression stays on.
+    #
+    # ``None`` (default) -> auto-compute ``max(2, min(8, os.cpu_count() or 4))``.
+    # ``0`` or negative  -> disables the semaphore (unbounded); useful for
+    # the Unit 6 counter-factual and for deliberately reproducing the
+    # original starvation. Any positive integer is honored verbatim.
+    #
+    # CLI: ``--anthropic-pre-upstream-concurrency``.
+    # Env: ``HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY``.
+    # Precedence: CLI > env > auto-compute.
+    anthropic_pre_upstream_concurrency: int | None = None
+    # Upper bound for waiting on the Anthropic pre-upstream semaphore
+    # before failing fast with a 503 + Retry-After. Keeps the queue bounded
+    # when all pre-upstream slots are occupied by slow/hung work.
+    anthropic_pre_upstream_acquire_timeout_seconds: float = 15.0
+    # Fail-open timeout for Anthropic memory-context lookup while the request
+    # is still holding a pre-upstream slot. Compression already has its own
+    # COMPRESSION_TIMEOUT_SECONDS guard; this bounds the memory leg too.
+    anthropic_pre_upstream_memory_context_timeout_seconds: float = 2.0

@@ -1,6 +1,7 @@
 """Proxy server CLI commands."""
 
 import os
+import sys
 
 import click
 
@@ -44,6 +45,14 @@ from .main import main
         "Legacy aliases are accepted. Default: token. Env: HEADROOM_MODE"
     ),
 )
+@click.option(
+    "--intercept-tool-results",
+    is_flag=True,
+    help=(
+        "Opt in to tool_result interceptors (ast-grep Read outliner, etc.). "
+        "Off by default while this feature ships."
+    ),
+)
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
 @click.option("--no-cache", is_flag=True, help="Disable semantic caching")
 @click.option("--no-rate-limit", is_flag=True, help="Disable rate limiting")
@@ -58,6 +67,44 @@ from .main import main
     type=int,
     default=None,
     help="Upstream connection timeout in seconds (default: 10)",
+)
+@click.option(
+    "--anthropic-pre-upstream-concurrency",
+    type=int,
+    default=None,
+    envvar="HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY",
+    help=(
+        "Cap the number of Anthropic HTTP requests that may run pre-upstream work "
+        "(request parse / deep-copy / first compression stage / memory context / upstream connect) "
+        "concurrently. Prevents cold-start replay storms from starving /livez and new Codex WS opens. "
+        "Default: max(2, min(8, os.cpu_count() or 4)). "
+        "Set to 0 or negative to disable (unbounded). "
+        "Env: HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY."
+    ),
+)
+@click.option(
+    "--anthropic-pre-upstream-acquire-timeout-seconds",
+    type=float,
+    default=None,
+    envvar="HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS",
+    help=(
+        "Fail-fast timeout for waiting on the Anthropic pre-upstream semaphore "
+        "before returning 503 + Retry-After. "
+        "Default: 15.0 seconds. "
+        "Env: HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
+    "--anthropic-pre-upstream-memory-context-timeout-seconds",
+    type=float,
+    default=None,
+    envvar="HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS",
+    help=(
+        "Fail-open timeout for Anthropic memory-context lookup while the request "
+        "still holds a pre-upstream slot. "
+        "Default: 2.0 seconds. "
+        "Env: HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS."
+    ),
 )
 @click.option("--log-file", default=None, help="Path to JSONL log file")
 @click.option(
@@ -160,6 +207,11 @@ from .main import main
     help="Custom Gemini API URL for passthrough endpoints (env: GEMINI_TARGET_API_URL)",
 )
 @click.option(
+    "--cloudcode-api-url",
+    default=None,
+    help="Custom Cloud Code Assist API URL for compatibility endpoints (env: CLOUDCODE_TARGET_API_URL)",
+)
+@click.option(
     "--region",
     default="us-west-2",
     help="Cloud region for Bedrock/Vertex/etc (default: us-west-2)",
@@ -192,11 +244,15 @@ def proxy(
     mode: str | None,
     host: str,
     port: int,
+    intercept_tool_results: bool,
     no_optimize: bool,
     no_cache: bool,
     no_rate_limit: bool,
     retry_max_attempts: int | None,
     connect_timeout_seconds: int | None,
+    anthropic_pre_upstream_concurrency: int | None,
+    anthropic_pre_upstream_acquire_timeout_seconds: float | None,
+    anthropic_pre_upstream_memory_context_timeout_seconds: float | None,
     log_file: str | None,
     budget: float | None,
     code_graph: bool,
@@ -216,6 +272,7 @@ def proxy(
     anthropic_api_url: str | None,
     openai_api_url: str | None,
     gemini_api_url: str | None,
+    cloudcode_api_url: str | None,
     region: str,
     bedrock_region: str | None,
     bedrock_profile: str | None,
@@ -246,10 +303,36 @@ def proxy(
         click.echo(f"Details: {e}")
         raise SystemExit(1) from None
 
+    # Opt-in: turn on tool_result interceptors (ast-grep Read outline, etc.).
+    # Only fetch the bundled CLI tool binaries when the feature is enabled —
+    # otherwise we'd pay a network round-trip and risk a readonly-FS failure
+    # for capabilities the user hasn't asked for. The TransformPipeline reads
+    # this env var at construction time.
+    if intercept_tool_results:
+        from headroom.binaries import ensure_tools
+
+        resolved_tools = ensure_tools()
+        critical_tools = ["ast-grep"]
+        missing = [t for t in critical_tools if not resolved_tools.get(t)]
+        if missing:
+            # User explicitly opted in — fail fast rather than silently starting
+            # with non-functional interceptors. They can retry with the tool
+            # installed, or drop the flag if they want pass-through behavior.
+            click.secho(
+                f"error: --intercept-tool-results requires tool(s) that could not "
+                f"be installed: {missing}. Run `headroom tools doctor` to diagnose, "
+                "or omit the flag to start the proxy without interceptors.",
+                fg="red",
+                err=True,
+            )
+            sys.exit(1)
+        os.environ["HEADROOM_INTERCEPT_ENABLED"] = "1"
+
     # Resolve API URL overrides: CLI flag > env var > None
     effective_anthropic_api_url = anthropic_api_url or os.environ.get("ANTHROPIC_TARGET_API_URL")
     effective_openai_api_url = openai_api_url or os.environ.get("OPENAI_TARGET_API_URL")
     effective_gemini_api_url = gemini_api_url or os.environ.get("GEMINI_TARGET_API_URL")
+    effective_cloudcode_api_url = cloudcode_api_url or os.environ.get("CLOUDCODE_TARGET_API_URL")
 
     # Resolve anyllm provider: env var takes precedence over CLI default (matches argparse path)
     effective_anyllm_provider = os.environ.get("HEADROOM_ANYLLM_PROVIDER") or anyllm_provider
@@ -284,6 +367,7 @@ def proxy(
         anthropic_api_url=effective_anthropic_api_url,
         openai_api_url=effective_openai_api_url,
         gemini_api_url=effective_gemini_api_url,
+        cloudcode_api_url=effective_cloudcode_api_url,
         mode=effective_mode,
         optimize=not no_optimize,
         cache_enabled=not no_cache,
@@ -323,6 +407,22 @@ def proxy(
         license_key=license_key,
         # Stateless mode: disable all filesystem writes
         stateless=is_stateless,
+        # Unit 4: bounded pre-upstream concurrency on the Anthropic HTTP
+        # path. ``None`` -> HeadroomProxy computes ``max(2, min(8,
+        # os.cpu_count() or 4))``; ``<= 0`` -> disabled (unbounded).
+        # Precedence: CLI > env > auto-compute (click's ``envvar``
+        # handles the env-var fallback).
+        anthropic_pre_upstream_concurrency=anthropic_pre_upstream_concurrency,
+        anthropic_pre_upstream_acquire_timeout_seconds=(
+            anthropic_pre_upstream_acquire_timeout_seconds
+            if anthropic_pre_upstream_acquire_timeout_seconds is not None
+            else 15.0
+        ),
+        anthropic_pre_upstream_memory_context_timeout_seconds=(
+            anthropic_pre_upstream_memory_context_timeout_seconds
+            if anthropic_pre_upstream_memory_context_timeout_seconds is not None
+            else 2.0
+        ),
     )
 
     memory_status = "DISABLED"
@@ -335,6 +435,7 @@ def proxy(
 
     anthropic_url = config.anthropic_api_url or "https://api.anthropic.com"
     openai_url = config.openai_api_url or "https://api.openai.com"
+    cloudcode_url = config.cloudcode_api_url or "https://cloudcode-pa.googleapis.com"
     backend_section = ""
 
     if config.backend == "anyllm" or config.backend.startswith("anyllm-"):
@@ -415,9 +516,10 @@ Starting proxy server...
 {stateless_line}{telemetry_line}
 {backend_section}
 Routing:
-  /v1/messages         → {anthropic_url}
-  /v1/chat/completions → {openai_url}
-  /v1/responses        → {openai_url}  (HTTP + WebSocket)
+  /v1/messages                    → {anthropic_url}
+  /v1/chat/completions            → {openai_url}
+  /v1/responses                   → {openai_url}  (HTTP + WebSocket)
+  /v1internal:streamGenerateContent → {cloudcode_url}
 
 Usage:
   Claude Code:   ANTHROPIC_BASE_URL=http://{config.host}:{config.port} claude

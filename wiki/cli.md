@@ -246,6 +246,9 @@ headroom proxy --mode cache
 | `--no-rate-limit` | off | Disable rate limiting |
 | `--retry-max-attempts` | runtime default `3` | Maximum upstream retry attempts |
 | `--connect-timeout-seconds` | runtime default `10` | Upstream connection timeout |
+| `--anthropic-pre-upstream-concurrency` | auto `max(2, min(8, cpu_count))` | Cap simultaneous pre-upstream work on `/v1/messages` (body read, deep copy, first compression stage, memory-context lookup, upstream connect). `0` or negative disables (unbounded); any positive integer is honoured verbatim. Prevents cold-start replay storms from starving `/livez`, `/readyz`, and new Codex WS opens. |
+| `--anthropic-pre-upstream-acquire-timeout-seconds` | `15.0` | Fail fast when the Anthropic pre-upstream queue is saturated. Requests that wait longer return `503` with `Retry-After` instead of parking indefinitely. |
+| `--anthropic-pre-upstream-memory-context-timeout-seconds` | `2.0` | Fail-open timeout for Anthropic memory-context lookup while the request still holds a pre-upstream slot. |
 | `--log-file` | unset | JSONL log output path |
 | `--budget` | unset | Daily USD budget limit |
 | `--no-code-aware` | off | Disable AST-aware code compression |
@@ -273,7 +276,8 @@ headroom proxy --mode cache
 Notes:
 
 - `--learn` implies memory unless `--no-learn` is also set.
-- Proxy startup can also read environment variables such as `HEADROOM_HOST`, `HEADROOM_PORT`, `HEADROOM_BUDGET`, `HEADROOM_MODE`, `HEADROOM_ANYLLM_PROVIDER`, `ANTHROPIC_TARGET_API_URL`, `OPENAI_TARGET_API_URL`, and `GEMINI_TARGET_API_URL`.
+- Proxy startup can also read environment variables such as `HEADROOM_HOST`, `HEADROOM_PORT`, `HEADROOM_BUDGET`, `HEADROOM_MODE`, `HEADROOM_ANYLLM_PROVIDER`, `HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY`, `HEADROOM_ANTHROPIC_PRE_UPSTREAM_ACQUIRE_TIMEOUT_SECONDS`, `HEADROOM_ANTHROPIC_PRE_UPSTREAM_MEMORY_CONTEXT_TIMEOUT_SECONDS`, `ANTHROPIC_TARGET_API_URL`, `OPENAI_TARGET_API_URL`, and `GEMINI_TARGET_API_URL`. CLI flags take precedence over environment variables.
+- The default Anthropic pre-upstream cap is intentionally conservative for CPU/ONNX-heavy work. Larger containers may want to raise it after checking the resolved runtime values on `/readyz` or `/debug/warmup`.
 
 See also: [Proxy Server](proxy.md), [Configuration](configuration.md)
 
