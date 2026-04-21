@@ -27,6 +27,17 @@ def test_release_workflow_publishes_both_node_packages_to_github_packages() -> N
     assert "SDK_TARBALL: ${{ steps.gpr-sdk-publish.outputs.unscoped_sdk_tarball }}" in content
 
 
+def test_release_workflow_publishes_python_distributions_to_github_release() -> None:
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    assert "Publish ${{ env.PYPI_PACKAGE }} Python distributions to GitHub Release" in content
+    assert (
+        'gh release upload "$TAG" release-assets/*.whl release-assets/*.tar.gz --clobber' in content
+    )
+    assert "Publish Node package tarballs to GitHub Release" in content
+    assert 'gh release upload "$TAG" release-assets/*.tgz --clobber' in content
+
+
 def test_create_release_runs_after_successful_build_even_if_other_publishes_fail() -> None:
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
