@@ -310,12 +310,10 @@ def compute_turn_id(
             break
         if isinstance(content, list):
             has_text = any(
-                isinstance(block, dict) and block.get("type") == "text"
-                for block in content
+                isinstance(block, dict) and block.get("type") == "text" for block in content
             )
             has_tool_result = any(
-                isinstance(block, dict) and block.get("type") == "tool_result"
-                for block in content
+                isinstance(block, dict) and block.get("type") == "tool_result" for block in content
             )
             # An agent-loop continuation carries tool_result blocks; only a
             # fresh user turn is text-only.
