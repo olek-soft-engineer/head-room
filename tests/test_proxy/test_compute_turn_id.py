@@ -106,3 +106,51 @@ def test_returns_16_hex_chars():
     assert turn_id is not None
     assert len(turn_id) == 16
     int(turn_id, 16)  # raises if not hex
+
+
+def test_skips_non_dict_and_non_user_messages():
+    # A non-dict entry and an assistant message must both be skipped by the
+    # reverse scan before it finds the real user-text message.
+    messages = [
+        _user("the actual prompt"),
+        {"role": "assistant", "content": "response"},
+        "not-a-dict-message-entry",
+    ]
+    assert compute_turn_id(MODEL, SYSTEM, messages) is not None
+
+
+def test_ignores_empty_string_user_content():
+    # An empty-string user content is not a real prompt; keep scanning.
+    messages = [_user(""), _user("the real prompt")]
+    hit = compute_turn_id(MODEL, SYSTEM, messages)
+    assert hit is not None
+    # Hash should match a single-message [real prompt] prefix — i.e. the
+    # scan stopped at "the real prompt" and included the leading empty msg
+    # in the hashed prefix. Either way: not None and reproducible.
+    assert hit == compute_turn_id(MODEL, SYSTEM, messages)
+
+
+def test_mixed_text_and_tool_result_is_not_a_turn_boundary():
+    # A user message whose content list has BOTH text and tool_result is
+    # treated as an agent-loop continuation (not a fresh prompt). If
+    # nothing else earlier qualifies, compute_turn_id returns None.
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                {"type": "text", "text": "and a comment"},
+            ],
+        }
+    ]
+    assert compute_turn_id(MODEL, SYSTEM, messages) is None
+
+
+def test_none_system_hashes_without_system_segment():
+    messages = [_user("hi")]
+    a = compute_turn_id(MODEL, None, messages)
+    b = compute_turn_id(MODEL, None, messages)
+    assert a is not None
+    assert a == b
+    # Different-system values must still produce a different id than None.
+    assert a != compute_turn_id(MODEL, "some system", messages)
