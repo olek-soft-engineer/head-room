@@ -163,6 +163,23 @@ from headroom.transforms import (
     is_tree_sitter_available,
 )
 
+AnyLLMBackend: Any = None
+LiteLLMBackend: Any = None
+
+try:
+    from headroom.backends.anyllm import AnyLLMBackend as _AnyLLMBackend
+
+    AnyLLMBackend = _AnyLLMBackend
+except ImportError:
+    pass
+
+try:
+    from headroom.backends.litellm import LiteLLMBackend as _LiteLLMBackend
+
+    LiteLLMBackend = _LiteLLMBackend
+except ImportError:
+    pass
+
 fcntl: Any = None
 try:
     import fcntl as _fcntl
@@ -413,6 +430,8 @@ class HeadroomProxy(
             anyllm_provider=config.anyllm_provider,
             bedrock_region=config.bedrock_region,
             logger=logger,
+            anyllm_backend_cls=AnyLLMBackend,
+            litellm_backend_cls=LiteLLMBackend,
         )
 
         # Request counter for IDs

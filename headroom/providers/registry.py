@@ -138,6 +138,8 @@ def create_proxy_backend(
     anyllm_provider: str,
     bedrock_region: str | None,
     logger: logging.Logger,
+    anyllm_backend_cls: Any | None = None,
+    litellm_backend_cls: Any | None = None,
 ) -> Backend | None:
     """Create the optional translated backend for Anthropic proxy requests."""
     if backend == "anthropic":
@@ -146,7 +148,7 @@ def create_proxy_backend(
     if backend == "anyllm" or backend.startswith("anyllm-"):
         provider = anyllm_provider
         try:
-            backend_cls = _load_anyllm_backend()
+            backend_cls = anyllm_backend_cls or _load_anyllm_backend()
             instance = cast("Backend", backend_cls(provider=provider))
             logger.info("any-llm backend enabled (provider=%s)", provider)
             return instance
@@ -160,7 +162,7 @@ def create_proxy_backend(
     normalized_backend = backend if backend.startswith("litellm-") else f"litellm-{backend}"
     provider = normalized_backend.replace("litellm-", "")
     try:
-        backend_cls = _load_litellm_backend()
+        backend_cls = litellm_backend_cls or _load_litellm_backend()
         instance = cast("Backend", backend_cls(provider=provider, region=bedrock_region))
         logger.info("LiteLLM backend enabled (provider=%s, region=%s)", provider, bedrock_region)
         return instance

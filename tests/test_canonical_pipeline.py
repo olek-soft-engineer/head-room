@@ -142,9 +142,9 @@ def test_compress_emits_canonical_pipeline_events(monkeypatch):
     )
 
     assert result.tokens_before == 20
-    assert result.tokens_after == 2
+    assert result.tokens_after == 8
     assert hooks.post_event is not None
-    assert hooks.post_event.tokens_saved == 18
+    assert hooks.post_event.tokens_saved == 12
     assert hooks.stages == [
         PipelineStage.INPUT_RECEIVED,
         PipelineStage.INPUT_ROUTED,

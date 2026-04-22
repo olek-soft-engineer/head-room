@@ -904,9 +904,11 @@ class AnthropicHandlerMixin:
                     },
                 )
                 if routed_event.messages is not None:
+                    previous_optimized_messages = optimized_messages
                     optimized_messages = routed_event.messages
-                    optimized_tokens = tokenizer.count_messages(optimized_messages)
-                    tokens_saved = max(0, original_tokens - optimized_tokens)
+                    if routed_event.messages is not previous_optimized_messages:
+                        optimized_tokens = tokenizer.count_messages(optimized_messages)
+                        tokens_saved = max(0, original_tokens - optimized_tokens)
 
             compressed_event = self.pipeline_extensions.emit(
                 PipelineStage.INPUT_COMPRESSED,
@@ -922,9 +924,11 @@ class AnthropicHandlerMixin:
                 },
             )
             if compressed_event.messages is not None:
+                previous_optimized_messages = optimized_messages
                 optimized_messages = compressed_event.messages
-                optimized_tokens = tokenizer.count_messages(optimized_messages)
-                tokens_saved = max(0, original_tokens - optimized_tokens)
+                if compressed_event.messages is not previous_optimized_messages:
+                    optimized_tokens = tokenizer.count_messages(optimized_messages)
+                    tokens_saved = max(0, original_tokens - optimized_tokens)
 
             # Hook: post_compress — let hooks observe compression results
             if self.config.hooks and tokens_saved > 0:
@@ -1197,6 +1201,7 @@ class AnthropicHandlerMixin:
                 headers=headers,
                 metadata={"path": "/v1/messages", "stream": stream},
             )
+            previous_presend_messages = optimized_messages
             if presend_event.messages is not None:
                 optimized_messages = presend_event.messages
                 body["messages"] = optimized_messages
@@ -1205,8 +1210,9 @@ class AnthropicHandlerMixin:
                 body["tools"] = tools
             if presend_event.headers is not None:
                 headers = presend_event.headers
-            optimized_tokens = tokenizer.count_messages(body["messages"])
-            tokens_saved = max(0, original_tokens - optimized_tokens)
+            if presend_event.messages is not previous_presend_messages:
+                optimized_tokens = tokenizer.count_messages(body["messages"])
+                tokens_saved = max(0, original_tokens - optimized_tokens)
 
             # Unit 2: mark end of pre-upstream phase. Everything after this
             # point is upstream I/O or post-response bookkeeping.
