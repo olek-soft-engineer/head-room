@@ -22,6 +22,10 @@ def runner() -> CliRunner:
 
 @pytest.fixture
 def wrap_modules(monkeypatch: pytest.MonkeyPatch) -> tuple[types.ModuleType, click.Group]:
+    headroom_pkg = sys.modules.get("headroom")
+    saved_headroom_cli_attr = (
+        headroom_pkg.cli if headroom_pkg is not None and hasattr(headroom_pkg, "cli") else None
+    )
     saved_modules = {
         name: sys.modules.get(name)
         for name in ("headroom.cli", "headroom.cli.main", "headroom.cli.wrap")
@@ -44,6 +48,18 @@ def wrap_modules(monkeypatch: pytest.MonkeyPatch) -> tuple[types.ModuleType, cli
         for name, module in saved_modules.items():
             if module is not None:
                 sys.modules[name] = module
+        if saved_modules["headroom.cli"] is not None:
+            cli_pkg = saved_modules["headroom.cli"]
+            if saved_modules["headroom.cli.main"] is not None:
+                cli_pkg.main = saved_modules["headroom.cli.main"]
+            if saved_modules["headroom.cli.wrap"] is not None:
+                cli_pkg.wrap = saved_modules["headroom.cli.wrap"]
+        if headroom_pkg is not None:
+            if saved_headroom_cli_attr is None:
+                if hasattr(headroom_pkg, "cli"):
+                    delattr(headroom_pkg, "cli")
+            else:
+                headroom_pkg.cli = saved_headroom_cli_attr
 
 
 def test_wrap_copilot_auto_anthropic_injects_instructions(
