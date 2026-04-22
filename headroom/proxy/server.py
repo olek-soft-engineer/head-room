@@ -32,7 +32,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
     from ..backends.base import Backend
@@ -1660,13 +1660,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def _get_cached_stats_payload() -> dict[str, Any]:
         """Return a short-TTL cached `/stats` snapshot for dashboard polling."""
         now = time.monotonic()
-        cached_payload = _stats_snapshot.get("value")
+        cached_payload = cast(dict[str, Any] | None, _stats_snapshot.get("value"))
         if cached_payload is not None and now < float(_stats_snapshot["expires_at"]):
             return cached_payload
 
         async with _stats_snapshot_lock:
             now = time.monotonic()
-            cached_payload = _stats_snapshot.get("value")
+            cached_payload = cast(dict[str, Any] | None, _stats_snapshot.get("value"))
             if cached_payload is not None and now < float(_stats_snapshot["expires_at"]):
                 return cached_payload
 

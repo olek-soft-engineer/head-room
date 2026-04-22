@@ -14,7 +14,7 @@ import random
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from headroom import paths as _paths
 
@@ -133,7 +133,7 @@ def _get_rtk_stats() -> dict[str, Any] | None:
     now = time.monotonic()
     with _rtk_stats_cache_lock:
         if _rtk_stats_cache["has_value"] and now < float(_rtk_stats_cache["expires_at"]):
-            return _rtk_stats_cache["value"]
+            return cast(dict[str, Any] | None, _rtk_stats_cache["value"])
 
     payload: dict[str, Any] | None
     rtk_bin = shutil.which("rtk")
