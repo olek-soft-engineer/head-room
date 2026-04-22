@@ -16,6 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   block, delete it manually and re-run. (#231)
 
 ### Added
+- **`turn_id` linking agent-loop API calls to a single user prompt** — a new
+  `compute_turn_id(model, system, messages)` helper in
+  `headroom/proxy/helpers.py` hashes the message prefix up to and including
+  the last user-text message, yielding an id that is stable across every
+  agent-loop iteration of one prompt but rolls over when the user sends a
+  new prompt (or runs `/compact`, `/clear`). `RequestLog` gained a
+  `turn_id: str | None` field, which is stamped at every log site
+  (anthropic handler bedrock + direct branches, and the streaming handler)
+  and surfaced as `turn_id` in `/transformations/feed`. Lets downstream
+  consumers (e.g. the Headroom Desktop Activity tab) aggregate savings per
+  user prompt rather than per API call.
 - **Telemetry stack & install-mode identity fields** — anonymous beacon now
   reports `headroom_stack` (how Headroom is invoked: `proxy`, `wrap_claude`,
   `adapter_ts_openai`, ...) and `install_mode` (`wrapped` / `persistent` /

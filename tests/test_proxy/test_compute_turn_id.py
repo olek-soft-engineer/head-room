@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from headroom.proxy.helpers import compute_turn_id
 
-
 MODEL = "claude-sonnet-4-5"
 SYSTEM = "You are helpful."
 
