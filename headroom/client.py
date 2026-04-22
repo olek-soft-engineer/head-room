@@ -22,6 +22,7 @@ from .config import (
 from .parser import parse_messages
 from .pipeline import PipelineExtensionManager, PipelineStage, summarize_routing_markers
 from .providers.base import Provider
+from .providers.registry import call_client_transport
 from .storage import create_storage
 from .tokenizer import Tokenizer
 from .transforms import CacheAligner, TransformPipeline
@@ -604,22 +605,15 @@ class HeadroomClient:
 
         # Call underlying client based on API style
         try:
-            if api_style == "anthropic":
-                response = self._call_anthropic(
-                    model=model,
-                    messages=optimized_messages,
-                    stream=stream,
-                    metrics=metrics,
-                    **kwargs,
-                )
-            else:
-                response = self._call_openai(
-                    model=model,
-                    messages=optimized_messages,
-                    stream=stream,
-                    metrics=metrics,
-                    **kwargs,
-                )
+            response = call_client_transport(
+                api_style,
+                self,
+                model=model,
+                messages=optimized_messages,
+                stream=stream,
+                metrics=metrics,
+                **kwargs,
+            )
 
             self._pipeline_extensions.emit(
                 PipelineStage.POST_SEND,
@@ -657,33 +651,15 @@ class HeadroomClient:
         **kwargs: Any,
     ) -> Any:
         """Call OpenAI-style API."""
-        if stream:
-            response = self._original.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=True,
-                **kwargs,
-            )
-            return self._wrap_stream(response, metrics)
-        else:
-            response = self._original.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=False,
-                **kwargs,
-            )
-
-            # Extract output tokens from response
-            if hasattr(response, "usage") and response.usage:
-                metrics.tokens_output = response.usage.completion_tokens
-                # Check for cached tokens in usage
-                if hasattr(response.usage, "prompt_tokens_details"):
-                    details = response.usage.prompt_tokens_details
-                    if hasattr(details, "cached_tokens"):
-                        metrics.cached_tokens = details.cached_tokens
-
-            self._storage.save(metrics)
-            return response
+        return call_client_transport(
+            "openai",
+            self,
+            model=model,
+            messages=messages,
+            stream=stream,
+            metrics=metrics,
+            **kwargs,
+        )
 
     def _call_anthropic(
         self,
@@ -695,32 +671,15 @@ class HeadroomClient:
         **kwargs: Any,
     ) -> Any:
         """Call Anthropic-style API."""
-        if stream:
-            # Anthropic streaming returns a context manager
-            stream_manager = self._original.messages.stream(
-                model=model,
-                messages=messages,
-                **kwargs,
-            )
-            # Save metrics when stream is created
-            self._storage.save(metrics)
-            return stream_manager
-        else:
-            response = self._original.messages.create(
-                model=model,
-                messages=messages,
-                **kwargs,
-            )
-
-            # Extract output tokens from Anthropic response
-            if hasattr(response, "usage") and response.usage:
-                metrics.tokens_output = response.usage.output_tokens
-                # Check for cached tokens in Anthropic usage
-                if hasattr(response.usage, "cache_read_input_tokens"):
-                    metrics.cached_tokens = response.usage.cache_read_input_tokens
-
-            self._storage.save(metrics)
-            return response
+        return call_client_transport(
+            "anthropic",
+            self,
+            model=model,
+            messages=messages,
+            stream=stream,
+            metrics=metrics,
+            **kwargs,
+        )
 
     def _wrap_stream(
         self,
