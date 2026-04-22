@@ -228,6 +228,7 @@ def test_wrap_copilot_translated_backend_still_requires_byok(
                 [
                     "wrap",
                     "copilot",
+                    "--no-rtk",
                     "--backend",
                     "anyllm",
                     "--",
