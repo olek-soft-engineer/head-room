@@ -91,6 +91,8 @@ from headroom.pipeline import PipelineExtensionManager, PipelineStage
 from headroom.providers.proxy_routes import register_provider_routes
 from headroom.providers.registry import (
     DEFAULT_ANTHROPIC_API_URL,
+    DEFAULT_CLOUDCODE_API_URL,
+    DEFAULT_GEMINI_API_URL,
     DEFAULT_OPENAI_API_URL,
     build_proxy_provider_runtime,
     create_proxy_backend,
@@ -205,6 +207,11 @@ class HeadroomProxy(
 ):
     """Production-ready Headroom optimization proxy."""
 
+    ANTHROPIC_API_URL = DEFAULT_ANTHROPIC_API_URL
+    OPENAI_API_URL = DEFAULT_OPENAI_API_URL
+    GEMINI_API_URL = DEFAULT_GEMINI_API_URL
+    CLOUDCODE_API_URL = DEFAULT_CLOUDCODE_API_URL
+
     def __init__(self, config: ProxyConfig):
         self.config = config
         self.config.mode = normalize_proxy_mode(self.config.mode)
@@ -215,6 +222,16 @@ class HeadroomProxy(
         )
 
         self.provider_runtime = build_proxy_provider_runtime(config)
+        api_targets = self.provider_runtime.api_targets
+
+        # Preserve the long-standing proxy compatibility surface while keeping
+        # provider_runtime as the source of truth for resolved upstream targets.
+        HeadroomProxy.ANTHROPIC_API_URL = api_targets.anthropic
+        HeadroomProxy.OPENAI_API_URL = api_targets.openai
+        HeadroomProxy.GEMINI_API_URL = api_targets.gemini
+        HeadroomProxy.CLOUDCODE_API_URL = api_targets.cloudcode
+        self.anthropic_provider = self.provider_runtime.pipeline_provider("anthropic")
+        self.openai_provider = self.provider_runtime.pipeline_provider("openai")
 
         # Initialize transforms based on routing mode
         # Choose context manager: IntelligentContextManager (smart) or RollingWindow (legacy)
@@ -283,11 +300,11 @@ class HeadroomProxy(
 
         self.anthropic_pipeline = TransformPipeline(
             transforms=transforms,
-            provider=self.provider_runtime.pipeline_provider("anthropic"),
+            provider=self.anthropic_provider,
         )
         self.openai_pipeline = TransformPipeline(
             transforms=transforms,
-            provider=self.provider_runtime.pipeline_provider("openai"),
+            provider=self.openai_provider,
         )
 
         # Initialize components

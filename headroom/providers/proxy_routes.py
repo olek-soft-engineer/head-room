@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
@@ -12,6 +12,28 @@ from fastapi.responses import Response
 from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
 
 logger = logging.getLogger("headroom.proxy.routes")
+
+
+def _api_target(proxy: Any, provider_name: str) -> str:
+    legacy_attrs = {
+        "anthropic": "ANTHROPIC_API_URL",
+        "openai": "OPENAI_API_URL",
+        "gemini": "GEMINI_API_URL",
+        "cloudcode": "CLOUDCODE_API_URL",
+    }
+    legacy_attr = legacy_attrs[provider_name]
+    return cast(str, getattr(proxy, legacy_attr, proxy.provider_runtime.api_target(provider_name)))
+
+
+def _select_passthrough_base_url(proxy: Any, headers: dict[str, str]) -> str:
+    if headers.get("x-goog-api-key"):
+        return _api_target(proxy, "gemini")
+    if headers.get("api-key"):
+        azure_base = headers.get("x-headroom-base-url", "")
+        if azure_base:
+            return azure_base.rstrip("/")
+    provider_name = proxy.provider_runtime.model_metadata_provider(headers)
+    return _api_target(proxy, provider_name)
 
 
 def register_provider_routes(app: FastAPI, proxy: Any) -> None:
@@ -25,7 +47,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def anthropic_count_tokens(request: Request):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("anthropic"),
+            _api_target(proxy, "anthropic"),
             "count_tokens",
             "anthropic",
         )
@@ -87,7 +109,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         if is_chatgpt_auth:
             url = f"https://chatgpt.com/backend-api/codex/responses/{sub_path}"
         else:
-            url = f"{proxy.provider_runtime.api_target('openai')}/v1/responses/{sub_path}"
+            url = f"{_api_target(proxy, 'openai')}/v1/responses/{sub_path}"
 
         if request.url.query:
             url = f"{url}?{request.url.query}"
@@ -178,7 +200,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target(provider_name),
+            _api_target(proxy, provider_name),
             "models",
             provider_name,
         )
@@ -188,7 +210,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
         provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target(provider_name),
+            _api_target(proxy, provider_name),
             "models",
             provider_name,
         )
@@ -197,7 +219,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def openai_embeddings(request: Request):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("openai"),
+            _api_target(proxy, "openai"),
             "embeddings",
             "openai",
         )
@@ -206,7 +228,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def openai_moderations(request: Request):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("openai"),
+            _api_target(proxy, "openai"),
             "moderations",
             "openai",
         )
@@ -215,7 +237,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def openai_images_generations(request: Request):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("openai"),
+            _api_target(proxy, "openai"),
             "images/generations",
             "openai",
         )
@@ -224,7 +246,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def openai_audio_transcriptions(request: Request):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("openai"),
+            _api_target(proxy, "openai"),
             "audio/transcriptions",
             "openai",
         )
@@ -233,7 +255,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def openai_audio_speech(request: Request):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("openai"),
+            _api_target(proxy, "openai"),
             "audio/speech",
             "openai",
         )
@@ -242,7 +264,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def gemini_list_models(request: Request):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("gemini"),
+            _api_target(proxy, "gemini"),
             "models",
             "gemini",
         )
@@ -251,7 +273,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def gemini_get_model(request: Request, model_name: str):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("gemini"),
+            _api_target(proxy, "gemini"),
             "models",
             "gemini",
         )
@@ -260,7 +282,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def gemini_embed_content(request: Request, model: str):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("gemini"),
+            _api_target(proxy, "gemini"),
             "embedContent",
             "gemini",
         )
@@ -269,7 +291,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def gemini_batch_embed_contents(request: Request, model: str):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("gemini"),
+            _api_target(proxy, "gemini"),
             "batchEmbedContents",
             "gemini",
         )
@@ -294,7 +316,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def gemini_create_cached_content(request: Request):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("gemini"),
+            _api_target(proxy, "gemini"),
             "cachedContents",
             "gemini",
         )
@@ -303,7 +325,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def gemini_list_cached_contents(request: Request):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("gemini"),
+            _api_target(proxy, "gemini"),
             "cachedContents",
             "gemini",
         )
@@ -312,7 +334,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def gemini_get_cached_content(request: Request, cache_id: str):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("gemini"),
+            _api_target(proxy, "gemini"),
             "cachedContents",
             "gemini",
         )
@@ -321,7 +343,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def gemini_delete_cached_content(request: Request, cache_id: str):
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.api_target("gemini"),
+            _api_target(proxy, "gemini"),
             "cachedContents",
             "gemini",
         )
@@ -333,5 +355,5 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             return await proxy.handle_passthrough(request, custom_base.rstrip("/"))
         return await proxy.handle_passthrough(
             request,
-            proxy.provider_runtime.select_passthrough_base_url(dict(request.headers)),
+            _select_passthrough_base_url(proxy, dict(request.headers)),
         )
