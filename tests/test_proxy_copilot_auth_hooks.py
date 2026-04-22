@@ -10,6 +10,27 @@ from types import SimpleNamespace
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+_ISOLATED_MODULE_NAMES = (
+    "headroom.proxy",
+    "headroom.proxy.handlers",
+    "httpx",
+    "fastapi.responses",
+    "tests.headroom_proxy_handlers_openai",
+    "tests.headroom_proxy_handlers_streaming",
+)
+
+
+@pytest.fixture(autouse=True)
+def restore_isolated_modules() -> None:
+    saved_modules = {name: sys.modules.get(name) for name in _ISOLATED_MODULE_NAMES}
+    try:
+        yield
+    finally:
+        for name in _ISOLATED_MODULE_NAMES:
+            sys.modules.pop(name, None)
+        for name, module in saved_modules.items():
+            if module is not None:
+                sys.modules[name] = module
 
 
 def _load_handler_module(module_name: str, relative_path: str):
@@ -39,8 +60,12 @@ def _load_handler_module(module_name: str, relative_path: str):
     class StreamingResponse(Response):
         pass
 
+    class JSONResponse(Response):
+        pass
+
     responses_mod.Response = Response
     responses_mod.StreamingResponse = StreamingResponse
+    responses_mod.JSONResponse = JSONResponse
     sys.modules["fastapi.responses"] = responses_mod
 
     spec = importlib.util.spec_from_file_location(module_name, ROOT / relative_path)
