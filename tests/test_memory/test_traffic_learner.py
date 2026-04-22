@@ -753,3 +753,326 @@ class TestEvidencePersistence:
         assert len(rows) == 1
         assert rows[0][0] == "seed-id"
         assert rows[0][2]["evidence_count"] == 4
+
+
+# =============================================================================
+# flush_to_file end-to-end + early-return paths
+# =============================================================================
+
+
+class _FakeWriteResult:
+    def __init__(self, files_written):
+        self.files_written = files_written
+
+
+class _FakeWriter:
+    def __init__(self):
+        self.calls: list[tuple] = []
+        self.files_to_return: list = []
+        self.raise_on_write = False
+
+    def write(self, recommendations, project, *, dry_run):
+        self.calls.append((list(recommendations), project, dry_run))
+        if self.raise_on_write:
+            raise RuntimeError("boom")
+        return _FakeWriteResult(list(self.files_to_return))
+
+
+class _FakePlugin:
+    def __init__(self, roots, writer, discover_raises=False):
+        self._roots = roots
+        self._writer = writer
+        self._discover_raises = discover_raises
+
+    def discover_projects(self):
+        if self._discover_raises:
+            raise RuntimeError("discover blew up")
+        return list(self._roots)
+
+    def create_writer(self):
+        return self._writer
+
+
+def _install_plugin_registry(monkeypatch, plugin):
+    """Stub out headroom.learn.registry so flush_to_file uses our fake."""
+    import sys
+    import types as _types
+
+    fake = _types.ModuleType("headroom.learn.registry")
+    fake.auto_detect_plugins = lambda: [plugin] if plugin is not None else []  # type: ignore[attr-defined]
+    fake.get_plugin = lambda agent_type: plugin  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "headroom.learn.registry", fake)
+
+
+def _make_project(path):
+    from pathlib import Path as _P
+
+    from headroom.learn.models import ProjectInfo
+
+    p = _P(path)
+    return ProjectInfo(name=p.name, project_path=p, data_path=p)
+
+
+class TestFlushToFile:
+    @pytest.mark.asyncio
+    async def test_end_to_end_writes_per_project(self, tmp_path, monkeypatch):
+        """Happy path: anchored patterns → bucketed per project → writer called."""
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+
+        learner = TrafficLearner(backend=backend, agent_type="claude", min_evidence=2)
+        writer = _FakeWriter()
+        writer.files_to_return = [tmp_path / "CLAUDE.md"]
+        proj = _make_project(str(tmp_path))
+        plugin = _FakePlugin(roots=[proj], writer=writer)
+        _install_plugin_registry(monkeypatch, plugin)
+
+        # Need the save worker running so accumulated patterns actually land in
+        # the DB where flush_to_file reads them.
+        await learner.start()
+        try:
+
+            def mk() -> ExtractedPattern:
+                return ExtractedPattern(
+                    category=PatternCategory.ENVIRONMENT,
+                    content=f"Use /usr/bin/python3 at {tmp_path}/main.py",
+                    importance=0.6,
+                )
+
+            # Two sightings → save at evidence_count=2 (crosses live-flush gate).
+            await learner._accumulate(mk())
+            await learner._accumulate(mk())
+            await _wait_for_saved(learner, 1, db)
+
+            await learner.flush_to_file()
+        finally:
+            await learner.stop()
+
+        assert len(writer.calls) >= 1
+        recs, written_proj, dry_run = writer.calls[0]
+        assert dry_run is False
+        assert written_proj is proj
+        assert len(recs) == 1
+        assert "python3" in recs[0].content
+
+    @pytest.mark.asyncio
+    async def test_early_returns_no_plugin(self, monkeypatch):
+        """No plugin detected → flush is a no-op."""
+        learner = TrafficLearner(backend=None, agent_type="unknown", min_evidence=1)
+        _install_plugin_registry(monkeypatch, None)
+        # Seed an accumulator entry so the check isn't vacuously "no patterns".
+        learner._pattern_counts["h"] = (
+            ExtractedPattern(
+                category=PatternCategory.ENVIRONMENT,
+                content="x",
+                importance=0.5,
+                evidence_count=2,
+            ),
+            2,
+        )
+        await learner.flush_to_file()  # returns without raising
+
+    @pytest.mark.asyncio
+    async def test_early_return_no_patterns(self, monkeypatch):
+        """Empty accumulator and empty DB → flush returns without calling writer."""
+        writer = _FakeWriter()
+        plugin = _FakePlugin(roots=[_make_project("/x/a")], writer=writer)
+        _install_plugin_registry(monkeypatch, plugin)
+
+        learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
+        await learner.flush_to_file()
+        assert writer.calls == []
+
+    @pytest.mark.asyncio
+    async def test_discover_projects_failure_is_swallowed(self, monkeypatch):
+        """If plugin.discover_projects raises, flush logs and returns."""
+        writer = _FakeWriter()
+        plugin = _FakePlugin(roots=[], writer=writer, discover_raises=True)
+        _install_plugin_registry(monkeypatch, plugin)
+
+        learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
+        learner._pattern_counts["h"] = (
+            ExtractedPattern(
+                category=PatternCategory.ENVIRONMENT,
+                content="whatever",
+                importance=0.5,
+                evidence_count=2,
+            ),
+            2,
+        )
+        await learner.flush_to_file()
+        assert writer.calls == []  # no roots → short-circuits before writer
+
+    @pytest.mark.asyncio
+    async def test_unanchored_patterns_dropped(self, tmp_path, monkeypatch):
+        """Patterns with no path anchoring are dropped before writer is called."""
+        writer = _FakeWriter()
+        plugin = _FakePlugin(roots=[_make_project(str(tmp_path))], writer=writer)
+        _install_plugin_registry(monkeypatch, plugin)
+
+        learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
+        # Content has no absolute path — should be dropped as un-anchored.
+        learner._pattern_counts["h"] = (
+            ExtractedPattern(
+                category=PatternCategory.PREFERENCE,
+                content="User preference: use terse output",
+                importance=0.7,
+                evidence_count=2,
+            ),
+            2,
+        )
+        await learner.flush_to_file()
+        assert writer.calls == []
+
+    @pytest.mark.asyncio
+    async def test_writer_exception_does_not_propagate(self, tmp_path, monkeypatch):
+        """A writer raising should be logged; flush must not bubble the error."""
+        writer = _FakeWriter()
+        writer.raise_on_write = True
+        plugin = _FakePlugin(roots=[_make_project(str(tmp_path))], writer=writer)
+        _install_plugin_registry(monkeypatch, plugin)
+
+        learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
+        learner._pattern_counts["h"] = (
+            ExtractedPattern(
+                category=PatternCategory.ENVIRONMENT,
+                content=f"Use {tmp_path}/tool.py",
+                importance=0.6,
+                evidence_count=2,
+            ),
+            2,
+        )
+        await learner.flush_to_file()  # must not raise
+        assert len(writer.calls) == 1
+
+
+# =============================================================================
+# Internal helper edge cases — _resolve_backend_db_path / _collect_all_patterns
+# / _hydrate_persisted_state / _bump_persisted_evidence
+# =============================================================================
+
+
+class TestBackendResolution:
+    def test_resolve_none_backend(self):
+        from headroom.memory.traffic_learner import _resolve_backend_db_path
+
+        assert _resolve_backend_db_path(None) is None
+
+    def test_resolve_backend_without_config(self):
+        from headroom.memory.traffic_learner import _resolve_backend_db_path
+
+        class _Bare:
+            pass
+
+        assert _resolve_backend_db_path(_Bare()) is None
+
+    def test_resolve_backend_with_empty_db_path(self):
+        import types as _types
+
+        from headroom.memory.traffic_learner import _resolve_backend_db_path
+
+        backend = _types.SimpleNamespace(_config=_types.SimpleNamespace(db_path=""))
+        assert _resolve_backend_db_path(backend) is None
+
+
+class TestCollectAllPatterns:
+    @pytest.mark.asyncio
+    async def test_merges_db_and_accumulator(self, tmp_path):
+        """Patterns in both DB and accumulator get evidence_count summed by hash."""
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+
+        # Seed DB with a traffic_learner row at evidence_count=3.
+        await backend.save_memory(
+            content="shared pattern",
+            user_id="t",
+            importance=0.5,
+            metadata={
+                "source": "traffic_learner",
+                "category": "environment",
+                "evidence_count": 3,
+            },
+        )
+
+        learner = TrafficLearner(backend=backend, min_evidence=1)
+        # Same content in accumulator with count=2; hash matches.
+        p = ExtractedPattern(
+            category=PatternCategory.ENVIRONMENT,
+            content="shared pattern",
+            importance=0.5,
+        )
+        learner._pattern_counts[p.content_hash] = (p, 2)
+
+        merged = learner._collect_all_patterns()
+        assert len(merged) == 1
+        assert merged[0].evidence_count == 3 + 2
+
+    def test_handles_missing_db_gracefully(self, tmp_path):
+        """A backend pointing to a nonexistent DB is skipped, not raised."""
+        backend = _FakeBackend(tmp_path / "absent.db")  # file not created
+        learner = TrafficLearner(backend=backend, min_evidence=1)
+        merged = learner._collect_all_patterns()
+        assert merged == []
+
+
+class TestHydrateEdgeCases:
+    @pytest.mark.asyncio
+    async def test_no_backend(self):
+        """start() with backend=None hydrates to empty state and still runs."""
+        learner = TrafficLearner(backend=None, min_evidence=1)
+        await learner.start()
+        try:
+            assert learner._saved_hashes == set()
+            assert learner._persisted_ids == {}
+        finally:
+            await learner.stop()
+
+    @pytest.mark.asyncio
+    async def test_missing_db_file(self, tmp_path):
+        """Backend with a db_path that doesn't exist → hydrate is a no-op."""
+        backend = _FakeBackend(tmp_path / "not-there.db")
+        learner = TrafficLearner(backend=backend, min_evidence=1)
+        await learner._hydrate_persisted_state()
+        assert learner._saved_hashes == set()
+        assert learner._persisted_ids == {}
+
+
+class TestBumpEdgeCases:
+    @pytest.mark.asyncio
+    async def test_bump_with_no_backend_is_noop(self):
+        learner = TrafficLearner(backend=None, min_evidence=1)
+        # Should not raise even with no backend.
+        await learner._bump_persisted_evidence("some-id")
+
+    @pytest.mark.asyncio
+    async def test_bump_with_missing_db_is_noop(self, tmp_path):
+        backend = _FakeBackend(tmp_path / "absent.db")
+        learner = TrafficLearner(backend=backend, min_evidence=1)
+        await learner._bump_persisted_evidence("some-id")  # no exception
+
+    @pytest.mark.asyncio
+    async def test_bump_unknown_id_is_noop(self, tmp_path):
+        """Updating a non-existent memory id silently affects zero rows."""
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=1)
+        await learner._bump_persisted_evidence("no-such-id")
+        assert _read_traffic_rows(db) == []
+
+
+# =============================================================================
+# stop() cancels the flush task
+# =============================================================================
+
+
+class TestStopCancels:
+    @pytest.mark.asyncio
+    async def test_stop_cancels_flush_task(self):
+        learner = TrafficLearner(backend=None, min_evidence=1)
+        await learner.start()
+        assert learner._flush_task is not None and not learner._flush_task.done()
+        await learner.stop()
+        assert learner._flush_task is None or learner._flush_task.done()
