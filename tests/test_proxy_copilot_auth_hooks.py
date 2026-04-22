@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 import types
@@ -50,8 +51,7 @@ def _load_handler_module(module_name: str, relative_path: str):
     return module
 
 
-@pytest.mark.asyncio
-async def test_openai_passthrough_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_passthrough_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     openai_mod = _load_handler_module(
         "tests.headroom_proxy_handlers_openai",
         "headroom/proxy/handlers/openai.py",
@@ -95,20 +95,21 @@ async def test_openai_passthrough_applies_copilot_auth(monkeypatch: pytest.Monke
     request.body = body
 
     handler = Dummy()
-    response = await handler.handle_passthrough(
-        request,
-        "https://api.githubcopilot.com",
-        "models",
-        "openai",
+    response = asyncio.run(
+        handler.handle_passthrough(
+            request,
+            "https://api.githubcopilot.com",
+            "models",
+            "openai",
+        )
     )
 
-    assert seen["url"] == "https://api.githubcopilot.com/v1/models"
+    assert seen["url"] == "https://api.githubcopilot.com/models"
     assert seen["request_kwargs"]["headers"] == {"Authorization": "Bearer upstream-token"}
     assert response.status_code == 200
 
 
-@pytest.mark.asyncio
-async def test_streaming_response_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_streaming_response_applies_copilot_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     streaming_mod = _load_handler_module(
         "tests.headroom_proxy_handlers_streaming",
         "headroom/proxy/handlers/streaming.py",
@@ -149,19 +150,21 @@ async def test_streaming_response_applies_copilot_auth(monkeypatch: pytest.Monke
             return SimpleNamespace(headers={}, status_code=200)
 
     handler = Dummy()
-    response = await handler._stream_response(
-        url="https://api.githubcopilot.com/v1/responses",
-        headers={"authorization": "Bearer downstream"},
-        body={"model": "gpt-4o"},
-        provider="openai",
-        model="gpt-4o",
-        request_id="req-test",
-        original_tokens=0,
-        optimized_tokens=0,
-        tokens_saved=0,
-        transforms_applied=[],
-        tags={},
-        optimization_latency=0.0,
+    response = asyncio.run(
+        handler._stream_response(
+            url="https://api.githubcopilot.com/v1/responses",
+            headers={"authorization": "Bearer downstream"},
+            body={"model": "gpt-4o"},
+            provider="openai",
+            model="gpt-4o",
+            request_id="req-test",
+            original_tokens=0,
+            optimized_tokens=0,
+            tokens_saved=0,
+            transforms_applied=[],
+            tags={},
+            optimization_latency=0.0,
+        )
     )
 
     assert seen["url"] == "https://api.githubcopilot.com/v1/responses"

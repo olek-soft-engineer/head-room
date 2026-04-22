@@ -44,13 +44,16 @@ def test_wrap_copilot_auto_anthropic_injects_instructions(
     def fake_launch_tool(**kwargs):  # noqa: ANN003
         captured.update(kwargs)
 
-    with patch("headroom.cli.wrap.shutil.which", return_value="copilot"):
-        with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=Path("/tmp/rtk")):
-            with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool):
-                result = runner.invoke(
-                    main,
-                    ["wrap", "copilot", "--", "--model", "claude-sonnet-4-20250514"],
-                )
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
+        patch("headroom.cli.wrap._ensure_rtk_binary", return_value=Path("/tmp/rtk")),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--", "--model", "claude-sonnet-4-20250514"],
+        )
 
     assert result.exit_code == 0, result.output
     instructions = tmp_path / ".github" / "copilot-instructions.md"
@@ -78,25 +81,28 @@ def test_wrap_copilot_openai_backend_sets_completions_env(
     def fake_launch_tool(**kwargs):  # noqa: ANN003
         captured.update(kwargs)
 
-    with patch("headroom.cli.wrap.shutil.which", return_value="copilot"):
-        with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool):
-            result = runner.invoke(
-                main,
-                [
-                    "wrap",
-                    "copilot",
-                    "--no-rtk",
-                    "--backend",
-                    "anyllm",
-                    "--anyllm-provider",
-                    "groq",
-                    "--region",
-                    "us-central1",
-                    "--",
-                    "--model",
-                    "gpt-4o",
-                ],
-            )
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            [
+                "wrap",
+                "copilot",
+                "--no-rtk",
+                "--backend",
+                "anyllm",
+                "--anyllm-provider",
+                "groq",
+                "--region",
+                "us-central1",
+                "--",
+                "--model",
+                "gpt-4o",
+            ],
+        )
 
     assert result.exit_code == 0, result.output
 
@@ -120,14 +126,17 @@ def test_wrap_copilot_auto_detects_running_proxy_backend(
     def fake_launch_tool(**kwargs):  # noqa: ANN003
         captured.update(kwargs)
 
-    with patch("headroom.cli.wrap.shutil.which", return_value="copilot"):
-        with patch("headroom.cli.wrap._check_proxy", return_value=True):
-            with patch("headroom.cli.wrap._detect_running_proxy_backend", return_value="anyllm"):
-                with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool):
-                    result = runner.invoke(
-                        main,
-                        ["wrap", "copilot", "--no-rtk", "--", "--model", "gpt-4o"],
-                    )
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
+        patch("headroom.cli.wrap._check_proxy", return_value=True),
+        patch("headroom.cli.wrap._detect_running_proxy_backend", return_value="anyllm"),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--no-rtk", "--", "--model", "gpt-4o"],
+        )
 
     assert result.exit_code == 0, result.output
     env = captured["env"]
@@ -237,16 +246,19 @@ def test_wrap_copilot_clears_stale_wire_api_in_anthropic_mode(
     def fake_launch_tool(**kwargs):  # noqa: ANN003
         captured.update(kwargs)
 
-    with patch("headroom.cli.wrap.shutil.which", return_value="copilot"):
-        with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool):
-            result = runner.invoke(
-                main,
-                ["wrap", "copilot", "--no-rtk", "--", "--model", "claude-sonnet-4-20250514"],
-                env={
-                    "COPILOT_PROVIDER_WIRE_API": "responses",
-                    "ANTHROPIC_API_KEY": "sk-test-dummy",
-                },
-            )
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--no-rtk", "--", "--model", "claude-sonnet-4-20250514"],
+            env={
+                "COPILOT_PROVIDER_WIRE_API": "responses",
+                "ANTHROPIC_API_KEY": "sk-test-dummy",
+            },
+        )
 
     assert result.exit_code == 0, result.output
     env = captured["env"]
