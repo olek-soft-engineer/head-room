@@ -148,7 +148,11 @@ def _read_windows_copilot_cli_oauth_token() -> str | None:
     cred_ptr = ctypes.POINTER(CREDENTIAL)
     credentials = ctypes.POINTER(cred_ptr)()
     count = wintypes.DWORD()
-    advapi32 = ctypes.WinDLL("Advapi32.dll")
+    win_dll = getattr(ctypes, "WinDLL", None)
+    if win_dll is None:
+        return None
+
+    advapi32 = win_dll("Advapi32.dll")
     advapi32.CredEnumerateW.argtypes = [
         wintypes.LPCWSTR,
         wintypes.DWORD,
