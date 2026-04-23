@@ -84,6 +84,27 @@ def _resolve_placeholder(spec: str, *, home: Path, project: Path) -> Path:
     return Path(spec.format(home=str(home), project=str(project)))
 
 
+def _resolve_headroom_bin(name: str) -> str:
+    """Return the absolute path to the headroom binary before PATH is scrubbed.
+
+    ``with_clean_path`` intentionally narrows PATH so agent shims dominate;
+    that would also hide the real ``headroom`` binary (typically at
+    ``/opt/*venv/bin/headroom`` or similar). Resolving up-front lets the
+    subprocess launch even after PATH is cleaned.
+    """
+
+    if os.sep in name or (os.altsep and os.altsep in name):
+        return name
+    import shutil
+
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+    # Fall back to the bare name; subprocess will raise a clear
+    # FileNotFoundError that the case output surfaces.
+    return name
+
+
 def _run_single(case: Case, headroom_bin: str = "headroom") -> bool:
     """Execute one case. Return True on pass, False on fail."""
 
@@ -99,6 +120,10 @@ def _run_single(case: Case, headroom_bin: str = "headroom") -> bool:
         for shim_name, behavior in case.shims.items():
             make_shim(shim_name, shim_dir, behavior=behavior)
 
+        # Resolve headroom to its absolute path BEFORE mutating PATH so the
+        # shim dir can dominate PATH without losing the headroom binary.
+        resolved_bin = _resolve_headroom_bin(headroom_bin)
+
         with with_clean_path([shim_dir]) as env:
             env["HOME"] = str(home)
             env["USERPROFILE"] = str(home)
@@ -106,7 +131,7 @@ def _run_single(case: Case, headroom_bin: str = "headroom") -> bool:
             env.update(case.env_extra)
 
             proc = subprocess.run(
-                [headroom_bin, *case.argv],
+                [resolved_bin, *case.argv],
                 env=env,
                 cwd=str(project),
                 capture_output=True,
@@ -169,6 +194,8 @@ def _run_in_scratch(
     for shim_name, behavior in case.shims.items():
         make_shim(shim_name, shim_dir, behavior=behavior)
 
+    resolved_bin = _resolve_headroom_bin(headroom_bin)
+
     with with_clean_path([shim_dir]) as env:
         env["HOME"] = str(home)
         env["USERPROFILE"] = str(home)
@@ -176,7 +203,7 @@ def _run_in_scratch(
         env.update(case.env_extra)
 
         proc = subprocess.run(
-            [headroom_bin, *case.argv],
+            [resolved_bin, *case.argv],
             env=env,
             cwd=str(project),
             capture_output=True,
