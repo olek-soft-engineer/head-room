@@ -45,14 +45,63 @@ def test_init_auto_detects_targets(monkeypatch) -> None:
 
 
 def test_init_fails_when_auto_detection_empty(monkeypatch) -> None:
+    """Bare ``headroom init`` with no agents on PATH prints a guided error.
+
+    Regression guard for issue #245: the error must list every target that
+    was probed, confirm that -g / --global is a valid flag, and show the
+    explicit per-target invocation so the user knows how to proceed.
+    """
+
     init_cli, fake_main = _load_init_module(monkeypatch)
     runner = CliRunner()
-    monkeypatch.setattr(init_cli, "detect_init_targets", lambda global_scope: [])
+    monkeypatch.setattr(init_cli.shutil, "which", lambda name: None)
 
-    result = runner.invoke(fake_main, ["init"])
+    result = runner.invoke(fake_main, ["init", "-g"])
 
     assert result.exit_code != 0
-    assert "auto-detected" in result.output
+    assert "No supported user-scope agents were found on PATH" in result.output
+    assert "probed the following agents" in result.output
+    # Every in-scope target is listed with its lookup status.
+    for target in ("claude", "codex", "copilot", "openclaw"):
+        assert target in result.output
+    # The user is told that -g is still valid and given a concrete next step.
+    assert "-g" in result.output
+    assert "headroom init -g claude" in result.output
+
+
+def test_format_empty_detection_error_local_scope(monkeypatch) -> None:
+    """Local-scope variant of the guided error only lists local-scope agents."""
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    monkeypatch.setattr(init_cli.shutil, "which", lambda name: None)
+
+    message = init_cli._format_empty_detection_error(global_scope=False)
+
+    assert "local-scope agents" in message
+    assert "claude" in message and "codex" in message
+    # Copilot / openclaw are global-only; must not be suggested for local.
+    assert "headroom init copilot" not in message
+    assert "headroom init openclaw" not in message
+    assert "headroom init claude" in message
+    assert "headroom init codex" in message
+
+
+def test_format_empty_detection_error_reports_found_paths(monkeypatch, tmp_path) -> None:
+    """When a binary IS present, the error still surfaces its path for debugging."""
+
+    init_cli, _ = _load_init_module(monkeypatch)
+    fake_claude = tmp_path / "claude"
+    fake_claude.write_text("")
+    monkeypatch.setattr(
+        init_cli.shutil,
+        "which",
+        lambda name: str(fake_claude) if name == "claude" else None,
+    )
+
+    message = init_cli._format_empty_detection_error(global_scope=True)
+
+    assert f"claude: found at {fake_claude}" in message
+    assert "codex: not found" in message
 
 
 def test_init_copilot_requires_global(monkeypatch) -> None:

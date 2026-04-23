@@ -460,15 +460,71 @@ def _ensure_profile_running(profile: str) -> None:
         return
 
 
-def detect_init_targets(global_scope: bool) -> list[str]:
+def _probe_init_targets(global_scope: bool) -> list[tuple[str, str | None]]:
+    """Return ``[(target, which_result)]`` for every in-scope supported target.
+
+    ``which_result`` is the absolute path reported by :func:`shutil.which`, or
+    ``None`` when the binary is not on PATH. Callers use the list both to
+    build an auto-detected target list and to produce a diagnostic error
+    message when nothing was found.
+    """
+
     allowed = _GLOBAL_TARGETS if global_scope else _LOCAL_TARGETS
-    detected: list[str] = []
+    probes: list[tuple[str, str | None]] = []
     for target in _SUPPORTED_TARGETS:
         if target not in allowed:
             continue
-        if shutil.which(target):
-            detected.append(target)
-    return detected
+        probes.append((target, shutil.which(target)))
+    return probes
+
+
+def detect_init_targets(global_scope: bool) -> list[str]:
+    """Return agent names in scope for which a binary was found on PATH."""
+
+    return [name for name, path in _probe_init_targets(global_scope) if path]
+
+
+def _format_empty_detection_error(global_scope: bool) -> str:
+    """Build the error message shown when no in-scope targets were detected.
+
+    Lists every agent that was probed, what ``shutil.which`` returned, and
+    confirms how to proceed explicitly — including that the ``-g`` / ``--global``
+    flag the user tried is still valid.
+    """
+
+    probes = _probe_init_targets(global_scope)
+    scope_flag = "-g" if global_scope else ""
+    scope_label = "user" if global_scope else "local"
+
+    lines: list[str] = [
+        f"No supported {scope_label}-scope agents were found on PATH.",
+        "",
+        "Headroom probed the following agents via shutil.which():",
+    ]
+    for name, path in probes:
+        status = f"found at {path}" if path else "not found"
+        lines.append(f"  - {name}: {status}")
+
+    lines.extend(
+        [
+            "",
+            f"The {scope_flag or '--local (no flag)'} option is still supported; "
+            "headroom init just needs to know which agent to target.",
+            "Install the agent you want first, then re-run with an explicit target:",
+            "",
+        ]
+    )
+    for name, _path in probes:
+        flag = " -g" if global_scope else ""
+        lines.append(f"  headroom init{flag} {name}")
+
+    lines.extend(
+        [
+            "",
+            "Tip: run `headroom init --help` to see all options.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _init_claude(*, global_scope: bool, profile: str, port: int) -> None:
@@ -576,10 +632,7 @@ def init(
 
     targets = detect_init_targets(global_scope)
     if not targets:
-        scope_label = "user" if global_scope else "local"
-        raise click.ClickException(
-            f"No supported {scope_label} init targets were auto-detected. Specify one explicitly."
-        )
+        raise click.ClickException(_format_empty_detection_error(global_scope))
     _run_init_targets(
         targets=targets,
         global_scope=global_scope,
