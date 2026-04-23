@@ -22,10 +22,13 @@ def test_providers_package_resolves_exports_lazily_and_caches_them(monkeypatch) 
 
     monkeypatch.setattr(module, "import_module", fake_import_module)
 
-    assert module.OpenAIProvider is sentinel
-    assert module.OpenAIProvider is sentinel
-    assert import_calls == ["headroom.providers.openai"]
-    assert "OpenAIProvider" in module.__dir__()
+    try:
+        assert module.OpenAIProvider is sentinel
+        assert module.OpenAIProvider is sentinel
+        assert import_calls == ["headroom.providers.openai"]
+        assert "OpenAIProvider" in module.__dir__()
+    finally:
+        module.__dict__.pop("OpenAIProvider", None)
 
 
 def test_providers_package_rejects_missing_and_dunder_path_attributes() -> None:
