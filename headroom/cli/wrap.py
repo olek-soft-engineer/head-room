@@ -747,24 +747,30 @@ def _ensure_proxy(
     openai_api_url: str | None = None,
 ) -> subprocess.Popen | None:
     """Start or verify proxy. Returns process handle if we started it."""
+    helpers = _live_wrap_module()
     if not no_proxy:
-        manifest = _find_persistent_manifest(port)
+        manifest = helpers._find_persistent_manifest(port)
         if manifest is not None:
             from headroom.install.health import probe_ready
 
             if probe_ready(manifest.health_url):
                 click.echo(f"  Proxy already running on port {port}")
                 return None
-            if _recover_persistent_proxy(port):
+            if helpers._recover_persistent_proxy(port):
                 return None
-            raise click.ClickException(
-                f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
+            if helpers._check_proxy(port):
+                raise click.ClickException(
+                    f"Persistent deployment '{manifest.profile}' on port {port} is not healthy."
+                )
+            click.echo(
+                f"  Warning: persistent deployment '{manifest.profile}' on port {port} "
+                "is stale; starting a fresh proxy instead."
             )
 
-        if _check_proxy(port):
+        if helpers._check_proxy(port):
             # Proxy is running — check if it has the features we need
             needs_restart = False
-            running_config = _query_proxy_config(port)
+            running_config = helpers._query_proxy_config(port)
 
             if running_config is not None:
                 missing = []
@@ -788,7 +794,7 @@ def _ensure_proxy(
 
                     proxy_pid = running_config.get("pid")
                     if proxy_pid is not None:
-                        if not _kill_proxy_by_pid(int(proxy_pid), port):
+                        if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
                             raise click.ClickException(
                                 f"Failed to stop existing proxy (PID {proxy_pid}) on port {port}. "
                                 "Stop it manually and retry."
@@ -831,7 +837,7 @@ def _ensure_proxy(
             click.echo(f"  Error: {e}")
             raise SystemExit(1) from e
     else:
-        if not _check_proxy(port):
+        if not helpers._check_proxy(port):
             click.echo(f"  Warning: No proxy detected on port {port}")
         return None
 
