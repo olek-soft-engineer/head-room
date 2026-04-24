@@ -17,6 +17,8 @@ from headroom.memory.traffic_learner import (
     _classify_error,
     _is_error,
     _load_persisted_patterns_from_sqlite,
+    _normalize_bash_for_hash,
+    _parse_iso_timestamp,
     _patterns_to_recommendations,
     _project_for_pattern,
     _refine_error_recovery,
@@ -1338,6 +1340,18 @@ class TestRefineErrorRecovery:
         kept_evidence = sorted(p.evidence_count for p in refined)
         assert kept_evidence[0] >= 11  # Bottom of top-15 out of 1..25
 
+    def test_read_recovery_without_success_path_not_revalidated(self):
+        """Read patterns lacking `success_path` in metadata skip re-validation cleanly."""
+        p = ExtractedPattern(
+            category=PatternCategory.ERROR_RECOVERY,
+            content="Some legacy Read bullet",
+            importance=0.7,
+            metadata={"tool": "Read", "error_path": "/something.rs"},
+            last_seen_at=datetime.now(UTC),
+        )
+        refined = _refine_error_recovery([p])
+        assert p in refined
+
     def test_bash_recoveries_not_revalidated(self, tmp_path):
         """Bash patterns pass through re-validation regardless of command content."""
         bash_pat = ExtractedPattern(
@@ -1369,3 +1383,464 @@ class TestRefineErrorRecovery:
         assert p.last_seen_at is None
         refined = _refine_error_recovery([p])
         assert p in refined
+
+    def test_refined_empty_skips_section_in_recommendations(self, tmp_path):
+        """If all error_recovery patterns fail re-validation, no recommendation is emitted."""
+        # Only pattern is a Read recovery pointing at a nonexistent success_path.
+        stale = ExtractedPattern(
+            category=PatternCategory.ERROR_RECOVERY,
+            content="File `/a.rs` does not exist. The correct path is `/gone.rs`.",
+            importance=0.7,
+            metadata={
+                "tool": "Read",
+                "error_path": "/a.rs",
+                "success_path": str(tmp_path / "does-not-exist.rs"),
+            },
+            last_seen_at=datetime.now(UTC),
+        )
+        recs = _patterns_to_recommendations([stale])
+        # Section should be skipped entirely — no recommendation produced.
+        assert recs == []
+
+    def test_oserror_during_revalidation_keeps_row(self, monkeypatch):
+        """Transient OS errors during path checks should not drop the row."""
+        p = ExtractedPattern(
+            category=PatternCategory.ERROR_RECOVERY,
+            content="File `/a.rs` does not exist. The correct path is `/b.rs`.",
+            importance=0.7,
+            metadata={"tool": "Read", "error_path": "/a.rs", "success_path": "/b.rs"},
+            last_seen_at=datetime.now(UTC),
+        )
+
+        def _raise(self):
+            raise OSError("simulated permission error")
+
+        monkeypatch.setattr("pathlib.Path.exists", _raise)
+        refined = _refine_error_recovery([p])
+        assert p in refined
+
+
+class TestNormalizeBashForHash:
+    """Bash command normalization for hash-key collapse."""
+
+    def test_empty_string_returns_empty(self):
+        assert _normalize_bash_for_hash("") == ""
+
+    def test_no_volatile_suffix_unchanged(self):
+        assert _normalize_bash_for_hash("cargo check") == "cargo check"
+
+    def test_strips_head_suffix(self):
+        assert _normalize_bash_for_hash("grep foo bar | head -20") == "grep foo bar"
+
+    def test_strips_tail_suffix(self):
+        assert _normalize_bash_for_hash("cargo check | tail -5") == "cargo check"
+
+    def test_strips_trailing_context_flags(self):
+        # The regex is anchored to end-of-string; context flags must be trailing.
+        assert _normalize_bash_for_hash("grep foo bar -A 3") == "grep foo bar"
+
+    def test_strips_stderr_redirect(self):
+        assert _normalize_bash_for_hash("cargo check 2>&1") == "cargo check"
+
+    def test_cuts_at_first_chain(self):
+        # && boundary collapses to just the primary command
+        assert _normalize_bash_for_hash("cd /tmp && ls") == "cd /tmp"
+
+
+class TestParseIsoTimestamp:
+    """Edge-case coverage for _parse_iso_timestamp."""
+
+    def test_none_returns_none(self):
+        assert _parse_iso_timestamp(None) is None
+
+    def test_empty_string_returns_none(self):
+        assert _parse_iso_timestamp("") is None
+
+    def test_non_string_returns_none(self):
+        assert _parse_iso_timestamp(12345) is None
+        assert _parse_iso_timestamp(3.14) is None
+
+    def test_invalid_format_returns_none(self):
+        assert _parse_iso_timestamp("not an iso string") is None
+
+    def test_naive_timestamp_assumed_utc(self):
+        parsed = _parse_iso_timestamp("2026-04-20T12:00:00")
+        assert parsed is not None
+        assert parsed.tzinfo == UTC
+
+    def test_aware_timestamp_preserved(self):
+        parsed = _parse_iso_timestamp("2026-04-20T12:00:00+00:00")
+        assert parsed is not None
+        assert parsed.tzinfo is not None
+
+
+class TestLoadPersistedPatternsTimestamps:
+    """The sqlite load path reads first_seen_at / last_seen_at correctly."""
+
+    def _make_db(self, tmp_path, rows: list[dict]):
+        import json as _json
+        import sqlite3 as _sql
+
+        db = tmp_path / "memory.db"
+        conn = _sql.connect(db)
+        conn.execute(
+            "CREATE TABLE memories ("
+            "id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+            "metadata TEXT NOT NULL DEFAULT '{}', "
+            "entity_refs TEXT NOT NULL DEFAULT '[]', "
+            "importance REAL NOT NULL DEFAULT 0.5, "
+            "created_at TEXT)"
+        )
+        for i, r in enumerate(rows):
+            conn.execute(
+                "INSERT INTO memories "
+                "(id, content, metadata, entity_refs, importance, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    str(i),
+                    r["content"],
+                    _json.dumps(r.get("metadata", {})),
+                    _json.dumps(r.get("entity_refs", [])),
+                    r.get("importance", 0.5),
+                    r.get("created_at"),
+                ),
+            )
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_reads_timestamps_from_metadata(self, tmp_path):
+        db = self._make_db(
+            tmp_path,
+            [
+                {
+                    "content": "env bullet",
+                    "metadata": {
+                        "source": "traffic_learner",
+                        "category": "environment",
+                        "evidence_count": 3,
+                        "first_seen_at": "2026-04-10T10:00:00+00:00",
+                        "last_seen_at": "2026-04-20T15:00:00+00:00",
+                    },
+                }
+            ],
+        )
+        patterns = _load_persisted_patterns_from_sqlite(db)
+        assert len(patterns) == 1
+        p = patterns[0]
+        assert p.first_seen_at is not None
+        assert p.first_seen_at.year == 2026 and p.first_seen_at.month == 4
+        assert p.last_seen_at is not None
+        assert p.last_seen_at.day == 20
+
+    def test_falls_back_to_created_at(self, tmp_path):
+        """When metadata has no timestamps, `created_at` is used."""
+        db = self._make_db(
+            tmp_path,
+            [
+                {
+                    "content": "env bullet",
+                    "metadata": {
+                        "source": "traffic_learner",
+                        "category": "environment",
+                        "evidence_count": 1,
+                    },
+                    "created_at": "2026-03-01T09:00:00+00:00",
+                }
+            ],
+        )
+        patterns = _load_persisted_patterns_from_sqlite(db)
+        assert len(patterns) == 1
+        assert patterns[0].first_seen_at is not None
+        assert patterns[0].first_seen_at.month == 3
+        # last_seen defaults to first_seen when metadata lacks both.
+        assert patterns[0].last_seen_at == patterns[0].first_seen_at
+
+    def test_collision_merges_timestamps_max_last_min_first(self, tmp_path):
+        """Two rows collapsing to the same hash keep the widest timestamp range."""
+        db = self._make_db(
+            tmp_path,
+            [
+                {
+                    "content": "dup bullet",
+                    "importance": 0.4,
+                    "metadata": {
+                        "source": "traffic_learner",
+                        "category": "preference",
+                        "evidence_count": 2,
+                        "first_seen_at": "2026-04-10T00:00:00+00:00",
+                        "last_seen_at": "2026-04-15T00:00:00+00:00",
+                    },
+                },
+                {
+                    "content": "dup bullet",
+                    "importance": 0.9,
+                    "metadata": {
+                        "source": "traffic_learner",
+                        "category": "preference",
+                        "evidence_count": 3,
+                        "first_seen_at": "2026-04-01T00:00:00+00:00",
+                        "last_seen_at": "2026-04-20T00:00:00+00:00",
+                    },
+                },
+            ],
+        )
+        patterns = _load_persisted_patterns_from_sqlite(db)
+        assert len(patterns) == 1
+        p = patterns[0]
+        assert p.evidence_count == 5
+        # Higher importance wins when collision merges.
+        assert p.importance == 0.9
+        assert p.first_seen_at is not None and p.first_seen_at.day == 1
+        assert p.last_seen_at is not None and p.last_seen_at.day == 20
+
+    def test_non_numeric_importance_falls_back_to_default(self, tmp_path):
+        """Rows with an unparseable importance value use 0.5."""
+        import json as _json
+        import sqlite3 as _sql
+
+        db = tmp_path / "memory.db"
+        conn = _sql.connect(db)
+        conn.execute(
+            "CREATE TABLE memories ("
+            "id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+            "metadata TEXT NOT NULL DEFAULT '{}', "
+            "entity_refs TEXT NOT NULL DEFAULT '[]', "
+            "importance TEXT, "
+            "created_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO memories (id, content, metadata, importance) VALUES (?,?,?,?)",
+            (
+                "0",
+                "bullet",
+                _json.dumps(
+                    {
+                        "source": "traffic_learner",
+                        "category": "environment",
+                        "evidence_count": 1,
+                    }
+                ),
+                "not-a-number",
+            ),
+        )
+        conn.commit()
+        conn.close()
+        patterns = _load_persisted_patterns_from_sqlite(db)
+        assert len(patterns) == 1
+        assert patterns[0].importance == 0.5
+
+    def test_malformed_metadata_json_skipped_gracefully(self, tmp_path):
+        """Rows with invalid JSON metadata don't crash the load."""
+        import sqlite3 as _sql
+
+        db = tmp_path / "memory.db"
+        conn = _sql.connect(db)
+        conn.execute(
+            "CREATE TABLE memories ("
+            "id TEXT PRIMARY KEY, content TEXT NOT NULL, "
+            "metadata TEXT NOT NULL DEFAULT '{}', "
+            "entity_refs TEXT NOT NULL DEFAULT '[]', "
+            "importance REAL NOT NULL DEFAULT 0.5, "
+            "created_at TEXT)"
+        )
+        # Invalid JSON in metadata
+        conn.execute(
+            "INSERT INTO memories VALUES (?,?,?,?,?,?)",
+            ("0", "bullet", "{not json", "[]", 0.5, None),
+        )
+        conn.commit()
+        conn.close()
+        # Should not raise — the row is simply skipped (no recognizable category).
+        patterns = _load_persisted_patterns_from_sqlite(db)
+        assert patterns == []
+
+
+class TestBumpPersistsLastSeenAt:
+    """_bump_persisted_evidence sets $.last_seen_at on every bump."""
+
+    @pytest.mark.asyncio
+    async def test_bump_sets_last_seen_at_in_metadata(self, tmp_path):
+        import sqlite3 as _sql
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        # Seed a traffic_learner row with no last_seen_at.
+        import json as _json
+
+        conn = _sql.connect(db)
+        conn.execute(
+            "INSERT INTO memories (id, content, metadata) VALUES (?,?,?)",
+            (
+                "row-1",
+                "bullet",
+                _json.dumps(
+                    {
+                        "source": "traffic_learner",
+                        "category": "environment",
+                        "evidence_count": 1,
+                    }
+                ),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=1)
+        await learner._bump_persisted_evidence("row-1")
+
+        conn = _sql.connect(db)
+        row = conn.execute("SELECT metadata FROM memories WHERE id='row-1'").fetchone()
+        conn.close()
+        meta = _json.loads(row[0])
+        assert meta["evidence_count"] == 2
+        assert "last_seen_at" in meta
+        # Should be parseable back.
+        parsed = _parse_iso_timestamp(meta["last_seen_at"])
+        assert parsed is not None
+
+
+class TestHydrateLegacyRow:
+    """Legacy rows without `category` metadata fall back to literal-content hashing."""
+
+    @pytest.mark.asyncio
+    async def test_hydrate_legacy_row_without_category(self, tmp_path):
+        import sqlite3 as _sql
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        import json as _json
+
+        conn = _sql.connect(db)
+        # No `category` key in metadata — must still hydrate.
+        conn.execute(
+            "INSERT INTO memories (id, content, metadata) VALUES (?,?,?)",
+            (
+                "legacy-1",
+                "legacy bullet",
+                _json.dumps({"source": "traffic_learner"}),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=1)
+        await learner._hydrate_persisted_state()
+
+        # Falls back to sha256(content) for the hash key.
+        import hashlib as _h
+
+        expected = _h.sha256(b"legacy bullet").hexdigest()[:16]
+        assert expected in learner._saved_hashes
+        assert learner._persisted_ids[expected] == "legacy-1"
+
+    @pytest.mark.asyncio
+    async def test_hydrate_skips_empty_content(self, tmp_path):
+        """Rows with empty content are skipped during hydration."""
+        import json as _json
+        import sqlite3 as _sql
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        conn = _sql.connect(db)
+        conn.execute(
+            "INSERT INTO memories (id, content, metadata) VALUES (?,?,?)",
+            ("empty", "", _json.dumps({"source": "traffic_learner"})),
+        )
+        conn.execute(
+            "INSERT INTO memories (id, content, metadata) VALUES (?,?,?)",
+            (
+                "ok",
+                "normal bullet",
+                _json.dumps({"source": "traffic_learner", "category": "environment"}),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=1)
+        await learner._hydrate_persisted_state()
+
+        assert "empty" not in learner._persisted_ids.values()
+        assert "ok" in learner._persisted_ids.values()
+
+    @pytest.mark.asyncio
+    async def test_hydrate_invalid_category_falls_back(self, tmp_path):
+        """Unknown category values (e.g., typos) are handled as legacy rows."""
+        import sqlite3 as _sql
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        import json as _json
+
+        conn = _sql.connect(db)
+        conn.execute(
+            "INSERT INTO memories (id, content, metadata) VALUES (?,?,?)",
+            (
+                "bad-cat",
+                "mystery bullet",
+                _json.dumps({"source": "traffic_learner", "category": "mystery_type"}),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=1)
+        # Must not raise.
+        await learner._hydrate_persisted_state()
+
+
+class TestCollectAllPatternsTimestamps:
+    """_collect_all_patterns bumps last_seen_at on in-session re-sightings."""
+
+    @pytest.mark.asyncio
+    async def test_re_sighting_bumps_last_seen_at(self, tmp_path):
+        """A persisted pattern re-observed in this session gets last_seen_at=now."""
+        import json as _json
+        import sqlite3 as _sql
+
+        db = tmp_path / "memory.db"
+        _init_db(db)
+        old_last_seen = "2026-01-01T00:00:00+00:00"
+        conn = _sql.connect(db)
+        conn.execute(
+            "INSERT INTO memories (id, content, metadata) VALUES (?,?,?)",
+            (
+                "seed-1",
+                "some env bullet",
+                _json.dumps(
+                    {
+                        "source": "traffic_learner",
+                        "category": "environment",
+                        "evidence_count": 1,
+                        "first_seen_at": old_last_seen,
+                        "last_seen_at": old_last_seen,
+                    }
+                ),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        backend = _FakeBackend(db)
+        learner = TrafficLearner(backend=backend, min_evidence=1)
+
+        # Simulate in-session accumulation of the same pattern.
+        pattern = ExtractedPattern(
+            category=PatternCategory.ENVIRONMENT,
+            content="some env bullet",
+            importance=0.7,
+        )
+        learner._pattern_counts[pattern.content_hash] = (pattern, 1)
+
+        merged = learner._collect_all_patterns()
+        assert len(merged) == 1
+        m = merged[0]
+        assert m.last_seen_at is not None
+        # last_seen_at should be bumped past the stale 2026-01 timestamp.
+        assert m.last_seen_at.year == datetime.now(UTC).year
+        assert m.last_seen_at > _parse_iso_timestamp(old_last_seen)
