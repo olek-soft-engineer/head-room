@@ -1,57 +1,78 @@
-//! headroom-proxy: Rust proxy binary (Phase 0 scaffolding).
+//! headroom-proxy: transparent reverse proxy binary.
 //!
-//! Currently exposes only `/healthz`. Provider routes land in Phase 2.
+//! Drops in front of the existing Python proxy. End-users hit the public
+//! port; this binary forwards every HTTP/SSE/WebSocket request verbatim to
+//! `--upstream`. See RUST_DEV.md for the operator runbook.
 
-use axum::{routing::get, Json, Router};
-use serde_json::{json, Value};
 use std::net::SocketAddr;
 
-async fn healthz() -> Json<Value> {
-    Json(json!({ "ok": true }))
-}
-
-fn app() -> Router {
-    Router::new().route("/healthz", get(healthz))
-}
+use clap::Parser;
+use headroom_proxy::config::CliArgs;
+use headroom_proxy::{build_app, AppState, Config};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber_init();
-    let addr: SocketAddr = "127.0.0.1:8787".parse()?;
-    tracing::info!(%addr, crate_hello = headroom_core::hello(), "starting headroom-proxy");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app()).await?;
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let args = CliArgs::parse();
+    let config = Config::from_cli(args);
+
+    init_tracing(&config.log_level);
+
+    tracing::info!(
+        listen = %config.listen,
+        upstream = %config.upstream,
+        upstream_timeout_s = config.upstream_timeout.as_secs(),
+        upstream_connect_timeout_s = config.upstream_connect_timeout.as_secs(),
+        max_body_bytes = config.max_body_bytes,
+        rewrite_host = config.rewrite_host,
+        graceful_shutdown_timeout_s = config.graceful_shutdown_timeout.as_secs(),
+        "headroom-proxy starting"
+    );
+
+    let state = AppState::new(config.clone())?;
+    let app = build_app(state).into_make_service_with_connect_info::<SocketAddr>();
+
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    tracing::info!(addr = %listener.local_addr()?, "listening");
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
     Ok(())
 }
 
-fn tracing_subscriber_init() {
-    // Minimal no-op initializer so we don't pull tracing-subscriber in Phase 0.
-    // Replace with tracing-subscriber in Phase 2 when richer logging is needed.
+fn init_tracing(level: &str) {
+    let filter = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
+    let json_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_current_span(false)
+        .with_span_list(false);
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(json_layer)
+        .try_init();
 }
 
-#[cfg(test)]
-mod tests {
-    use super::app;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut s) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
 
-    #[tokio::test]
-    async fn healthz_returns_ok() {
-        let response = app()
-            .oneshot(
-                Request::builder()
-                    .uri("/healthz")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value, serde_json::json!({"ok": true}));
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
     }
+    tracing::info!("shutdown signal received");
 }
