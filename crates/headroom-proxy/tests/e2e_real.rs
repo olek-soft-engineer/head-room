@@ -311,7 +311,10 @@ async fn e2e_anthropic_streaming() {
             }
         }
     }
-    eprintln!("[debug] chunks={chunks} bytes={} last_err={last_err:?}", buf.len());
+    eprintln!(
+        "[debug] chunks={chunks} bytes={} last_err={last_err:?}",
+        buf.len()
+    );
     let has_start = buf.contains("message_start");
     let has_delta = buf.contains("content_block_delta") || buf.contains("\"delta\"");
     let has_stop = buf.contains("message_stop");
@@ -320,7 +323,10 @@ async fn e2e_anthropic_streaming() {
         "stream missing expected events (start={has_start} delta={has_delta} stop={has_stop}). buf:\n{}",
         &buf.chars().take(2000).collect::<String>()
     );
-    assert!(chunks >= 1, "expected at least one SSE chunk (got {chunks})");
+    assert!(
+        chunks >= 1,
+        "expected at least one SSE chunk (got {chunks})"
+    );
 
     proxy.shutdown().await;
     drop(py);
@@ -357,9 +363,7 @@ async fn e2e_openai_non_streaming() {
     let text = resp.text().await.unwrap();
     assert_eq!(status, 200, "non-200 from openai: {text}");
     let v: Value = serde_json::from_str(&text).unwrap();
-    let content = v["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("");
+    let content = v["choices"][0]["message"]["content"].as_str().unwrap_or("");
     assert!(
         content.to_uppercase().contains("PONG"),
         "expected PONG, got: {content}"

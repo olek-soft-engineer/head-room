@@ -79,8 +79,11 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          manifest-path: crates/headroom-py/Cargo.toml
-          args: --release --out dist
+          # `manifest-path:` is NOT a valid input on this action (it warns and
+          # ignores). Pass -m inside `args` so maturin sees the right Cargo.toml.
+          # Without this, maturin runs from the repo root and fails because
+          # the workspace Cargo.toml has no [package] section.
+          args: --release -m crates/headroom-py/Cargo.toml --out dist
           target: ${{ matrix.maturin-target }}
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
