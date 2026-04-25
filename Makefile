@@ -29,7 +29,7 @@ test-parity:
 		echo "error: activate a venv first (e.g. source .venv/bin/activate)"; \
 		exit 1; \
 	fi
-	$(MATURIN) develop -m crates/headroom-py/pyproject.toml
+	$(MATURIN) develop -m crates/headroom-py/Cargo.toml
 	$(CARGO) run -p headroom-parity -- run --fixtures $(FIXTURES)
 
 bench:
@@ -43,7 +43,7 @@ build-proxy:
 	printf 'headroom-proxy: %s bytes (%.1f MiB)\n' "$$SIZE" "$$(echo "$$SIZE / 1048576" | bc -l)"
 
 build-wheel:
-	$(MATURIN) build --release -m crates/headroom-py/pyproject.toml
+	$(MATURIN) build --release -m crates/headroom-py/Cargo.toml
 
 fmt:
 	$(CARGO) fmt --all

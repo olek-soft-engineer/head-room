@@ -72,7 +72,8 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          args: --release -m crates/headroom-py/pyproject.toml --out dist
+          manifest-path: crates/headroom-py/Cargo.toml
+          args: --release --out dist
           target: ${{ matrix.maturin-target }}
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
