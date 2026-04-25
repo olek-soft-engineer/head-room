@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame as TgCloseFrame;
 use tokio_tungstenite::tungstenite::Message as TgMsg;
 
 use crate::headers::build_forward_request_headers;
-use crate::proxy::AppState;
+use crate::proxy::{join_upstream_path, AppState};
 
 /// Entry point invoked from the catch-all when an upgrade is detected.
 pub async fn ws_handler(
@@ -63,6 +63,7 @@ pub async fn ws_handler(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    let path = req.uri().path().to_string();
     ws.on_upgrade(move |client_ws| async move {
         if let Err(e) = run_ws_pump(
             client_ws,
@@ -70,6 +71,7 @@ pub async fn ws_handler(
             forward_headers,
             subprotocols,
             request_id,
+            path,
         )
         .await
         {
@@ -93,31 +95,15 @@ impl IntoResponseBody for (StatusCode, String) {
 fn build_upstream_ws_url(base: &url::Url, req_uri: &http::Uri) -> Result<url::Url, String> {
     let mut joined = base.clone();
     let new_scheme = match joined.scheme() {
-        "http" => "ws".to_string(),
-        "https" => "wss".to_string(),
-        s @ ("ws" | "wss") => s.to_string(),
+        "http" => "ws",
+        "https" => "wss",
+        "ws" | "wss" => "ws", // already WS; set_scheme is a no-op but keeps it uniform
         other => return Err(format!("unsupported upstream scheme: {other}")),
     };
     joined
-        .set_scheme(&new_scheme)
+        .set_scheme(new_scheme)
         .map_err(|()| "failed to set ws scheme".to_string())?;
-    let path = req_uri.path();
-    let query = req_uri.query();
-    let base_path = joined.path().trim_end_matches('/').to_string();
-    let combined = if path.is_empty() || path == "/" {
-        if base_path.is_empty() {
-            "/".to_string()
-        } else {
-            base_path
-        }
-    } else if base_path.is_empty() {
-        path.to_string()
-    } else {
-        format!("{base_path}{path}")
-    };
-    joined.set_path(&combined);
-    joined.set_query(query);
-    Ok(joined)
+    Ok(join_upstream_path(&joined, req_uri.path(), req_uri.query()))
 }
 
 async fn run_ws_pump(
@@ -126,6 +112,7 @@ async fn run_ws_pump(
     forward_headers: http::HeaderMap,
     subprotocols: Option<String>,
     request_id: String,
+    path: String,
 ) -> Result<(), String> {
     // Build the upstream handshake request manually so we can inject headers.
     let mut req = upstream_url
@@ -167,58 +154,61 @@ async fn run_ws_pump(
     let (mut upstream_sink, mut upstream_stream) = upstream_ws.split();
     let (mut client_sink, mut client_stream) = client_ws.split();
 
-    // Pump client -> upstream.
-    let c2u = async {
-        while let Some(msg) = client_stream.next().await {
-            let m = match msg {
-                Ok(m) => m,
-                Err(_) => break,
-            };
-            let tg = match ax_to_tg(m) {
-                Some(tg) => tg,
-                None => continue,
-            };
-            let close = matches!(tg, TgMsg::Close(_));
-            if upstream_sink.send(tg).await.is_err() {
-                break;
-            }
-            if close {
-                break;
-            }
-        }
-        let _ = upstream_sink.close().await;
-    };
-
-    // Pump upstream -> client.
-    let u2c = async {
-        while let Some(msg) = upstream_stream.next().await {
-            let m = match msg {
-                Ok(m) => m,
-                Err(_) => break,
-            };
-            let ax = match tg_to_ax(m) {
-                Some(ax) => ax,
-                None => continue,
-            };
-            let close = matches!(ax, AxMsg::Close(_));
-            if client_sink.send(ax).await.is_err() {
-                break;
-            }
-            if close {
-                break;
-            }
-        }
-        let _ = client_sink.close().await;
-    };
-
     tracing::info!(
         request_id = %request_id,
+        path = %path,
         protocol = "ws",
         upstream = %upstream_url,
         "ws session opened"
     );
-    tokio::join!(c2u, u2c);
-    tracing::info!(request_id = %request_id, protocol = "ws", "ws session closed");
+
+    // Each direction runs in its own task. We use a cancel token so that when
+    // either side closes/errors, the other is aborted immediately rather than
+    // blocking forever on next().await (the half-close hang bug).
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_c2u = cancel.clone();
+    let cancel_u2c = cancel.clone();
+
+    // Pump client -> upstream.
+    let c2u = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_c2u.cancelled() => break,
+                msg = client_stream.next() => {
+                    let Some(msg) = msg else { break };
+                    let m = match msg { Ok(m) => m, Err(_) => break };
+                    let tg = match ax_to_tg(m) { Some(tg) => tg, None => continue };
+                    let close = matches!(tg, TgMsg::Close(_));
+                    if upstream_sink.send(tg).await.is_err() { break; }
+                    if close { break; }
+                }
+            }
+        }
+        let _ = upstream_sink.close().await;
+        cancel_c2u.cancel();
+    });
+
+    // Pump upstream -> client.
+    let u2c = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_u2c.cancelled() => break,
+                msg = upstream_stream.next() => {
+                    let Some(msg) = msg else { break };
+                    let m = match msg { Ok(m) => m, Err(_) => break };
+                    let ax = match tg_to_ax(m) { Some(ax) => ax, None => continue };
+                    let close = matches!(ax, AxMsg::Close(_));
+                    if client_sink.send(ax).await.is_err() { break; }
+                    if close { break; }
+                }
+            }
+        }
+        let _ = client_sink.close().await;
+        cancel_u2c.cancel();
+    });
+
+    let _ = tokio::join!(c2u, u2c);
+    tracing::info!(request_id = %request_id, path = %path, protocol = "ws", "ws session closed");
     Ok(())
 }
 

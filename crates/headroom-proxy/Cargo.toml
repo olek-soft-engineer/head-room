@@ -39,6 +39,7 @@ hyper = "1"
 url = "2"
 humantime = "2"
 bytesize = "1"
+tokio-util = { version = "0.7" }
 headroom-core = { path = "../headroom-core" }
 
 [dev-dependencies]

@@ -10,8 +10,9 @@ use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{any, get};
 use axum::Router;
+use futures_util::{StreamExt as _, TryStreamExt};
+#[cfg(test)]
 use bytes::Bytes;
-use futures_util::TryStreamExt;
 #[cfg(test)]
 use http_body_util::BodyExt;
 
@@ -100,30 +101,30 @@ fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// Build the upstream URL by joining the configured base with the incoming
 /// path-and-query. Preserves '?' and the query string verbatim.
 pub(crate) fn build_upstream_url(base: &url::Url, uri: &Uri) -> Result<url::Url, ProxyError> {
-    let path = uri.path();
-    let query = uri.query();
+    Ok(join_upstream_path(base, uri.path(), uri.query()))
+}
 
-    // We treat the configured upstream as a base. Strip its trailing slash
-    // when joining a path that starts with '/' so that "http://x:1/api" + "/v1/foo"
-    // yields "http://x:1/api/v1/foo" rather than "http://x:1/v1/foo".
+/// Shared path-join helper used by HTTP and WebSocket handlers.
+/// Appends `path` to `base`, preserving any base path prefix, then sets `query`.
+pub(crate) fn join_upstream_path(base: &url::Url, path: &str, query: Option<&str>) -> url::Url {
     let mut joined = base.clone();
-    {
-        let base_path = joined.path().trim_end_matches('/').to_string();
-        let combined = if path.is_empty() || path == "/" {
-            if base_path.is_empty() {
-                "/".to_string()
-            } else {
-                base_path
-            }
-        } else if base_path.is_empty() {
-            path.to_string()
+    // Strip trailing slash from base path so "http://x:1/api" + "/v1/foo"
+    // yields "http://x:1/api/v1/foo" rather than "http://x:1/v1/foo".
+    let base_path = joined.path().trim_end_matches('/').to_string();
+    let combined = if path.is_empty() || path == "/" {
+        if base_path.is_empty() {
+            "/".to_string()
         } else {
-            format!("{base_path}{path}")
-        };
-        joined.set_path(&combined);
-    }
+            base_path
+        }
+    } else if base_path.is_empty() {
+        path.to_string()
+    } else {
+        format!("{base_path}{path}")
+    };
+    joined.set_path(&combined);
     joined.set_query(query);
-    Ok(joined)
+    joined
 }
 
 /// Forward an HTTP request to the upstream and stream the response back.
@@ -184,9 +185,17 @@ async fn forward_http(
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
-    // Stream response body back without buffering.
-    let resp_stream = upstream_resp.bytes_stream();
-    let body = Body::from_stream(resp_stream.map_ok(Bytes::from));
+    // Stream response body back without buffering. Wrap errors so mid-stream
+    // upstream failures are logged rather than silently truncating the client.
+    let rid = request_id.clone();
+    let resp_stream = upstream_resp.bytes_stream().map(move |r| match r {
+        Ok(b) => Ok(b),
+        Err(e) => {
+            tracing::warn!(request_id = %rid, error = %e, "upstream stream error mid-response");
+            Err(e)
+        }
+    });
+    let body = Body::from_stream(resp_stream);
 
     let mut response = Response::builder().status(status);
     {

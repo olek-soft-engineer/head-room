@@ -17,16 +17,12 @@ pub async fn healthz() -> impl IntoResponse {
 /// 2xx, 503 otherwise. The endpoint name is reserved by the proxy and is
 /// not forwarded; operators must not name a real upstream route this.
 pub async fn healthz_upstream(State(state): State<AppState>) -> Response {
-    let url = match state.config.upstream.join("healthz") {
-        Ok(u) => u,
-        Err(e) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"ok": false, "error": format!("bad upstream url: {e}")})),
-            )
-                .into_response();
-        }
-    };
+    // Use an absolute path so upstream URLs with non-trailing-slash paths
+    // (e.g. http://localhost:8788/api) resolve to /healthz, not replace the
+    // last segment. Url::join("healthz") would strip "api" per RFC 3986.
+    let mut url = state.config.upstream.clone();
+    url.set_path("/healthz");
+    url.set_query(None);
     match state.client.get(url).send().await {
         Ok(resp) if resp.status().is_success() => {
             (StatusCode::OK, Json(json!({"ok": true}))).into_response()
