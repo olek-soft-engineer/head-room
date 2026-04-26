@@ -55,9 +55,18 @@ jobs:
         run: |
           pip install 'maturin>=1.5,<2.0'
 
+      # `scripts/build_rust_extension.sh` uses `maturin develop` which requires
+      # a virtualenv. CI runs against bare setup-python with no venv, so build
+      # a wheel + pip-install it instead. Then symlink the `.so` into the
+      # in-tree `headroom/` package so the editable install resolves
+      # `import headroom._core` past the source dir shadowing site-packages.
       - name: Build Rust extension (headroom._core)
         run: |
-          bash scripts/build_rust_extension.sh
+          maturin build --release -m crates/headroom-py/Cargo.toml --out dist
+          pip install --force-reinstall --no-deps dist/headroom_core_py-*.whl
+          SO_FILE=$(python -c "import headroom._core, pathlib; print(pathlib.Path(headroom._core.__file__).resolve())")
+          ln -sf "$SO_FILE" "headroom/$(basename "$SO_FILE")"
+          python -c "from headroom._core import DiffCompressor; print('headroom._core OK:', DiffCompressor)"
 
       - name: Run linting
         if: matrix.python-version == '3.12'
