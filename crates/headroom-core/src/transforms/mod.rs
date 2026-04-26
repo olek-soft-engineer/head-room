@@ -16,6 +16,7 @@
 //! prod and are returned alongside the parity-equal output for tests.
 
 pub mod diff_compressor;
+pub mod smart_crusher;
 
 pub use diff_compressor::{
     DiffCompressionResult, DiffCompressor, DiffCompressorConfig, DiffCompressorStats,
