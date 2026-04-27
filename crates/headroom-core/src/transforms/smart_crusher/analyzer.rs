@@ -225,16 +225,45 @@ impl SmartAnalyzer {
                     .filter_map(|v| v.as_f64().filter(|f| f.is_finite()))
                     .collect();
                 if !nums.is_empty() {
-                    stats.min_val = nums.iter().cloned().reduce(f64::min);
-                    stats.max_val = nums.iter().cloned().reduce(f64::max);
-                    stats.mean_val = mean(&nums);
+                    let min_val = nums.iter().cloned().reduce(f64::min);
+                    let max_val = nums.iter().cloned().reduce(f64::max);
+                    let mean_val = mean(&nums);
                     // `variance = 0` when n < 2 (Python: `if len(nums) > 1`).
-                    stats.variance = if nums.len() > 1 {
+                    let variance = if nums.len() > 1 {
                         sample_variance(&nums)
                     } else {
                         Some(0.0)
                     };
-                    stats.change_points = self.detect_change_points(&nums, 5);
+                    // Python wraps the numeric-stats block in
+                    // `try/except (OverflowError, ValueError)` and resets
+                    // ALL fields to None on failure. Mirror that
+                    // all-or-nothing reset: if any computed stat is non-
+                    // finite (or computation returned None), drop the
+                    // entire numeric stats block and leave change_points
+                    // empty.
+                    let all_finite = mean_val.map(f64::is_finite).unwrap_or(false)
+                        && variance.map(f64::is_finite).unwrap_or(false)
+                        && min_val.map(f64::is_finite).unwrap_or(false)
+                        && max_val.map(f64::is_finite).unwrap_or(false);
+                    if all_finite {
+                        stats.min_val = min_val;
+                        stats.max_val = max_val;
+                        stats.mean_val = mean_val;
+                        stats.variance = variance;
+                        stats.change_points = self.detect_change_points(&nums, 5);
+                    } else {
+                        // Python parity: the except block sets `variance = 0`
+                        // (int literal) but min/max/mean to None. Downstream
+                        // truthiness checks (`if stats.variance:` and
+                        // `(variance or 0) > 0`) treat 0 the same as None,
+                        // but the FieldStats serialization shape matters
+                        // for parity fixtures. Pin variance to Some(0.0).
+                        stats.min_val = None;
+                        stats.max_val = None;
+                        stats.mean_val = None;
+                        stats.variance = Some(0.0);
+                        stats.change_points = Vec::new();
+                    }
                 }
             }
             "string" => {
@@ -877,6 +906,30 @@ mod tests {
         // Python: statistics.variance(1..=10) = 9.166666...
         let v = s.variance.expect("variance present");
         assert!((v - 9.166666666666666).abs() < 1e-9);
+    }
+
+    #[test]
+    fn analyze_field_numeric_overflow_resets_all_stats_to_none() {
+        // Python parity: when stats computation overflows, the
+        // `try/except (OverflowError, ValueError)` block resets ALL
+        // numeric fields to None. We mirror by checking finiteness across
+        // the bundle and dropping the whole numeric stats group on
+        // failure.
+        let huge = 1e200;
+        // Two extreme opposite values: variance overflows.
+        let items = vec![json!({"n": huge}), json!({"n": -huge})];
+        let s = analyzer().analyze_field("n", &items);
+        assert_eq!(s.field_type, "numeric");
+        // Per Python: min/max/mean reset to None; variance = 0 (int);
+        // change_points empty.
+        assert_eq!(s.min_val, None);
+        assert_eq!(s.max_val, None);
+        assert_eq!(s.mean_val, None);
+        assert_eq!(s.variance, Some(0.0));
+        assert!(s.change_points.is_empty());
+        // Non-numeric stats (count, unique, is_constant) should still hold.
+        assert_eq!(s.count, 2);
+        assert_eq!(s.unique_count, 2);
     }
 
     #[test]
