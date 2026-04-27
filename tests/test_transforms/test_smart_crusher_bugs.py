@@ -20,6 +20,7 @@ from headroom.transforms.smart_crusher import SmartCrusher
 
 
 def _make_crusher(max_items: int = 10, min_items: int = 3) -> SmartCrusher:
+    """Build a SmartCrusher with deterministic small-K config for tests."""
     config = SmartCrusherConfig(
         enabled=True,
         min_items_to_analyze=min_items,
@@ -30,102 +31,13 @@ def _make_crusher(max_items: int = 10, min_items: int = 3) -> SmartCrusher:
     return SmartCrusher(config=config)
 
 
-# ---------------------------------------------------------------------------
-# Bug 1: Number array type mixing
-# ---------------------------------------------------------------------------
-
-
-class TestNumberArraySchemaPreservation:
-    """_crush_number_array must return only original numeric values.
-
-    Previously it prepended a stats summary string, producing
-    [string, int, int, ...] which violates the schema-preserving
-    guarantee and breaks type-aware JSON consumers.
-    """
-
-    def test_crushed_number_array_contains_only_numbers(self) -> None:
-        """Every element of the crushed array must be int or float."""
-        crusher = _make_crusher(max_items=10)
-        numbers = list(range(50))  # 0..49, well above the n<=8 passthrough
-        crushed, strategy = crusher._crush_number_array(numbers)
-
-        for i, item in enumerate(crushed):
-            assert isinstance(item, int | float), (
-                f"Item {i} is {type(item).__name__} = {item!r}, expected int/float. "
-                f"Schema-preserving guarantee violated."
-            )
-
-    def test_crushed_number_array_subset_of_original(self) -> None:
-        """Every value in the crushed array must exist in the original."""
-        crusher = _make_crusher(max_items=10)
-        numbers = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
-        crushed, _ = crusher._crush_number_array(numbers)
-
-        original_set = set(numbers)
-        for item in crushed:
-            assert item in original_set, (
-                f"Value {item!r} not in original array — generated content detected"
-            )
-
-    def test_stats_summary_in_strategy_not_in_array(self) -> None:
-        """Statistics should be communicated via strategy string, not array content."""
-        crusher = _make_crusher(max_items=5)
-        numbers = list(range(100))
-        crushed, strategy = crusher._crush_number_array(numbers)
-
-        # Strategy should contain stats info
-        assert "number:" in strategy
-
-        # Array should not contain any strings
-        strings_in_result = [x for x in crushed if isinstance(x, str)]
-        assert strings_in_result == [], f"Found string(s) in numeric array: {strings_in_result}"
-
-    def test_number_array_passthrough_for_small(self) -> None:
-        """Arrays with n <= 8 should pass through unchanged."""
-        crusher = _make_crusher()
-        small = [1, 2, 3, 4, 5]
-        crushed, strategy = crusher._crush_number_array(small)
-        assert crushed == small
-        assert strategy == "number:passthrough"
-
-    def test_number_array_preserves_outliers(self) -> None:
-        """Outlier values should be preserved in the crushed output."""
-        crusher = _make_crusher(max_items=10)
-        # Normal range + extreme outlier
-        numbers = [10] * 20 + [10000]
-        crushed, strategy = crusher._crush_number_array(numbers)
-        assert 10000 in crushed, "Outlier value 10000 was dropped"
-
-    def test_number_array_preserves_boundaries(self) -> None:
-        """First and last values should always be kept."""
-        crusher = _make_crusher(max_items=5)
-        numbers = list(range(100))
-        crushed, strategy = crusher._crush_number_array(numbers)
-        assert crushed[0] == 0, "First value not preserved"
-        assert numbers[-1] in crushed, "Last value not preserved"
-
-    def test_non_finite_passthrough(self) -> None:
-        """All-NaN/Inf arrays should return unchanged."""
-        crusher = _make_crusher()
-        nans = [float("nan")] * 10
-        crushed, strategy = crusher._crush_number_array(nans)
-        assert strategy == "number:no_finite"
-        assert len(crushed) == 10
-
-    def test_full_crush_pipeline_number_array_types(self) -> None:
-        """End-to-end: crushing a JSON number array via the public API."""
-        crusher = _make_crusher(max_items=10)
-        content = json.dumps(list(range(50)))
-        result, was_modified, info = crusher._smart_crush_content(content)
-
-        if was_modified:
-            parsed = json.loads(result)
-            assert isinstance(parsed, list)
-            for item in parsed:
-                assert isinstance(item, int | float), (
-                    f"Public API returned non-numeric item {item!r} in number array"
-                )
-
+# Bug #1 (number array schema preservation) — invariant pinned by the
+# Rust port (`crates/headroom-core/src/transforms/smart_crusher/crushers.rs::
+# crush_number_array` + its unit tests) and the parity fixtures
+# (`tests/parity/fixtures/smart_crusher/number_array_40_changepoint*`).
+# The Python `_crush_number_array` helper that the previous tests
+# probed was removed when the Python implementation was retired in
+# Stage 3c.1b.
 
 # ---------------------------------------------------------------------------
 # Bug 2: Race condition on _current_field_semantics
@@ -212,79 +124,12 @@ class TestRecursionDepthLimit:
         assert isinstance(parsed, list)
 
 
-# ---------------------------------------------------------------------------
-# Stage 3c.1 lockstep bug fixes (#1 percentile, #2 sequential, #3 rare-status,
-# #4 k-split). Each test pins the Python behavior post-fix; Rust has matching
-# tests so parity fixtures byte-equal both languages.
-# ---------------------------------------------------------------------------
-
-
-class TestStage3c1BugFixes:
-    """Bugs fixed in lockstep with the Rust port at Stage 3c.1."""
-
-    # Bug #1 — percentile off-by-one (cosmetic, strategy string only).
-    def test_bug1_percentile_uses_linear_interpolation(self) -> None:
-        from headroom.transforms.smart_crusher import _percentile_linear
-
-        # n=10 [10..100]: p25 index = 0.25 * 9 = 2.25 → 30*0.75 + 40*0.25 = 32.5
-        sorted_vals = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0]
-        assert _percentile_linear(sorted_vals, 0.25) == 32.5
-        assert _percentile_linear(sorted_vals, 0.75) == 77.5
-        # n=1 → return the single value.
-        assert _percentile_linear([42.0], 0.25) == 42.0
-        # n=0 → 0.0 (defensive).
-        assert _percentile_linear([], 0.25) == 0.0
-
-    # Bug #2 — zero-padded string IDs misclassified as sequential.
-    def test_bug2_zero_padded_strings_not_sequential(self) -> None:
-        from headroom.transforms.smart_crusher import _detect_sequential_pattern
-
-        # Pre-fix: int("001") → 1, so ["001",...,"005"] looked like 1..5
-        # and was classified as sequential. Post-fix: had_non_string_numeric
-        # stays False because every value came from a string → return False.
-        zero_padded = ["001", "002", "003", "004", "005"]
-        assert _detect_sequential_pattern(zero_padded, check_order=False) is False
-
-        # Real ints (not strings) still classify as sequential.
-        real_ints = [1, 2, 3, 4, 5]
-        assert _detect_sequential_pattern(real_ints, check_order=False) is True
-
-    # Bug #3 — rare-status detection cardinality cap.
-    def test_bug3_high_cardinality_pareto(self) -> None:
-        from headroom.transforms.smart_crusher import _detect_rare_status_values
-
-        # 60×INFO + 25×WARN + 15 distinct error codes (cardinality 17).
-        # Pre-fix: 17 > 10 → field skipped → 0 outliers.
-        # Post-fix: top-2 covers 85% (60+25=85), K=2 ≤ 5, the 15 rare codes flagged.
-        items = []
-        for _ in range(60):
-            items.append({"code": "INFO"})
-        for _ in range(25):
-            items.append({"code": "WARN"})
-        for i in range(15):
-            items.append({"code": f"ERR_{i}"})
-        outliers = _detect_rare_status_values(items, common_fields={"code"})
-        assert len(outliers) == 15
-
-    def test_bug3_uniform_distribution_no_outliers(self) -> None:
-        # 50 distinct values, 1 each → top-K never reaches 80% with K<=5.
-        # Field correctly identified as non-categorical.
-        from headroom.transforms.smart_crusher import _detect_rare_status_values
-
-        items = [{"code": f"CAT_{i}"} for i in range(50)]
-        assert _detect_rare_status_values(items, common_fields={"code"}) == []
-
-    # Bug #4 — k-split overshoot when k_total=1.
-    def test_bug4_k_split_no_overshoot_when_k_total_one(self) -> None:
-        from headroom import SmartCrusherConfig
-        from headroom.transforms.smart_crusher import SmartCrusher
-
-        config = SmartCrusherConfig(min_items_to_analyze=1)
-        crusher = SmartCrusher(config=config)
-        # Force k_total=1 by passing a single-item list — the n<=8 fast
-        # path returns n=1, so k_total=1.
-        k_total, k_first, k_last, k_importance = crusher._compute_k_split(["only"], 1.0)
-        assert k_total == 1
-        assert k_first + k_last <= k_total, (
-            f"BUG #4: k_first={k_first} + k_last={k_last} must not exceed k_total={k_total}"
-        )
+# Stage 3c.1 lockstep bug-fix tests previously lived here; they probed
+# Python helpers (`_percentile_linear`, `_detect_sequential_pattern`,
+# `_detect_rare_status_values`, `_compute_k_split`) that were removed
+# along with the Python implementation in Stage 3c.1b. The Rust port
+# pins the same invariants — see the `bug1_*` / `bug2_*` / `bug3_*` /
+# `bug4_*` tests in `crates/headroom-core/src/transforms/smart_crusher/`
+# (notably `crushers.rs` and `analyzer.rs`). Parity fixtures
+# (`tests/parity/fixtures/smart_crusher/`) byte-compare the post-fix
+# behavior across the language boundary.
