@@ -36,6 +36,7 @@ mod analyzer;
 mod anchors;
 mod classifier;
 mod config;
+mod crushers;
 mod error_keywords;
 mod field_detect;
 mod hashing;
@@ -48,6 +49,7 @@ pub use analyzer::SmartAnalyzer;
 pub use anchors::{extract_query_anchors, item_matches_anchors};
 pub use classifier::{classify_array, ArrayType};
 pub use config::SmartCrusherConfig;
+pub use crushers::{compute_k_split, crush_number_array, crush_object, crush_string_array};
 pub use error_keywords::ERROR_KEYWORDS;
 pub use field_detect::{detect_id_field_statistically, detect_score_field_statistically};
 pub use hashing::hash_field_name;
@@ -55,7 +57,7 @@ pub use outliers::{
     detect_error_items_for_preservation, detect_rare_status_values, detect_structural_outliers,
 };
 pub use statistics::{calculate_string_entropy, detect_sequential_pattern, is_uuid_format};
-pub use stats_math::{mean, sample_stdev, sample_variance};
+pub use stats_math::{format_g, mean, median, sample_stdev, sample_variance};
 pub use types::{
     ArrayAnalysis, CompressionPlan, CompressionStrategy, CrushResult, CrushabilityAnalysis,
     FieldStats,

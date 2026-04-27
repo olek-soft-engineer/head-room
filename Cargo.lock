@@ -927,6 +927,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "criterion",
+ "flate2",
  "hf-hub",
  "md-5",
  "proptest",
