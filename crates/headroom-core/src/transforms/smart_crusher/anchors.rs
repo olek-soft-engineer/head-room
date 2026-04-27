@@ -311,10 +311,7 @@ mod tests {
     fn item_matches_anchor_in_key() {
         let anchors: HashSet<String> = ["status".to_string()].into_iter().collect();
         // The anchor "status" appears in the JSON-serialized key.
-        assert!(item_matches_anchors(
-            &json!({"status": "ok"}),
-            &anchors
-        ));
+        assert!(item_matches_anchors(&json!({"status": "ok"}), &anchors));
     }
 
     #[test]
@@ -359,10 +356,7 @@ mod tests {
         // below would fail.
         let v = json!({"name": "Alice", "ok": true, "count": 5, "val": null});
         let r = python_repr(&v);
-        assert_eq!(
-            r,
-            "{'name': 'Alice', 'ok': True, 'count': 5, 'val': None}"
-        );
+        assert_eq!(r, "{'name': 'Alice', 'ok': True, 'count': 5, 'val': None}");
     }
 
     #[test]

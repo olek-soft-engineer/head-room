@@ -44,7 +44,11 @@ mod tests {
     #[test]
     fn all_lowercase_invariant() {
         for &kw in ERROR_KEYWORDS {
-            assert_eq!(kw, kw.to_lowercase(), "ERROR_KEYWORDS must all be lowercase");
+            assert_eq!(
+                kw,
+                kw.to_lowercase(),
+                "ERROR_KEYWORDS must all be lowercase"
+            );
         }
     }
 
@@ -53,8 +57,18 @@ mod tests {
         // Pin the exact set so accidental edits surface in CI rather
         // than silently changing item-preservation behavior.
         let expected = [
-            "error", "exception", "failed", "failure", "critical", "fatal", "crash", "panic",
-            "abort", "timeout", "denied", "rejected",
+            "error",
+            "exception",
+            "failed",
+            "failure",
+            "critical",
+            "fatal",
+            "crash",
+            "panic",
+            "abort",
+            "timeout",
+            "denied",
+            "rejected",
         ];
         let actual: std::collections::BTreeSet<&str> = ERROR_KEYWORDS.iter().copied().collect();
         let expected: std::collections::BTreeSet<&str> = expected.iter().copied().collect();

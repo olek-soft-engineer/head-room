@@ -199,7 +199,10 @@ impl RelevanceScorer for HybridScorer {
         let bm25_results = self.bm25.score_batch(items, context);
 
         if !self.embedding_available {
-            return bm25_results.iter().map(|r| self.boost_bm25_only(r)).collect();
+            return bm25_results
+                .iter()
+                .map(|r| self.boost_bm25_only(r))
+                .collect();
         }
 
         let emb_results = self.embedding.score_batch(items, context);

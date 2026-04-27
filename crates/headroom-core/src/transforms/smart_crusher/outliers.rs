@@ -91,7 +91,9 @@ pub fn detect_structural_outliers(items: &[Value]) -> Vec<usize> {
 
     // 1. Rare-field outliers.
     for (i, item) in items.iter().enumerate() {
-        let Some(obj) = item.as_object() else { continue };
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
         let has_rare = obj.keys().any(|k| rare_fields.contains(k.as_str()));
         if has_rare {
             outlier_set.insert(i);
@@ -212,8 +214,12 @@ pub fn detect_rare_status_values(items: &[Value], common_fields: &HashSet<String
 
         // Items with values NOT in top_k_values are outliers.
         for (i, item) in items.iter().enumerate() {
-            let Some(obj) = item.as_object() else { continue };
-            let Some(field_value) = obj.get(field_name) else { continue };
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
+            let Some(field_value) = obj.get(field_name) else {
+                continue;
+            };
             let item_value = if matches!(field_value, Value::Null) {
                 "__none__".to_string()
             } else {
@@ -362,8 +368,10 @@ mod tests {
             .collect();
         let common: HashSet<String> = ["code".to_string()].into_iter().collect();
         let outliers = detect_rare_status_values(&items, &common);
-        assert!(outliers.is_empty(),
-            "uniform distribution must not produce rare-status outliers");
+        assert!(
+            outliers.is_empty(),
+            "uniform distribution must not produce rare-status outliers"
+        );
     }
 
     #[test]
@@ -461,10 +469,7 @@ mod tests {
 
     #[test]
     fn error_keywords_no_match() {
-        let items: Vec<Value> = vec![
-            json!({"name": "alice"}),
-            json!({"count": 5}),
-        ];
+        let items: Vec<Value> = vec![json!({"name": "alice"}), json!({"count": 5})];
         let errs = detect_error_items_for_preservation(&items, None);
         assert!(errs.is_empty());
     }

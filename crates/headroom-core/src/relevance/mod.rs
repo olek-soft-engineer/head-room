@@ -50,8 +50,10 @@ pub fn create_scorer(tier: &str) -> Result<Box<dyn RelevanceScorer + Send + Sync
             if s.is_available() {
                 Ok(Box::new(s))
             } else {
-                Err("EmbeddingScorer requires the ONNX backend (not yet implemented in Rust)"
-                    .to_string())
+                Err(
+                    "EmbeddingScorer requires the ONNX backend (not yet implemented in Rust)"
+                        .to_string(),
+                )
             }
         }
         other => Err(format!(

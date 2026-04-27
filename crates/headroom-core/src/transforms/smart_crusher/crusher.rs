@@ -38,9 +38,7 @@ use serde_json::Value;
 use super::analyzer::SmartAnalyzer;
 use super::classifier::{classify_array, ArrayType};
 use super::config::SmartCrusherConfig;
-use super::crushers::{
-    compute_k_split, crush_number_array, crush_object, crush_string_array,
-};
+use super::crushers::{compute_k_split, crush_number_array, crush_object, crush_string_array};
 use super::planning::SmartCrusherPlanner;
 use super::types::{CompressionPlan, CompressionStrategy, CrushResult};
 use crate::relevance::{HybridScorer, RelevanceScorer};
@@ -211,23 +209,24 @@ impl SmartCrusher {
                     match arr_type {
                         ArrayType::DictArray => {
                             let result = self.crush_array(arr, query_context, bias);
-                            info_parts
-                                .push(format!("{}({}->{})", result.strategy_info, n, result.items.len()));
+                            info_parts.push(format!(
+                                "{}({}->{})",
+                                result.strategy_info,
+                                n,
+                                result.items.len()
+                            ));
                             return (Value::Array(result.items), info_parts.join(","));
                         }
                         ArrayType::StringArray => {
-                            let strs: Vec<&str> =
-                                arr.iter().filter_map(|v| v.as_str()).collect();
-                            let (crushed, strategy) =
-                                crush_string_array(&strs, &self.config, bias);
+                            let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                            let (crushed, strategy) = crush_string_array(&strs, &self.config, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
                             let crushed_values: Vec<Value> =
                                 crushed.into_iter().map(Value::String).collect();
                             return (Value::Array(crushed_values), info_parts.join(","));
                         }
                         ArrayType::NumberArray => {
-                            let (crushed, strategy) =
-                                crush_number_array(arr, &self.config, bias);
+                            let (crushed, strategy) = crush_number_array(arr, &self.config, bias);
                             info_parts.push(format!("{}({}->{})", strategy, n, crushed.len()));
                             return (Value::Array(crushed), info_parts.join(","));
                         }
@@ -246,8 +245,7 @@ impl SmartCrusher {
                 // Below threshold or not crushable → recurse into items.
                 let mut processed: Vec<Value> = Vec::with_capacity(n);
                 for item in arr {
-                    let (p_item, p_info) =
-                        self.process_value(item, depth + 1, query_context, bias);
+                    let (p_item, p_info) = self.process_value(item, depth + 1, query_context, bias);
                     processed.push(p_item);
                     if !p_info.is_empty() {
                         info_parts.push(p_info);
@@ -259,8 +257,7 @@ impl SmartCrusher {
                 // First pass: recurse into values to compress nested arrays.
                 let mut processed = serde_json::Map::new();
                 for (k, v) in map {
-                    let (p_val, p_info) =
-                        self.process_value(v, depth + 1, query_context, bias);
+                    let (p_val, p_info) = self.process_value(v, depth + 1, query_context, bias);
                     processed.insert(k.clone(), p_val);
                     if !p_info.is_empty() {
                         info_parts.push(p_info);
@@ -401,8 +398,7 @@ impl SmartCrusher {
             groups.push(group_key(item), i, item.clone());
         }
 
-        let mut keep_indices: std::collections::BTreeSet<usize> =
-            std::collections::BTreeSet::new();
+        let mut keep_indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         let mut strategy_parts: Vec<String> = Vec::new();
 
         for (type_key, indices, values) in groups.into_iter() {
@@ -414,17 +410,14 @@ impl SmartCrusher {
 
             match type_key {
                 "dict" => {
-                    let CrushArrayResult {
-                        items: crushed, ..
-                    } = self.crush_array(&values, query_context, bias);
+                    let CrushArrayResult { items: crushed, .. } =
+                        self.crush_array(&values, query_context, bias);
                     // Find which original indices survived by matching
                     // canonical-JSON serialization. Mirrors Python's
                     // `json.dumps(c, sort_keys=True, default=str)`-keyed
                     // set match.
-                    let crushed_keys: std::collections::HashSet<String> = crushed
-                        .iter()
-                        .map(canonical_json_for_match)
-                        .collect();
+                    let crushed_keys: std::collections::HashSet<String> =
+                        crushed.iter().map(canonical_json_for_match).collect();
                     for (i, idx) in indices.iter().enumerate() {
                         if crushed_keys.contains(&canonical_json_for_match(&values[i])) {
                             keep_indices.insert(*idx);
@@ -450,21 +443,15 @@ impl SmartCrusher {
                     // Python: just adaptive sampling + outlier detection
                     // (no summary prefix). Keeps first/last by index
                     // and items >variance_threshold σ from mean.
-                    let item_strings: Vec<String> =
-                        values.iter().map(|v| v.to_string()).collect();
-                    let item_refs: Vec<&str> =
-                        item_strings.iter().map(|s| s.as_str()).collect();
+                    let item_strings: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+                    let item_refs: Vec<&str> = item_strings.iter().map(|s| s.as_str()).collect();
                     let (_kt, kf, kl, _) = compute_k_split(&item_refs, &self.config, bias);
 
                     let kf = kf.min(values.len());
                     let kl = kl.min(values.len().saturating_sub(kf));
                     let first_idx: Vec<usize> = indices.iter().take(kf).copied().collect();
-                    let last_idx: Vec<usize> = indices
-                        .iter()
-                        .rev()
-                        .take(kl)
-                        .copied()
-                        .collect::<Vec<_>>();
+                    let last_idx: Vec<usize> =
+                        indices.iter().rev().take(kl).copied().collect::<Vec<_>>();
                     keep_indices.extend(&first_idx);
                     keep_indices.extend(&last_idx);
 
@@ -474,18 +461,12 @@ impl SmartCrusher {
                         .filter_map(|v| v.as_f64().filter(|f| f.is_finite()))
                         .collect();
                     if finite.len() > 1 {
-                        if let Some(mean_v) =
-                            super::stats_math::mean(&finite)
-                        {
-                            if let Some(std_v) =
-                                super::stats_math::sample_stdev(&finite)
-                            {
+                        if let Some(mean_v) = super::stats_math::mean(&finite) {
+                            if let Some(std_v) = super::stats_math::sample_stdev(&finite) {
                                 if std_v > 0.0 {
                                     let threshold = self.config.variance_threshold * std_v;
                                     for (i, val) in values.iter().enumerate() {
-                                        if let Some(num) =
-                                            val.as_f64().filter(|f| f.is_finite())
-                                        {
+                                        if let Some(num) = val.as_f64().filter(|f| f.is_finite()) {
                                             if (num - mean_v).abs() > threshold {
                                                 keep_indices.insert(indices[i]);
                                             }
@@ -662,25 +643,21 @@ mod tests {
         let c = crusher();
         let items: Vec<Value> = (0..30).map(|_| json!({"status": "ok"})).collect();
         let result = c.crush_array(&items, "", 1.0);
-        assert!(
-            result.items.len() <= 30,
-            "should not exceed original count"
-        );
+        assert!(result.items.len() <= 30, "should not exceed original count");
     }
 
     #[test]
     fn crush_array_keeps_error_items() {
         let c = crusher();
-        let mut items: Vec<Value> = (0..30)
-            .map(|i| json!({"id": i, "status": "ok"}))
-            .collect();
+        let mut items: Vec<Value> = (0..30).map(|i| json!({"id": i, "status": "ok"})).collect();
         items.push(json!({"id": 30, "status": "error", "msg": "FATAL"}));
         let result = c.crush_array(&items, "", 1.0);
         // Whatever path is taken, the error item should survive.
         assert!(
-            result.items.iter().any(|item| {
-                item.get("status").and_then(|v| v.as_str()) == Some("error")
-            }),
+            result
+                .items
+                .iter()
+                .any(|item| { item.get("status").and_then(|v| v.as_str()) == Some("error") }),
             "error item must survive crush_array"
         );
     }
@@ -709,9 +686,7 @@ mod tests {
     fn crush_mixed_groups_and_compresses_dicts() {
         let c = crusher();
         // 25 dicts (large group → gets crushed) + 5 strings (small group → all kept).
-        let mut items: Vec<Value> = (0..25)
-            .map(|i| json!({"id": i, "status": "ok"}))
-            .collect();
+        let mut items: Vec<Value> = (0..25).map(|i| json!({"id": i, "status": "ok"})).collect();
         for i in 0..5 {
             items.push(json!(format!("string_{}", i)));
         }
@@ -844,5 +819,4 @@ mod tests {
         let result = c.crush_array(&items, "anything", 1.0);
         assert!(result.items.len() <= 30);
     }
-
 }

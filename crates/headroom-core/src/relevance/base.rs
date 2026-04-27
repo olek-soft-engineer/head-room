@@ -72,7 +72,10 @@ pub fn default_batch_score<S: RelevanceScorer>(
     items: &[&str],
     context: &str,
 ) -> Vec<RelevanceScore> {
-    items.iter().map(|item| scorer.score(item, context)).collect()
+    items
+        .iter()
+        .map(|item| scorer.score(item, context))
+        .collect()
 }
 
 #[cfg(test)]

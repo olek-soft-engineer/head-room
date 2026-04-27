@@ -44,11 +44,7 @@ pub fn detect_id_field_statistically(stats: &FieldStats, values: &[Value]) -> (b
         // First 20 string-typed values for sampling. Python: `values[:20]`
         // then filters by `isinstance(v, str)` — order-preserving slice
         // before filter, so we mirror that.
-        let sample_values: Vec<&str> = values
-            .iter()
-            .take(20)
-            .filter_map(|v| v.as_str())
-            .collect();
+        let sample_values: Vec<&str> = values.iter().take(20).filter_map(|v| v.as_str()).collect();
 
         if !sample_values.is_empty() {
             let uuid_count = sample_values.iter().filter(|s| is_uuid_format(s)).count();
@@ -180,10 +176,7 @@ pub fn detect_score_field_statistically(stats: &FieldStats, items: &[Value]) -> 
 
     if values_in_order.len() >= 5 {
         let num_pairs = values_in_order.len() - 1;
-        let descending_count = values_in_order
-            .windows(2)
-            .filter(|w| w[0] >= w[1])
-            .count();
+        let descending_count = values_in_order.windows(2).filter(|w| w[0] >= w[1]).count();
         if num_pairs > 0 && (descending_count as f64 / num_pairs as f64) > 0.7 {
             confidence += 0.3;
         }

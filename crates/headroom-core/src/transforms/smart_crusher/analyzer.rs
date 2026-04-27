@@ -37,13 +37,9 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::config::SmartCrusherConfig;
-use super::field_detect::{
-    detect_id_field_statistically, detect_score_field_statistically,
-};
+use super::field_detect::{detect_id_field_statistically, detect_score_field_statistically};
 use super::stats_math::{mean, sample_stdev, sample_variance};
-use super::types::{
-    ArrayAnalysis, CompressionStrategy, CrushabilityAnalysis, FieldStats,
-};
+use super::types::{ArrayAnalysis, CompressionStrategy, CrushabilityAnalysis, FieldStats};
 
 /// Statistical analyzer for compression decisions.
 ///
@@ -111,7 +107,8 @@ impl SmartAnalyzer {
 
         let crushability = self.analyze_crushability(items, &field_stats);
 
-        let strategy = self.select_strategy(&field_stats, &pattern, items.len(), Some(&crushability));
+        let strategy =
+            self.select_strategy(&field_stats, &pattern, items.len(), Some(&crushability));
 
         let reduction = if strategy == CompressionStrategy::Skip {
             0.0
@@ -349,9 +346,7 @@ impl SmartAnalyzer {
             let avg_len = stats.avg_length.unwrap_or(0.0);
             if stats.unique_ratio > 0.5 && avg_len > 20.0 {
                 has_message_like = true;
-            } else if stats.unique_ratio < 0.1
-                && (2..=10).contains(&stats.unique_count)
-            {
+            } else if stats.unique_ratio < 0.1 && (2..=10).contains(&stats.unique_count) {
                 has_level_like = true;
             }
         }
@@ -405,8 +400,7 @@ impl SmartAnalyzer {
                         // which is falsy for 0; we mirror by checking `mn != 0` to
                         // match Python's behavior (very unlikely range edge but pinned).
                         let unix_seconds = (1_000_000_000.0..=2_000_000_000.0).contains(&mn);
-                        let unix_millis =
-                            (1_000_000_000_000.0..=2_000_000_000_000.0).contains(&mn);
+                        let unix_millis = (1_000_000_000_000.0..=2_000_000_000_000.0).contains(&mn);
                         if unix_seconds || unix_millis {
                             return true;
                         }
@@ -429,9 +423,7 @@ impl SmartAnalyzer {
         items: &[Value],
         field_stats: &BTreeMap<String, FieldStats>,
     ) -> CrushabilityAnalysis {
-        use super::outliers::{
-            detect_error_items_for_preservation, detect_structural_outliers,
-        };
+        use super::outliers::{detect_error_items_for_preservation, detect_structural_outliers};
 
         let mut signals_present: Vec<String> = Vec::new();
         let mut signals_absent: Vec<String> = Vec::new();
@@ -505,8 +497,12 @@ impl SmartAnalyzer {
             }
             let threshold = self.config.variance_threshold * std;
             for (i, item) in items.iter().enumerate() {
-                let Some(obj) = item.as_object() else { continue };
-                let Some(v) = obj.get(&stats.name) else { continue };
+                let Some(obj) = item.as_object() else {
+                    continue;
+                };
+                let Some(v) = obj.get(&stats.name) else {
+                    continue;
+                };
                 if let Some(num) = v.as_f64() {
                     if !num.is_nan() && (num - mean_val).abs() > threshold {
                         anomaly_indices.insert(i);
@@ -546,8 +542,7 @@ impl SmartAnalyzer {
         };
 
         let max_uniqueness = avg_string_uniqueness.max(id_uniqueness).max(0.0);
-        let non_id_content_uniqueness =
-            avg_string_uniqueness.max(avg_non_id_numeric_uniqueness);
+        let non_id_content_uniqueness = avg_string_uniqueness.max(avg_non_id_numeric_uniqueness);
 
         // 6. Change points.
         let has_change_points = field_stats
@@ -1120,9 +1115,7 @@ mod tests {
     #[test]
     fn crushability_repetitive_content_with_ids_crushes() {
         // Unique ID + constant content field → repetitive_content path.
-        let items: Vec<Value> = (0..20)
-            .map(|i| json!({"id": i, "status": "ok"}))
-            .collect();
+        let items: Vec<Value> = (0..20).map(|i| json!({"id": i, "status": "ok"})).collect();
         let a = analyzer();
         let mut fs: BTreeMap<String, FieldStats> = BTreeMap::new();
         for k in ["id", "status"] {

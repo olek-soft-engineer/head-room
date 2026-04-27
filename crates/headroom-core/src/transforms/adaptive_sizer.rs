@@ -51,12 +51,7 @@ use std::io::Write;
 ///   harder).
 /// - `min_k`: lower bound on the return value.
 /// - `max_k`: upper bound; `None` means "no cap" (i.e. up to `items.len()`).
-pub fn compute_optimal_k(
-    items: &[&str],
-    bias: f64,
-    min_k: usize,
-    max_k: Option<usize>,
-) -> usize {
+pub fn compute_optimal_k(items: &[&str], bias: f64, min_k: usize, max_k: Option<usize>) -> usize {
     let n = items.len();
     let effective_max = max_k.unwrap_or(n);
 
@@ -279,12 +274,7 @@ pub fn count_unique_simhash(items: &[&str], threshold: u32) -> usize {
 ///
 /// `tolerance` is the maximum allowed ratio difference (Python default
 /// 0.15 = 15%).
-pub fn validate_with_zlib(
-    items: &[&str],
-    k: usize,
-    max_k: usize,
-    tolerance: f64,
-) -> usize {
+pub fn validate_with_zlib(items: &[&str], k: usize, max_k: usize, tolerance: f64) -> usize {
     if k >= items.len() || k >= max_k {
         return k;
     }
@@ -539,7 +529,12 @@ mod tests {
         // 20 diverse items with similar per-item compressibility — full
         // and subset get similar ratios → no bump.
         let many: Vec<String> = (0..20)
-            .map(|i| format!("entry id={} payload=item value with content for item number {}", i, i))
+            .map(|i| {
+                format!(
+                    "entry id={} payload=item value with content for item number {}",
+                    i, i
+                )
+            })
             .collect();
         let items: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
         let result = validate_with_zlib(&items, 10, 100, 0.15);
@@ -599,7 +594,17 @@ mod tests {
         let k_low = compute_optimal_k(&refs, 0.7, 3, None);
         let k_mid = compute_optimal_k(&refs, 1.0, 3, None);
         let k_high = compute_optimal_k(&refs, 1.5, 3, None);
-        assert!(k_low <= k_mid, "bias 0.7 → {} should be ≤ bias 1.0 → {}", k_low, k_mid);
-        assert!(k_mid <= k_high, "bias 1.0 → {} should be ≤ bias 1.5 → {}", k_mid, k_high);
+        assert!(
+            k_low <= k_mid,
+            "bias 0.7 → {} should be ≤ bias 1.0 → {}",
+            k_low,
+            k_mid
+        );
+        assert!(
+            k_mid <= k_high,
+            "bias 1.0 → {} should be ≤ bias 1.5 → {}",
+            k_mid,
+            k_high
+        );
     }
 }

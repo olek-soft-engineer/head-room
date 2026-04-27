@@ -172,7 +172,12 @@ impl RelevanceScorer for BM25Scorer {
             n => {
                 let preview: Vec<&str> = matched.iter().take(3).map(|s| s.as_str()).collect();
                 let suffix = if n > 3 { "..." } else { "" };
-                format!("BM25: matched {} terms ({}{})", n, preview.join(", "), suffix)
+                format!(
+                    "BM25: matched {} terms ({}{})",
+                    n,
+                    preview.join(", "),
+                    suffix
+                )
             }
         };
 
@@ -275,7 +280,10 @@ mod tests {
 
     #[test]
     fn score_no_match_returns_zero() {
-        let s = scorer().score(r#"{"id": 1, "name": "alice"}"#, "completely unrelated query");
+        let s = scorer().score(
+            r#"{"id": 1, "name": "alice"}"#,
+            "completely unrelated query",
+        );
         assert_eq!(s.score, 0.0);
         assert_eq!(s.reason, "BM25: no term matches");
         assert!(s.matched_terms.is_empty());
@@ -284,10 +292,7 @@ mod tests {
     #[test]
     fn score_uuid_match_gets_long_token_bonus() {
         let item = r#"{"id": "550e8400-e29b-41d4-a716-446655440000", "name": "Alice"}"#;
-        let s = scorer().score(
-            item,
-            "find record 550e8400-e29b-41d4-a716-446655440000",
-        );
+        let s = scorer().score(item, "find record 550e8400-e29b-41d4-a716-446655440000");
         // Long-match bonus is +0.3, applied after normalization.
         // Even a low raw score should clear 0.3 with the bonus.
         assert!(

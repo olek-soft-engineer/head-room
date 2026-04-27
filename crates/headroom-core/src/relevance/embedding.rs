@@ -182,11 +182,7 @@ impl RelevanceScorer for EmbeddingScorer {
             .take(items.len())
             .map(|emb| {
                 let sim = cosine_similarity(emb, &context_emb);
-                RelevanceScore::new(
-                    sim,
-                    format!("Embedding: {:.2}", sim),
-                    Vec::new(),
-                )
+                RelevanceScore::new(sim, format!("Embedding: {:.2}", sim), Vec::new())
             })
             .collect()
     }

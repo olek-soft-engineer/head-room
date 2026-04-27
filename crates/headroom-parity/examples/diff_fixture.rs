@@ -37,21 +37,25 @@ fn main() -> Result<()> {
     } else {
         println!("\n=== DIFFER ===");
         // Field-by-field for objects
-        if let (Some(exp_obj), Some(act_obj)) =
-            (fixture.output.as_object(), actual.as_object())
-        {
-            for key in exp_obj.keys().chain(act_obj.keys()).collect::<std::collections::BTreeSet<_>>() {
+        if let (Some(exp_obj), Some(act_obj)) = (fixture.output.as_object(), actual.as_object()) {
+            for key in exp_obj
+                .keys()
+                .chain(act_obj.keys())
+                .collect::<std::collections::BTreeSet<_>>()
+            {
                 let e = exp_obj.get(key);
                 let a = act_obj.get(key);
                 if e != a {
                     println!("  field {key}:");
                     println!(
                         "    expected: {}",
-                        e.map(|v| serde_json::to_string(v).unwrap()).unwrap_or_default()
+                        e.map(|v| serde_json::to_string(v).unwrap())
+                            .unwrap_or_default()
                     );
                     println!(
                         "    actual  : {}",
-                        a.map(|v| serde_json::to_string(v).unwrap()).unwrap_or_default()
+                        a.map(|v| serde_json::to_string(v).unwrap())
+                            .unwrap_or_default()
                     );
                 }
             }

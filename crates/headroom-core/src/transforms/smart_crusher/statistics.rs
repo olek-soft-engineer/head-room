@@ -116,9 +116,8 @@ fn python_int_parse(s: &str) -> Option<i64> {
         // Reject patterns Python rejects: leading/trailing underscore,
         // double underscores. Otherwise strip them out.
         let bytes = trimmed.as_bytes();
-        let starts_or_ends = bytes[0] == b'_'
-            || *bytes.last().unwrap() == b'_'
-            || trimmed.contains("__");
+        let starts_or_ends =
+            bytes[0] == b'_' || *bytes.last().unwrap() == b'_' || trimmed.contains("__");
         if starts_or_ends {
             return None;
         }
@@ -216,10 +215,7 @@ pub fn detect_sequential_pattern(values: &[Value], check_order: bool) -> bool {
     // Sort and compute pairwise diffs.
     let mut sorted_nums = nums.clone();
     sorted_nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let diffs: Vec<f64> = sorted_nums
-        .windows(2)
-        .map(|w| w[1] - w[0])
-        .collect();
+    let diffs: Vec<f64> = sorted_nums.windows(2).map(|w| w[1] - w[0]).collect();
     if diffs.is_empty() {
         return false;
     }
@@ -239,10 +235,7 @@ pub fn detect_sequential_pattern(values: &[Value], check_order: bool) -> bool {
     if check_order {
         // Python: ascending count over original (not-sorted) sequence.
         // IDs ascend in array order; scores typically descend.
-        let ascending_count = nums
-            .windows(2)
-            .filter(|w| w[0] <= w[1])
-            .count();
+        let ascending_count = nums.windows(2).filter(|w| w[0] <= w[1]).count();
         let n_pairs = nums.len() - 1;
         let is_ascending = ascending_count as f64 / n_pairs as f64 > 0.7;
         return is_ascending;
@@ -389,14 +382,7 @@ mod tests {
         // field that has BOTH genuine ints AND string-encoded ints
         // should still be detected (the unambiguous ints dominate the
         // signal).
-        let v = vec![
-            json!(1),
-            json!(2),
-            json!("3"),
-            json!(4),
-            json!(5),
-            json!(6),
-        ];
+        let v = vec![json!(1), json!(2), json!("3"), json!(4), json!(5), json!(6)];
         assert!(detect_sequential_pattern(&v, true));
     }
 
@@ -426,13 +412,7 @@ mod tests {
         // Floats with non-integer values but constant unit step. avg_diff
         // = 1.0, all diffs in [0.5, 2.0], should be sequential. (Suggestion
         // S6 in code review — pins float arithmetic doesn't drift.)
-        let v: Vec<Value> = vec![
-            json!(1.5),
-            json!(2.5),
-            json!(3.5),
-            json!(4.5),
-            json!(5.5),
-        ];
+        let v: Vec<Value> = vec![json!(1.5), json!(2.5), json!(3.5), json!(4.5), json!(5.5)];
         assert!(detect_sequential_pattern(&v, true));
     }
 

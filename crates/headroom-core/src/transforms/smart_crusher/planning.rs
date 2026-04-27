@@ -165,7 +165,13 @@ impl<'a> SmartCrusherPlanner<'a> {
 
         // 3. Numeric anomalies (>variance_threshold σ from per-field mean).
         for (name, stats) in &analysis.field_stats {
-            for_each_anomaly(name, stats, items, self.config.variance_threshold, &mut keep);
+            for_each_anomaly(
+                name,
+                stats,
+                items,
+                self.config.variance_threshold,
+                &mut keep,
+            );
         }
 
         // 4. Items around change points (window of ±1).
@@ -247,9 +253,7 @@ impl<'a> SmartCrusherPlanner<'a> {
                 (i, score)
             })
             .collect();
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let top_count = max_items.saturating_sub(3);
         for (idx, _) in scored.iter().take(top_count) {
@@ -678,11 +682,7 @@ mod tests {
         let item = json!({"customer_id": "user-12345-alice"});
         let h = hash_field_name("customer_id");
         let fields = vec![h];
-        assert!(item_has_preserve_field_match(
-            &item,
-            &fields,
-            "alice"
-        ));
+        assert!(item_has_preserve_field_match(&item, &fields, "alice"));
     }
 
     #[test]

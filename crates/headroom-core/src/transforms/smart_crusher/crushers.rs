@@ -403,7 +403,13 @@ pub fn crush_object(
     let keys: Vec<&String> = obj.keys().collect();
     let kv_strings: Vec<String> = keys
         .iter()
-        .map(|k| format!("{}: {}", k, serde_json::to_string(&obj[k.as_str()]).unwrap_or_default()))
+        .map(|k| {
+            format!(
+                "{}: {}",
+                k,
+                serde_json::to_string(&obj[k.as_str()]).unwrap_or_default()
+            )
+        })
         .collect();
     let kv_refs: Vec<&str> = kv_strings.iter().map(|s| s.as_str()).collect();
 
@@ -421,7 +427,9 @@ pub fn crush_object(
     // Always keep: error-keyword values.
     let mut keep_keys: HashSet<String> = HashSet::new();
     for (key, val) in obj {
-        let val_str = serde_json::to_string(val).unwrap_or_default().to_lowercase();
+        let val_str = serde_json::to_string(val)
+            .unwrap_or_default()
+            .to_lowercase();
         if ERROR_KEYWORDS.iter().any(|kw| val_str.contains(kw)) {
             keep_keys.insert(key.clone());
         }
@@ -534,7 +542,11 @@ fn format_number_repr(x: f64) -> String {
         return "nan".to_string();
     }
     if x.is_infinite() {
-        return if x > 0.0 { "inf".to_string() } else { "-inf".to_string() };
+        return if x > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
     }
     if x.fract() == 0.0 && x.abs() < 1e16 {
         return format!("{}", x as i64);
@@ -630,7 +642,13 @@ mod tests {
     #[test]
     fn string_array_keeps_error_strings() {
         let items: Vec<&str> = (0..30)
-            .map(|i| if i == 15 { "FATAL: out of memory" } else { "ok" })
+            .map(|i| {
+                if i == 15 {
+                    "FATAL: out of memory"
+                } else {
+                    "ok"
+                }
+            })
             .collect();
         let (out, strat) = crush_string_array(&items, &cfg(), 1.0);
         // Error item at index 15 must survive.
@@ -773,7 +791,10 @@ mod tests {
             );
         }
         let (out, _) = crush_object(&obj, &cfg(), 1.0);
-        assert!(out.contains_key("tiny"), "tiny key (small value) must survive");
+        assert!(
+            out.contains_key("tiny"),
+            "tiny key (small value) must survive"
+        );
     }
 
     #[test]

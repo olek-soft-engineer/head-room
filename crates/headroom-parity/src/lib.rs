@@ -302,14 +302,8 @@ impl TransformComparator for SmartCrusherComparator {
             .get("content")
             .and_then(|v| v.as_str())
             .context("smart_crusher fixture input.content must be a JSON string")?;
-        let query = input
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let bias = input
-            .get("bias")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0);
+        let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let bias = input.get("bias").and_then(|v| v.as_f64()).unwrap_or(1.0);
 
         let defaults = SmartCrusherConfig::default();
         let cfg = SmartCrusherConfig {

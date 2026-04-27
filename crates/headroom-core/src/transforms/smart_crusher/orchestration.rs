@@ -176,12 +176,12 @@ pub fn prioritize_indices(
     // Over budget — apply critical-items-first prioritization.
 
     // Errors (keyword-detected — preservation guarantee).
-    let error_indices: BTreeSet<usize> =
-        detect_error_items_for_preservation(items, None).into_iter().collect();
+    let error_indices: BTreeSet<usize> = detect_error_items_for_preservation(items, None)
+        .into_iter()
+        .collect();
 
     // Structural outliers (statistical — rare fields, rare statuses).
-    let outlier_indices: BTreeSet<usize> =
-        detect_structural_outliers(items).into_iter().collect();
+    let outlier_indices: BTreeSet<usize> = detect_structural_outliers(items).into_iter().collect();
 
     // Numeric anomalies (>variance_threshold σ from per-field mean).
     let anomaly_indices = numeric_anomaly_indices(config, items, analysis);
@@ -260,7 +260,9 @@ fn numeric_anomaly_indices(
         }
         let threshold = config.variance_threshold * std;
         for (i, item) in items.iter().enumerate() {
-            let Some(obj) = item.as_object() else { continue };
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
             let Some(v) = obj.get(field_name) else {
                 continue;
             };
@@ -276,9 +278,7 @@ fn numeric_anomaly_indices(
 }
 
 fn is_numeric_field_with_variance(stats: &FieldStats) -> bool {
-    stats.field_type == "numeric"
-        && stats.mean_val.is_some()
-        && stats.variance.unwrap_or(0.0) > 0.0
+    stats.field_type == "numeric" && stats.mean_val.is_some() && stats.variance.unwrap_or(0.0) > 0.0
 }
 
 /// Hash function used by all three orchestration helpers.
@@ -345,11 +345,7 @@ mod tests {
 
     #[test]
     fn dedup_all_distinct_unchanged() {
-        let items = vec![
-            json!({"id": 1}),
-            json!({"id": 2}),
-            json!({"id": 3}),
-        ];
+        let items = vec![json!({"id": 1}), json!({"id": 2}), json!({"id": 3})];
         let kept = idx_set(&[0, 1, 2]);
         let result = deduplicate_indices_by_content(&kept, &items);
         assert_eq!(result, idx_set(&[0, 1, 2]));
@@ -367,10 +363,7 @@ mod tests {
     fn dedup_key_order_independent() {
         // {"b":2, "a":1} and {"a":1, "b":2} must hash to the same value
         // because we serialize with sort_keys=True.
-        let items = vec![
-            json!({"b": 2, "a": 1}),
-            json!({"a": 1, "b": 2}),
-        ];
+        let items = vec![json!({"b": 2, "a": 1}), json!({"a": 1, "b": 2})];
         let kept = idx_set(&[0, 1]);
         let result = deduplicate_indices_by_content(&kept, &items);
         assert_eq!(result.len(), 1);

@@ -890,10 +890,7 @@ mod tests {
         // Python ensure_ascii=True: 'café' → '\\u00e9' for é.
         // Reference verified via: json.dumps({"k": "café"}, sort_keys=True)
         let v = json!({"k": "café"});
-        assert_eq!(
-            python_json_dumps_sort_keys(&v),
-            "{\"k\": \"caf\\u00e9\"}"
-        );
+        assert_eq!(python_json_dumps_sort_keys(&v), "{\"k\": \"caf\\u00e9\"}");
     }
 
     #[test]
@@ -941,10 +938,7 @@ mod tests {
     fn compute_item_hash_matches_python_with_unicode() {
         // Reference: hashlib.md5(json.dumps({"k":"café"}, sort_keys=True).encode())
         //   .hexdigest()[:16] = "6761da28ed7eb489"
-        assert_eq!(
-            compute_item_hash(&json!({"k": "café"})),
-            "6761da28ed7eb489"
-        );
+        assert_eq!(compute_item_hash(&json!({"k": "café"})), "6761da28ed7eb489");
     }
 
     #[test]

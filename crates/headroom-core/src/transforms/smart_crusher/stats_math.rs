@@ -100,7 +100,11 @@ pub fn format_g(x: f64) -> String {
         return "nan".to_string();
     }
     if x.is_infinite() {
-        return if x > 0.0 { "inf".to_string() } else { "-inf".to_string() };
+        return if x > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
     }
     if x == 0.0 {
         return "0".to_string();
@@ -133,7 +137,10 @@ fn normalize_scientific_exp(s: &str) -> String {
     let exp_part = &rest[1..];
     let exp_num: i32 = exp_part.parse().unwrap_or(0);
     let mantissa_clean = if mantissa.contains('.') {
-        mantissa.trim_end_matches('0').trim_end_matches('.').to_string()
+        mantissa
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
     } else {
         mantissa.to_string()
     };

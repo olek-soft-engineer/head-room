@@ -581,9 +581,7 @@ impl PySmartCrusher {
     #[new]
     #[pyo3(signature = (config = None))]
     fn new(config: Option<&PySmartCrusherConfig>) -> Self {
-        let cfg = config
-            .map(|c| c.inner.clone())
-            .unwrap_or_default();
+        let cfg = config.map(|c| c.inner.clone()).unwrap_or_default();
         Self {
             inner: RustSmartCrusher::new(cfg),
         }
@@ -603,12 +601,7 @@ impl PySmartCrusher {
     /// `smart_crush_tool_output` convenience function and direct
     /// callers that want the tuple form.
     #[pyo3(signature = (content, query = "", bias = 1.0))]
-    fn smart_crush_content(
-        &self,
-        content: &str,
-        query: &str,
-        bias: f64,
-    ) -> (String, bool, String) {
+    fn smart_crush_content(&self, content: &str, query: &str, bias: f64) -> (String, bool, String) {
         self.inner.smart_crush_content(content, query, bias)
     }
 }
