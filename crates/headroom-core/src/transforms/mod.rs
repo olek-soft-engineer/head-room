@@ -16,6 +16,7 @@
 //! prod and are returned alongside the parity-equal output for tests.
 
 pub mod adaptive_sizer;
+pub mod anchor_selector;
 pub mod diff_compressor;
 pub mod smart_crusher;
 
