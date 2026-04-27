@@ -41,6 +41,14 @@ regex = "1"
 # outcome — but if a parity fixture flakes here, swap to
 # `features = ["zlib"]` to link against system libz for byte-equal output.
 flate2 = "1"
+# `fastembed` is the Rust port of the Python fastembed library. Used by
+# `relevance::EmbeddingScorer` for sentence embeddings in semantic relevance
+# scoring. Default features pull in `ort` (ONNX Runtime) with auto-download
+# of the runtime binary; the model file (BAAI/bge-small-en-v1.5, ~30 MB
+# int8-quantized ONNX) auto-downloads from HuggingFace Hub on first use.
+# Same library + same model = byte-equal embeddings between Python and Rust
+# (both call into ONNX Runtime over the identical ONNX file).
+fastembed = "5"
 
 [dev-dependencies]
 proptest = "1"
