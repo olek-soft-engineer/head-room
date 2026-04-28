@@ -159,6 +159,37 @@ The recorder monkey-patches the in-process transform classes (see
 `record_all()` in `tests/parity/recorder.py`). It does **not** modify any
 file under `headroom/`.
 
+## Known regressions in retired-Python components
+
+The Stage 3b/3c.1b retirements deleted Python source for `DiffCompressor`
+and `SmartCrusher` and replaced them with PyO3-delegating shims. The
+2026-04-28 audit found that the retirements shipped with subsystems
+silently disconnected. This section tracks each gap and its disposition
+so they don't regress further or get forgotten.
+
+### SmartCrusher
+
+| Subsystem | State | Tracked by |
+|---|---|---|
+| TOIN learning loop | **Re-attached 2026-04-28.** Shim's `crush()` and `_smart_crush_content()` now call `toin.record_compression()` after a real compression. Filtered on `strategy != "passthrough"` to ignore JSON re-canonicalization. Best-effort: TOIN failures are logged at debug level and don't break compression. | `tests/test_smart_crusher_toin_attachment.py` |
+| CCR marker emission knob | **Open gap.** `ccr_config.inject_retrieval_marker=False` is not honored — the Rust port emits `<<ccr:HASH N_rows_offloaded>>` markers as part of `dropped_summary` unconditionally. Shim now logs a WARNING when callers pass `False`. **Fix needed:** add a `enable_ccr_marker: bool` gate in `crates/headroom-core/src/transforms/smart_crusher/crusher.rs::crush_array`, plumb through `SmartCrusherConfig` and the PyO3 bridge. | This file + warning at `headroom/transforms/smart_crusher.py` |
+| Custom relevance scorer | **Open gap.** `relevance_config` and `scorer` constructor args are accepted for source compatibility but the Rust default `HybridScorer` always runs. Shim now logs WARNING (previously debug). **Fix needed:** expose a Python-bridged scorer constructor surface from `crates/headroom-core/src/relevance/`. | Warning at `headroom/transforms/smart_crusher.py` |
+| Per-tool TOIN learning hook | **Re-attached partially.** `_smart_crush_content` accepts `tool_name` and now threads it into the TOIN record. The hook is best-effort — it improves `query_context` aggregation but doesn't drive per-tool overrides yet. | `tests/test_smart_crusher_toin_attachment.py::test_smart_crush_content_records_to_toin` |
+
+### DiffCompressor
+
+| Subsystem | State |
+|---|---|
+| Adaptive context windows | Honored byte-for-byte (parity fixture-locked). |
+| TOIN integration | Never had one — DiffCompressor records via `_record_to_toin` in ContentRouter, which already runs for non-SmartCrusher strategies. No regression. |
+
+### Watch list (potential regressions, not yet audited)
+
+- `CCRConfig.enabled=False` end-to-end behavior. Currently the Rust port has a CCR store that's controlled by builder selection, not by a config flag. Sometimes-disabled paths haven't been audited.
+- `SmartCrusherConfig.use_feedback_hints=False` — config field is forwarded to Rust but its honoring inside the Rust crusher hasn't been verified against a parity fixture for the disabled path.
+
+When any item above changes, update both this section and the test file. The shim's docstring also references this section — keep them aligned.
+
 ## Phase 0 Blockers
 
 These are known limitations for Phase 0. They are tracked here so Phase 1

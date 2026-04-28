@@ -18,18 +18,28 @@ The `headroom._core` extension is a hard import: there is no Python
 fallback. Build it locally with `scripts/build_rust_extension.sh`
 (wraps `maturin develop`) or install a prebuilt wheel.
 
-Stage 3c.1 deliberately keeps the optional subsystems (TOIN,
-feedback, CCR marker injection, telemetry) disabled in the Rust port.
-The shim accepts `relevance_config`, `scorer`, and `ccr_config`
-constructor args for source compatibility but does not wire them
-through — they re-attach in Stage 3c.2 when those subsystems land in
-Rust. CCR marker injection in `_smart_crush_content` is a Stage 3c.2
-follow-up; today the Rust port never emits CCR markers, so the
-disabled-path behavior is byte-equal.
+# Functionality state (post-audit, 2026-04-28)
+
+- **TOIN learning** — re-attached. `crush()` and `_smart_crush_content`
+  call `toin.record_compression()` after a real compression (filtered on
+  `strategy != "passthrough"` to ignore JSON re-canonicalization).
+  The retired Python class did this inline; the bridge keeps the
+  highest-traffic strategy fueling the learning loop.
+- **CCR marker emission** — partial gap. The Rust port emits
+  `<<ccr:HASH N_rows_offloaded>>` markers unconditionally as part of
+  `dropped_summary`; the `ccr_config.inject_retrieval_marker=False`
+  knob is therefore not honored end-to-end. The shim now logs a
+  WARNING when callers pass `False`. Suppression needs a Rust-side
+  gate; see RUST_DEV.md.
+- **Custom relevance scorer / scorer override** — still not wired.
+  `relevance_config` and `scorer` constructor args are accepted for
+  source compat but the Rust default `HybridScorer` is always used.
+  The shim now logs a WARNING (was: debug) when these are passed.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -159,14 +169,26 @@ class SmartCrusher(Transform):
         self._with_compaction = with_compaction
 
         # CCR config is preserved on `self` for callers that read it
-        # back (`headroom.proxy.server` does), but the Rust port doesn't
-        # exercise it: Stage 3c.1 keeps CCR marker injection disabled
-        # because the Rust port has no compression store. When Stage
-        # 3c.2 lands the CCR port, this wires through to Rust.
+        # back (`headroom.proxy.server` does). Storage-side semantics
+        # (CCR cache lookups) are honored via the Rust crusher's own
+        # CCR store. *Marker emission* is the gap: the Rust port emits
+        # `<<ccr:HASH N_rows_offloaded>>` markers unconditionally as
+        # part of `dropped_summary`, so `inject_retrieval_marker=False`
+        # has no effect on the prompt today. We log a WARNING (not
+        # debug) so it's visible. Suppression of marker emission needs
+        # a Rust-side gate; tracked in RUST_DEV.md.
         if ccr_config is None:
             self._ccr_config = CCRConfig(enabled=True, inject_retrieval_marker=False)
         else:
             self._ccr_config = ccr_config
+        if not self._ccr_config.inject_retrieval_marker:
+            logger.warning(
+                "SmartCrusher: ccr_config.inject_retrieval_marker=False "
+                "is currently NOT honored by the Rust port — CCR row-drop "
+                "markers (`<<ccr:HASH N_rows_offloaded>>`) will still appear "
+                "in compressed output. Tracked as a known regression in "
+                "RUST_DEV.md until a Rust-side gate lands."
+            )
 
         # `relevance_config` and `scorer` are accepted for source
         # compatibility but currently dropped — Stage 3c.1 ships with
@@ -174,11 +196,17 @@ class SmartCrusher(Transform):
         # Stage 3c.2 when the relevance crate gains a Python-bridged
         # constructor surface.
         if relevance_config is not None or scorer is not None:
-            logger.debug(
-                "SmartCrusher: relevance_config/scorer args are ignored in "
-                "Stage 3c.1 (Rust port uses default HybridScorer). They "
-                "will be wired through in Stage 3c.2."
+            logger.warning(
+                "SmartCrusher: custom relevance_config/scorer args are "
+                "currently ignored (Rust port uses default HybridScorer). "
+                "Tracked as a known regression in RUST_DEV.md."
             )
+
+        # Lazy TOIN handle. Loaded on first compression that has items
+        # to learn from. Skipping import at __init__ keeps cold-start
+        # fast for environments where telemetry is disabled.
+        self._toin: Any = None
+        self._toin_load_failed = False
 
         # Build the Rust crusher with every field from the Python
         # config, plus the relevance_threshold default (0.3) — the
@@ -221,6 +249,26 @@ class SmartCrusher(Transform):
         working.
         """
         r = self._rust.crush(content, query, bias)
+        # Re-attach the TOIN learning loop. The retired Python class
+        # recorded compressions into TOIN inline; the Rust port doesn't
+        # know about TOIN, and `ContentRouter._record_to_toin` skips
+        # SmartCrusher on the assumption SmartCrusher records its own.
+        # Bridging the gap here keeps JSON-array compressions fueling
+        # the learning system.
+        #
+        # Filter on `was_modified AND strategy != "passthrough"`. The
+        # Rust crusher sometimes flips `was_modified=True` from pure
+        # JSON re-canonicalization (whitespace normalization) without
+        # actually compressing — the strategy stays `"passthrough"` in
+        # that case, and there's no learning value in recording it.
+        if r.was_modified and r.strategy != "passthrough":
+            self._record_to_toin(
+                original=content,
+                compressed=r.compressed,
+                strategy=r.strategy,
+                query_context=query,
+                tool_name=None,
+            )
         return CrushResult(
             compressed=r.compressed,
             original=r.original,
@@ -290,11 +338,102 @@ class SmartCrusher(Transform):
         """Apply smart crushing; return `(crushed, was_modified, info)`.
 
         Mirrors the retired Python method's tuple shape. `tool_name` is
-        accepted for API compatibility and currently ignored — Stage
-        3c.1 has no per-tool TOIN learning hook.
+        threaded through to TOIN's per-tool learning records; if no
+        tool name is available (e.g. the legacy pipeline doesn't have
+        one in scope) the recording uses content-based signature only.
         """
         crushed, was_modified, info = self._rust.smart_crush_content(content, query_context, bias)
+        # Same passthrough filter as `crush()` — re-canonicalization of
+        # JSON whitespace can flip `was_modified=True` even when the
+        # `info` field reports `passthrough` and no compression happened.
+        if was_modified and info != "passthrough":
+            self._record_to_toin(
+                original=content,
+                compressed=crushed,
+                strategy=info or "smart_crusher",
+                query_context=query_context,
+                tool_name=tool_name,
+            )
         return crushed, was_modified, info
+
+    def _record_to_toin(
+        self,
+        original: str,
+        compressed: str,
+        strategy: str,
+        query_context: str,
+        tool_name: str | None,
+    ) -> None:
+        """Record a successful compression into TOIN's learning store.
+
+        Replaces the inline TOIN call the retired Python SmartCrusher
+        had at the end of its compression path. Best-effort: TOIN
+        failures are logged at debug level and never bubble — the
+        compression itself has already happened and is correct.
+
+        Token estimates use the `len(json) // 4` rule the retired
+        implementation used. The router doesn't pass a tokenizer down
+        this far, and re-tokenizing here would dominate the recording
+        cost. Rough estimates are fine for learning aggregates.
+        """
+        if self._toin_load_failed:
+            return
+        try:
+            try:
+                items = json.loads(original)
+            except (json.JSONDecodeError, ValueError):
+                # Not JSON — nothing structural for TOIN to learn from
+                # at the array level. The Rust crusher only sets
+                # `was_modified=True` on JSON-array inputs, so this
+                # branch is rare; bail quietly.
+                return
+            if not isinstance(items, list):
+                return
+
+            from ..telemetry.models import ToolSignature
+
+            signature = ToolSignature.from_items(items)
+            original_tokens = max(1, len(original) // 4)
+            compressed_tokens = max(1, len(compressed) // 4)
+
+            if self._toin is None:
+                from ..telemetry.toin import get_toin
+
+                self._toin = get_toin()
+
+            # Extract the kept-row count from the compressed payload
+            # when possible. The lossy path emits a JSON array with a
+            # `_ccr_dropped` sentinel suffix; the lossless path emits
+            # CSV-schema or compact JSON. For the array case we get an
+            # exact compressed_count; otherwise fall back to the rough
+            # `original_count` (TOIN cares more about structural
+            # signature than count precision).
+            try:
+                compressed_parsed = json.loads(compressed)
+                compressed_count = (
+                    len(strip_ccr_sentinels(compressed_parsed))
+                    if isinstance(compressed_parsed, list)
+                    else len(items)
+                )
+            except (json.JSONDecodeError, ValueError):
+                compressed_count = len(items)
+
+            self._toin.record_compression(
+                tool_signature=signature,
+                original_count=len(items),
+                compressed_count=compressed_count,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
+                strategy=strategy,
+                query_context=query_context if query_context else None,
+                items=items[:5],  # Sample for field-level learning
+            )
+        except ImportError:
+            # TOIN module not installed in this build — disable for
+            # the lifetime of this crusher to avoid retry overhead.
+            self._toin_load_failed = True
+        except Exception as e:  # pragma: no cover - best effort
+            logger.debug("SmartCrusher TOIN recording failed (non-fatal): %s", e)
 
     def _extract_context_from_messages(self, messages: list[dict[str, Any]]) -> str:
         """Build a query string from the last 5 user messages + recent
