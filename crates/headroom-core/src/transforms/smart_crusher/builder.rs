@@ -30,6 +30,9 @@
 //! makes your intent explicit; the `new()` factory shorthand for the
 //! OSS preset.
 
+use std::sync::Arc;
+
+use crate::ccr::{CcrStore, InMemoryCcrStore};
 use crate::relevance::{HybridScorer, RelevanceScorer};
 use crate::transforms::anchor_selector::{AnchorConfig, AnchorSelector};
 
@@ -49,6 +52,7 @@ pub struct SmartCrusherBuilder {
     constraints: Vec<Box<dyn Constraint>>,
     observers: Vec<Box<dyn Observer>>,
     compaction: Option<CompactionStage>,
+    ccr_store: Option<Arc<dyn CcrStore>>,
 }
 
 impl SmartCrusherBuilder {
@@ -62,6 +66,7 @@ impl SmartCrusherBuilder {
             constraints: Vec::new(),
             observers: Vec::new(),
             compaction: None,
+            ccr_store: None,
         }
     }
 
@@ -140,6 +145,20 @@ impl SmartCrusherBuilder {
         self.with_compaction(CompactionStage::default_csv_schema())
     }
 
+    /// Plug in a CCR store. The lossy `crush_array` path stashes each
+    /// dropped array's full original here keyed by its hash, so the
+    /// runtime can serve retrieval tool calls with no data loss.
+    pub fn with_ccr_store(mut self, store: Arc<dyn CcrStore>) -> Self {
+        self.ccr_store = Some(store);
+        self
+    }
+
+    /// Convenience: install the default in-memory CCR store
+    /// (1000 entries, 5-minute TTL — matches Python).
+    pub fn with_default_ccr_store(self) -> Self {
+        self.with_ccr_store(Arc::new(InMemoryCcrStore::new()))
+    }
+
     /// Construct the `SmartCrusher`. If `with_scorer` was not called,
     /// falls back to `HybridScorer::default()` so a builder with no
     /// other customization still produces a working crusher.
@@ -157,6 +176,7 @@ impl SmartCrusherBuilder {
             self.constraints,
             self.observers,
             self.compaction,
+            self.ccr_store,
         )
     }
 }
