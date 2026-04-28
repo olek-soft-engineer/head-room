@@ -188,9 +188,6 @@ logger = logging.getLogger("headroom.proxy")
 
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
 
-# Always-on file logging to ~/.headroom/logs/ for `headroom perf` analysis
-_setup_file_logging()
-
 
 # Compression pipeline timeout in seconds
 
@@ -1063,6 +1060,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         raise ImportError("FastAPI required. Install: pip install fastapi uvicorn httpx")
 
     from contextlib import asynccontextmanager
+
+    # Always-on file logging to ~/.headroom/logs/ for `headroom perf` analysis.
+    # Installed here (not at module import) so importing headroom.proxy.server
+    # in tests or library contexts does not silently attach a RotatingFileHandler
+    # to the user's live proxy.log.
+    _setup_file_logging()
 
     config = config or ProxyConfig()
     proxy = HeadroomProxy(config)
