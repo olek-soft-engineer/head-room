@@ -42,6 +42,39 @@ from .base import Transform
 logger = logging.getLogger(__name__)
 
 
+# ─── CCR sentinel ─────────────────────────────────────────────────────────
+#
+# When SmartCrusher's lossy path drops rows, it appends a sentinel object
+# `{"_ccr_dropped": "<<ccr:HASH N_rows_offloaded>>"}` to the kept-items
+# array. The LLM sees this in the prompt and can ask for the original via
+# the CCR retrieval tool. Downstream consumers that iterate the array
+# expecting a uniform schema (e.g. `for e in entries: e["level"]`) need
+# to skip the sentinel — that's what `strip_ccr_sentinels` is for.
+
+CCR_SENTINEL_KEY = "_ccr_dropped"
+
+
+def is_ccr_sentinel(item: Any) -> bool:
+    """True if `item` is a CCR-dropped sentinel object."""
+    return isinstance(item, dict) and CCR_SENTINEL_KEY in item
+
+
+def strip_ccr_sentinels(items: Any) -> Any:
+    """Return `items` with any CCR-dropped sentinel objects filtered out.
+
+    Pass this through any iteration over a compressed array's contents
+    when your code expects a uniform-schema list of records. The sentinel
+    carries a `<<ccr:HASH ...>>` marker for the LLM and shouldn't be
+    confused for a record — it has only the `_ccr_dropped` key.
+
+    Non-list inputs pass through unchanged so callers can wrap whatever
+    `json.loads` returned without first checking the shape.
+    """
+    if not isinstance(items, list):
+        return items
+    return [x for x in items if not is_ccr_sentinel(x)]
+
+
 # ─── Public dataclasses ───────────────────────────────────────────────────
 
 
@@ -212,6 +245,20 @@ class SmartCrusher(Transform):
         the hash directly rather than parsing it out of a prompt marker.
         """
         result: dict[str, Any] = self._rust.crush_array_json(items_json, query, bias)
+        return result
+
+    def compact_document_json(self, doc_json: str) -> str:
+        """Run the document walker on ``doc_json`` and return compacted JSON.
+
+        Lossless walker pass over objects, arrays, and strings —
+        tabular sub-arrays become CSV+schema strings, long opaque
+        blobs become ``<<ccr:HASH,KIND,SIZE>>`` markers (originals
+        stashed in this crusher's CCR store, so ``ccr_get`` resolves them).
+
+        Use this when callers want pure document-shape compaction
+        without per-array lossy crushing.
+        """
+        result: str = self._rust.compact_document_json(doc_json)
         return result
 
     def ccr_get(self, hash_key: str) -> str | None:

@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 
+use headroom_core::transforms::smart_crusher::compaction::DocumentCompactor;
 use headroom_core::transforms::smart_crusher::{
     CrushResult as RustCrushResult, SmartCrusher as RustSmartCrusher,
     SmartCrusherConfig as RustSmartCrusherConfig,
@@ -703,6 +704,30 @@ impl PySmartCrusher {
             result.compacted,
             result.compaction_kind,
         )
+    }
+
+    /// Run the document-level walker on `doc_json` (JSON string) and
+    /// return the compacted document as JSON.
+    ///
+    /// The walker recursively descends through objects, arrays, and
+    /// strings; tabular sub-arrays become rendered CSV+schema strings,
+    /// long opaque blobs become `<<ccr:HASH,KIND,SIZE>>` markers (with
+    /// originals stashed in this crusher's CCR store, so `ccr_get`
+    /// resolves them).
+    ///
+    /// Distinct from `crush_array_json`: this is the lossless walker
+    /// pass without per-array lossy crushing — useful when the caller
+    /// wants document-shape compaction (forms, configs, mixed records)
+    /// rather than statistical row drop.
+    fn compact_document_json(&self, doc_json: &str) -> String {
+        let parsed: serde_json::Value =
+            serde_json::from_str(doc_json).unwrap_or_else(|e| panic!("doc_json must be JSON: {e}"));
+        let mut dc = DocumentCompactor::new();
+        if let Some(store) = self.inner.ccr_store() {
+            dc = dc.with_ccr_store(store.clone());
+        }
+        let out = dc.compact(parsed);
+        serde_json::to_string(&out).expect("serialize compacted document")
     }
 
     /// Look up an original payload by CCR hash.

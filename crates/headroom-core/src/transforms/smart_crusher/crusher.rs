@@ -40,9 +40,10 @@ use serde_json::Value;
 use super::analyzer::SmartAnalyzer;
 use super::builder::SmartCrusherBuilder;
 use super::classifier::{classify_array, ArrayType};
-use super::compaction::classifier::{classify_cell, CellClass, ClassifyConfig};
-use super::compaction::ir::OpaqueKind;
-use super::compaction::{Compaction, CompactionStage};
+use super::compaction::{
+    classify_cell, emit_opaque_ccr_marker, try_parse_json_container, CellClass, ClassifyConfig,
+    Compaction, CompactionStage,
+};
 use super::config::SmartCrusherConfig;
 use super::crushers::{compute_k_split, crush_number_array, crush_object, crush_string_array};
 use super::planning::SmartCrusherPlanner;
@@ -390,7 +391,31 @@ impl SmartCrusher {
                                 n,
                                 result.items.len()
                             ));
-                            return (Value::Array(result.items), info_parts.join(","));
+                            // Lossy path with rows dropped → append a
+                            // CCR-Dropped sentinel object as the last
+                            // element of the kept-items array. This is
+                            // the **only** place the LLM sees the
+                            // `<<ccr:HASH ...>>` pointer in the prompt.
+                            // Without this, the store has the data but
+                            // no model can ever ask for it.
+                            //
+                            // Sentinel shape: `{"_ccr_dropped":
+                            // "<<ccr:HASH N_rows_offloaded>>"}` —
+                            // preserves "array-of-objects" shape so
+                            // downstream consumers iterating with
+                            // `x.get(...)` keep working; the well-known
+                            // `_ccr_dropped` key signals metadata
+                            // unambiguously.
+                            let mut items = result.items;
+                            if !result.dropped_summary.is_empty() {
+                                let mut sentinel = serde_json::Map::new();
+                                sentinel.insert(
+                                    "_ccr_dropped".to_string(),
+                                    Value::String(result.dropped_summary),
+                                );
+                                items.push(Value::Object(sentinel));
+                            }
+                            return (Value::Array(items), info_parts.join(","));
                         }
                         ArrayType::StringArray => {
                             let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
@@ -451,11 +476,10 @@ impl SmartCrusher {
 
                 (Value::Object(processed), info_parts.join(","))
             }
-            // Strings: walker-equivalent handling. Parse stringified-JSON
-            // containers and recurse; CCR-substitute long opaque blobs.
-            // (Stage 3c.2 PR5: brings DocumentCompactor's String semantics
-            // into the public `crush()` path so tool outputs that wrap
-            // JSON in strings, or contain opaque blobs, get processed.)
+            // Strings: walker-equivalent handling. Delegates to
+            // `process_string` which parses stringified-JSON containers
+            // (recursing through `process_value`) and CCR-substitutes
+            // opaque blobs (with store-write so retrieval works).
             Value::String(s) => self.process_string(s, depth, query_context, bias),
             // Other scalars — passthrough.
             _ => (value.clone(), String::new()),
@@ -486,7 +510,7 @@ impl SmartCrusher {
         bias: f64,
     ) -> (Value, String) {
         // 1. Stringified-JSON: parse, recurse, re-render.
-        if let Some(parsed) = try_parse_json_container_str(s) {
+        if let Some(parsed) = try_parse_json_container(s) {
             let (processed, sub_info) = self.process_value(&parsed, depth + 1, query_context, bias);
             // If recursion produced something different, re-emit.
             // Special case: if the recursion returned a `Value::String`
@@ -509,14 +533,14 @@ impl SmartCrusher {
             }
         }
 
-        // 2. Opaque blob: substitute with CCR marker.
+        // 2. Opaque blob: substitute with CCR marker AND stash the
+        // original in the store (PR8) so retrieval works. Hash + format
+        // identical to walker.rs via the shared helper — zero drift.
         let cfg = ClassifyConfig::default();
         if let CellClass::Opaque(kind) = classify_cell(&Value::String(s.to_string()), &cfg) {
-            let marker = ccr_marker_for_string(s.as_bytes(), &kind);
-            return (
-                Value::String(marker),
-                format!("string_ccr:{}", opaque_kind_label(&kind)),
-            );
+            let marker = emit_opaque_ccr_marker(s, &kind, self.ccr_store.as_ref());
+            let kind_label = opaque_kind_label(&kind);
+            return (Value::String(marker), format!("string_ccr:{kind_label}"));
         }
 
         // 3. Plain string — passthrough.
@@ -890,61 +914,25 @@ fn hash_array_for_ccr(items: &[Value]) -> String {
         .collect()
 }
 
-// ─── PR5 walker-integration helpers (string handling) ───────────────────────
+// ─── PR5 walker-integration helpers (string handling) ──────────────────────
+//
+// Parse-as-JSON-container, marker formatting, and humanize-bytes used to
+// live here as locals. PR8 extracted them into `compaction::walker` so
+// `walker.rs` and `process_value` share one canonical implementation —
+// killing the drift risk where the two paths could format markers
+// differently. `process_string` now calls `try_parse_json_container` and
+// `emit_opaque_ccr_marker` directly. Only `opaque_kind_label` survives
+// here because `process_string`'s `string_ccr:<kind>` strategy-info
+// label is local to this module's debug-string convention.
 
-/// Cheap parse-as-JSON-container check. Returns `Some(parsed)` only
-/// when `s` parses to an object or array — not for bare scalars
-/// (numbers, bools, nulls) that happen to be valid JSON literals.
-fn try_parse_json_container_str(s: &str) -> Option<Value> {
-    let trimmed = s.trim_start();
-    if !matches!(trimmed.chars().next(), Some('{') | Some('[')) {
-        return None;
-    }
-    serde_json::from_str::<Value>(s)
-        .ok()
-        .filter(|v| matches!(v, Value::Object(_) | Value::Array(_)))
-}
-
-/// Format a CCR retrieval marker for an opaque string. Format must
-/// match `compaction::walker::format_ccr_marker` so downstream
-/// consumers can pattern-match markers regardless of which path
-/// emitted them.
-fn ccr_marker_for_string(bytes: &[u8], kind: &OpaqueKind) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(bytes);
-    let hash: String = h
-        .finalize()
-        .iter()
-        .take(6)
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    format!(
-        "<<ccr:{},{},{}>>",
-        hash,
-        opaque_kind_label(kind),
-        humanize_bytes(bytes.len())
-    )
-}
-
-fn opaque_kind_label(kind: &OpaqueKind) -> &str {
+fn opaque_kind_label(kind: &super::compaction::OpaqueKind) -> &str {
+    use super::compaction::OpaqueKind;
     match kind {
         OpaqueKind::Base64Blob => "base64",
         OpaqueKind::LongString => "string",
         OpaqueKind::HtmlChunk => "html",
         OpaqueKind::Other(s) => s.as_str(),
     }
-}
-
-fn humanize_bytes(n: usize) -> String {
-    if n < 1024 {
-        return format!("{n}B");
-    }
-    let kb = n as f64 / 1024.0;
-    if kb < 1024.0 {
-        return format!("{kb:.1}KB");
-    }
-    format!("{:.1}MB", kb / 1024.0)
 }
 
 #[cfg(test)]
@@ -1423,11 +1411,11 @@ mod tests {
 
     #[test]
     fn process_string_helper_parses_only_containers() {
-        assert!(try_parse_json_container_str("{\"a\":1}").is_some());
-        assert!(try_parse_json_container_str("[1,2,3]").is_some());
-        assert!(try_parse_json_container_str("123").is_none()); // bare scalar
-        assert!(try_parse_json_container_str("\"hello\"").is_none()); // bare string
-        assert!(try_parse_json_container_str("not json").is_none());
-        assert!(try_parse_json_container_str("{malformed").is_none());
+        assert!(try_parse_json_container("{\"a\":1}").is_some());
+        assert!(try_parse_json_container("[1,2,3]").is_some());
+        assert!(try_parse_json_container("123").is_none()); // bare scalar
+        assert!(try_parse_json_container("\"hello\"").is_none()); // bare string
+        assert!(try_parse_json_container("not json").is_none());
+        assert!(try_parse_json_container("{malformed").is_none());
     }
 }
