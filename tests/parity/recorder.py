@@ -264,6 +264,22 @@ def record_all(root: Path | None = None) -> dict[str, str]:
     except Exception as e:
         statuses["ccr"] = f"blocked:{e.__class__.__name__}:{e}"
 
+    # --- content_detector --------------------------------------------------
+    # `detect_content_type` is a module-level function, so we monkey-patch
+    # the module attribute rather than a class method.
+    try:
+        from headroom.transforms import content_detector as _cd_mod
+
+        _wrap_function(
+            _cd_mod,
+            "detect_content_type",
+            "content_detector",
+            root=root,
+        )
+        statuses["content_detector"] = "patched"
+    except Exception as e:
+        statuses["content_detector"] = f"blocked:{e.__class__.__name__}:{e}"
+
     return statuses
 
 
@@ -289,6 +305,32 @@ def _wrap_method(
     wrapped = decorator(original)
     wrapped._parity_recorder_wrapped = True  # type: ignore[attr-defined]
     setattr(cls, method_name, wrapped)
+
+
+def _wrap_function(
+    module: Any,
+    fn_name: str,
+    transform_name: str,
+    *,
+    root: Path | None = None,
+    input_arg: int = 0,
+    input_kw: str | None = None,
+) -> None:
+    """Monkey-patch a module-level free function the same way `_wrap_method`
+    handles class methods. Idempotent; safe to call repeatedly."""
+    original = getattr(module, fn_name)
+    if getattr(original, "_parity_recorder_wrapped", False):
+        return  # idempotent
+
+    decorator = record(
+        transform_name,
+        root=root,
+        input_arg=input_arg,
+        input_kw=input_kw,
+    )
+    wrapped = decorator(original)
+    wrapped._parity_recorder_wrapped = True  # type: ignore[attr-defined]
+    setattr(module, fn_name, wrapped)
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +583,147 @@ def _varied_text_inputs() -> list[str]:
     return out[:20]
 
 
+def _varied_content_detector_inputs() -> list[str]:
+    """Hit every dispatch branch in `detect_content_type`. Each entry below
+    targets a specific path so parity diffs surface the right branch."""
+    json_array_dicts = '[{"id":1,"name":"a"},{"id":2,"name":"b"},{"id":3,"name":"c"}]'
+    json_array_scalars = "[1, 2, 3, 4, 5]"
+    json_empty_array = "[]"
+    json_object = '{"foo": "bar"}'
+
+    git_diff = (
+        "diff --git a/foo.py b/foo.py\n"
+        "index abc..def 100644\n"
+        "--- a/foo.py\n"
+        "+++ b/foo.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        "-old line\n"
+        "+new line\n"
+        " unchanged\n"
+    )
+    merge_diff = (
+        "diff --combined merged.py\n"
+        "index aaa..bbb..ccc 100644\n"
+        "--- a/merged.py\n"
+        "+++ b/merged.py\n"
+        "@@@ -1,4 -1,4 +1,5 @@@\n"
+        "  unchanged\n"
+        "- branch_a_only\n"
+        " -branch_b_only\n"
+        "++merge_added\n"
+    )
+
+    html_doctype = (
+        "<!DOCTYPE html>\n<html>\n<head><title>x</title></head>\n"
+        "<body><div><span>hi</span></div></body>\n</html>"
+    )
+    html_structural = "<div>a</div>\n<span>b</span>\n<script>x()</script>\n<style>y</style>"
+    html_below_threshold = "<p>just one tag</p>"
+
+    search_results = (
+        "src/main.py:42:def process():\n"
+        "src/util.py:13:    return None\n"
+        "lib/x.py:7:class X:\n"
+        "tests/test_a.py:3:    assert True"
+    )
+
+    build_log = (
+        "INFO starting build\n"
+        "WARN deprecated API used\n"
+        "ERROR compilation failed\n"
+        "FAILED test_x\n"
+        "PASSED test_y\n"
+        "============================================\n"
+    )
+    pytest_output = (
+        "============================= test session starts ==============================\n"
+        + "\n".join(f"tests/test_{i}.py::test_case PASSED" for i in range(5))
+        + "\nFAILED tests/test_5.py::test_bad\n"
+        + "Traceback (most recent call last)\n"
+    )
+
+    python_code = (
+        "import os\n"
+        "from typing import Any\n\n"
+        "@dataclass\n"
+        "class Foo:\n"
+        '    """Docstring."""\n'
+        "    def bar(self):\n"
+        "        return 42\n\n"
+        "def baz():\n"
+        "    pass\n\n"
+        "if __name__ == '__main__':\n"
+        "    baz()\n"
+    )
+    js_code = (
+        "import x from 'y';\n"
+        "export const foo = 1;\n"
+        "function bar() { return 42; }\n"
+        "const f = async function() {};\n"
+        "module.exports = { foo, bar };\n"
+    )
+    ts_code = (
+        "interface User { id: number; name: string; }\n"
+        "type Maybe<T> = T | null;\n"
+        "enum Color { Red, Green, Blue }\n"
+        "function f(x: number): boolean { return x > 0; }\n"
+    )
+    go_code = (
+        "package main\n\n"
+        'import "fmt"\n\n'
+        "type Foo struct { ID int }\n\n"
+        "func (f *Foo) Bar() int { return f.ID }\n\n"
+        'func main() { fmt.Println("hi") }\n'
+    )
+    rust_code = (
+        "use std::collections::HashMap;\n\n"
+        "pub struct Foo { id: u32 }\n\n"
+        "impl Foo {\n"
+        "    pub fn new() -> Self { Self { id: 0 } }\n"
+        "}\n\n"
+        "fn main() {}\n"
+        "#[derive(Debug)]\n"
+        "enum Color { Red, Green }\n"
+    )
+    java_code = (
+        "package com.example;\n\n"
+        "public class Foo {\n"
+        "    @Override\n"
+        '    public String toString() { return "foo"; }\n'
+        "}\n\n"
+        "private interface Bar {}\n"
+        "protected enum Baz { A, B }\n"
+    )
+
+    plain_text = "Just some prose text without any structure or special markers."
+    empty = ""
+    whitespace = "   \n\t  \n"
+
+    return [
+        json_array_dicts,
+        json_array_scalars,
+        json_empty_array,
+        json_object,
+        git_diff,
+        merge_diff,
+        html_doctype,
+        html_structural,
+        html_below_threshold,
+        search_results,
+        build_log,
+        pytest_output,
+        python_code,
+        js_code,
+        ts_code,
+        go_code,
+        rust_code,
+        java_code,
+        plain_text,
+        empty,
+        whitespace,
+    ]
+
+
 def _varied_message_batches() -> list[list[dict[str, Any]]]:
     today = _dt.date.today().isoformat()
     out: list[list[dict[str, Any]]] = []
@@ -566,6 +749,7 @@ def run_default_workload(root: Path | None = None) -> dict[str, int]:
         "tokenizer": 0,
         "cache_aligner": 0,
         "ccr": 0,
+        "content_detector": 0,
     }
 
     # log_compressor
@@ -642,6 +826,18 @@ def run_default_workload(root: Path | None = None) -> dict[str, int]:
                 LOG.debug("ccr inject failed on input %d: %s", i, e)
     except Exception as e:
         LOG.warning("ccr workload failed: %s", e)
+
+    # content_detector — drive a wide mix of content types so every dispatch
+    # branch (json_array, diff, html, search, log, code-by-language,
+    # plain-text fallback) is exercised at least once.
+    try:
+        from headroom.transforms import content_detector as _cd_mod
+
+        for s in _varied_content_detector_inputs():
+            _cd_mod.detect_content_type(s)
+            counts["content_detector"] += 1
+    except Exception as e:
+        LOG.warning("content_detector workload failed: %s", e)
 
     return counts
 

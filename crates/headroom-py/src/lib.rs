@@ -21,10 +21,13 @@ use headroom_core::transforms::smart_crusher::{
     SmartCrusherConfig as RustSmartCrusherConfig,
 };
 use headroom_core::transforms::{
-    DiffCompressionResult, DiffCompressor, DiffCompressorConfig, DiffCompressorStats,
+    detect_content_type as rust_detect_content_type,
+    is_json_array_of_dicts as rust_is_json_array_of_dicts, ContentType as RustContentType,
+    DetectionResult as RustDetectionResult, DiffCompressionResult, DiffCompressor,
+    DiffCompressorConfig, DiffCompressorStats,
 };
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyString};
 
 /// Identity stub used by the Python smoke test to verify linkage.
 #[pyfunction]
@@ -799,6 +802,109 @@ impl PySmartCrusher {
     }
 }
 
+// ─── ContentDetector ───────────────────────────────────────────────────────
+
+/// Mirror of `headroom.transforms.content_detector.DetectionResult`.
+///
+/// Field names + types match the Python dataclass exactly so the existing
+/// Python `ContentRouter` (which `import`s `DetectionResult` directly) can
+/// continue to read `.content_type`, `.confidence`, and `.metadata` without
+/// modification.
+///
+/// `content_type` is exposed as the lowercase string tag (e.g.
+/// `"json_array"`). The Python wrapper translates it back into the
+/// `ContentType` enum so the call-site looks identical.
+#[pyclass(name = "DetectionResult", module = "headroom._core")]
+#[derive(Clone)]
+struct PyDetectionResult {
+    inner: RustDetectionResult,
+}
+
+#[pymethods]
+impl PyDetectionResult {
+    #[getter]
+    fn content_type(&self) -> &'static str {
+        self.inner.content_type.as_str()
+    }
+
+    #[getter]
+    fn confidence(&self) -> f64 {
+        self.inner.confidence
+    }
+
+    /// Per-type metadata bag (e.g. `{"language": "python", "pattern_matches": 5}`
+    /// for code, `{"item_count": 3, "is_dict_array": true}` for JSON arrays).
+    /// Returned as a fresh `dict` so callers can mutate without affecting
+    /// the underlying Rust value.
+    #[getter]
+    fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new_bound(py);
+        for (k, v) in &self.inner.metadata {
+            // Convert each JSON value into the closest Python primitive.
+            // Detection metadata is always a flat dict of scalars (ints,
+            // bools, strings) so we don't need to recurse.
+            let py_value: PyObject = match v {
+                serde_json::Value::Bool(b) => b.into_py(py),
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_u64() {
+                        i.into_py(py)
+                    } else if let Some(i) = n.as_i64() {
+                        i.into_py(py)
+                    } else if let Some(f) = n.as_f64() {
+                        f.into_py(py)
+                    } else {
+                        py.None()
+                    }
+                }
+                serde_json::Value::String(s) => PyString::new_bound(py, s).into_py(py),
+                serde_json::Value::Null => py.None(),
+                // Detection never emits arrays / objects in metadata
+                // today; if it ever does, fall through to JSON-string for
+                // visibility rather than silently dropping.
+                other => PyString::new_bound(py, &other.to_string()).into_py(py),
+            };
+            dict.set_item(k, py_value)?;
+        }
+        Ok(dict)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DetectionResult(content_type={:?}, confidence={}, metadata=<{} keys>)",
+            self.inner.content_type.as_str(),
+            self.inner.confidence,
+            self.inner.metadata.len()
+        )
+    }
+}
+
+/// Detect the type of `content`. Returns a `DetectionResult` with the
+/// same field surface as Python's dataclass.
+///
+/// Releases the GIL while detecting — pattern matching can be substantial
+/// on large bodies (HTML scans, 500-line diff windows), and freeing the
+/// GIL lets other Python threads make progress in the meantime.
+#[pyfunction]
+fn detect_content_type(py: Python<'_>, content: &str) -> PyDetectionResult {
+    let owned = content.to_string();
+    let result = py.allow_threads(move || rust_detect_content_type(&owned));
+    PyDetectionResult { inner: result }
+}
+
+/// Quick check: is `content` a JSON array of dictionaries (the format
+/// `SmartCrusher` natively handles)?
+#[pyfunction]
+fn is_json_array_of_dicts(py: Python<'_>, content: &str) -> bool {
+    let owned = content.to_string();
+    py.allow_threads(move || rust_is_json_array_of_dicts(&owned))
+}
+
+// Suppress unused-import warning when ContentType isn't referenced
+// directly — `as_str()` is the public surface.
+const _: fn() = || {
+    let _ = RustContentType::PlainText;
+};
+
 // ─── Module init ───────────────────────────────────────────────────────────
 
 #[pymodule]
@@ -811,5 +917,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySmartCrusherConfig>()?;
     m.add_class::<PyCrushResult>()?;
     m.add_class::<PySmartCrusher>()?;
+    m.add_class::<PyDetectionResult>()?;
+    m.add_function(wrap_pyfunction!(detect_content_type, m)?)?;
+    m.add_function(wrap_pyfunction!(is_json_array_of_dicts, m)?)?;
     Ok(())
 }
