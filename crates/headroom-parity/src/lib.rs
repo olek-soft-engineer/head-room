@@ -45,6 +45,15 @@ pub trait TransformComparator {
 }
 
 /// Compare a single fixture against a comparator and return an outcome.
+///
+/// f64 normalization: `serde_json` (without the `arbitrary_precision`
+/// feature) has an asymmetry — values constructed via `json!(f64)` keep
+/// full precision (e.g. `0.9500000000000001`), but values parsed from
+/// fixture JSON sometimes round to a neighboring f64 (e.g. `0.95`,
+/// differing by 1 ULP). To make comparisons robust we round-trip the
+/// comparator's output through `to_string` + `from_str` so it goes
+/// through the same lossy parser the fixture did. Bit-identical f64s
+/// from both sides then compare equal.
 pub fn compare_fixture(
     comparator: &dyn TransformComparator,
     fixture: &Fixture,
@@ -57,12 +66,15 @@ pub fn compare_fixture(
             })
         }
     };
-    if actual == fixture.output {
+    let actual_normalized: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&actual)?)
+            .context("re-parsing comparator output through serde_json (f64 normalization)")?;
+    if actual_normalized == fixture.output {
         Ok(ComparisonOutcome::Match)
     } else {
         Ok(ComparisonOutcome::Diff {
             expected: serde_json::to_string_pretty(&fixture.output)?,
-            actual: serde_json::to_string_pretty(&actual)?,
+            actual: serde_json::to_string_pretty(&actual_normalized)?,
         })
     }
 }
@@ -401,6 +413,48 @@ impl TransformComparator for SmartCrusherComparator {
     }
 }
 
+/// Real comparator for the `content_detector` transform. Drives the Rust
+/// port over the recorded fixture inputs (a single JSON string) and
+/// emits the same shape Python's recorder serializes for
+/// `DetectionResult`:
+///
+/// ```json
+/// {"content_type": "json_array", "confidence": 1.0, "metadata": {...}}
+/// ```
+///
+/// Python's recorder relies on `_json_default` to serialize the
+/// `DetectionResult` dataclass and the `ContentType` enum:
+/// - dataclass → `asdict(...)` produces `{content_type, confidence, metadata}`.
+/// - enum → its `.value` (the lowercase tag, e.g. "json_array").
+///
+/// Numeric fields in metadata are recorded as JSON numbers (Python ints
+/// stay ints), so we mirror that exactly with `serde_json::Number`.
+pub struct ContentDetectorComparator;
+
+impl TransformComparator for ContentDetectorComparator {
+    fn name(&self) -> &str {
+        "content_detector"
+    }
+
+    fn run(
+        &self,
+        input: &serde_json::Value,
+        _config: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use headroom_core::transforms::detect_content_type;
+
+        let content = input
+            .as_str()
+            .context("content_detector fixture input must be a JSON string")?;
+        let result = detect_content_type(content);
+        Ok(serde_json::json!({
+            "content_type": result.content_type.as_str(),
+            "confidence": result.confidence,
+            "metadata": serde_json::Value::Object(result.metadata),
+        }))
+    }
+}
+
 /// Every built-in comparator, in a stable order.
 pub fn builtin_comparators() -> Vec<Box<dyn TransformComparator>> {
     vec![
@@ -410,6 +464,7 @@ pub fn builtin_comparators() -> Vec<Box<dyn TransformComparator>> {
         Box::new(TokenizerComparator),
         Box::new(CcrComparator),
         Box::new(SmartCrusherComparator),
+        Box::new(ContentDetectorComparator),
     ]
 }
 

@@ -17,9 +17,13 @@
 
 pub mod adaptive_sizer;
 pub mod anchor_selector;
+pub mod content_detector;
 pub mod diff_compressor;
 pub mod smart_crusher;
 
+pub use content_detector::{
+    detect_content_type, is_json_array_of_dicts, ContentType, DetectionResult,
+};
 pub use diff_compressor::{
     DiffCompressionResult, DiffCompressor, DiffCompressorConfig, DiffCompressorStats,
 };
