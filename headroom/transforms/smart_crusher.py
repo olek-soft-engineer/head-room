@@ -214,6 +214,20 @@ class SmartCrusher(Transform):
         result: dict[str, Any] = self._rust.crush_array_json(items_json, query, bias)
         return result
 
+    def compact_document_json(self, doc_json: str) -> str:
+        """Run the document walker on ``doc_json`` and return compacted JSON.
+
+        Lossless walker pass over objects, arrays, and strings —
+        tabular sub-arrays become CSV+schema strings, long opaque
+        blobs become ``<<ccr:HASH,KIND,SIZE>>`` markers (originals
+        stashed in this crusher's CCR store, so ``ccr_get`` resolves them).
+
+        Use this when callers want pure document-shape compaction
+        without per-array lossy crushing.
+        """
+        result: str = self._rust.compact_document_json(doc_json)
+        return result
+
     def ccr_get(self, hash_key: str) -> str | None:
         """Look up an original payload by CCR hash from the Rust store.
 

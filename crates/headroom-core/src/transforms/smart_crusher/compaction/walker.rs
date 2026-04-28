@@ -29,12 +29,15 @@
 //! BEFORE running TabularCompactor on the array, so inner sub-tables
 //! become strings first and the outer table sees them as cells.
 
+use std::sync::Arc;
+
 use serde_json::{Map, Value};
 
 use super::classifier::{classify_cell, CellClass};
 use super::compactor::{compact, CompactConfig};
 use super::formatter::{CsvSchemaFormatter, Formatter};
 use super::ir::OpaqueKind;
+use crate::ccr::CcrStore;
 
 use sha2::{Digest, Sha256};
 
@@ -50,6 +53,10 @@ use sha2::{Digest, Sha256};
 pub struct DocumentCompactor {
     pub config: CompactConfig,
     pub formatter: Box<dyn Formatter>,
+    /// Optional CCR store. When set, opaque-string CCR markers also
+    /// stash the original blob keyed by the marker hash, mirroring the
+    /// row-drop CCR contract from `SmartCrusher::crush_array`.
+    pub ccr_store: Option<Arc<dyn CcrStore>>,
 }
 
 impl Default for DocumentCompactor {
@@ -57,6 +64,7 @@ impl Default for DocumentCompactor {
         Self {
             config: CompactConfig::default(),
             formatter: Box::new(CsvSchemaFormatter::new()),
+            ccr_store: None,
         }
     }
 }
@@ -73,6 +81,11 @@ impl DocumentCompactor {
 
     pub fn with_config(mut self, config: CompactConfig) -> Self {
         self.config = config;
+        self
+    }
+
+    pub fn with_ccr_store(mut self, store: Arc<dyn CcrStore>) -> Self {
+        self.ccr_store = Some(store);
         self
     }
 
@@ -124,10 +137,11 @@ fn walk_string(s: String, ctx: &DocumentCompactor) -> Value {
         };
     }
 
-    // Long opaque blob: substitute with CCR marker.
+    // Long opaque blob: substitute with CCR marker (and stash the
+    // original in the store if one is configured, so retrieval works).
     if let CellClass::Opaque(kind) = classify_cell(&Value::String(s.clone()), &ctx.config.classify)
     {
-        return Value::String(format_ccr_marker(s.as_bytes(), &kind));
+        return Value::String(emit_opaque_ccr_marker(&s, &kind, ctx.ccr_store.as_ref()));
     }
 
     Value::String(s)
@@ -136,7 +150,7 @@ fn walk_string(s: String, ctx: &DocumentCompactor) -> Value {
 /// Parse a string as JSON IF it looks like a container (starts with `{`
 /// or `[`) AND parses cleanly to Object/Array. Returns None otherwise —
 /// we don't recurse on bare scalars even if they parse.
-fn try_parse_json_container(s: &str) -> Option<Value> {
+pub fn try_parse_json_container(s: &str) -> Option<Value> {
     let trimmed = s.trim_start();
     if !matches!(trimmed.chars().next(), Some('{') | Some('[')) {
         return None;
@@ -146,22 +160,37 @@ fn try_parse_json_container(s: &str) -> Option<Value> {
         .filter(|v| matches!(v, Value::Object(_) | Value::Array(_)))
 }
 
-fn format_ccr_marker(bytes: &[u8], kind: &OpaqueKind) -> String {
+/// Emit an opaque-blob CCR marker AND (optionally) stash the original
+/// in the store so retrieval works. The hash is computed identically
+/// regardless of store presence — same input → same marker — so the
+/// runtime contract is stable across configurations.
+///
+/// Marker format: `<<ccr:HASH,KIND,SIZE>>` where HASH is the 12-char
+/// SHA-256 hex prefix of the payload bytes, KIND is `base64` / `string`
+/// / `html` / custom, SIZE is humanized (`123B`, `4.5KB`, `1.2MB`).
+pub fn emit_opaque_ccr_marker(
+    payload: &str,
+    kind: &OpaqueKind,
+    store: Option<&Arc<dyn CcrStore>>,
+) -> String {
     let mut h = Sha256::new();
-    h.update(bytes);
+    h.update(payload.as_bytes());
     let hash: String = h
         .finalize()
         .iter()
         .take(6)
         .map(|b| format!("{b:02x}"))
         .collect();
+    if let Some(s) = store {
+        s.put(&hash, payload);
+    }
     let kind_str = match kind {
         OpaqueKind::Base64Blob => "base64",
         OpaqueKind::LongString => "string",
         OpaqueKind::HtmlChunk => "html",
         OpaqueKind::Other(s) => s.as_str(),
     };
-    format!("<<ccr:{},{},{}>>", hash, kind_str, humanize(bytes.len()))
+    format!("<<ccr:{},{},{}>>", hash, kind_str, humanize(payload.len()))
 }
 
 fn humanize(n: usize) -> String {

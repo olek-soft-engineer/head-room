@@ -239,6 +239,87 @@ def test_kept_subset_is_subset_of_original() -> None:
     assert retrieved == original
 
 
+def test_marker_visible_in_crush_output_native() -> None:
+    """PR8 cornerstone: the public crush() output now carries the
+    `<<ccr:HASH ...>>` marker so the LLM sees the retrieval pointer."""
+    from headroom._core import SmartCrusher, SmartCrusherConfig
+
+    crusher = SmartCrusher(SmartCrusherConfig(lossless_min_savings_ratio=0.99))
+    items = [{"id": i, "status": "ok"} for i in range(50)]
+    raw = json.dumps(items)
+
+    result = crusher.crush(raw, "", 1.0)
+    assert "<<ccr:" in result.compressed, f"expected marker in output: {result.compressed[:200]!r}"
+    assert "rows_offloaded" in result.compressed
+
+    # The marker hash resolves in the store.
+    import re
+
+    m = re.search(r"<<ccr:([a-f0-9]+) ", result.compressed)
+    assert m is not None
+    hash_key = m.group(1)
+    assert crusher.ccr_get(hash_key) is not None
+
+
+def test_opaque_blob_in_object_emits_marker_and_stores_native() -> None:
+    """A long base64-ish blob in a field becomes a CCR marker AND the
+    original gets stashed."""
+    from headroom._core import SmartCrusher
+
+    crusher = SmartCrusher()
+    big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" * 8
+    raw = json.dumps({"id": 1, "blob": big})
+
+    result = crusher.crush(raw, "", 1.0)
+    parsed = json.loads(result.compressed)
+    blob_out = parsed["blob"]
+    assert blob_out.startswith("<<ccr:") and ",base64," in blob_out
+
+    # The store grew, hash resolves, original byte-equal.
+    import re
+
+    m = re.search(r"<<ccr:([a-f0-9]+),", blob_out)
+    assert m is not None
+    retrieved = crusher.ccr_get(m.group(1))
+    assert retrieved == big
+
+
+def test_compact_document_json_via_pyo3() -> None:
+    """The walker is reachable from Python and writes to the same store."""
+    from headroom._core import SmartCrusher
+
+    crusher = SmartCrusher()
+    starting = crusher.ccr_len()
+    big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=" * 8
+    doc = {"id": 1, "blob": big}
+
+    out = crusher.compact_document_json(json.dumps(doc))
+    parsed = json.loads(out)
+    assert parsed["id"] == 1
+    assert parsed["blob"].startswith("<<ccr:")
+    assert crusher.ccr_len() == starting + 1
+
+    import re
+
+    m = re.search(r"<<ccr:([a-f0-9]+),", parsed["blob"])
+    assert crusher.ccr_get(m.group(1)) == big
+
+
+def test_compact_document_via_shim() -> None:
+    """Same path via the Python shim."""
+    from headroom.config import SmartCrusherConfig as PyConfig
+    from headroom.transforms.smart_crusher import SmartCrusher
+
+    crusher = SmartCrusher(PyConfig())
+    items = [{"id": i, "status": "ok", "tag": "alpha"} for i in range(30)]
+    out = crusher.compact_document_json(json.dumps({"events": items}))
+    parsed = json.loads(out)
+    # Tabular sub-array compacted to a string.
+    assert isinstance(parsed["events"], str), (
+        f"expected string, got {type(parsed['events']).__name__}"
+    )
+
+
 def test_distinct_payloads_have_distinct_hashes_and_separate_storage() -> None:
     """Two different payloads → two different hashes → both
     independently retrievable. Pins the per-payload isolation."""

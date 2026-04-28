@@ -222,3 +222,159 @@ fn full_crush_pipeline_roundtrips_through_store() {
     let store_len = store.len();
     assert!(store_len > 0, "expected at least one CCR store entry");
 }
+
+// ─── PR8 additions: marker injection + walker unification ──────────
+
+#[test]
+fn lossy_crush_injects_marker_into_output_json() {
+    // Cornerstone of PR8: the public `crush()` API output now carries
+    // the `<<ccr:HASH ...>>` marker as a string element of the array.
+    // Without this, the LLM never sees the retrieval pointer.
+    let crusher = SmartCrusher::new(force_lossy_config());
+    let items = lossy_friendly_items(50);
+    let raw = serde_json::to_string(&Value::Array(items)).unwrap();
+
+    let result = crusher.crush(&raw, "", 1.0);
+
+    assert!(
+        result.compressed.contains("<<ccr:"),
+        "expected marker in output, got: {}",
+        result.compressed
+    );
+    assert!(
+        result.compressed.contains("rows_offloaded>>"),
+        "marker should advertise dropped count: {}",
+        result.compressed
+    );
+
+    // The hash in the marker is the same one in the store.
+    let marker_hash =
+        extract_hash_from_marker(&result.compressed).expect("marker must embed a hash");
+    let store = crusher.ccr_store().unwrap();
+    assert!(
+        store.get(&marker_hash).is_some(),
+        "marker hash {marker_hash} must resolve in the store"
+    );
+}
+
+#[test]
+fn nested_array_inside_object_gets_marker_injected() {
+    // The public crush() recurses through wrapper objects. A nested
+    // `events: [...]` array that triggers lossy must get a marker too.
+    let crusher = SmartCrusher::new(force_lossy_config());
+    let doc = json!({
+        "user": "alice",
+        "events": (0..50).map(|i| json!({"id": i, "status": "ok"}))
+            .collect::<Vec<_>>(),
+    });
+
+    let result = crusher.crush(&doc.to_string(), "", 1.0);
+    assert!(result.compressed.contains("<<ccr:"));
+
+    let parsed: Value = serde_json::from_str(&result.compressed).unwrap();
+    let events = parsed.get("events").expect("events field preserved");
+    let arr = events.as_array().expect("events stays an array");
+    let last = arr.last().expect("non-empty array");
+    let marker = last
+        .get("_ccr_dropped")
+        .and_then(|v| v.as_str())
+        .expect("sentinel object with _ccr_dropped key");
+    assert!(
+        marker.starts_with("<<ccr:"),
+        "expected CCR marker text, got: {marker}"
+    );
+}
+
+#[test]
+fn opaque_string_in_object_emits_marker_and_stores_original() {
+    // Walker semantics in process_value: a long base64-ish blob in
+    // an object field should be replaced with a CCR marker AND the
+    // original bytes stashed in the store.
+    let crusher = SmartCrusher::new(SmartCrusherConfig::default());
+    let store = crusher.ccr_store().unwrap().clone();
+    let starting_len = store.len();
+
+    // 64-char base64 alphabet repeated → tripping the opaque-blob
+    // detector deterministically.
+    let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+    let doc = json!({"id": 1, "blob": big.clone()});
+
+    let result = crusher.crush(&doc.to_string(), "", 1.0);
+    let parsed: Value = serde_json::from_str(&result.compressed).unwrap();
+    let blob_out = parsed.get("blob").and_then(|v| v.as_str()).unwrap();
+
+    assert!(
+        blob_out.starts_with("<<ccr:") && blob_out.contains(",base64,"),
+        "expected base64 CCR marker, got: {blob_out}"
+    );
+
+    // The store grew by 1 and holds the original payload.
+    assert_eq!(
+        store.len(),
+        starting_len + 1,
+        "opaque-string CCR must write to store"
+    );
+    let marker_hash = extract_inner_hash(blob_out).unwrap();
+    let retrieved = store.get(&marker_hash).expect("hash must resolve");
+    assert_eq!(retrieved, big);
+}
+
+#[test]
+fn stringified_json_array_recurses_and_compacts() {
+    // A field whose value is a JSON-encoded array should be parsed,
+    // recursively crushed, and re-encoded — the walker behavior, now
+    // available from the main pipeline.
+    let crusher = SmartCrusher::new(force_lossy_config());
+    let inner = (0..50)
+        .map(|i| json!({"id": i, "status": "ok"}))
+        .collect::<Vec<_>>();
+    let inner_json = serde_json::to_string(&inner).unwrap();
+    let doc = json!({"id": "outer", "payload": inner_json});
+
+    let result = crusher.crush(&doc.to_string(), "", 1.0);
+    let parsed: Value = serde_json::from_str(&result.compressed).unwrap();
+    let payload = parsed.get("payload").and_then(|v| v.as_str()).unwrap();
+
+    // The payload string went through process_value's String arm,
+    // which parsed it as JSON, recursed, and re-emitted. Result:
+    // either a marker-bearing array string or a direct-rendered form.
+    assert!(
+        payload.contains("<<ccr:") || payload.contains("rows_offloaded"),
+        "expected stringified-JSON to be processed, got: {payload}"
+    );
+}
+
+#[test]
+fn document_walker_with_store_roundtrips_opaque_blob() {
+    // Direct DocumentCompactor usage with the same store.
+    use headroom_core::transforms::smart_crusher::compaction::DocumentCompactor;
+
+    let store: Arc<dyn CcrStore> = Arc::new(InMemoryCcrStore::new());
+    let dc = DocumentCompactor::new().with_ccr_store(store.clone());
+
+    let big = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(8);
+    let out = dc.compact(json!({"id": 1, "blob": big.clone()}));
+    let blob = out.pointer("/blob").and_then(|v| v.as_str()).unwrap();
+    assert!(blob.starts_with("<<ccr:"));
+
+    let h = extract_inner_hash(blob).unwrap();
+    assert_eq!(store.get(&h).unwrap(), big);
+}
+
+// ─── helpers ──────────────────────────────────────────────────────
+
+/// Pull the hash out of a `<<ccr:HASH N_rows_offloaded>>` row marker.
+fn extract_hash_from_marker(s: &str) -> Option<String> {
+    let i = s.find("<<ccr:")?;
+    let after = &s[i + 6..];
+    let end = after.find(' ')?;
+    Some(after[..end].to_string())
+}
+
+/// Pull the hash out of a `<<ccr:HASH,KIND,SIZE>>` opaque marker.
+fn extract_inner_hash(s: &str) -> Option<String> {
+    let i = s.find("<<ccr:")?;
+    let after = &s[i + 6..];
+    let end = after.find(',')?;
+    Some(after[..end].to_string())
+}
