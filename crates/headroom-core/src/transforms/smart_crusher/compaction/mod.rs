@@ -27,11 +27,13 @@ pub mod classifier;
 pub mod compactor;
 pub mod formatter;
 pub mod ir;
+pub mod walker;
 
 pub use classifier::{classify_cell, CellClass, ClassifyConfig};
 pub use compactor::{compact, CompactConfig};
 pub use formatter::{CsvSchemaFormatter, Formatter, JsonFormatter};
 pub use ir::{Bucket, CellValue, Compaction, FieldSpec, OpaqueKind, Row, Schema};
+pub use walker::{compact_document, DocumentCompactor};
 
 /// Composed compaction stage: a config + formatter pair.
 ///
