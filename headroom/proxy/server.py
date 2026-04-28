@@ -2290,7 +2290,9 @@ def _proxy_config_from_env() -> ProxyConfig:
         try:
             return ProxyConfig(**json.loads(raw_config))
         except (TypeError, ValueError, json.JSONDecodeError):
-            logger.warning("Invalid %s; falling back to HEADROOM_* env vars", _MULTI_WORKER_CONFIG_ENV)
+            logger.warning(
+                "Invalid %s; falling back to HEADROOM_* env vars", _MULTI_WORKER_CONFIG_ENV
+            )
 
     return ProxyConfig(
         host=_get_env_str("HEADROOM_HOST", "127.0.0.1"),
