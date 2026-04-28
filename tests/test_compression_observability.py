@@ -35,6 +35,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import pytest
+
 from headroom.transforms.content_detector import ContentType
 from headroom.transforms.content_router import (
     CompressionStrategy,
@@ -179,7 +181,32 @@ def _bigger_array(n: int = 60) -> str:
     return _json.dumps(items)
 
 
-def test_smart_crusher_apply_records_observer_per_crushed_message():
+@pytest.fixture
+def isolated_toin(tmp_path, monkeypatch):
+    """Point TOIN at a tempdir for the duration of the test.
+
+    SmartCrusher.apply() feeds the global TOIN learning store via
+    `record_compression`. Its default storage path is
+    `~/.headroom/toin.json`, which persists across pytest invocations.
+    On Python 3.11 CI runs the suite twice (regular + coverage); a
+    pattern written in run #1 changes which rows the lossy sampler
+    keeps in run #2 and breaks `test_first_last_items_always_preserved`
+    in `test_evals.py`.
+
+    Isolating the TOIN file per test contains the side effect.
+    """
+    from pathlib import Path
+
+    from headroom.telemetry.toin import TOIN_PATH_ENV_VAR, reset_toin
+
+    storage = str(Path(tmp_path) / "toin.json")
+    monkeypatch.setenv(TOIN_PATH_ENV_VAR, storage)
+    reset_toin()
+    yield
+    reset_toin()
+
+
+def test_smart_crusher_apply_records_observer_per_crushed_message(isolated_toin):
     """End-to-end: SmartCrusher.apply() walks messages, crushes the
     big tool_result, fires the observer with strategy='smart_crusher'."""
     from headroom.providers.openai import OpenAITokenCounter
@@ -205,7 +232,7 @@ def test_smart_crusher_apply_records_observer_per_crushed_message():
             assert compressed >= 0
 
 
-def test_smart_crusher_apply_swallows_observer_failures():
+def test_smart_crusher_apply_swallows_observer_failures(isolated_toin):
     """Observer raises → compression still completes, returns valid
     TransformResult, count of raises matches the crushed_count."""
     from headroom.providers.openai import OpenAITokenCounter
