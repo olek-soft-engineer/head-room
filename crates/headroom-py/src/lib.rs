@@ -23,11 +23,48 @@ use headroom_core::transforms::{
     DiffCompressionResult, DiffCompressor, DiffCompressorConfig, DiffCompressorStats,
 };
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 /// Identity stub used by the Python smoke test to verify linkage.
 #[pyfunction]
 fn hello() -> &'static str {
     headroom_core::hello()
+}
+
+fn type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Build the dict returned by `SmartCrusher.crush_array_json`. Kept
+/// outside `#[pymethods]` so we can `unwrap()` `set_item` (it cannot
+/// fail when keys are static str literals and values are owned String /
+/// Option<String> / Option<&'static str>) without tripping the
+/// `clippy::useless_conversion` false positive that fires inside the
+/// pyo3 0.22 method-attribute macro.
+fn build_crush_array_dict<'py>(
+    py: Python<'py>,
+    kept_json: String,
+    ccr_hash: Option<String>,
+    dropped_summary: String,
+    strategy_info: String,
+    compacted: Option<String>,
+    compaction_kind: Option<&'static str>,
+) -> Bound<'py, PyDict> {
+    let dict = PyDict::new_bound(py);
+    dict.set_item("items", kept_json).unwrap();
+    dict.set_item("ccr_hash", ccr_hash).unwrap();
+    dict.set_item("dropped_summary", dropped_summary).unwrap();
+    dict.set_item("strategy_info", strategy_info).unwrap();
+    dict.set_item("compacted", compacted).unwrap();
+    dict.set_item("compaction_kind", compaction_kind).unwrap();
+    dict
 }
 
 // ─── DiffCompressorConfig ──────────────────────────────────────────────────
@@ -620,6 +657,74 @@ impl PySmartCrusher {
     #[pyo3(signature = (content, query = "", bias = 1.0))]
     fn smart_crush_content(&self, content: &str, query: &str, bias: f64) -> (String, bool, String) {
         self.inner.smart_crush_content(content, query, bias)
+    }
+
+    /// Crush a JSON array directly and return the structured result.
+    ///
+    /// Input is a JSON string holding an array (`[item, item, ...]`).
+    /// Returns a dict with:
+    /// - `items`: JSON array string of the kept rows after compression
+    /// - `ccr_hash`: 12-char hash if rows were dropped, else `None`
+    /// - `dropped_summary`: `<<ccr:HASH N_rows_offloaded>>` marker
+    ///   text, empty if nothing dropped
+    /// - `strategy_info`: debug string describing what ran (e.g.
+    ///   `"smart_sample"`, `"lossless:table"`, `"none:adaptive_at_limit"`)
+    /// - `compacted`: rendered bytes when the lossless path won, else `None`
+    /// - `compaction_kind`: `"table" | "buckets" | "ccr" | None`
+    ///
+    /// This surfaces `CrushArrayResult` to Python so tests and the proxy
+    /// runtime can reach the CCR hash directly (rather than parsing it
+    /// out of the prompt marker).
+    #[pyo3(signature = (items_json, query = "", bias = 1.0))]
+    fn crush_array_json<'py>(
+        &self,
+        py: Python<'py>,
+        items_json: &str,
+        query: &str,
+        bias: f64,
+    ) -> Bound<'py, PyDict> {
+        // Errors here surface as Python `RuntimeError` via pyo3's panic
+        // catcher — callers are expected to pass valid array-shaped JSON.
+        let parsed: serde_json::Value = serde_json::from_str(items_json)
+            .unwrap_or_else(|e| panic!("items_json must be JSON: {e}"));
+        let items = match parsed {
+            serde_json::Value::Array(a) => a,
+            other => panic!("items_json must be a JSON array, got {}", type_name(&other)),
+        };
+        let result = self.inner.crush_array(&items, query, bias);
+        let kept_json = serde_json::to_string(&serde_json::Value::Array(result.items))
+            .expect("serialize kept items");
+        build_crush_array_dict(
+            py,
+            kept_json,
+            result.ccr_hash,
+            result.dropped_summary,
+            result.strategy_info,
+            result.compacted,
+            result.compaction_kind,
+        )
+    }
+
+    /// Look up an original payload by CCR hash.
+    ///
+    /// When the lossy path drops rows, it stashes the **full original**
+    /// array into the in-memory CCR store keyed by the 12-char hash
+    /// embedded in the prompt's `<<ccr:HASH ...>>` marker. The runtime
+    /// (proxy server / MCP retrieval tool) calls this to serve the
+    /// dropped rows back to the LLM on demand.
+    ///
+    /// Returns the canonical-JSON serialization of the original
+    /// `[item, item, ...]` array, or `None` if the hash is unknown,
+    /// expired, or the crusher was constructed without a CCR store.
+    fn ccr_get(&self, hash: &str) -> Option<String> {
+        self.inner.ccr_store().and_then(|s| s.get(hash))
+    }
+
+    /// Number of entries currently held by the CCR store. `0` if no
+    /// store is configured. Informational; use it from tests and
+    /// telemetry, not from the retrieval hot path.
+    fn ccr_len(&self) -> usize {
+        self.inner.ccr_store().map(|s| s.len()).unwrap_or(0)
     }
 }
 

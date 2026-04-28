@@ -195,6 +195,44 @@ class SmartCrusher(Transform):
             strategy=r.strategy,
         )
 
+    def crush_array_json(
+        self,
+        items_json: str,
+        query: str = "",
+        bias: float = 1.0,
+    ) -> dict[str, Any]:
+        """Crush a JSON array directly and surface the structured result.
+
+        Returns a dict with `items` (kept rows as JSON), `ccr_hash` (12-char
+        hash if rows were dropped), `dropped_summary` (the marker text),
+        `strategy_info`, `compacted` (rendered bytes when lossless won),
+        and `compaction_kind`.
+
+        Used by tests and by the proxy's CCR retrieval flow when it needs
+        the hash directly rather than parsing it out of a prompt marker.
+        """
+        result: dict[str, Any] = self._rust.crush_array_json(items_json, query, bias)
+        return result
+
+    def ccr_get(self, hash_key: str) -> str | None:
+        """Look up an original payload by CCR hash from the Rust store.
+
+        Returns the canonical-JSON serialization of the original
+        `[item, item, ...]` array that the lossy path stashed before
+        emitting `<<ccr:HASH ...>>`. Returns ``None`` if the hash is
+        unknown, expired, or no store is configured.
+
+        Used by the proxy's CCR retrieval tool to serve the dropped
+        rows back to the LLM on demand.
+        """
+        result: str | None = self._rust.ccr_get(hash_key)
+        return result
+
+    def ccr_len(self) -> int:
+        """Number of entries currently held by the Rust CCR store."""
+        n: int = self._rust.ccr_len()
+        return n
+
     def _smart_crush_content(
         self,
         content: str,

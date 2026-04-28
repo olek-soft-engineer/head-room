@@ -1369,6 +1369,7 @@ version = "0.1.0"
 dependencies = [
  "headroom-core",
  "pyo3",
+ "serde_json",
 ]
 
 [[package]]

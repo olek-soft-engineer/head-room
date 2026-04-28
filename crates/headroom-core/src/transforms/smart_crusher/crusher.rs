@@ -33,6 +33,8 @@
 //! Python side, locking byte-equal output. The TOIN/CCR/feedback
 //! integration ports happen later (Stage 3c.2 follow-ups).
 
+use std::sync::Arc;
+
 use serde_json::Value;
 
 use super::analyzer::SmartAnalyzer;
@@ -44,6 +46,7 @@ use super::crushers::{compute_k_split, crush_number_array, crush_object, crush_s
 use super::planning::SmartCrusherPlanner;
 use super::traits::{Constraint, CrushEvent, Observer};
 use super::types::{CompressionPlan, CompressionStrategy, CrushResult};
+use crate::ccr::CcrStore;
 use crate::relevance::RelevanceScorer;
 use crate::transforms::adaptive_sizer::compute_optimal_k;
 use crate::transforms::anchor_selector::AnchorSelector;
@@ -119,6 +122,16 @@ pub struct SmartCrusher {
     /// the lossy path on success. When `None` (default OSS), parity
     /// with the pre-PR2 lossy-only pipeline is preserved exactly.
     pub compaction: Option<CompactionStage>,
+    /// Optional CCR store. When set, the lossy path stashes the **full
+    /// original** array into the store keyed by `ccr_hash` before
+    /// returning — the runtime can then serve dropped rows back via
+    /// retrieval tool calls. When `None`, hashes are still emitted but
+    /// nothing is stored (legacy / parity mode).
+    ///
+    /// `Arc` so callers can keep their own handle to the same store
+    /// (e.g. the proxy server holds it for retrieval lookups while
+    /// SmartCrusher writes through it).
+    pub ccr_store: Option<Arc<dyn CcrStore>>,
 }
 
 impl SmartCrusher {
@@ -141,6 +154,7 @@ impl SmartCrusher {
         SmartCrusherBuilder::new(config)
             .with_default_oss_setup()
             .with_default_compaction()
+            .with_default_ccr_store()
             .build()
     }
 
@@ -158,6 +172,7 @@ impl SmartCrusher {
     pub fn without_compaction(config: SmartCrusherConfig) -> Self {
         SmartCrusherBuilder::new(config)
             .with_default_oss_setup()
+            .with_default_ccr_store()
             .build()
     }
 
@@ -195,6 +210,7 @@ impl SmartCrusher {
         constraints: Vec<Box<dyn Constraint>>,
         observers: Vec<Box<dyn Observer>>,
         compaction: Option<CompactionStage>,
+        ccr_store: Option<Arc<dyn CcrStore>>,
     ) -> Self {
         SmartCrusher {
             config,
@@ -204,7 +220,15 @@ impl SmartCrusher {
             constraints,
             observers,
             compaction,
+            ccr_store,
         }
+    }
+
+    /// Handle to the CCR store, if configured. Used by the runtime
+    /// (proxy server, PyO3 bridge) to look up originals when retrieval
+    /// tool calls fire.
+    pub fn ccr_store(&self) -> Option<&Arc<dyn CcrStore>> {
+        self.ccr_store.as_ref()
     }
 
     fn planner(&self) -> SmartCrusherPlanner<'_> {
@@ -544,10 +568,19 @@ impl SmartCrusher {
         let result = self.execute_plan(&plan, items);
 
         // Emit CCR-Dropped marker iff rows were actually dropped.
+        // **This is the cornerstone of CCR's no-data-loss guarantee:**
+        // we hash the full original, stash it in the configured store,
+        // and emit a marker pointing at that hash. The runtime later
+        // serves the original back via retrieval tool calls.
         let dropped_count = items.len().saturating_sub(result.len());
         let (ccr_hash, dropped_summary) = if dropped_count > 0 {
             let h = hash_array_for_ccr(items);
             let marker = format!("<<ccr:{h} {dropped_count}_rows_offloaded>>");
+            if let Some(store) = &self.ccr_store {
+                let canonical =
+                    serde_json::to_string(&Value::Array(items.to_vec())).unwrap_or_default();
+                store.put(&h, &canonical);
+            }
             (Some(h), marker)
         } else {
             (None, String::new())
