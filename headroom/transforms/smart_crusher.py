@@ -18,23 +18,27 @@ The `headroom._core` extension is a hard import: there is no Python
 fallback. Build it locally with `scripts/build_rust_extension.sh`
 (wraps `maturin develop`) or install a prebuilt wheel.
 
-# Functionality state (post-audit, 2026-04-28)
+# Functionality state (post-audit, 2026-04-29)
 
 - **TOIN learning** — re-attached. `crush()` and `_smart_crush_content`
   call `toin.record_compression()` after a real compression (filtered on
   `strategy != "passthrough"` to ignore JSON re-canonicalization).
   The retired Python class did this inline; the bridge keeps the
   highest-traffic strategy fueling the learning loop.
-- **CCR marker emission** — partial gap. The Rust port emits
-  `<<ccr:HASH N_rows_offloaded>>` markers unconditionally as part of
-  `dropped_summary`; the `ccr_config.inject_retrieval_marker=False`
-  knob is therefore not honored end-to-end. The shim now logs a
-  WARNING when callers pass `False`. Suppression needs a Rust-side
-  gate; see RUST_DEV.md.
-- **Custom relevance scorer / scorer override** — still not wired.
-  `relevance_config` and `scorer` constructor args are accepted for
-  source compat but the Rust default `HybridScorer` is always used.
-  The shim now logs a WARNING (was: debug) when these are passed.
+- **CCR marker emission** — honored end-to-end. Both
+  `ccr_config.enabled=False` and
+  `ccr_config.inject_retrieval_marker=False` flip the Rust crusher's
+  `enable_ccr_marker` field; the lossy row-drop path then skips both
+  the marker text and the CCR store write. Scope: gates only the
+  row-drop sentinel path. Stage-3c.2 opaque-string CCR substitutions
+  still emit always — they have no Python equivalent.
+- **Custom relevance scorer / scorer override** — fails loud.
+  `relevance_config` and `scorer` constructor args remain in the
+  signature for source compat, but the shim raises
+  `NotImplementedError` when either is non-None. Silently dropping a
+  user-supplied scorer is a silent-fallback bug we explicitly refuse
+  to ship; full plumbing lands with Stage-3c.2's relevance-crate
+  Python bridge.
 """
 
 from __future__ import annotations
@@ -176,37 +180,39 @@ class SmartCrusher(Transform):
         self._observer = observer
 
         # CCR config is preserved on `self` for callers that read it
-        # back (`headroom.proxy.server` does). Storage-side semantics
-        # (CCR cache lookups) are honored via the Rust crusher's own
-        # CCR store. *Marker emission* is the gap: the Rust port emits
-        # `<<ccr:HASH N_rows_offloaded>>` markers unconditionally as
-        # part of `dropped_summary`, so `inject_retrieval_marker=False`
-        # has no effect on the prompt today. We log a WARNING (not
-        # debug) so it's visible. Suppression of marker emission needs
-        # a Rust-side gate; tracked in RUST_DEV.md.
+        # back (`headroom.proxy.server` does). Both `enabled=False` and
+        # `inject_retrieval_marker=False` collapse to the Rust crusher's
+        # `enable_ccr_marker=False` gate — when either is off, the
+        # lossy row-drop path skips marker emission AND the CCR store
+        # write (no point storing a payload nothing in the prompt can
+        # reference; storing it under `enabled=False` would also be a
+        # surprise side effect the user explicitly disabled).
+        #
+        # Scope: gates ONLY the row-drop sentinel path. Stage-3c.2
+        # opaque-string CCR substitutions still emit always — they have
+        # no Python equivalent and no production caller has asked for
+        # them to be suppressed.
         if ccr_config is None:
             self._ccr_config = CCRConfig(enabled=True, inject_retrieval_marker=False)
         else:
             self._ccr_config = ccr_config
-        if not self._ccr_config.inject_retrieval_marker:
-            logger.warning(
-                "SmartCrusher: ccr_config.inject_retrieval_marker=False "
-                "is currently NOT honored by the Rust port — CCR row-drop "
-                "markers (`<<ccr:HASH N_rows_offloaded>>`) will still appear "
-                "in compressed output. Tracked as a known regression in "
-                "RUST_DEV.md until a Rust-side gate lands."
-            )
 
-        # `relevance_config` and `scorer` are accepted for source
-        # compatibility but currently dropped — Stage 3c.1 ships with
-        # the Rust default `HybridScorer`. Custom scorers re-attach in
-        # Stage 3c.2 when the relevance crate gains a Python-bridged
-        # constructor surface.
+        # `relevance_config` and `scorer` remain in the signature for
+        # source compatibility, but the Rust port doesn't support
+        # overrides yet (it always uses `HybridScorer` from the
+        # relevance crate; the Python-bridged constructor surface
+        # arrives in Stage 3c.2). Silently dropping a user-supplied
+        # scorer would be a textbook silent fallback — if a caller
+        # depends on a custom scoring function and we ignore it, the
+        # compression they get back is wrong in a way they cannot see.
+        # Fail loud instead. See `feedback_no_silent_fallbacks.md`.
         if relevance_config is not None or scorer is not None:
-            logger.warning(
-                "SmartCrusher: custom relevance_config/scorer args are "
-                "currently ignored (Rust port uses default HybridScorer). "
-                "Tracked as a known regression in RUST_DEV.md."
+            raise NotImplementedError(
+                "SmartCrusher: custom `relevance_config` / `scorer` "
+                "overrides are not yet supported by the Rust-backed "
+                "implementation. Pass `None` to use the default "
+                "HybridScorer. Tracked in RUST_DEV.md; full support "
+                "lands with Stage 3c.2's relevance-crate Python bridge."
             )
 
         # Lazy TOIN handle. Loaded on first compression that has items
@@ -236,6 +242,9 @@ class SmartCrusher(Transform):
             first_fraction=cfg.first_fraction,
             last_fraction=cfg.last_fraction,
             relevance_threshold=0.3,
+            enable_ccr_marker=(
+                self._ccr_config.enabled and self._ccr_config.inject_retrieval_marker
+            ),
         )
         # Default: lossless-first compaction (PR4). Lossless wins for
         # cleanly tabular input where it saves ≥ 30% bytes; otherwise
