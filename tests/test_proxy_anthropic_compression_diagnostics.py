@@ -142,12 +142,12 @@ def test_optimization_failure_logs_exception_type() -> None:
 
         assert response.status_code == 200, response.text
         warning_msgs = [
-            call.args[0] for call in mock_warning.call_args_list
+            call.args[0]
+            for call in mock_warning.call_args_list
             if call.args and "Optimization failed" in str(call.args[0])
         ]
         assert warning_msgs, (
-            f"expected an 'Optimization failed' warning, got calls: "
-            f"{mock_warning.call_args_list!r}"
+            f"expected an 'Optimization failed' warning, got calls: {mock_warning.call_args_list!r}"
         )
         msg = warning_msgs[0]
         assert "TimeoutError" in msg, f"expected exception type in warning, got: {msg!r}"
