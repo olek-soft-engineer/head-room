@@ -456,6 +456,7 @@ impl PySmartCrusherConfig {
         last_fraction = 0.15,
         relevance_threshold = 0.3,
         lossless_min_savings_ratio = 0.30,
+        enable_ccr_marker = true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -476,6 +477,7 @@ impl PySmartCrusherConfig {
         last_fraction: f64,
         relevance_threshold: f64,
         lossless_min_savings_ratio: f64,
+        enable_ccr_marker: bool,
     ) -> Self {
         Self {
             inner: RustSmartCrusherConfig {
@@ -496,6 +498,7 @@ impl PySmartCrusherConfig {
                 last_fraction,
                 relevance_threshold,
                 lossless_min_savings_ratio,
+                enable_ccr_marker,
             },
         }
     }
@@ -563,6 +566,10 @@ impl PySmartCrusherConfig {
     #[getter]
     fn relevance_threshold(&self) -> f64 {
         self.inner.relevance_threshold
+    }
+    #[getter]
+    fn enable_ccr_marker(&self) -> bool {
+        self.inner.enable_ccr_marker
     }
 
     fn __repr__(&self) -> String {

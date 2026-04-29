@@ -172,36 +172,99 @@ def test_non_json_input_does_not_record(fresh_toin):
 # ─── CCR marker knob ───────────────────────────────────────────────────
 
 
-def test_ccr_inject_marker_false_logs_warning(monkeypatch):
-    """Until the Rust port honors the marker-suppression flag, we want a
-    visible warning when callers ask for it. This guards against the
-    silent regression that started this audit.
-
-    Why monkeypatch instead of `caplog`: `caplog` flakes under the full
-    suite — earlier tests can leave `logging.disable()` or root-handler
-    state that suppresses the named logger's records before the
-    test's filter sees them. Patching `logger.warning` on the module
-    bypasses every level/disable/handler concern; we only assert that
-    the constructor *called* `logger.warning` with the flag name in
-    the message.
-    """
+def test_ccr_inject_marker_false_suppresses_markers_in_output(fresh_toin):
+    """`inject_retrieval_marker=False` is honored end-to-end now. The
+    Rust crusher's `enable_ccr_marker` flips off and the lossy path
+    skips both the `<<ccr:HASH>>` marker text and the CCR store write.
+    Compression itself still happens — rows still drop — just without
+    a retrieval pointer in the prompt."""
     from headroom.config import CCRConfig
-    from headroom.transforms import smart_crusher as sc_module
 
-    captured: list[str] = []
-    real_warning = sc_module.logger.warning
-
-    def _capture(msg: str, *args: object, **kwargs: object) -> None:
-        captured.append(msg % args if args else msg)
-        real_warning(msg, *args, **kwargs)
-
-    monkeypatch.setattr(sc_module.logger, "warning", _capture)
-
-    SmartCrusher(
+    crusher = SmartCrusher(
         SmartCrusherConfig(),
         ccr_config=CCRConfig(enabled=True, inject_retrieval_marker=False),
     )
+    payload = _bigger_array(60)
+    result = crusher.crush(payload, query="", bias=1.0)
 
-    assert any("inject_retrieval_marker=False" in m for m in captured), (
-        "expected a WARNING about the unsupported marker-suppression flag"
+    if result.strategy == "passthrough":
+        pytest.skip("payload didn't trigger compression — bump the size")
+
+    assert "<<ccr:" not in result.compressed, f"expected no marker, got: {result.compressed!r}"
+    assert "_ccr_dropped" not in result.compressed
+
+
+def test_ccr_inject_marker_true_emits_markers_when_lossy(fresh_toin):
+    """The opt-in case keeps marker emission on. If the lossy path
+    runs (which it should for a sufficiently big crushable payload),
+    the `<<ccr:HASH>>` marker appears in the compressed output."""
+    from headroom.config import CCRConfig
+
+    crusher = SmartCrusher(
+        SmartCrusherConfig(),
+        ccr_config=CCRConfig(enabled=True, inject_retrieval_marker=True),
     )
+    payload = _bigger_array(60)
+    result = crusher.crush(payload, query="", bias=1.0)
+
+    if result.strategy == "passthrough":
+        pytest.skip("payload didn't trigger compression")
+    # If lossless won, marker won't appear (no row drops). If lossy
+    # ran on these uniform `{status, tag, n}` records, we expect rows
+    # to drop and the marker to fire.
+    if "lossy" in result.strategy or "row" in result.strategy.lower():
+        assert "<<ccr:" in result.compressed
+
+
+def test_ccr_enabled_false_suppresses_markers_in_output(fresh_toin):
+    """`CCRConfig.enabled=False` is the master kill-switch and must
+    behave the same as `inject_retrieval_marker=False`: no marker text,
+    no sentinel key, no CCR store write. Both flags collapse to the
+    Rust-side `enable_ccr_marker=False` gate; storing a payload under
+    `enabled=False` would be a surprise side effect the user
+    explicitly opted out of."""
+    from headroom.config import CCRConfig
+
+    crusher = SmartCrusher(
+        SmartCrusherConfig(),
+        # Note: inject_retrieval_marker stays True — we want to prove
+        # `enabled=False` alone is enough to suppress.
+        ccr_config=CCRConfig(enabled=False, inject_retrieval_marker=True),
+    )
+    payload = _bigger_array(60)
+    result = crusher.crush(payload, query="", bias=1.0)
+
+    if result.strategy == "passthrough":
+        pytest.skip("payload didn't trigger compression — bump the size")
+
+    assert "<<ccr:" not in result.compressed, f"expected no marker, got: {result.compressed!r}"
+    assert "_ccr_dropped" not in result.compressed
+
+
+# ─── Custom scorer / relevance_config override ─────────────────────────
+
+
+def test_custom_scorer_arg_raises_not_implemented():
+    """The Rust port doesn't support custom scorers yet. Silently
+    dropping a user-supplied scorer would be a textbook silent
+    fallback (the user's scoring logic gets ignored, compression
+    looks fine but is wrong). Fail loud instead."""
+
+    class FakeScorer:
+        pass
+
+    with pytest.raises(NotImplementedError, match="relevance_config.*scorer"):
+        SmartCrusher(SmartCrusherConfig(), scorer=FakeScorer())
+
+
+def test_custom_relevance_config_arg_raises_not_implemented():
+    """Same fail-loud contract for `relevance_config`."""
+    with pytest.raises(NotImplementedError, match="relevance_config.*scorer"):
+        SmartCrusher(SmartCrusherConfig(), relevance_config={"alpha": 0.7})
+
+
+def test_default_construction_still_works():
+    """Sanity: the audit fail-loud only triggers when the user passes
+    one of the unsupported args. Default `SmartCrusher()` still
+    constructs fine."""
+    SmartCrusher(SmartCrusherConfig())  # no raise
