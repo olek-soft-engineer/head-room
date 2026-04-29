@@ -188,12 +188,21 @@ class SmartCrusher(Transform):
         # reference; storing it under `enabled=False` would also be a
         # surprise side effect the user explicitly disabled).
         #
+        # Default falls through to `CCRConfig()` so direct callers
+        # (the proxy and tests that don't pass an explicit config) get
+        # the documented dataclass defaults (`enabled=True,
+        # inject_retrieval_marker=True`). The previous override here
+        # set `inject_retrieval_marker=False` as a no-op-intent hack
+        # back when the Rust port silently ignored the flag; now that
+        # the flag is honored, that override would actively suppress
+        # markers + store writes for every caller.
+        #
         # Scope: gates ONLY the row-drop sentinel path. Stage-3c.2
         # opaque-string CCR substitutions still emit always — they have
         # no Python equivalent and no production caller has asked for
         # them to be suppressed.
         if ccr_config is None:
-            self._ccr_config = CCRConfig(enabled=True, inject_retrieval_marker=False)
+            self._ccr_config = CCRConfig()
         else:
             self._ccr_config = ccr_config
 
