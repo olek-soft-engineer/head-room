@@ -22,6 +22,7 @@ pub mod detection;
 pub mod diff_compressor;
 pub mod log_compressor;
 pub mod magika_detector;
+pub mod pipeline;
 pub mod search_compressor;
 pub mod smart_crusher;
 pub mod unidiff_detector;
@@ -38,6 +39,11 @@ pub use log_compressor::{
     LogLevel, LogLine,
 };
 pub use magika_detector::{magika_detect, map_magika_label, MagikaDetectorError};
+pub use pipeline::{
+    CompressionContext, CompressionPipeline, CompressionPipelineBuilder, JsonMinifier,
+    LineImportanceFilter, LineImportanceFilterConfig, LosslessTransform, LossyTransform,
+    PipelineConfig, PipelineResult, TransformError, TransformResult,
+};
 pub use search_compressor::{
     FileMatches, SearchCompressionResult, SearchCompressor, SearchCompressorConfig,
     SearchCompressorStats, SearchMatch,
