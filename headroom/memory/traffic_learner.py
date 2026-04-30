@@ -827,9 +827,7 @@ class TrafficLearner:
             # reads, not a recovery, and emitting a rule is actively wrong.
             if not _paths_related_as_typo(error_path, success_path):
                 return None
-            content = (
-                f"File `{error_path}` does not exist. The correct path is `{success_path}`."
-            )
+            content = f"File `{error_path}` does not exist. The correct path is `{success_path}`."
             return ExtractedPattern(
                 category=PatternCategory.ERROR_RECOVERY,
                 content=content,
