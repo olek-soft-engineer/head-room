@@ -868,6 +868,34 @@ class TestFlushToFile:
         assert "python3" in recs[0].content
 
     @pytest.mark.asyncio
+    async def test_shutdown_flush_respects_min_evidence(self, tmp_path, monkeypatch):
+        """Regression: stop() must not bypass the evidence gate.
+
+        Earlier behavior collapsed min_evidence to 1 at shutdown, persisting
+        every singleton pattern. This is exactly inverted: singletons are the
+        *least* trustworthy patterns. The gate must use self._min_evidence at
+        all times, including stop()'s final flush.
+        """
+        writer = _FakeWriter()
+        proj = _make_project(str(tmp_path))
+        plugin = _FakePlugin(roots=[proj], writer=writer)
+        _install_plugin_registry(monkeypatch, plugin)
+
+        learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=5)
+        # Singleton pattern: should NOT survive the shutdown flush.
+        learner._pattern_counts["h"] = (
+            ExtractedPattern(
+                category=PatternCategory.ENVIRONMENT,
+                content=f"singleton at {tmp_path}/main.py",
+                importance=0.5,
+                evidence_count=1,
+            ),
+            1,
+        )
+        await learner.stop()  # triggers a final flush_to_file
+        assert writer.calls == [], "singleton survived the shutdown gate"
+
+    @pytest.mark.asyncio
     async def test_early_returns_no_plugin(self, monkeypatch):
         """No plugin detected → flush is a no-op."""
         learner = TrafficLearner(backend=None, agent_type="unknown", min_evidence=1)
