@@ -69,6 +69,13 @@ magika = "1"
 # bring `encoding_rs` for non-UTF8 sniffing — we keep them on for
 # compatibility with arbitrary tool outputs.
 unidiff = "0.4"
+# `aho-corasick` powers the Tier-3 KeywordDetector in `signals/`.
+# A single deterministic-finite-automaton scan finds every keyword
+# in a line in O(n + m) — orders of magnitude faster than running N
+# regex .search() calls and harder to misuse. Word-boundary checks
+# happen as a post-filter on the byte offsets the automaton returns.
+# Default features (std, perf-literal) keep the build small.
+aho-corasick = "1"
 
 [dev-dependencies]
 proptest = "1"

@@ -183,6 +183,45 @@ so they don't regress further or get forgotten.
 | Adaptive context windows | Honored byte-for-byte (parity fixture-locked). |
 | TOIN integration | Never had one — DiffCompressor records via `_record_to_toin` in ContentRouter, which already runs for non-SmartCrusher strategies. No regression. |
 
+### Phase 3e.1 — `signals/` trait module + KeywordDetector (2026-04-29)
+
+The Python `error_detection.py` regex registry was retired and reborn as a
+trait + tier system in `crates/headroom-core/src/signals/`. See
+`signals/README.md` for the full architecture; the highlights:
+
+- **Per-granularity traits.** `LineImportanceDetector` ships today; future
+  `ContentTypeDetector` and `ItemImportanceDetector<I>` will follow as their
+  consumers get touched.
+- **`Tiered<T>` combinator.** Composition, not inheritance. Future ML
+  detectors slot in as new tiers without changes to `KeywordDetector` or
+  any caller.
+- **One concrete impl.** `KeywordDetector` (aho-corasick) is the only tier
+  registered today. **No NoOp/stub impls** — per project no-silent-fallbacks
+  rule, future tiers land with their real implementations.
+- **Bug fixes baked in.** `ERROR_KEYWORDS` regex now includes
+  `timeout|abort|denied|rejected` (previously drifted from the keyword set);
+  `token` dropped from `SECURITY_KEYWORDS` (false-positived on every LLM
+  metric reference). Both fixed in the Python regex too via the shim that
+  recompiles patterns from the Rust-exposed keyword tables.
+- **Companion canonical extension path.** `signals/README.md` documents
+  the BGE classifier head — a 384-dim → 4-class softmax on top of the
+  already-loaded `bge-small-en-v1.5` embedder — as the natural ML tier.
+  Two alternatives kept open: distilled tinyBERT in ONNX, logistic
+  regression on lexical features.
+
+### Phase 3g (queued) — Compression Pipeline Formalization (issue #315)
+
+Strategic decision 2026-04-29: after Phase 3e (compressor ports) and
+Phase 3f (Rust MCP scaffold) wrap, formalize the lossless-then-lossy-
+then-CCR ordering as a cross-cutting `CompressionPipeline` orchestrator
++ `LosslessTransform` / `LossyTransform` traits in
+`crates/headroom-core/src/pipeline/`. Existing compressors get
+refactored as compositions of pluggable transforms. The crucial design
+choice — **parsers for structure, models at the prose/structure
+boundary** — is captured in issue #315 and
+`memory/project_lossless_first_pipeline.md`. Do NOT start coding before
+3e/3f finish.
+
 ### Watch list (potential regressions, not yet audited)
 
 - `CCRConfig.enabled=False` end-to-end — **closed 2026-04-29**. Both `enabled=False` and `inject_retrieval_marker=False` collapse to the same Rust `enable_ccr_marker=False` gate (no marker, no store write). See the SmartCrusher table above.

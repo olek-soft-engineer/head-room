@@ -15,6 +15,9 @@
 
 use std::collections::BTreeMap;
 
+use headroom_core::signals::{
+    ImportanceCategory, ImportanceContext, KeywordDetector, KeywordRegistry, LineImportanceDetector,
+};
 use headroom_core::transforms::smart_crusher::compaction::DocumentCompactor;
 use headroom_core::transforms::smart_crusher::{
     CrushResult as RustCrushResult, SmartCrusher as RustSmartCrusher,
@@ -926,6 +929,91 @@ const _: fn() = || {
     let _ = RustContentType::PlainText;
 };
 
+// ─── signals: line-importance detector bridge ────────────────────────────
+//
+// One process-wide [`KeywordDetector`] is shared via `OnceLock` because
+// the underlying aho-corasick automaton is stateless and cheap to clone
+// nothing on call. The Python shim re-exports the keyword tables and a
+// pair of thin functions; that's enough surface for the legacy
+// `error_detection` callers without dragging the trait into Python.
+
+use std::sync::OnceLock;
+
+fn shared_keyword_detector() -> &'static KeywordDetector {
+    static DETECTOR: OnceLock<KeywordDetector> = OnceLock::new();
+    DETECTOR.get_or_init(KeywordDetector::new)
+}
+
+/// Returns `Some(ctx)` for known names and `None` otherwise — caller
+/// converts to PyValueError. Avoids the pyo3-0.22 + clippy
+/// `useless_conversion` false positive that fires when `?` propagates a
+/// `PyResult<_>` through another `PyResult<_>`.
+fn ctx_from_str(name: &str) -> Option<ImportanceContext> {
+    match name {
+        "text" => Some(ImportanceContext::Text),
+        "search" => Some(ImportanceContext::Search),
+        "diff" => Some(ImportanceContext::Diff),
+        "log" => Some(ImportanceContext::Log),
+        _ => None,
+    }
+}
+
+fn category_to_str(cat: ImportanceCategory) -> &'static str {
+    match cat {
+        ImportanceCategory::Error => "error",
+        ImportanceCategory::Warning => "warning",
+        ImportanceCategory::Importance => "importance",
+        ImportanceCategory::Security => "security",
+        ImportanceCategory::Markdown => "markdown",
+    }
+}
+
+/// Score a line against the default Headroom keyword detector.
+///
+/// Returns `Some((category | None, priority, confidence))` for known
+/// contexts (`text|search|diff|log`) and `None` for an unknown context
+/// — the Python shim translates `None` into `ValueError` for the
+/// caller. Returning `Option` instead of `PyResult` dodges the
+/// pyo3-0.22 + clippy `useless_conversion` false positive that the
+/// `#[pyfunction]` macro triggers when its inner result-shape carries
+/// `PyErr`. The bridge layer is the right place for this conversion;
+/// keeping the Rust signature panic-free and `PyResult`-free is worth
+/// a one-line shim on the Python side.
+#[pyfunction]
+#[pyo3(signature = (line, context = "text"))]
+fn score_line(line: &str, context: &str) -> Option<(Option<&'static str>, f32, f32)> {
+    let ctx = ctx_from_str(context)?;
+    let signal = shared_keyword_detector().score(line, ctx);
+    Some((
+        signal.category.map(category_to_str),
+        signal.priority,
+        signal.confidence,
+    ))
+}
+
+/// Lax substring check: does `text` contain any error indicator? Mirrors
+/// Python `error_detection.content_has_error_indicators`.
+#[pyfunction]
+fn content_has_error_indicators(text: &str) -> bool {
+    shared_keyword_detector().contains_error_indicator(text)
+}
+
+/// Snapshot of the default keyword sets, exposed as a dict so the Python
+/// shim can recompile the legacy `re.Pattern` objects without
+/// re-declaring keyword data on the Python side. Uses `.unwrap()` on
+/// `set_item` because keys are static str literals and values are
+/// `Vec<&'static str>`, which can't fail — and avoids the pyo3-0.22
+/// `useless_conversion` clippy false positive.
+#[pyfunction]
+fn keyword_registry_snapshot(py: Python<'_>) -> Py<PyDict> {
+    let registry = KeywordRegistry::default_set();
+    let dict = PyDict::new_bound(py);
+    for (key, words) in registry.as_map() {
+        dict.set_item(key, words).unwrap();
+    }
+    dict.unbind()
+}
+
 // ─── Module init ───────────────────────────────────────────────────────────
 
 #[pymodule]
@@ -941,5 +1029,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDetectionResult>()?;
     m.add_function(wrap_pyfunction!(detect_content_type, m)?)?;
     m.add_function(wrap_pyfunction!(is_json_array_of_dicts, m)?)?;
+    m.add_function(wrap_pyfunction!(score_line, m)?)?;
+    m.add_function(wrap_pyfunction!(content_has_error_indicators, m)?)?;
+    m.add_function(wrap_pyfunction!(keyword_registry_snapshot, m)?)?;
     Ok(())
 }
