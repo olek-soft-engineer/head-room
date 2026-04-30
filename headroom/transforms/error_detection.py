@@ -10,9 +10,9 @@ Phase 3e.1 ported the keyword data + scoring logic to
    truth.
 2. Re-exports the legacy ``frozenset`` and compiled-regex names
    (``ERROR_KEYWORDS``, ``ERROR_PATTERN``, ``PRIORITY_PATTERNS_TEXT``,
-   …) so the existing callers in ``text_compressor``,
-   ``search_compressor``, ``diff_compressor``, and
-   ``intelligent_context`` keep working without same-PR refactors.
+   …) so the existing callers in ``search_compressor``,
+   ``diff_compressor``, and ``intelligent_context`` keep working
+   without same-PR refactors.
 3. Delegates ``content_has_error_indicators`` to the Rust
    aho-corasick automaton.
 

@@ -5,7 +5,7 @@ the keyword tables exposed by the Rust `headroom._core.signals` module.
 These tests pin:
 
 * The shim re-exports the legacy frozenset and Pattern names callers
-  rely on (text_compressor, search_compressor, intelligent_context).
+  rely on (search_compressor, intelligent_context).
 * Two bug fixes from the Rust port land in the Python regex too:
     1. ERROR_PATTERN now matches abort/timeout/denied/rejected (was a
        drift between ERROR_KEYWORDS and the compiled regex).
