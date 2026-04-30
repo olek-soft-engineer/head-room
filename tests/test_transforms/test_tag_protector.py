@@ -181,3 +181,65 @@ class TestRestoreTags:
         restored = restore_tags(cleaned, protected)
         assert "<system-reminder>Rule 1: always validate</system-reminder>" in restored
         assert "<tool_call>search(q='test')</tool_call>" in restored
+
+
+class TestBugFixesPhase3e4:
+    """Bug fixes baked into the Phase 3e.4 Rust port. Each test pins
+    behavior the Python regex implementation got wrong."""
+
+    def test_fixed_in_3e4_duplicate_blocks_get_distinct_placeholders(self):
+        """Bug #2: Python's `result.replace(orig, ph, 1)` replaces the
+        FIRST textual match of `orig`, not the matched offset. Two
+        identical custom-tag blocks in the same input collapsed to a
+        single placeholder + a stray duplicate of the second block.
+        The Rust walker emits offset-based output, so distinct blocks
+        always get distinct placeholders."""
+        text = (
+            "<system-reminder>same</system-reminder> middle <system-reminder>same</system-reminder>"
+        )
+        cleaned, protected = protect_tags(text)
+        assert len(protected) == 2
+        placeholders = {p[0] for p in protected}
+        assert len(placeholders) == 2  # two DIFFERENT placeholders
+        assert "<system-reminder>" not in cleaned
+        # Roundtrip is exact byte-for-byte.
+        assert restore_tags(cleaned, protected) == text
+
+    def test_fixed_in_3e4_handles_60_nested_custom_tags(self):
+        """Bug #3: Python had a hard `max_iterations = 50` safety cap
+        that quietly stopped protecting deeper nested input. The Rust
+        walker is bounded by input length only."""
+        depth = 60
+        text = "<lvl>" * depth + "core" + "</lvl>" * depth
+        cleaned, protected = protect_tags(text)
+        # Outermost span eats everything → ONE placeholder, no leaks.
+        assert "<lvl>" not in cleaned
+        assert "</lvl>" not in cleaned
+        assert len(protected) == 1
+        assert restore_tags(cleaned, protected) == text
+
+    def test_fixed_in_3e4_self_closing_duplicates_distinct(self):
+        """Bug #4: same first-occurrence-replace bug for self-closing
+        tags. Two identical `<marker/>` would collapse to one
+        placeholder + a stray dup."""
+        text = "<marker/> middle <marker/>"
+        cleaned, protected = protect_tags(text)
+        assert len(protected) == 2
+        assert protected[0][0] != protected[1][0]
+        assert "<marker/>" not in cleaned
+        assert restore_tags(cleaned, protected) == text
+
+    def test_fixed_in_3e4_placeholder_collision_avoided(self):
+        """Bug #5: input contains a literal `{{HEADROOM_TAG_…}}`
+        substring. Python silently used the same prefix and let the
+        collision break restoration. Rust salts the prefix when this
+        happens."""
+        text = (
+            "User wrote {{HEADROOM_TAG_0}} on purpose. <system-reminder>real one</system-reminder>"
+        )
+        cleaned, protected = protect_tags(text)
+        assert len(protected) == 1
+        # Placeholder picked must NOT collide with the user's literal.
+        assert protected[0][0] != "{{HEADROOM_TAG_0}}"
+        # Roundtrip is exact (the user's literal stays intact).
+        assert restore_tags(cleaned, protected) == text

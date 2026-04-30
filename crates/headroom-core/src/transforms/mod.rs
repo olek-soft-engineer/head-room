@@ -24,6 +24,7 @@ pub mod log_compressor;
 pub mod magika_detector;
 pub mod search_compressor;
 pub mod smart_crusher;
+pub mod tag_protector;
 pub mod unidiff_detector;
 
 pub use content_detector::{
@@ -42,4 +43,5 @@ pub use search_compressor::{
     FileMatches, SearchCompressionResult, SearchCompressor, SearchCompressorConfig,
     SearchCompressorStats, SearchMatch,
 };
+pub use tag_protector::{is_known_html_tag, protect_tags, restore_tags, ProtectStats};
 pub use unidiff_detector::{detect_diff, is_diff};
