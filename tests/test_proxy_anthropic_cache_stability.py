@@ -1445,8 +1445,8 @@ def test_issue_327_streaming_and_non_streaming_compute_same_frozen_count() -> No
 
         proxy = client.app.state.proxy
         fake_tracker = _FakePrefixTracker(frozen_count=12)
-        proxy.session_tracker_store.compute_session_id = (
-            lambda request, model, messages: "stream-parity-A"
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stream-parity-A"
         )
         proxy.session_tracker_store.get_or_create = lambda s, p: fake_tracker
         proxy._get_compression_cache = lambda s: fake_cache_a
@@ -1502,8 +1502,8 @@ def test_issue_327_streaming_and_non_streaming_compute_same_frozen_count() -> No
 
         proxy = client.app.state.proxy
         fake_tracker = _FakePrefixTracker(frozen_count=12)
-        proxy.session_tracker_store.compute_session_id = (
-            lambda request, model, messages: "stream-parity-B"
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "stream-parity-B"
         )
         proxy.session_tracker_store.get_or_create = lambda s, p: fake_tracker
         proxy._get_compression_cache = lambda s: fake_cache_b
