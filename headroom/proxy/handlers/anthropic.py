@@ -746,45 +746,33 @@ class AnthropicHandlerMixin:
                         # Zone 1: Swap cached compressed versions into working copy
                         working_messages = comp_cache.apply_cached(messages)
 
-                        # Re-freeze boundary: consecutive stable messages from start
+                        # Re-freeze boundary: consecutive stable messages from start.
                         # Safety: never freeze beyond provider-confirmed cached prefix.
+                        # `prefix_tracker.frozen_message_count` (set above) is the
+                        # AUTHORITATIVE positional truth — derived from Anthropic's
+                        # `cache_read_input_tokens` response. `compute_frozen_count`
+                        # provides a defensive lower bound from local cache state.
+                        # Use the smaller; never extend past what Anthropic actually
+                        # has cached.
+                        #
+                        # Issue #327: a previous version walked past
+                        # `prefix_tracker.frozen_message_count` whenever an upcoming
+                        # tool_result's content-hash matched `_stable_hashes` or
+                        # `should_defer_compression` returned True. That conflated
+                        # content equality with positional cache membership: the
+                        # prefix cache is positional (bytes 0..K cached, anything
+                        # past K is fresh), but `_stable_hashes` is content-keyed
+                        # and grows unbounded. On long Claude Code sessions where
+                        # tool_result content rhymes across turns (repeated system
+                        # prompts, repeated file reads, etc.), the walker advanced
+                        # `frozen_message_count` to `len(messages)` and the
+                        # pipeline produced `transforms_applied=[]` on 73% of
+                        # requests. The walker has been removed; trust
+                        # `prefix_tracker` clamped by `compute_frozen_count`.
                         cache_frozen_count = comp_cache.compute_frozen_count(messages)
                         frozen_message_count = min(frozen_message_count, cache_frozen_count)
                         # Record all tool_results in the verified frozen prefix as stable
                         comp_cache.mark_stable_from_messages(messages, frozen_message_count)
-
-                        # TTL-aware deferral: extend freeze to cover messages whose
-                        # first-time compression would bust the cache mid-TTL window.
-                        # This batches first-time compressions near the 5-min TTL
-                        # boundary, trading one big bust for many small ones.
-                        ttl_frozen = frozen_message_count
-                        from headroom.cache.compression_cache import (
-                            _extract_tool_result_content,
-                            _is_tool_result_message,
-                        )
-
-                        for idx in range(frozen_message_count, len(messages)):
-                            msg = messages[idx]
-                            if _is_tool_result_message(msg):
-                                tr_content = _extract_tool_result_content(msg)
-                                if tr_content is not None:
-                                    h = comp_cache.content_hash(tr_content)
-                                    # Already compressed or stable — keep going
-                                    if h in comp_cache._cache or h in comp_cache._stable_hashes:
-                                        ttl_frozen = idx + 1
-                                    elif comp_cache.should_defer_compression(h):
-                                        # New content within TTL — defer and freeze
-                                        comp_cache.mark_stable(h)
-                                        ttl_frozen = idx + 1
-                                    else:
-                                        break  # TTL expired — compress this turn
-                                else:
-                                    break
-                            else:
-                                # Non-tool_result messages are stable (user/assistant text)
-                                ttl_frozen = idx + 1
-
-                        frozen_message_count = ttl_frozen
 
                         async with stage_timer.measure("compression_first_stage"):
                             result = await asyncio.wait_for(

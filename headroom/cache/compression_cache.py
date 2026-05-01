@@ -83,6 +83,17 @@ class CompressionCache:
     def __init__(self, max_entries: int = 10000) -> None:
         self.max_entries = max_entries
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
+        # `_stable_hashes` is CONTENT-KEYED, not positional. It records "we
+        # have seen this content before and it is known not to compress
+        # further." It MUST NOT be used as a positional cache-safety gate
+        # — Anthropic's prefix cache is positional (bytes 0..K cached,
+        # anything past K fresh), and content-equality with an old message
+        # does not imply Anthropic has cached the new byte position. Issue
+        # #327 was caused by such a misuse in the Anthropic token-mode
+        # walker; the walker has been removed. Legitimate uses today:
+        # `compute_frozen_count` (bounded above by the `min` clamp at
+        # `proxy/handlers/anthropic.py`) and `update_from_result`'s
+        # "unchanged content" tracking.
         self._stable_hashes: set[str] = set()
         self._first_seen: dict[str, float] = {}
         self._hits: int = 0
