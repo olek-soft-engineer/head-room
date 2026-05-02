@@ -1,5 +1,15 @@
-//! Anthropic `/v1/messages` request compression — Phase B PR-B2
-//! live-zone dispatcher entry point.
+//! Anthropic `/v1/messages` request compression — live-zone
+//! dispatcher entry point.
+//!
+//! # Provider scope
+//!
+//! This module is **Anthropic-only**. The proxy gates compression
+//! on `path == "/v1/messages"` (see `compression::is_compressible_path`).
+//! OpenAI Chat Completions, OpenAI Responses, and Google Gemini
+//! each get their own sibling module in Phase C — they share
+//! [`headroom_core::transforms::LiveZoneOutcome`] and the
+//! per-content-type compressor backend, but the walkers are
+//! provider-specific because the request shapes diverge.
 //!
 //! # Pipeline
 //!
@@ -9,25 +19,29 @@
 //!    the body is parsed at all — when disabled, floor=0 without
 //!    inspection.
 //! 2. Hand the buffered body bytes to
-//!    [`headroom_core::transforms::compress_live_zone`]. The
-//!    dispatcher inspects the live zone (latest user message) and
-//!    dispatches per-block compression. PR-B2 wires every per-type
-//!    function to a no-op, so the dispatcher always returns
-//!    [`headroom_core::transforms::LiveZoneOutcome::NoChange`].
-//! 3. Translate the result into [`Outcome`] for the proxy: every
-//!    PR-B2 call lands on [`Outcome::NoCompression`].
+//!    [`headroom_core::transforms::compress_anthropic_live_zone`].
+//!    The dispatcher inspects the live zone (latest user message),
+//!    detects per-block content type, dispatches each block to the
+//!    matching compressor (SmartCrusher / LogCompressor /
+//!    SearchCompressor / DiffCompressor), and rewrites the body
+//!    via byte-range surgery so unmodified bytes round-trip
+//!    byte-equal.
+//! 3. Translate [`LiveZoneOutcome::Modified`] →
+//!    [`Outcome::Compressed`] (caller forwards the new body) or
+//!    [`LiveZoneOutcome::NoChange`] → [`Outcome::NoCompression`]
+//!    (caller forwards the original body verbatim).
 //!
 //! # Cache-safety invariant
 //!
-//! The dispatcher does not mutate any byte in the request body for
-//! PR-B2. The proxy's `proxy.rs` forwards the *original* buffered
-//! bytes verbatim. Phase A's SHA-256 fixtures still pass: the
-//! introduction of dispatching (vs. unconditional passthrough)
-//! changes log lines but no upstream-bound bytes.
+//! Bytes outside the rewritten block round-trip byte-equal. The
+//! `byte_fidelity_outside_compressed_block` integration test in
+//! `crates/headroom-core/tests/live_zone_dispatch.rs` pins the
+//! SHA-256 prefix-and-suffix invariant in CI.
 
 use bytes::Bytes;
 use headroom_core::transforms::{
-    compress_live_zone, AuthMode, BlockAction, ExclusionReason, LiveZoneError, LiveZoneOutcome,
+    compress_anthropic_live_zone, AuthMode, BlockAction, ExclusionReason, LiveZoneError,
+    LiveZoneOutcome,
 };
 
 use crate::compression::resolve_frozen_count;
@@ -139,10 +153,13 @@ pub fn compress_anthropic_request(
 
     let frozen_count = resolve_frozen_count(&parsed, cache_control_policy, request_id);
 
-    // Run the live-zone dispatcher. PR-B2: every block lands on a
-    // no-op compressor, so the result is always NoChange. PR-B3+
-    // begin returning Modified.
-    match compress_live_zone(body, frozen_count, AuthMode::Payg) {
+    // Run the live-zone dispatcher. PR-B3 wires per-type compressors:
+    // SmartCrusher / LogCompressor / SearchCompressor / DiffCompressor.
+    // The dispatcher returns `Modified` whenever at least one block
+    // was rewritten and `NoChange` otherwise (live zone empty, every
+    // compressor declined, or every compressor produced output that
+    // wasn't smaller than the input).
+    match compress_anthropic_live_zone(body, frozen_count, AuthMode::Payg) {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
             let block_count = manifest.block_outcomes.len();
             let blocks_excluded = manifest
@@ -163,7 +180,7 @@ pub fn compress_anthropic_request(
                 method = "POST",
                 compression_mode = mode.as_str(),
                 decision = "no_change",
-                reason = "no_op_skeleton_pr_b2",
+                reason = "no_block_compressed",
                 body_bytes = body.len(),
                 frozen_message_count = frozen_count,
                 messages_total = manifest.messages_total,
@@ -174,22 +191,62 @@ pub fn compress_anthropic_request(
             );
             Outcome::NoCompression
         }
-        Ok(LiveZoneOutcome::Modified { .. }) => {
-            // PR-B3+ will reach this arm. We keep it in B2 only as
-            // a debug_assert so an accidental early Modified emission
-            // surfaces immediately rather than producing a body
-            // we're not yet prepared to forward.
-            debug_assert!(
-                false,
-                "PR-B2 dispatcher must never return LiveZoneOutcome::Modified"
-            );
-            tracing::warn!(
+        Ok(LiveZoneOutcome::Modified { new_body, manifest }) => {
+            // Aggregate manifest into the proxy's `Compressed` payload.
+            // PR-B3 reports byte-counts (not token counts); PR-B4
+            // upgrades the gate to a tokenizer-validated count and
+            // updates these fields with the real numbers.
+            let mut original_bytes_total: usize = 0;
+            let mut compressed_bytes_total: usize = 0;
+            let mut strategies: Vec<&'static str> = Vec::new();
+            for entry in &manifest.block_outcomes {
+                if let BlockAction::Compressed {
+                    strategy,
+                    original_bytes,
+                    compressed_bytes,
+                } = entry.action
+                {
+                    original_bytes_total += original_bytes;
+                    compressed_bytes_total += compressed_bytes;
+                    if !strategies.contains(&strategy) {
+                        strategies.push(strategy);
+                    }
+                }
+            }
+            let body_bytes_in = body.len();
+            let new_body_bytes = Bytes::copy_from_slice(new_body.get().as_bytes());
+            let body_bytes_out = new_body_bytes.len();
+            let block_count = manifest.block_outcomes.len();
+            tracing::info!(
                 request_id = %request_id,
                 path = "/v1/messages",
-                "live-zone dispatcher emitted Modified outcome in PR-B2; \
-                 falling back to original bytes (this is a regression)"
+                method = "POST",
+                compression_mode = mode.as_str(),
+                decision = "compressed",
+                reason = "live_zone_blocks_rewritten",
+                body_bytes_in = body_bytes_in,
+                body_bytes_out = body_bytes_out,
+                bytes_freed = body_bytes_in.saturating_sub(body_bytes_out),
+                frozen_message_count = frozen_count,
+                messages_total = manifest.messages_total,
+                latest_user_message_index = ?manifest.latest_user_message_index,
+                live_zone_blocks = block_count,
+                live_zone_strategies = ?strategies,
+                live_zone_block_original_bytes = original_bytes_total,
+                live_zone_block_compressed_bytes = compressed_bytes_total,
+                "anthropic live-zone dispatch"
             );
-            Outcome::NoCompression
+            Outcome::Compressed {
+                body: new_body_bytes,
+                // PR-B4 will replace these with tokenizer counts.
+                // For now report block-content byte counts so
+                // observers can compute the savings ratio.
+                tokens_before: original_bytes_total,
+                tokens_after: compressed_bytes_total,
+                strategies_applied: strategies,
+                // PR-B7 wires CCR retrieval-marker injection.
+                markers_inserted: Vec::new(),
+            }
         }
         Err(LiveZoneError::BodyNotJson(_)) => {
             // We already parsed successfully above; the dispatcher's

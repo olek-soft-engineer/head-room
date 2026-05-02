@@ -38,8 +38,8 @@ pub use diff_compressor::{
     DiffCompressionResult, DiffCompressor, DiffCompressorConfig, DiffCompressorStats,
 };
 pub use live_zone::{
-    compress_live_zone, AuthMode, BlockAction, BlockOutcome, CompressionManifest, ExclusionReason,
-    LiveZoneError, LiveZoneOutcome,
+    compress_anthropic_live_zone, AuthMode, BlockAction, BlockOutcome, CompressionManifest,
+    ExclusionReason, LiveZoneError, LiveZoneOutcome,
 };
 pub use log_compressor::{
     LogCompressionResult, LogCompressor, LogCompressorConfig, LogCompressorStats, LogFormat,

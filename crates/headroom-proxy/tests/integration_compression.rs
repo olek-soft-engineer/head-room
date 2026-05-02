@@ -649,17 +649,18 @@ mod tracing_capture {
 
         let logs = String::from_utf8(buf.lock().unwrap().clone()).expect("logs are utf-8");
 
-        // PR-B2: live-zone dispatcher logs `decision="no_change"`
-        // with `reason="no_op_skeleton_pr_b2"` until PR-B3 wires
-        // per-type compressors. Pin the contract so a future
-        // refactor can't silently change the operator-facing log
-        // schema.
+        // PR-B3: live-zone dispatcher logs `decision="no_change"`
+        // with `reason="no_block_compressed"` when the live zone
+        // had no compressible blocks (or every compressor declined
+        // / produced larger output). The `decision="compressed"`
+        // path is exercised by
+        // `crates/headroom-core/tests/live_zone_dispatch.rs`.
         assert!(
             logs.contains(r#""decision":"no_change""#),
             "decision field missing or wrong; logs: {logs}",
         );
         assert!(
-            logs.contains(r#""reason":"no_op_skeleton_pr_b2""#),
+            logs.contains(r#""reason":"no_block_compressed""#),
             "reason field missing or wrong; logs: {logs}",
         );
         assert!(
