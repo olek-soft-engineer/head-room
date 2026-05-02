@@ -326,12 +326,14 @@ async fn passthrough_mode_off_byte_equal_sha256() {
 
 #[tokio::test]
 async fn passthrough_mode_live_zone_currently_passthrough_byte_equal_sha256() {
-    // PR-A1: live_zone is reserved for Phase B and currently falls
-    // through to passthrough WITH a warn log. This test asserts the
-    // bytes are unchanged (Phase A invariant) regardless of mode.
-    // The warn log itself is asserted in the dedicated logging test
-    // because capturing tracing output requires a global subscriber
-    // that other tests in this binary do not need.
+    // PR-B2: live-zone dispatcher is wired but every per-type
+    // compressor is still a no-op skeleton, so the proxy forwards
+    // the buffered body byte-equal. This test pins the cache-safety
+    // invariant for the live-zone path through the B2 → B3 → B4 →
+    // B7 transitions: no-op compressors must never mutate bytes.
+    // PR-B3+ replaces this guarantee with the per-type compressor
+    // contract (compress only the live zone; bytes outside the
+    // live zone byte-equal).
     let upstream = MockServer::start().await;
     let captured = mount_anthropic_capture(&upstream).await;
     let proxy = start_proxy_with(&upstream.uri(), |c| {
@@ -647,13 +649,17 @@ mod tracing_capture {
 
         let logs = String::from_utf8(buf.lock().unwrap().clone()).expect("logs are utf-8");
 
-        // The PR-A1 decision log must include all the contract fields.
+        // PR-B2: live-zone dispatcher logs `decision="no_change"`
+        // with `reason="no_op_skeleton_pr_b2"` until PR-B3 wires
+        // per-type compressors. Pin the contract so a future
+        // refactor can't silently change the operator-facing log
+        // schema.
         assert!(
-            logs.contains(r#""decision":"passthrough""#),
+            logs.contains(r#""decision":"no_change""#),
             "decision field missing or wrong; logs: {logs}",
         );
         assert!(
-            logs.contains(r#""reason":"phase_a_lockdown""#),
+            logs.contains(r#""reason":"no_op_skeleton_pr_b2""#),
             "reason field missing or wrong; logs: {logs}",
         );
         assert!(
@@ -664,11 +670,28 @@ mod tracing_capture {
             logs.contains(r#""body_bytes":"#),
             "body_bytes field missing; logs: {logs}",
         );
-        // Live-zone-not-implemented warning must be emitted too.
+        // The dispatcher exposes the manifest contract (frozen
+        // floor + messages_total + live_zone block counts) on
+        // every log line so operators can see why a request did
+        // or didn't compress without enabling debug logging.
         assert!(
-            logs.contains("compression mode 'live_zone' is reserved for Phase B")
-                || logs.contains(r#""phase":"A""#),
-            "live_zone warn log missing; logs: {logs}",
+            logs.contains(r#""frozen_message_count":"#),
+            "frozen_message_count field missing; logs: {logs}",
+        );
+        assert!(
+            logs.contains(r#""messages_total":"#),
+            "messages_total field missing; logs: {logs}",
+        );
+        assert!(
+            logs.contains(r#""live_zone_blocks":"#),
+            "live_zone_blocks field missing; logs: {logs}",
+        );
+        // The "reserved for Phase B" warning that PR-A1 emitted
+        // is intentionally gone post-PR-B2. Lock it out so a
+        // bad cherry-pick can't reintroduce a stale warning.
+        assert!(
+            !logs.contains("compression mode 'live_zone' is reserved for Phase B"),
+            "obsolete Phase A warning leaked into Phase B logs: {logs}",
         );
         // Sanity: we never log the Authorization header.
         assert!(

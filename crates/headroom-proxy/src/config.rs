@@ -203,9 +203,11 @@ pub struct CliArgs {
     /// Compression mode policy for `/v1/messages`.
     ///
     /// `off` (default): byte-faithful passthrough on every request.
-    /// `live_zone`: reserved for Phase B; in PR-A1 this parses-but-
-    /// warns and behaves identically to `off`. The flag exists so
-    /// Phase B can flip the default with one config change.
+    /// `live_zone`: PR-B2 wired the dispatcher; PR-B2's per-type
+    /// compressors are no-ops, so the body still round-trips
+    /// byte-equal until PR-B3+ (which fills the per-type table).
+    /// The flag exists so the default can flip in one config
+    /// change once `live_zone` is the safer choice on real traffic.
     ///
     /// Source priority: CLI flag → `HEADROOM_PROXY_COMPRESSION_MODE`
     /// env var → default (`off`).

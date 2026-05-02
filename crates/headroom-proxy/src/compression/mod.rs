@@ -33,9 +33,16 @@
 //! original body being forwarded unchanged.
 
 pub mod anthropic;
+pub mod live_zone_anthropic;
 pub mod model_limits;
 
-pub use anthropic::{compress_anthropic_request, resolve_frozen_count, Outcome, PassthroughReason};
+// PR-A4 helper for cache-control floor derivation lives on the
+// passthrough-stub module so PR-B2's live-zone dispatcher can call
+// it without dragging in the rest of `anthropic.rs`. The stub
+// itself stays through B1 → B2 transition for parallel review;
+// `compress_anthropic_request` is sourced from the live-zone module.
+pub use anthropic::resolve_frozen_count;
+pub use live_zone_anthropic::{compress_anthropic_request, Outcome, PassthroughReason};
 
 /// Does this request path target an LLM endpoint we know how to
 /// compress? Cheap pre-filter before buffering the body. Phase B

@@ -20,6 +20,7 @@ pub mod anchor_selector;
 pub mod content_detector;
 pub mod detection;
 pub mod diff_compressor;
+pub mod live_zone;
 pub mod log_compressor;
 pub mod magika_detector;
 pub mod pipeline;
@@ -35,6 +36,10 @@ pub use content_detector::{
 pub use detection::detect;
 pub use diff_compressor::{
     DiffCompressionResult, DiffCompressor, DiffCompressorConfig, DiffCompressorStats,
+};
+pub use live_zone::{
+    compress_live_zone, AuthMode, BlockAction, BlockOutcome, CompressionManifest, ExclusionReason,
+    LiveZoneError, LiveZoneOutcome,
 };
 pub use log_compressor::{
     LogCompressionResult, LogCompressor, LogCompressorConfig, LogCompressorStats, LogFormat,

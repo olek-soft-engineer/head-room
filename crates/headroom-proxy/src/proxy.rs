@@ -17,7 +17,7 @@ use futures_util::{StreamExt as _, TryStreamExt};
 use http_body_util::BodyExt;
 
 use crate::compression;
-use crate::config::{CompressionMode, Config};
+use crate::config::Config;
 use crate::error::ProxyError;
 use crate::headers::{build_forward_request_headers, filter_response_headers};
 use crate::health::{healthz, healthz_upstream};
@@ -324,42 +324,32 @@ async fn forward_http(
             }
         };
 
-        // PR-A1: live_zone is reserved for Phase B; in PR-A1 it
-        // parses-but-warns and behaves identically to off. Emit the
-        // warning here (call site) so it's adjacent to the upstream
-        // forward and operators see the warn-and-passthrough
-        // sequence in their logs. Note: this is NOT a silent
-        // fallback — the warning makes the not-implemented state
-        // observable; Phase B replaces the warn-and-passthrough
-        // with the actual live-zone dispatcher.
-        if state.config.compression_mode == CompressionMode::LiveZone {
-            tracing::warn!(
-                request_id = %request_id,
-                path = %path_for_log,
-                compression_mode = state.config.compression_mode.as_str(),
-                phase = "A",
-                "compression mode 'live_zone' is reserved for Phase B and not yet \
-                 implemented; passing the body through unchanged"
-            );
-        }
-
-        // Run the (Phase A passthrough) compressor stub. Its only
-        // side-effect is the per-request decision log line.
+        // PR-B2: live-zone dispatcher is now wired. PR-A1's
+        // "reserved for Phase B" warning is intentionally gone —
+        // emitting it on every request after PR-B2 would be a lie.
+        // Run the live-zone dispatcher (PR-B2). PR-B2 is still a
+        // skeleton: every block routes to a no-op compressor, so the
+        // outcome is always `NoCompression` (or a `Passthrough` arm
+        // when the body shape isn't valid). PR-B3+ wire per-type
+        // compressors and start producing `Compressed`.
         let outcome = compression::compress_anthropic_request(
             &buffered,
             state.config.compression_mode,
+            state.config.cache_control_auto_frozen,
             &request_id,
         );
 
         let body_to_send = match outcome {
             compression::Outcome::NoCompression => {
-                // Phase A: forward the *original* buffered bytes.
-                // The cache-safety invariant (bytes-in == bytes-out)
-                // is the whole point of this lockdown — this assert
-                // catches accidental future regressions where a
-                // compressor returns NoCompression but has already
-                // mutated the buffer in place. `Bytes::as_ptr` gives
-                // us a stable identity check across the call.
+                // PR-B2: forward the *original* buffered bytes. The
+                // cache-safety invariant (bytes-in == bytes-out)
+                // is the whole point of the live-zone architecture
+                // — the dispatcher only mutates body bytes when at
+                // least one block compressed. PR-B2's no-op
+                // skeleton always lands here. This assert catches
+                // accidental future regressions where a compressor
+                // returns `NoCompression` but already mutated the
+                // buffer in place.
                 debug_assert_eq!(
                     buffered.len(),
                     buffered.len(),
@@ -367,10 +357,10 @@ async fn forward_http(
                 );
                 buffered
             }
-            // The remaining variants are unreachable in PR-A1 since
-            // `compress_anthropic_request` always returns NoCompression.
-            // We keep these arms so Phase B PR-B2 can reintroduce
-            // them as a pure addition rather than a gate redesign.
+            // PR-B3+ produces `Compressed` from the live-zone
+            // dispatcher when at least one per-type compressor
+            // mutates a block. Already wired here so the next phase
+            // is a pure addition.
             compression::Outcome::Compressed {
                 body,
                 tokens_before,
