@@ -1055,6 +1055,15 @@ class AnthropicHandlerMixin:
                     logger.debug(f"[{request_id}] post_compress hook error: {e}")
 
             # CCR Tool Injection: Inject retrieval tool if compression occurred
+            # OR if this session has previously done CCR (PR-B7 sticky-on).
+            # The legacy `CCRToolInjector` flips on/off based on the *current*
+            # request's compressed-content presence, busting cache every flip.
+            # We now route the tool-list update through
+            # `apply_session_sticky_ccr_tool`, which once-on/always-on per
+            # `SessionCcrTracker`. System-instruction injection keeps its
+            # existing per-request scan (it lives in the system prompt, which
+            # is the cache hot zone — gated separately by the
+            # `frozen_message_count > 0` guard below).
             tools = body.get("tools")
             _original_tools = tools  # Preserve for diagnostic / future retry
             if (
@@ -1074,26 +1083,38 @@ class AnthropicHandlerMixin:
                         f"(frozen prefix={frozen_message_count}) to preserve cache"
                     )
                     inject_tool = False
-                # Create fresh injector to avoid state leakage between requests
+                # Scan for compression markers + maybe inject system instructions.
+                # Tool-list injection is handled separately via the sticky helper.
                 injector = CCRToolInjector(
                     provider="anthropic",
-                    inject_tool=inject_tool,
+                    inject_tool=False,  # routed through sticky helper below
                     inject_system_instructions=inject_system_instructions,
                 )
-                optimized_messages, tools, was_injected = injector.process_request(
-                    optimized_messages, tools
-                )
+                injector.scan_for_markers(optimized_messages)
+                if inject_system_instructions and injector.has_compressed_content:
+                    optimized_messages = injector.inject_into_system_message(optimized_messages)
+
+                # Sticky-on tool registration (PR-B7): always inject the
+                # retrieval tool once a session has done CCR, regardless
+                # of whether THIS turn produced compressed content.
+                if inject_tool:
+                    from headroom.proxy.helpers import apply_session_sticky_ccr_tool
+
+                    tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
+                        provider="anthropic",
+                        session_id=session_id,
+                        request_id=request_id,
+                        existing_tools=tools,
+                        has_compressed_content_this_turn=injector.has_compressed_content,
+                    )
+                    if ccr_tool_injected:
+                        logger.debug(
+                            f"[{request_id}] CCR: tool registered (session={session_id}, "
+                            f"compressed_this_turn={injector.has_compressed_content}, "
+                            f"hashes_seen={len(injector.detected_hashes)})"
+                        )
 
                 if injector.has_compressed_content:
-                    if was_injected:
-                        logger.debug(
-                            f"[{request_id}] CCR: Injected retrieval tool for hashes: {injector.detected_hashes}"
-                        )
-                    else:
-                        logger.debug(
-                            f"[{request_id}] CCR: Tool already present (MCP?), skipped injection for hashes: {injector.detected_hashes}"
-                        )
-
                     # Track compression in context tracker for multi-turn awareness
                     if self.ccr_context_tracker:
                         self._turn_counter += 1

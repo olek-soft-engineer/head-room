@@ -1,37 +1,13 @@
-//! CCR (Compress-Cache-Retrieve) storage layer.
+//! In-memory CCR backend.
 //!
-//! When a transform compresses data with row-drop or opaque-string
-//! substitution, the *original payload* is stashed here keyed by the
-//! hash that ends up in the prompt. The runtime later honors retrieval
-//! tool calls by looking up the hash in this store and serving back the
-//! original. This is the cornerstone of CCR: lossy on the wire, lossless
-//! end-to-end.
+//! Process-local store backed by [`DashMap`] (sharded concurrent hash
+//! map). Distinct keys never contend on the read path; capacity-bound
+//! eviction is the only globally-serialized step.
 //!
-//! Mirrors the semantics of Python's [`CompressionStore`] (`headroom/
-//! cache/compression_store.py`) but stripped down to the contract that
-//! actually matters for retrieval — no BM25 search, no retrieval-event
-//! feedback, no per-tool metadata. Those live in the runtime layer; this
-//! crate only needs put/get.
-//!
-//! # Concurrency
-//!
-//! The default [`InMemoryCcrStore`] uses [`DashMap`] (sharded concurrent
-//! hash map) so reads and writes targeting different keys never contend.
-//! Only the FIFO insertion-order queue (used for capacity-bounded
-//! eviction) sits behind a single `Mutex`, and that mutex is held just
-//! long enough for an O(1) `push_back` or capacity-sweep.
-//!
-//! Profile under multi-worker load shows order-of-magnitude lower
-//! contention than the previous single-`Mutex<HashMap>` design — see
-//! `benches/ccr_store.rs`.
-//!
-//! # Pluggable backend
-//!
-//! Production deployments swap in their own [`CcrStore`] backed by Redis,
-//! MongoDB, or whatever shared cache fits. The default in-memory store
-//! ships ready for single-process use.
-//!
-//! [`CompressionStore`]: https://github.com/chopratejas/headroom/blob/main/headroom/cache/compression_store.py
+//! This is the **test-default** backend. Production deployments use
+//! [`super::sqlite::SqliteCcrStore`] or [`super::redis::RedisCcrStore`]
+//! which are persistent across worker restarts and shareable across
+//! workers (see `RUST_DEV.md` "Multi-worker deployment").
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -39,30 +15,7 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
-/// Pluggable CCR storage backend. `Send + Sync` so it can sit behind an
-/// `Arc` and be shared across threads in the proxy.
-pub trait CcrStore: Send + Sync {
-    /// Stash `payload` under `hash`. If the hash already exists, the
-    /// new payload overwrites — same hash should mean same content, so
-    /// re-storing is idempotent.
-    fn put(&self, hash: &str, payload: &str);
-
-    /// Look up `hash`. Returns `None` if missing or expired.
-    fn get(&self, hash: &str) -> Option<String>;
-
-    /// Number of live entries. Informational; used by tests + telemetry.
-    fn len(&self) -> usize;
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-/// Default capacity — matches Python's `CompressionStore` default.
-pub const DEFAULT_CAPACITY: usize = 1000;
-
-/// Default TTL — 5 minutes, matching Python.
-pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
+use crate::ccr::{CcrStore, DEFAULT_CAPACITY, DEFAULT_TTL};
 
 /// In-memory CCR store backed by [`DashMap`] for sharded concurrent
 /// access.

@@ -106,6 +106,7 @@ use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
+use crate::ccr::{compute_key, marker_for, CcrStore};
 use crate::tokenizer::get_tokenizer;
 
 // ─── Tunable constants (no magic numbers in the dispatch logic) ────────
@@ -512,8 +513,34 @@ fn diff_compressor() -> &'static DiffCompressor {
 pub fn compress_anthropic_live_zone(
     body_raw: &[u8],
     frozen_message_count: usize,
+    auth_mode: AuthMode,
+    model: &str,
+) -> Result<LiveZoneOutcome, LiveZoneError> {
+    compress_anthropic_live_zone_with_ccr(body_raw, frozen_message_count, auth_mode, model, None)
+}
+
+/// Same as [`compress_anthropic_live_zone`] but with an optional
+/// [`CcrStore`] for retrieval-marker injection (PR-B7).
+///
+/// When `ccr_store` is `Some(_)` and a compressor produces a strictly
+/// smaller block, the dispatcher:
+///
+/// 1. Computes `hash = compute_key(original_bytes)` (BLAKE3 → 24 hex
+///    chars).
+/// 2. Stores the original block content in the backend under that hash.
+/// 3. Appends the marker `<<ccr:HASH>>` to the compressed block content
+///    (newline-separated) so the model can later call
+///    `headroom_retrieve(hash="HASH")` to recover the original bytes.
+///
+/// When `ccr_store` is `None` (default for tests, default for the old
+/// `compress_anthropic_live_zone` shim), the dispatcher behaves
+/// identically to PR-B4 — no markers, no put.
+pub fn compress_anthropic_live_zone_with_ccr(
+    body_raw: &[u8],
+    frozen_message_count: usize,
     _auth_mode: AuthMode,
     model: &str,
+    ccr_store: Option<&dyn CcrStore>,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
     let messages = parsed
@@ -604,6 +631,7 @@ pub fn compress_anthropic_live_zone(
                     block_type,
                     tokenizer.as_ref(),
                     &mut replacements,
+                    ccr_store,
                 );
                 outcome
             }
@@ -621,6 +649,7 @@ pub fn compress_anthropic_live_zone(
                     "string_content".to_string(),
                     tokenizer.as_ref(),
                     &mut replacements,
+                    ccr_store,
                 )
             }
         };
@@ -694,6 +723,7 @@ fn compress_one_block(
     block_type: String,
     tokenizer: &dyn crate::tokenizer::Tokenizer,
     replacements: &mut Vec<Replacement>,
+    ccr_store: Option<&dyn CcrStore>,
 ) -> BlockOutcome {
     // 1. Byte-threshold gate. Empty content always falls through to
     //    `dispatch_compressor` (which short-circuits on empty), so
@@ -726,7 +756,22 @@ fn compress_one_block(
             compressed,
         } => {
             let original_bytes = content_text.len();
-            let compressed_bytes = compressed.len();
+            // PR-B7: when a CCR store is wired, persist the original
+            // block content keyed by `BLAKE3(original)[..24]` and append
+            // the `<<ccr:HASH>>` marker to the compressed string. The
+            // marker stays on a fresh trailing line so it is easy for
+            // the model to spot and so that the per-content-type
+            // compressors (which already produce trailing summary
+            // lines) keep their final newline before the marker.
+            //
+            // The token-validation gate (step 3) is computed against
+            // the marker-augmented string so the saved-token check
+            // stays honest — the marker costs ~6 tokens and we'd
+            // rather forward the original than ship a bigger payload
+            // for a 5-byte block.
+            let (compressed_for_replacement, ccr_hash_emitted) =
+                maybe_inject_ccr_marker(content_text, &compressed, ccr_store);
+            let compressed_bytes = compressed_for_replacement.len();
             // 3. Tokenizer-validated rejection. Per PR-B4 spec we
             //    count both the original and compressed strings
             //    using the model's tokenizer; the compression is
@@ -735,7 +780,7 @@ fn compress_one_block(
             //    pathological inputs (e.g. dense base64 → tokenizer
             //    fragments more aggressively after a transform).
             let original_tokens = tokenizer.count_text(content_text);
-            let compressed_tokens = tokenizer.count_text(&compressed);
+            let compressed_tokens = tokenizer.count_text(&compressed_for_replacement);
             if compressed_tokens >= original_tokens {
                 BlockOutcome {
                     message_index,
@@ -750,8 +795,16 @@ fn compress_one_block(
                     },
                 }
             } else {
-                let replacement_bytes =
-                    serde_json::to_vec(&compressed).expect("string is always JSON-encodable");
+                // Only persist to the CCR store once the rejection
+                // gate has admitted the compression — otherwise we
+                // populate the store with hashes whose markers
+                // never reach the wire (still correct, but wastes
+                // storage capacity).
+                if let (Some(store), Some(hash)) = (ccr_store, ccr_hash_emitted.as_deref()) {
+                    store.put(hash, content_text);
+                }
+                let replacement_bytes = serde_json::to_vec(&compressed_for_replacement)
+                    .expect("string is always JSON-encodable");
                 replacements.push(Replacement {
                     range: content_byte_range,
                     replacement: replacement_bytes,
@@ -1076,6 +1129,39 @@ fn apply_replacements(original: &[u8], replacements: &mut [Replacement]) -> Vec<
     }
     out.extend_from_slice(&original[cursor..]);
     out
+}
+
+/// PR-B7: append a `<<ccr:HASH>>` retrieval marker to the compressed
+/// block content when a CCR store is wired. Returns the
+/// (possibly-augmented) compressed string and the hash that was
+/// emitted (so the caller can decide whether to put the original into
+/// the store after the rejection gate). When `ccr_store` is `None`,
+/// returns the input compressed string unchanged with `None`.
+///
+/// The marker is appended on its own line — `\n<<ccr:HASH>>` — so:
+///
+/// 1. The marker is unambiguously after the compressor's last byte,
+///    even if that byte was a newline already (we only add one).
+/// 2. Markers are easy to detect in human-readable diffs / logs.
+/// 3. The Python `inject_ccr_retrieve_tool` regex in
+///    `headroom/ccr/tool_injection.py` keeps working — it matches
+///    `[a-f0-9]{24}` anywhere in the text.
+fn maybe_inject_ccr_marker(
+    original: &str,
+    compressed: &str,
+    ccr_store: Option<&dyn CcrStore>,
+) -> (String, Option<String>) {
+    if ccr_store.is_none() {
+        return (compressed.to_string(), None);
+    }
+    let hash = compute_key(original.as_bytes());
+    let marker = marker_for(&hash);
+    let augmented = if compressed.ends_with('\n') {
+        format!("{compressed}{marker}")
+    } else {
+        format!("{compressed}\n{marker}")
+    };
+    (augmented, Some(hash))
 }
 
 /// Per-block dispatch result — whether any compressor ran and what

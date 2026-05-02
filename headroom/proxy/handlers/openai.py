@@ -543,6 +543,12 @@ class OpenAIHandlerMixin:
                 logger.debug(f"[{request_id}] post_compress hook error: {e}")
 
         # CCR Tool Injection: Inject retrieval tool if compression occurred
+        # OR if this session has previously done CCR (PR-B7 sticky-on).
+        # See `headroom/proxy/handlers/anthropic.py` and PR-B7 plan
+        # `REALIGNMENT/04-phase-B-live-zone.md` for the rationale: once a
+        # session has done CCR, the `headroom_retrieve` tool stays
+        # registered for every subsequent turn so the prompt cache
+        # anchored on the previous turn's tool list never busts.
         tools = body.get("tools")
         _original_tools = tools  # Preserve for diagnostic / future retry
         if (
@@ -550,21 +556,28 @@ class OpenAIHandlerMixin:
         ) and not _bypass:
             injector = CCRToolInjector(
                 provider="openai",
-                inject_tool=self.config.ccr_inject_tool,
+                inject_tool=False,  # routed through sticky helper below
                 inject_system_instructions=self.config.ccr_inject_system_instructions,
             )
-            optimized_messages, tools, was_injected = injector.process_request(
-                optimized_messages, tools
-            )
+            injector.scan_for_markers(optimized_messages)
+            if self.config.ccr_inject_system_instructions and injector.has_compressed_content:
+                optimized_messages = injector.inject_into_system_message(optimized_messages)
 
-            if injector.has_compressed_content:
-                if was_injected:
+            if self.config.ccr_inject_tool:
+                from headroom.proxy.helpers import apply_session_sticky_ccr_tool
+
+                tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
+                    provider="openai",
+                    session_id=openai_session_id,
+                    request_id=request_id,
+                    existing_tools=tools,
+                    has_compressed_content_this_turn=injector.has_compressed_content,
+                )
+                if ccr_tool_injected:
                     logger.debug(
-                        f"[{request_id}] CCR: Injected retrieval tool for hashes: {injector.detected_hashes}"
-                    )
-                else:
-                    logger.debug(
-                        f"[{request_id}] CCR: Tool already present (MCP?), skipped injection for hashes: {injector.detected_hashes}"
+                        f"[{request_id}] CCR: tool registered (session={openai_session_id}, "
+                        f"compressed_this_turn={injector.has_compressed_content}, "
+                        f"hashes_seen={len(injector.detected_hashes)})"
                     )
 
         if is_cache_mode(self.config.mode):

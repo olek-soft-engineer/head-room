@@ -1591,6 +1591,286 @@ def apply_session_sticky_memory_tools(
     return tools_out, added_bytes > 0
 
 
+# ─── Session-sticky CCR tool injection (PR-B7) ─────────────────────────
+#
+# Per realignment plan PR-B7 (`REALIGNMENT/04-phase-B-live-zone.md`):
+# once a session has performed any CCR compression, the
+# `headroom_retrieve` tool stays registered in `body["tools"]` for every
+# subsequent request in that session — never toggled off.
+#
+# The legacy `CCRToolInjector.has_compressed_content` flips on/off based
+# on whether the *latest request* contained compression markers, which
+# bust the prompt cache every time the flag flips. Sticky-on means the
+# tool list bytes stay byte-stable across turns once injected.
+
+
+class SessionCcrTracker:
+    """Bounded LRU tracker recording per-(provider, session_id) CCR state.
+
+    Two pieces of state per session:
+
+      * ``has_done_ccr``: True once the proxy observed any CCR
+        compression marker in the messages of a request. Once True, it
+        never flips back to False (the prompt cache anchored on the
+        previous turn's tool list demands the tool stays present).
+      * ``golden_tool_bytes``: canonical serialization of the
+        ``headroom_retrieve`` tool definition recorded the first time
+        the tracker injected it. Subsequent turns replay these bytes
+        verbatim.
+
+    Bounded by ``max_sessions`` via ``OrderedDict`` LRU. Mirrors
+    :class:`SessionToolTracker` semantics so the operator's mental model
+    is one tracker pattern, not two.
+    """
+
+    def __init__(self, max_sessions: int | None = None) -> None:
+        if max_sessions is None:
+            max_sessions = get_tool_tracker_max_sessions()
+        if max_sessions <= 0:
+            raise ValueError("max_sessions must be > 0")
+        self._max_sessions = max_sessions
+        self._lock = threading.RLock()
+        # Value is (has_done_ccr, golden_tool_bytes_or_none).
+        self._sessions: OrderedDict[tuple[str, str], tuple[bool, bytes | None]] = OrderedDict()
+
+    @property
+    def active_sessions(self) -> int:
+        with self._lock:
+            return len(self._sessions)
+
+    def _key(self, provider: str, session_id: str) -> tuple[str, str]:
+        return (provider, session_id)
+
+    def has_done_ccr(self, provider: str, session_id: str) -> bool:
+        """Return True iff this session has previously performed CCR."""
+        if not provider:
+            raise ValueError("provider must be non-empty")
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        with self._lock:
+            entry = self._sessions.get(self._key(provider, session_id))
+            if entry is None:
+                return False
+            self._sessions.move_to_end(self._key(provider, session_id))
+            return entry[0]
+
+    def get_golden_tool_bytes(self, provider: str, session_id: str) -> bytes | None:
+        """Return the recorded golden tool-definition bytes, or None."""
+        if not provider:
+            raise ValueError("provider must be non-empty")
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        with self._lock:
+            entry = self._sessions.get(self._key(provider, session_id))
+            if entry is None:
+                return None
+            self._sessions.move_to_end(self._key(provider, session_id))
+            return entry[1]
+
+    def record_ccr_done(
+        self,
+        provider: str,
+        session_id: str,
+        golden_tool_bytes: bytes,
+    ) -> None:
+        """Mark the session as having performed CCR and pin the golden bytes.
+
+        First-write wins for ``golden_tool_bytes`` (subsequent calls
+        with the same session keep the original bytes — prevents drift
+        if the canonical serialization changed mid-session). The
+        ``has_done_ccr`` flag is monotonic: once True, never False.
+        """
+        if not provider:
+            raise ValueError("provider must be non-empty")
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+        if not golden_tool_bytes:
+            raise ValueError("golden_tool_bytes must be non-empty")
+        key = self._key(provider, session_id)
+        with self._lock:
+            existing = self._sessions.get(key)
+            if existing is None:
+                self._sessions[key] = (True, golden_tool_bytes)
+            else:
+                # Preserve original golden bytes; just promote the flag.
+                pinned = existing[1] if existing[1] is not None else golden_tool_bytes
+                self._sessions[key] = (True, pinned)
+            self._sessions.move_to_end(key)
+            while len(self._sessions) > self._max_sessions:
+                self._sessions.popitem(last=False)
+
+    def reset(self) -> None:
+        """Clear all session state (test helper)."""
+        with self._lock:
+            self._sessions.clear()
+
+
+# Process-wide singleton.
+_session_ccr_tracker_lock = threading.Lock()
+_session_ccr_tracker: SessionCcrTracker | None = None
+
+
+def get_session_ccr_tracker() -> SessionCcrTracker:
+    """Return the process-wide :class:`SessionCcrTracker` singleton."""
+    global _session_ccr_tracker
+    with _session_ccr_tracker_lock:
+        if _session_ccr_tracker is None:
+            _session_ccr_tracker = SessionCcrTracker()
+        return _session_ccr_tracker
+
+
+def _reset_session_ccr_tracker_for_test() -> None:
+    """Clear the process-wide CCR tracker (test-only)."""
+    global _session_ccr_tracker
+    with _session_ccr_tracker_lock:
+        _session_ccr_tracker = None
+
+
+def apply_session_sticky_ccr_tool(
+    *,
+    provider: Literal["anthropic", "openai", "google"],
+    session_id: str | None,
+    request_id: str | None,
+    existing_tools: list[dict[str, Any]] | None,
+    has_compressed_content_this_turn: bool,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Apply sticky-on CCR retrieval-tool injection per :class:`SessionCcrTracker`.
+
+    Coordination point for both Anthropic and OpenAI handlers — replaces
+    the legacy ``CCRToolInjector.inject_tool_definition`` "flip on, flip
+    off" behaviour.
+
+    Logic:
+
+      * If ``session_id`` is None: tracker is bypassed and the per-turn
+        ``has_compressed_content_this_turn`` flag drives the decision
+        verbatim (matching legacy behaviour for WS / pre-session paths).
+      * If the session has previously done CCR (``has_done_ccr``):
+        ALWAYS inject the recorded golden bytes — even if this turn has
+        no fresh compression. That is the load-bearing PR-B7 fix.
+      * Otherwise, inject only when this turn produced compressed content.
+        The first injection records the golden bytes for future turns.
+
+    Tools whose name already equals ``CCR_TOOL_NAME`` (e.g. the client
+    pre-registered it via MCP) are not re-appended; the client's bytes
+    win.
+
+    Returns ``(updated_tools, was_injected)``. ``updated_tools`` is a
+    fresh list (caller-safe).
+    """
+    from headroom.ccr.tool_injection import CCR_TOOL_NAME, create_ccr_tool_definition
+
+    if provider not in ("anthropic", "openai", "google"):
+        raise ValueError(f"unsupported provider: {provider!r}")
+
+    tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
+    existing_names: set[str] = set()
+    for t in tools_out:
+        n = _extract_tool_name(t)
+        if n:
+            existing_names.add(n)
+
+    # Client (or MCP) already provided a tool by this name — don't double up.
+    if CCR_TOOL_NAME in existing_names:
+        log_tool_injection_decision(
+            provider=provider,
+            session_id=session_id,
+            decision="skip",
+            tool_definition_bytes_count=0,
+            request_id=request_id,
+        )
+        return tools_out, False
+
+    # No session_id (e.g. WS path): per-turn decision drives directly.
+    if not session_id:
+        if not has_compressed_content_this_turn:
+            log_tool_injection_decision(
+                provider=provider,
+                session_id=None,
+                decision="skip",
+                tool_definition_bytes_count=0,
+                request_id=request_id,
+            )
+            return tools_out, False
+        tool_def = create_ccr_tool_definition(provider)
+        canonical = serialize_tool_definition_canonical(tool_def)
+        tools_out.append(tool_def)
+        log_tool_injection_decision(
+            provider=provider,
+            session_id=None,
+            decision="inject_first_time",
+            tool_definition_bytes_count=len(canonical),
+            request_id=request_id,
+        )
+        return tools_out, True
+
+    tracker = get_session_ccr_tracker()
+    previously_done = tracker.has_done_ccr(provider, session_id)
+
+    if previously_done:
+        # Sticky replay path. Always inject — even if this turn had no
+        # fresh CCR compression. Prefer the recorded golden bytes; fall
+        # back to a freshly serialized definition if (somehow) the
+        # tracker lost them. Loud per build constraint #4: we log the
+        # path taken either way.
+        golden = tracker.get_golden_tool_bytes(provider, session_id)
+        if golden is not None:
+            try:
+                tool_def = json.loads(golden.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                # Should never happen — golden bytes were produced by us.
+                raise RuntimeError(
+                    f"corrupt golden CCR tool bytes for session {session_id}: {exc}"
+                ) from exc
+            tools_out.append(tool_def)
+            log_tool_injection_decision(
+                provider=provider,
+                session_id=session_id,
+                decision="inject_sticky_replay",
+                tool_definition_bytes_count=len(golden),
+                request_id=request_id,
+            )
+            return tools_out, True
+        # Tracker says "done CCR" but somehow has no golden bytes. Pin
+        # them now so future turns are stable.
+        tool_def = create_ccr_tool_definition(provider)
+        canonical = serialize_tool_definition_canonical(tool_def)
+        tracker.record_ccr_done(provider, session_id, canonical)
+        tools_out.append(tool_def)
+        log_tool_injection_decision(
+            provider=provider,
+            session_id=session_id,
+            decision="inject_sticky_replay",
+            tool_definition_bytes_count=len(canonical),
+            request_id=request_id,
+        )
+        return tools_out, True
+
+    # Fresh session — only inject when this turn produced compressed content.
+    if not has_compressed_content_this_turn:
+        log_tool_injection_decision(
+            provider=provider,
+            session_id=session_id,
+            decision="skip",
+            tool_definition_bytes_count=0,
+            request_id=request_id,
+        )
+        return tools_out, False
+
+    tool_def = create_ccr_tool_definition(provider)
+    canonical = serialize_tool_definition_canonical(tool_def)
+    tracker.record_ccr_done(provider, session_id, canonical)
+    tools_out.append(tool_def)
+    log_tool_injection_decision(
+        provider=provider,
+        session_id=session_id,
+        decision="inject_first_time",
+        tool_definition_bytes_count=len(canonical),
+        request_id=request_id,
+    )
+    return tools_out, True
+
+
 async def _read_request_body_bytes(request: Request) -> bytes:
     """Read and (if needed) decompress the request body, returning raw UTF-8 bytes.
 
