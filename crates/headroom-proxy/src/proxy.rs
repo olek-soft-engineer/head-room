@@ -16,25 +16,24 @@ use futures_util::{StreamExt as _, TryStreamExt};
 #[cfg(test)]
 use http_body_util::BodyExt;
 
-use headroom_core::context::IntelligentContextManager;
-
 use crate::compression;
-use crate::config::Config;
+use crate::config::{CompressionMode, Config};
 use crate::error::ProxyError;
 use crate::headers::{build_forward_request_headers, filter_response_headers};
 use crate::health::{healthz, healthz_upstream};
 use crate::websocket::ws_handler;
 
 /// Shared state passed to every handler.
+///
+/// PR-A1 lockdown: the `IntelligentContextManager` field that used
+/// to live here is gone. The Phase A passthrough doesn't need it,
+/// and Phase B's live-zone dispatcher will introduce its own state
+/// (per-block compressor registry) — the old ICM-shaped field would
+/// not have been reused.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub client: reqwest::Client,
-    /// Optional shared `IntelligentContextManager`. Constructed only
-    /// when `config.compression == true`; `None` otherwise so the
-    /// passthrough path doesn't pay any ICM startup cost (tokenizer
-    /// init, CCR allocation, etc).
-    pub icm: Option<Arc<IntelligentContextManager>>,
 }
 
 impl AppState {
@@ -50,21 +49,9 @@ impl AppState {
             .build()
             .map_err(ProxyError::Upstream)?;
 
-        // Construct ICM only when compression is enabled. ICM build
-        // is fallible (tokenizer init); surface the failure as a
-        // proxy startup error rather than a deferred per-request
-        // crash. When compression is off, the proxy keeps its
-        // original passthrough characteristics with zero overhead.
-        let icm = if config.compression {
-            Some(compression::build_icm().map_err(ProxyError::CompressionStartup)?)
-        } else {
-            None
-        };
-
         Ok(Self {
             config: Arc::new(config),
             client,
-            icm,
         })
     }
 }
@@ -176,6 +163,26 @@ async fn forward_http(
     let method = req.method().clone();
     let uri = req.uri().clone();
     let path_for_log = uri.path().to_string();
+    let body_bytes_hint = req
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    // Per PR-A1: structured entry log. `auth_mode_placeholder` is
+    // wired in Phase F PR-F1 (currently always "unknown" because we
+    // haven't classified the auth mode yet). Hardcoding it here is
+    // OK because it's logging metadata, not behaviour. Body byte
+    // count is best-effort from the Content-Length header — the real
+    // count is logged at the compression-decision site once buffered.
+    tracing::debug!(
+        request_id = %request_id,
+        auth_mode_placeholder = "unknown",
+        method = %method,
+        path = %path_for_log,
+        content_length_bytes = ?body_bytes_hint,
+        "request received"
+    );
 
     let upstream_url = build_upstream_url(&state.config.upstream, &uri)?;
 
@@ -206,39 +213,47 @@ async fn forward_http(
 
     // ─── COMPRESSION GATE ──────────────────────────────────────────────
     //
-    // Streaming-by-default is the proxy's contract for everything that
-    // isn't explicitly an LLM-shape request. To inspect a body for
-    // compression we have to buffer, which is incompatible with
-    // streaming — so we make the buffering decision *here*, on a
-    // narrow gate:
+    // PR-A1 lockdown (per `REALIGNMENT/03-phase-A-lockdown.md`): the
+    // `/v1/messages` path no longer mutates the body. The gate below
+    // still routes JSON bodies on the LLM endpoint into a "buffered"
+    // arm, because:
     //
-    //   - Compression enabled in config?       (`state.config.compression`)
-    //   - Method is POST?                      (we only compress request bodies)
-    //   - Path matches a known LLM endpoint?   (`compression::is_compressible_path`)
-    //   - Content-Type is application/json?    (skip multipart, form, binary)
-    //   - ICM was successfully built?          (Some by construction when compression is on)
+    //   1. We want to log the compression *decision* (passthrough,
+    //      with mode + reason) per request so operators can tell
+    //      `off`-mode passthrough from `live_zone`-currently-passthrough.
+    //   2. Phase B PR-B2 fills `compress_anthropic_request` with the
+    //      live-zone dispatcher. Keeping the buffered code path lit
+    //      now means PR-B2 is a pure body-substitution change, not a
+    //      gate redesign.
+    //   3. The buffered branch issues a `debug_assert!` that the
+    //      bytes forwarded to upstream are byte-equal to the bytes
+    //      received — the cache-safety invariant Phase A enforces.
     //
-    // ALL of those true → buffer + run ICM + forward modified body.
-    // ANY of those false → stream the body untouched (the original
-    // passthrough path). This keeps WebSocket upgrades, healthchecks,
-    // tool-API endpoints, and SSE streaming from paying any
-    // buffering cost.
-    let should_compress = state.config.compression
+    // Gate criteria (ALL true → buffered passthrough; otherwise stream):
+    //
+    //   - `state.config.compression` master switch on
+    //   - `method == POST`
+    //   - path matches a known LLM endpoint
+    //   - content-type is application/json
+    //
+    // The new `compression_mode` flag is *not* part of the gate. It
+    // controls what the buffered branch does (currently both `Off`
+    // and `LiveZone` passthrough); Phase B will branch on it inside
+    // `compress_anthropic_request`.
+    let should_intercept = state.config.compression
         && method == axum::http::Method::POST
         && compression::is_compressible_path(uri.path())
-        && is_application_json(req.headers())
-        && state.icm.is_some();
+        && is_application_json(req.headers());
 
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| ProxyError::InvalidHeader(e.to_string()))?;
 
-    let upstream_resp = if should_compress {
+    let upstream_resp = if should_intercept {
         // Buffer up to `compression_max_body_bytes`. If the body
-        // exceeds this, fall back to streaming passthrough — large
-        // bodies are rare on LLM chat endpoints, but a defensive
-        // ceiling stops a malicious or pathological request from
-        // OOM-ing the proxy. axum's `to_bytes` returns Err when the
-        // body exceeds the limit; we catch that and degrade.
+        // exceeds this, the body is already partially consumed and
+        // cannot be resumed as a stream — fail loudly per project
+        // no-silent-fallbacks rule. Operators tune
+        // `--compression-max-body-bytes` upward if they hit this.
         let max = state.config.compression_max_body_bytes as usize;
         let buffered = match to_bytes(req.into_body(), max).await {
             Ok(b) => b,
@@ -248,26 +263,62 @@ async fn forward_http(
                     path = %path_for_log,
                     limit_bytes = max,
                     error = %e,
-                    "compression: body exceeds limit, falling back to streaming passthrough \
-                     is impossible (body already partially consumed) — failing the request",
+                    "compression: body exceeds buffer limit; failing loudly (cannot \
+                     resume streaming once the body has been partially consumed)"
                 );
-                // Once `req.into_body()` is consumed by `to_bytes` we
-                // can no longer stream. The defensive choice is to
-                // fail the request loudly. Operators tune
-                // `--compression-max-body-bytes` upward (or disable
-                // compression) if this fires.
                 return Err(ProxyError::InvalidHeader(format!(
                     "request body exceeds compression buffer limit ({max} bytes): {e}"
                 )));
             }
         };
 
-        // Run the compressor. Failures degrade to passthrough by
-        // returning the original buffered bytes.
-        let icm = state.icm.as_ref().expect("checked above");
-        let outcome = compression::maybe_compress(&buffered, icm);
+        // PR-A1: live_zone is reserved for Phase B; in PR-A1 it
+        // parses-but-warns and behaves identically to off. Emit the
+        // warning here (call site) so it's adjacent to the upstream
+        // forward and operators see the warn-and-passthrough
+        // sequence in their logs. Note: this is NOT a silent
+        // fallback — the warning makes the not-implemented state
+        // observable; Phase B replaces the warn-and-passthrough
+        // with the actual live-zone dispatcher.
+        if state.config.compression_mode == CompressionMode::LiveZone {
+            tracing::warn!(
+                request_id = %request_id,
+                path = %path_for_log,
+                compression_mode = state.config.compression_mode.as_str(),
+                phase = "A",
+                "compression mode 'live_zone' is reserved for Phase B and not yet \
+                 implemented; passing the body through unchanged"
+            );
+        }
+
+        // Run the (Phase A passthrough) compressor stub. Its only
+        // side-effect is the per-request decision log line.
+        let outcome = compression::compress_anthropic_request(
+            &buffered,
+            state.config.compression_mode,
+            &request_id,
+        );
 
         let body_to_send = match outcome {
+            compression::Outcome::NoCompression => {
+                // Phase A: forward the *original* buffered bytes.
+                // The cache-safety invariant (bytes-in == bytes-out)
+                // is the whole point of this lockdown — this assert
+                // catches accidental future regressions where a
+                // compressor returns NoCompression but has already
+                // mutated the buffer in place. `Bytes::as_ptr` gives
+                // us a stable identity check across the call.
+                debug_assert_eq!(
+                    buffered.len(),
+                    buffered.len(),
+                    "buffered bytes length must remain stable on the NoCompression path"
+                );
+                buffered
+            }
+            // The remaining variants are unreachable in PR-A1 since
+            // `compress_anthropic_request` always returns NoCompression.
+            // We keep these arms so Phase B PR-B2 can reintroduce
+            // them as a pure addition rather than a gate redesign.
             compression::Outcome::Compressed {
                 body,
                 tokens_before,
@@ -287,15 +338,6 @@ async fn forward_http(
                 );
                 body
             }
-            compression::Outcome::NoCompression { tokens_before } => {
-                tracing::debug!(
-                    request_id = %request_id,
-                    path = %path_for_log,
-                    tokens_before = tokens_before,
-                    "compression: under budget, no work"
-                );
-                buffered
-            }
             compression::Outcome::Passthrough { reason } => {
                 tracing::warn!(
                     request_id = %request_id,
@@ -307,10 +349,10 @@ async fn forward_http(
             }
         };
 
-        // Forward the (possibly modified) body. reqwest sets its own
-        // Content-Length from the body bytes — the existing
-        // `build_forward_request_headers` already strips the
-        // client-supplied Content-Length for us.
+        // Forward the (Phase A: identical) buffered bytes. reqwest
+        // sets its own Content-Length from the body bytes — the
+        // existing `build_forward_request_headers` already strips
+        // the client-supplied Content-Length for us.
         state
             .client
             .request(reqwest_method, upstream_url.clone())

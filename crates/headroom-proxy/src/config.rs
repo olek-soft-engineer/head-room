@@ -1,9 +1,47 @@
 //! Configuration for the proxy: CLI flags + env vars.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::net::SocketAddr;
 use std::time::Duration;
 use url::Url;
+
+/// Compression mode policy for the `/v1/messages` endpoint.
+///
+/// Drives whether `compress_anthropic_request` does any work. PR-A1
+/// (Phase A lockdown) wires the flag in but both modes currently
+/// passthrough — `live_zone` parses-but-warns until Phase B PR-B2
+/// fills in the live-zone-only block dispatcher.
+///
+/// We do NOT add an `icm` mode (the deleted code path) or a
+/// `passthrough` alias for `off` — those names are misleading. The
+/// only legal values are `off` (compression disabled) and `live_zone`
+/// (compress only the live-zone blocks; not yet implemented).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "snake_case")]
+pub enum CompressionMode {
+    /// Compression disabled. Body forwards byte-equal to upstream.
+    /// This is the default; Phase B will switch the default to
+    /// `live_zone` once that mode is implemented.
+    Off,
+    /// Compress only live-zone blocks (latest user message,
+    /// latest tool/function/shell/patch outputs). NOT YET IMPLEMENTED:
+    /// in PR-A1 this falls through to passthrough behaviour with a
+    /// loud warning. Phase B PR-B2 wires in the actual dispatcher.
+    LiveZone,
+}
+
+impl CompressionMode {
+    /// Stable snake_case name suitable for log fields. Avoids relying
+    /// on `Debug` (which renders `Off`/`LiveZone`) or `Display`
+    /// (which we don't implement to keep `ValueEnum` the single
+    /// source of truth for stringification).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompressionMode::Off => "off",
+            CompressionMode::LiveZone => "live_zone",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -72,6 +110,23 @@ pub struct CliArgs {
     /// they have a specific reason to cap compression separately.
     #[arg(long, value_parser = parse_bytes)]
     pub compression_max_body_bytes: Option<u64>,
+
+    /// Compression mode policy for `/v1/messages`.
+    ///
+    /// `off` (default): byte-faithful passthrough on every request.
+    /// `live_zone`: reserved for Phase B; in PR-A1 this parses-but-
+    /// warns and behaves identically to `off`. The flag exists so
+    /// Phase B can flip the default with one config change.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_COMPRESSION_MODE`
+    /// env var → default (`off`).
+    #[arg(
+        long = "compression-mode",
+        env = "HEADROOM_PROXY_COMPRESSION_MODE",
+        value_enum,
+        default_value_t = CompressionMode::Off,
+    )]
+    pub compression_mode: CompressionMode,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -102,6 +157,12 @@ pub struct Config {
     /// Inherits `max_body_bytes` when not overridden. Bodies larger
     /// than this still forward, just unchanged.
     pub compression_max_body_bytes: u64,
+    /// Policy mode for compression on `/v1/messages`. PR-A1 lockdown:
+    /// both `Off` and `LiveZone` result in byte-faithful passthrough;
+    /// `LiveZone` additionally emits a `tracing::warn!` per request
+    /// because the dispatcher isn't implemented yet (Phase B PR-B2
+    /// fills this in).
+    pub compression_mode: CompressionMode,
 }
 
 impl Config {
@@ -125,6 +186,7 @@ impl Config {
             graceful_shutdown_timeout: args.graceful_shutdown_timeout,
             compression: args.compression,
             compression_max_body_bytes,
+            compression_mode: args.compression_mode,
         }
     }
 
@@ -142,6 +204,7 @@ impl Config {
             graceful_shutdown_timeout: Duration::from_secs(5),
             compression: false,
             compression_max_body_bytes: 100 * 1024 * 1024,
+            compression_mode: CompressionMode::Off,
         }
     }
 }
