@@ -2556,7 +2556,9 @@ class OpenAIHandlerMixin:
                 if hasattr(ws_err, "response"):
                     resp_body = getattr(getattr(ws_err, "response", None), "body", b"")
                     if resp_body:
-                        _ws_detail += f" | {resp_body[:300].decode('utf-8', errors='replace')}"
+                        from headroom.proxy.helpers import safe_decode_for_logging
+
+                        _ws_detail += f" | {safe_decode_for_logging(resp_body, max_bytes=300)}"
                 logger.warning(
                     f"[{request_id}] WS upstream failed ({_ws_detail}), "
                     f"falling back to HTTP POST streaming"
@@ -2593,8 +2595,10 @@ class OpenAIHandlerMixin:
                         resp = e.response
                         body_bytes = getattr(resp, "body", None) or b""
                         if body_bytes:
+                            from headroom.proxy.helpers import safe_decode_for_logging
+
                             error_detail += (
-                                f" | body: {body_bytes[:500].decode('utf-8', errors='replace')}"
+                                f" | body: {safe_decode_for_logging(body_bytes, max_bytes=500)}"
                             )
                     except Exception:
                         pass
@@ -2751,7 +2755,9 @@ class OpenAIHandlerMixin:
                                 error_body += chunk
                                 if len(error_body) > 2000:
                                     break
-                            error_text = error_body.decode("utf-8", errors="replace")
+                            from headroom.proxy.helpers import safe_decode_for_logging
+
+                            error_text = safe_decode_for_logging(error_body)
                             logger.error(
                                 f"[{request_id}] WS→HTTP fallback got {response.status_code}: "
                                 f"{error_text[:500]}"

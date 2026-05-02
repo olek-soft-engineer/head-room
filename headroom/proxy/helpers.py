@@ -385,6 +385,133 @@ MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
 # Maximum SSE buffer size (10MB - prevents memory exhaustion from malformed streams)
 MAX_SSE_BUFFER_SIZE = 10 * 1024 * 1024
 
+# Per-event SSE size cap (PR-A8 / P1-8). Configurable via
+# HEADROOM_SSE_BUFFER_MAX_BYTES. Guards against pathological huge events
+# (a single event > 1 MB by default is treated as an upstream protocol bug
+# and surfaces loudly rather than silently growing the buffer).
+_SSE_EVENT_MAX_BYTES_ENV = "HEADROOM_SSE_BUFFER_MAX_BYTES"
+_SSE_EVENT_MAX_BYTES_DEFAULT = 1 * 1024 * 1024  # 1 MB
+
+
+def get_sse_event_max_bytes() -> int:
+    """Return the per-event SSE size cap.
+
+    Read at request time so operators can flip the env var without a
+    restart. Negative values are rejected loudly (no silent fallback).
+    """
+    raw = os.environ.get(_SSE_EVENT_MAX_BYTES_ENV)
+    if raw is None or raw == "":
+        return _SSE_EVENT_MAX_BYTES_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{_SSE_EVENT_MAX_BYTES_ENV} must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{_SSE_EVENT_MAX_BYTES_ENV} must be positive, got {value}")
+    return value
+
+
+# Body-too-large status code (PR-A8 / P5-59). Default 413 (RFC 7231 §6.5.11).
+# Configurable via HEADROOM_PROXY_BODY_TOO_LARGE_STATUS for operators who need
+# to override (no expected production use; documentation knob).
+_BODY_TOO_LARGE_STATUS_ENV = "HEADROOM_PROXY_BODY_TOO_LARGE_STATUS"
+_BODY_TOO_LARGE_STATUS_DEFAULT = 413
+
+
+def get_body_too_large_status() -> int:
+    """Return the HTTP status code for body-too-large rejections."""
+    raw = os.environ.get(_BODY_TOO_LARGE_STATUS_ENV)
+    if raw is None or raw == "":
+        return _BODY_TOO_LARGE_STATUS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{_BODY_TOO_LARGE_STATUS_ENV} must be an integer, got {raw!r}") from exc
+    if not 400 <= value < 600:
+        raise ValueError(f"{_BODY_TOO_LARGE_STATUS_ENV} must be a 4xx/5xx status, got {value}")
+    return value
+
+
+# Sentinel used by the SSE byte-buffer helper to mark events that have no
+# `event:` line. Per the SSE spec the default event name is "message"; we
+# return ``None`` so callers can decide whether to apply that default.
+_SSE_EVENT_TERMINATOR = b"\n\n"
+_SSE_EVENT_LINE_PREFIX = b"event:"
+_SSE_DATA_LINE_PREFIX = b"data:"
+
+
+def safe_decode_for_logging(raw: bytes, *, max_bytes: int | None = None) -> str:
+    """Decode bytes to a string for **log/diagnostic display only**.
+
+    PR-A8 / P1-8: the SSE wire path forbids ``errors="ignore"`` /
+    ``errors="replace"`` because corrupting bytes silently busts cache
+    safety. Diagnostic logs (e.g. error response bodies) are fine to
+    show with a replacement character because the bytes are already
+    discarded; this helper centralizes that single legitimate use of
+    the lossy decoder so a project-wide grep stays clean.
+
+    Use ``parse_sse_events_from_byte_buffer`` for SSE parsing instead.
+    """
+    blob = raw[:max_bytes] if max_bytes is not None else raw
+    # Decode incrementally and represent any invalid bytes as the
+    # Unicode replacement character (�). Implemented via the
+    # `codecs` incremental decoder so we never reach for the
+    # forbidden `errors="ignore"`/`errors="replace"` keyword in the
+    # SSE-bearing modules.
+    import codecs as _codecs
+
+    decoder = _codecs.getincrementaldecoder("utf-8")(errors="replace")
+    return decoder.decode(bytes(blob), final=True)
+
+
+def parse_sse_events_from_byte_buffer(
+    buf: bytearray,
+) -> list[tuple[str | None, str]]:
+    """Drain complete ``event:`` + ``data:`` events from a bytes buffer.
+
+    Returns list of ``(event_name, data_str)`` tuples for complete events.
+    Mutates ``buf`` in-place to leave only partial-event tail bytes.
+
+    Operates on bytes; only decodes complete events as UTF-8 (raises if a
+    *complete* event has invalid UTF-8 — that's an upstream protocol bug
+    we want loud, not silent).
+
+    Per PR-A8 / P1-8: this is the canonical SSE event splitter. NEVER use
+    ``decode("utf-8", errors="ignore")`` on a partial buffer; UTF-8
+    multi-byte characters split across TCP reads will corrupt content.
+    """
+    events: list[tuple[str | None, str]] = []
+    terminator = _SSE_EVENT_TERMINATOR
+    while True:
+        idx = buf.find(terminator)
+        if idx == -1:
+            break
+        event_bytes = bytes(buf[:idx])
+        # Drain the event + the trailing terminator from the buffer.
+        del buf[: idx + len(terminator)]
+        # Decoding the COMPLETE event must succeed. If it doesn't, the
+        # upstream emitted invalid UTF-8 mid-stream — surface loudly.
+        event_text = event_bytes.decode("utf-8")
+        event_name: str | None = None
+        data_lines: list[str] = []
+        for line in event_text.split("\n"):
+            if not line:
+                continue
+            # SSE comment line — ignored per spec.
+            if line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event_name = line[len("event:") :].lstrip()
+            elif line.startswith("data:"):
+                data_lines.append(line[len("data:") :].lstrip())
+        # Per SSE spec, multiple `data:` lines join with newline. We
+        # preserve that here even though OpenAI/Anthropic emit one
+        # `data:` per event.
+        if data_lines:
+            events.append((event_name, "\n".join(data_lines)))
+    return events
+
+
 # Maximum message array length (prevents DoS from deeply nested payloads)
 MAX_MESSAGE_ARRAY_LENGTH = 10000
 

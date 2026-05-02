@@ -282,7 +282,31 @@ async fn forward_http(
         // cannot be resumed as a stream — fail loudly per project
         // no-silent-fallbacks rule. Operators tune
         // `--compression-max-body-bytes` upward if they hit this.
+        //
+        // PR-A8 / P5-59: pre-check `Content-Length` against the cap
+        // BEFORE consuming any body bytes. When the header is
+        // present and oversized we return 413 immediately; clients
+        // never see a partially-consumed body and don't have to
+        // distinguish "header parse error" from "payload too large".
+        // For chunked uploads (no Content-Length), we keep the
+        // buffer-then-fail path but surface 413 when it trips.
         let max = state.config.compression_max_body_bytes as usize;
+        if let Some(len) = body_bytes_hint {
+            if len as usize > max {
+                tracing::warn!(
+                    request_id = %request_id,
+                    path = %path_for_log,
+                    limit_bytes = max,
+                    content_length = len,
+                    "compression: Content-Length exceeds buffer limit; \
+                     returning 413 without consuming body"
+                );
+                return Err(ProxyError::PayloadTooLarge(format!(
+                    "request Content-Length {len} exceeds compression \
+                     buffer limit ({max} bytes)"
+                )));
+            }
+        }
         let buffered = match to_bytes(req.into_body(), max).await {
             Ok(b) => b,
             Err(e) => {
@@ -294,7 +318,7 @@ async fn forward_http(
                     "compression: body exceeds buffer limit; failing loudly (cannot \
                      resume streaming once the body has been partially consumed)"
                 );
-                return Err(ProxyError::InvalidHeader(format!(
+                return Err(ProxyError::PayloadTooLarge(format!(
                     "request body exceeds compression buffer limit ({max} bytes): {e}"
                 )));
             }
@@ -404,6 +428,31 @@ async fn forward_http(
 
     let upstream_status = upstream_resp.status();
     let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    // PR-A8 / P5-57: capture the upstream request id BEFORE we move
+    // `upstream_resp.headers()` into the response filter. Anthropic
+    // emits `request-id` (lowercase, no `x-`); OpenAI emits
+    // `x-request-id`. We forward both to the client unchanged in
+    // `resp_headers` and additionally surface a side-channel
+    // `headroom-request-id` header so callers can correlate proxy
+    // logs without conflating with the proxy's own `x-request-id`.
+    let upstream_request_id_anthropic = upstream_resp
+        .headers()
+        .get("request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let upstream_request_id_openai = upstream_resp
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    // Prefer the provider-specific id whichever was set. Both
+    // present is unusual but legal; prefer Anthropic since it's the
+    // path-shape we lockdown with cache invariants.
+    let upstream_request_id = upstream_request_id_anthropic
+        .clone()
+        .or_else(|| upstream_request_id_openai.clone());
+
     let resp_headers = filter_response_headers(upstream_resp.headers());
 
     // Stream response body back without buffering. Wrap errors so mid-stream
@@ -426,6 +475,13 @@ async fn forward_http(
         if let Ok(v) = http::HeaderValue::from_str(&request_id) {
             h.insert(HeaderName::from_static("x-request-id"), v);
         }
+        // PR-A8 / P5-57: surface the upstream id in a distinct
+        // header so it's never conflated with the proxy's own.
+        if let Some(uid) = upstream_request_id.as_deref() {
+            if let Ok(v) = http::HeaderValue::from_str(uid) {
+                h.insert(HeaderName::from_static("headroom-upstream-request-id"), v);
+            }
+        }
     }
     let response = response
         .body(body)
@@ -433,6 +489,11 @@ async fn forward_http(
 
     tracing::info!(
         request_id = %request_id,
+        upstream_request_id = upstream_request_id.as_deref().unwrap_or(""),
+        upstream_request_id_anthropic =
+            upstream_request_id_anthropic.as_deref().unwrap_or(""),
+        upstream_request_id_openai =
+            upstream_request_id_openai.as_deref().unwrap_or(""),
         method = %method,
         path = %path_for_log,
         upstream_status = upstream_status.as_u16(),
