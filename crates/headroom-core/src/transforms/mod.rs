@@ -24,6 +24,7 @@ pub mod live_zone;
 pub mod log_compressor;
 pub mod magika_detector;
 pub mod pipeline;
+pub mod recommendations;
 pub mod safety;
 pub mod search_compressor;
 pub mod smart_crusher;
@@ -51,6 +52,7 @@ pub use pipeline::{
     JsonMinifier, JsonOffload, LogOffload, LogTemplate, OffloadOutput, OffloadTransform,
     PipelineConfig, PipelineResult, ReformatOutput, ReformatTransform, TransformError,
 };
+pub use recommendations::{Recommendation, RecommendationStore, RECOMMENDATIONS_PATH_ENV_VAR};
 pub use safety::{tool_pair_indices, ToolPair};
 pub use search_compressor::{
     FileMatches, SearchCompressionResult, SearchCompressor, SearchCompressorConfig,

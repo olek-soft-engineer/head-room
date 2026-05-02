@@ -189,7 +189,11 @@ fn threshold_for(content_type: ContentType) -> usize {
 /// Authentication mode of the originating request. Passed through to
 /// the dispatcher so PR-F2 can vary policy without re-shaping the
 /// public API. PR-B3 ignores the value (always treated as `Payg`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Also reused by [`super::recommendations`] (PR-B5) as the lookup
+/// key prefix — keeping one canonical enum avoids drift between the
+/// dispatcher's auth slice and the published recommendations'.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthMode {
     /// Pay-as-you-go API key. Most aggressive compression budget —
     /// every saved token is real money for the customer.
@@ -203,6 +207,23 @@ pub enum AuthMode {
     /// compression is less compelling and may interact badly with
     /// rate-limit accounting.
     Subscription,
+    /// Auth slice not yet detected. Matches the Python TOIN publish
+    /// CLI's "unknown" default. Used by the recommendations loader
+    /// (PR-B5) when an aggregation row didn't carry an auth tag.
+    Unknown,
+}
+
+impl AuthMode {
+    /// String form used as the recommendations-store lookup key.
+    /// Mirrors the Python publish CLI tag values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMode::Payg => "payg",
+            AuthMode::OAuth => "oauth",
+            AuthMode::Subscription => "subscription",
+            AuthMode::Unknown => "unknown",
+        }
+    }
 }
 
 /// Per-block decision recorded for observability. Independent of
