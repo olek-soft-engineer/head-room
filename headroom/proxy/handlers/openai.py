@@ -521,27 +521,62 @@ class OpenAIHandlerMixin:
                     "to preserve cache stability (openai)"
                 )
 
-        # Memory: inject context and tools for OpenAI requests
+        # Memory: inject context and tools for OpenAI requests.
+        #
+        # PR-A3 follow-up to A2: memory context now routes exclusively to
+        # the live-zone tail (latest user message), never via a system-level
+        # prepend. The cache hot zone (system messages) is sacrosanct —
+        # invariant I2. See REALIGNMENT/03-phase-A-lockdown.md PR-A3.
         memory_context_injected = False
         memory_tools_injected = False
         if self.memory_handler and memory_user_id:
             try:
-                # Inject memory context (search similar memories, add as system message)
                 if self.memory_handler.config.inject_context:
                     memory_context = await self.memory_handler.search_and_format_context(
                         memory_user_id, optimized_messages
                     )
                     if memory_context:
-                        # Prepend as system message for OpenAI format
-                        optimized_messages = [
-                            {"role": "system", "content": memory_context},
-                            *optimized_messages,
-                        ]
-                        memory_context_injected = True
-                        logger.info(
-                            f"[{request_id}] Memory: Injected {len(memory_context)} chars "
-                            f"of context for user {memory_user_id}"
+                        from headroom.proxy.helpers import (
+                            append_text_to_latest_user_chat_message,
+                            get_memory_injection_mode,
+                            log_memory_injection,
                         )
+
+                        injection_mode = get_memory_injection_mode()
+                        if injection_mode == "disabled":
+                            log_memory_injection(
+                                request_id=request_id,
+                                session_id=None,
+                                decision="skipped_disabled",
+                                bytes_injected=0,
+                                query=None,
+                            )
+                        else:
+                            new_messages, bytes_appended = append_text_to_latest_user_chat_message(
+                                optimized_messages, memory_context
+                            )
+                            if bytes_appended > 0:
+                                optimized_messages = new_messages
+                                memory_context_injected = True
+                                log_memory_injection(
+                                    request_id=request_id,
+                                    session_id=None,
+                                    decision="injected_live_zone_tail_chat",
+                                    bytes_injected=bytes_appended,
+                                    query=None,
+                                )
+                                logger.info(
+                                    f"[{request_id}] Memory: Injected {bytes_appended} chars "
+                                    f"into latest user message tail for user {memory_user_id}"
+                                )
+                            else:
+                                log_memory_injection(
+                                    request_id=request_id,
+                                    session_id=None,
+                                    decision="no_eligible_user_message",
+                                    bytes_injected=0,
+                                    query=None,
+                                )
 
                 # Inject memory tools
                 if self.memory_handler.config.inject_tools:
@@ -2444,6 +2479,31 @@ class OpenAIHandlerMixin:
         http_headers = dict(upstream_headers)
         http_headers["content-type"] = "application/json"
 
+        # Byte-faithful re-serialization (PR-A3, fixes P0-2). The WS payload
+        # is always synthesized from the WebSocket frame so the body is
+        # treated as mutated; we still go through the canonical path so
+        # numeric precision and UTF-8 are preserved.
+        from headroom.proxy.helpers import (
+            log_outbound_request,
+            prepare_outbound_body_bytes,
+        )
+
+        outbound_bytes, outbound_source = prepare_outbound_body_bytes(
+            body=http_body,
+            original_body_bytes=None,
+            body_mutated=True,
+        )
+        log_outbound_request(
+            forwarder="openai_ws",
+            method="POST",
+            path=http_url,
+            body_bytes_count=len(outbound_bytes),
+            body_mutated=True,
+            mutation_reasons=["ws_http_fallback_resynthesized"],
+            request_id=request_id,
+            source=outbound_source,
+        )
+
         logger.debug(f"[{request_id}] WS→HTTP fallback POST to {http_url}")
 
         try:
@@ -2454,7 +2514,7 @@ class OpenAIHandlerMixin:
                         "POST",
                         http_url,
                         headers=http_headers,
-                        json=http_body,
+                        content=outbound_bytes,
                         timeout=120.0,
                     ) as response:
                         if response.status_code != 200:

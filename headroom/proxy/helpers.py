@@ -67,6 +67,164 @@ def hash_query_for_log(query: str) -> str:
     return h.hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# Byte-faithful Python forwarder support (PR-A3 — fixes P0-2).
+# ---------------------------------------------------------------------------
+#
+# Every Python forwarder (server.py:_retry_request, streaming.py,
+# openai.py:_ws_http_fallback, batch.py) historically used
+# ``httpx.AsyncClient.post(url, json=body)``. httpx's default JSON encoder
+# uses ``separators=(", ", ": ")`` and ``ensure_ascii=True`` so the bytes
+# leaving the proxy never byte-equal the bytes that arrived from a
+# well-behaved client (Claude Code, Codex CLI emit compact + UTF-8). Every
+# such request collapses Anthropic prefix-cache hit-rate.
+#
+# PR-A3 switches every forwarder to byte-faithful forwarding:
+#   * unmutated body → forward original ``await request.body()`` verbatim;
+#   * mutated body  → re-serialize once via ``serialize_body_canonical``.
+#
+# A ``BodyMutationTracker`` accompanies each request so the forwarder can
+# pick the right path. Memory-injection / compression / image-rewrite sites
+# call ``tracker.mark_mutated(reason)``.
+
+_PYTHON_FORWARDER_MODE_ENV = "HEADROOM_PROXY_PYTHON_FORWARDER_MODE"
+PythonForwarderMode = Literal["byte_faithful", "legacy_json_kwarg"]
+_PYTHON_FORWARDER_MODE_DEFAULT: PythonForwarderMode = "byte_faithful"
+
+
+def get_python_forwarder_mode() -> PythonForwarderMode:
+    """Return the active Python-forwarder mode.
+
+    Read at request time. Unknown values raise loudly per the no-silent-
+    fallback build constraint. The ``legacy_json_kwarg`` value is an
+    explicit operator opt-in for emergency rollback — NOT a fallback.
+    """
+    raw = os.environ.get(_PYTHON_FORWARDER_MODE_ENV, "").strip().lower()
+    if not raw:
+        return _PYTHON_FORWARDER_MODE_DEFAULT
+    if raw in ("byte_faithful", "legacy_json_kwarg"):
+        return cast(PythonForwarderMode, raw)
+    raise ValueError(
+        f"Invalid {_PYTHON_FORWARDER_MODE_ENV}={raw!r}; "
+        "expected 'byte_faithful' or 'legacy_json_kwarg'"
+    )
+
+
+def serialize_body_canonical(body: dict[str, Any]) -> bytes:
+    """Re-serialize a request body deterministically with cache-stable formatting.
+
+    Uses compact separators and preserves UTF-8 (no ``\\uXXXX`` escapes), so
+    byte output matches what well-behaved API clients (Claude Code, Codex
+    CLI) emit. Python 3.7+ dict insertion order is preserved by
+    ``json.dumps`` so message ordering is stable.
+
+    This is the canonical re-serialization for any forwarder path that did
+    mutate the body (memory injection, compression, etc.).
+    """
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+class BodyMutationTracker:
+    """Records whether a request body was mutated and why.
+
+    The forwarder reads ``mutated`` to decide between byte-faithful
+    passthrough and canonical re-serialization. Reasons are logged with
+    each outbound request to make cache-affecting decisions auditable.
+
+    Thread-safety: a single tracker instance is owned by exactly one
+    request task. No locking needed.
+    """
+
+    __slots__ = ("_mutated", "_reasons")
+
+    def __init__(self) -> None:
+        self._mutated: bool = False
+        self._reasons: list[str] = []
+
+    def mark_mutated(self, reason: str) -> None:
+        """Mark the body as mutated and record the reason.
+
+        ``reason`` should be a stable identifier (snake_case) suitable for
+        log aggregation, e.g. ``memory_injection`` or
+        ``compression_smart_crusher``.
+        """
+        if not reason:
+            raise ValueError("BodyMutationTracker.mark_mutated: reason must be non-empty")
+        self._mutated = True
+        if reason not in self._reasons:
+            self._reasons.append(reason)
+
+    @property
+    def mutated(self) -> bool:
+        return self._mutated
+
+    @property
+    def reasons(self) -> list[str]:
+        return list(self._reasons)
+
+
+def prepare_outbound_body_bytes(
+    *,
+    body: dict[str, Any],
+    original_body_bytes: bytes | None,
+    body_mutated: bool,
+    forwarder_mode: PythonForwarderMode | None = None,
+) -> tuple[bytes, str]:
+    """Pick the outbound body bytes for a forwarder call.
+
+    Returns ``(outbound_bytes, source)`` where ``source`` is one of
+    ``passthrough`` (original bytes verbatim), ``canonical`` (re-serialized
+    deterministically because body was mutated), or ``legacy`` (rollback
+    mode — old ``json=body`` behavior).
+
+    * ``forwarder_mode == "byte_faithful"`` (default): unmutated → passthrough,
+      mutated → canonical.
+    * ``forwarder_mode == "legacy_json_kwarg"``: always re-encode via the old
+      httpx-style separators (operator opt-in, for rollback only).
+    """
+    mode = forwarder_mode if forwarder_mode is not None else get_python_forwarder_mode()
+    if mode == "legacy_json_kwarg":
+        # Old httpx default: separators=(", ", ": "), ensure_ascii=True.
+        legacy_bytes = json.dumps(body, separators=(", ", ": "), ensure_ascii=True).encode("utf-8")
+        return legacy_bytes, "legacy"
+
+    # byte_faithful path
+    if body_mutated or original_body_bytes is None:
+        return serialize_body_canonical(body), "canonical"
+    return original_body_bytes, "passthrough"
+
+
+def log_outbound_request(
+    *,
+    forwarder: str,
+    method: str,
+    path: str,
+    body_bytes_count: int,
+    body_mutated: bool,
+    mutation_reasons: list[str],
+    request_id: str | None,
+    source: str,
+) -> None:
+    """Structured log line for every outbound forwarder call.
+
+    Per realignment build constraints: every cache-affecting decision is
+    logged. Never includes ``Authorization``/``x-api-key`` content or full
+    body bytes.
+    """
+    logger.info(
+        "event=outbound_request forwarder=%s method=%s path=%s body_bytes=%d "
+        "body_mutated=%s mutation_reasons=%s source=%s request_id=%s",
+        forwarder,
+        method,
+        path,
+        body_bytes_count,
+        "true" if body_mutated else "false",
+        ",".join(mutation_reasons) if mutation_reasons else "",
+        source,
+        request_id or "",
+    )
+
+
 def log_memory_injection(
     *,
     request_id: str,
@@ -91,6 +249,67 @@ def log_memory_injection(
         bytes_injected,
         query_hash,
     )
+
+
+def append_text_to_latest_user_chat_message(
+    messages: list[dict[str, Any]],
+    context_text: str,
+) -> tuple[list[dict[str, Any]], int]:
+    """Append context text to the first text block of the latest user chat message.
+
+    OpenAI Chat Completions ``body["messages"]`` shape: each message is
+    ``{"role": ..., "content": str | list[{"type": "text"|"input_text", "text": ...}]}``.
+
+    This is the OpenAI Chat Completions analog of
+    ``_append_context_to_latest_non_frozen_user_turn`` (Anthropic) and
+    ``append_text_to_latest_user_input_item`` (OpenAI Responses). Used by
+    PR-A3 to retire the legacy system-prepend memory-injection path
+    (P0-equivalent for /v1/chat/completions).
+
+    Returns ``(new_messages, bytes_appended)``. ``bytes_appended == 0``
+    when no eligible user message was found (no mutation occurred).
+    """
+    if not messages or not context_text:
+        return messages, 0
+
+    new_messages = list(messages)
+    for idx in range(len(new_messages) - 1, -1, -1):
+        msg = new_messages[idx]
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "user":
+            continue
+
+        content = msg.get("content")
+        if isinstance(content, str):
+            updated_msg = {**msg, "content": content + "\n\n" + context_text}
+            new_messages[idx] = updated_msg
+            return new_messages, len(context_text)
+
+        if isinstance(content, list) and content:
+            new_content: list[dict[str, Any]] = []
+            appended = False
+            for part in content:
+                if (
+                    not appended
+                    and isinstance(part, dict)
+                    and part.get("type") in ("text", "input_text")
+                ):
+                    existing_text = part.get("text", "")
+                    new_part = {**part, "text": existing_text + "\n\n" + context_text}
+                    new_content.append(new_part)
+                    appended = True
+                else:
+                    new_content.append(part)
+            if appended:
+                updated_msg = {**msg, "content": new_content}
+                new_messages[idx] = updated_msg
+                return new_messages, len(context_text)
+
+        # User message but no eligible text block — leave untouched and stop.
+        return messages, 0
+
+    return messages, 0
 
 
 def append_text_to_latest_user_input_item(
@@ -344,16 +563,12 @@ def is_anthropic_auth(headers: dict[str, str]) -> bool:
     return False
 
 
-async def _read_request_json(request: Request) -> dict[str, Any]:
-    """Read and parse JSON from a request, handling compressed bodies.
+async def _read_request_body_bytes(request: Request) -> bytes:
+    """Read and (if needed) decompress the request body, returning raw UTF-8 bytes.
 
-    Clients like OpenAI Codex may send zstd, gzip, or deflate-compressed
-    request bodies.  Starlette's ``request.json()`` does not decompress
-    automatically, causing a UnicodeDecodeError on compressed bytes.
-
-    This helper inspects ``Content-Encoding``, decompresses if needed,
-    then JSON-decodes the result.  It raises ``ValueError`` on any
-    decompression or parse failure so callers can return a clean 400.
+    Mirrors ``_read_request_json`` but returns the bytes pre-parse so
+    forwarders can implement byte-faithful passthrough (PR-A3, fixes P0-2).
+    Raises ``ValueError`` on any decompression failure.
     """
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
     raw = await request.body()
@@ -363,9 +578,6 @@ async def _read_request_json(request: Request) -> dict[str, Any]:
             import zstandard
 
             dctx = zstandard.ZstdDecompressor()
-            # Use stream_reader for streaming zstd frames (no content size in header).
-            # Plain decompress() fails when the frame header omits the size, which
-            # is common with clients like OpenAI Codex.
             reader = dctx.stream_reader(raw)
             raw = reader.read()
             reader.close()
@@ -404,6 +616,22 @@ async def _read_request_json(request: Request) -> dict[str, Any]:
     elif encoding and encoding != "identity":
         raise ValueError(f"Unsupported Content-Encoding: {encoding}")
 
+    return cast(bytes, raw)
+
+
+async def _read_request_json(request: Request) -> dict[str, Any]:
+    """Read and parse JSON from a request, handling compressed bodies.
+
+    Clients like OpenAI Codex may send zstd, gzip, or deflate-compressed
+    request bodies.  Starlette's ``request.json()`` does not decompress
+    automatically, causing a UnicodeDecodeError on compressed bytes.
+
+    This helper inspects ``Content-Encoding``, decompresses if needed,
+    then JSON-decodes the result.  It raises ``ValueError`` on any
+    decompression or parse failure so callers can return a clean 400.
+    """
+    raw = await _read_request_body_bytes(request)
+
     # Decode and parse JSON
     try:
         text = raw.decode("utf-8")
@@ -414,6 +642,27 @@ async def _read_request_json(request: Request) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ValueError("Request body must be a JSON object, not " + type(result).__name__)
     return result
+
+
+async def read_request_json_with_bytes(request: Request) -> tuple[dict[str, Any], bytes]:
+    """Read JSON body AND return the original (decompressed) bytes.
+
+    Returned bytes are post-content-decoding (zstd/gzip/deflate/br are
+    decompressed) so they represent the body as the upstream API will
+    receive it. Forwarders pair this with a ``BodyMutationTracker`` to
+    decide between passthrough and canonical re-serialization.
+    """
+    raw = await _read_request_body_bytes(request)
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Request body is not valid UTF-8 (possibly compressed?): {exc}") from exc
+
+    result = json.loads(text)
+    if not isinstance(result, dict):
+        raise ValueError("Request body must be a JSON object, not " + type(result).__name__)
+    return result, raw
 
 
 def _strip_per_call_annotations(obj: Any) -> Any:

@@ -598,6 +598,10 @@ class StreamingMixin:
         pipeline_timing: dict[str, float] | None = None,
         prefix_tracker: Any | None = None,
         original_messages: list[dict] | None = None,
+        *,
+        original_body_bytes: bytes | None = None,
+        body_mutated: bool = True,
+        mutation_reasons: list[str] | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -616,6 +620,32 @@ class StreamingMixin:
 
         headers = await apply_copilot_api_auth(headers, url=url)
         start_time = time.time()
+
+        # Byte-faithful forwarding (PR-A3, fixes P0-2). Resolve outbound
+        # bytes once before entering the connection-retry loop. When a
+        # transform mutated the body we re-serialize canonically; otherwise
+        # we forward the original client bytes verbatim.
+        from headroom.proxy.helpers import (
+            log_outbound_request,
+            prepare_outbound_body_bytes,
+        )
+
+        outbound_bytes, outbound_source = prepare_outbound_body_bytes(
+            body=body,
+            original_body_bytes=original_body_bytes,
+            body_mutated=body_mutated,
+        )
+        outbound_headers = {**headers, "content-type": "application/json"}
+        log_outbound_request(
+            forwarder="streaming",
+            method="POST",
+            path=url,
+            body_bytes_count=len(outbound_bytes),
+            body_mutated=body_mutated,
+            mutation_reasons=list(mutation_reasons or []),
+            request_id=request_id,
+            source=outbound_source,
+        )
 
         # Mutable state for the generator to update
         stream_state: dict[str, Any] = {
@@ -648,7 +678,7 @@ class StreamingMixin:
             for attempt in range(retry_attempts):
                 try:
                     _upstream_req = self.http_client.build_request(
-                        "POST", url, json=body, headers=headers
+                        "POST", url, content=outbound_bytes, headers=outbound_headers
                     )
                     upstream_response = await self.http_client.send(_upstream_req, stream=True)
                     break

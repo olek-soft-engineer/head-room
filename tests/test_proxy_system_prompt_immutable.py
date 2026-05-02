@@ -84,7 +84,7 @@ def _install_session_tracker(proxy: object, frozen_count: int) -> None:
 
 
 def _install_capture_retry(proxy: object, captured: dict[str, object]) -> None:
-    async def _fake_retry(method, url, headers, body, stream=False):  # noqa: ANN001
+    async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
         captured["body"] = body
         captured["headers"] = dict(headers)
         return httpx.Response(
@@ -318,7 +318,7 @@ def test_memory_enabled_does_not_mutate_instructions_responses_api() -> None:
         proxy.config.image_optimize = False
         _install_memory_handler(proxy)
 
-        async def _fake_retry(method, url, headers, body, stream=False):  # noqa: ANN001
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             captured["body"] = body
             return httpx.Response(
                 200,
@@ -377,7 +377,7 @@ def test_memory_context_appears_in_responses_api_input_tail() -> None:
         proxy.config.image_optimize = False
         _install_memory_handler(proxy)
 
-        async def _fake_retry(method, url, headers, body, stream=False):  # noqa: ANN001
+        async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
             captured["body"] = body
             return httpx.Response(
                 200,

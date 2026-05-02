@@ -1030,17 +1030,67 @@ class HeadroomProxy(
         headers: dict,
         body: dict,
         stream: bool = False,
+        *,
+        original_body_bytes: bytes | None = None,
+        body_mutated: bool = True,
+        mutation_reasons: list[str] | None = None,
+        request_id: str | None = None,
+        forwarder_name: str = "server",
+        path_for_log: str | None = None,
     ) -> httpx.Response:
-        """Make request with retry and exponential backoff."""
+        """Make request with retry and exponential backoff.
+
+        Byte-faithful forwarding (PR-A3, fixes P0-2):
+          * If ``original_body_bytes`` is provided AND ``body_mutated`` is
+            ``False``, the original bytes are forwarded verbatim. SHA-256
+            of upstream-received bytes equals client-sent bytes.
+          * Otherwise the body dict is canonically re-serialized via
+            ``serialize_body_canonical`` (compact separators, ensure_ascii=False).
+          * ``HEADROOM_PROXY_PYTHON_FORWARDER_MODE=legacy_json_kwarg`` is an
+            explicit operator opt-in for emergency rollback to the old
+            ``httpx ... json=body`` behavior.
+
+        The default ``body_mutated=True`` preserves backward compatibility
+        for callers that still pass only ``body`` (e.g. CCR continuations
+        construct their body from scratch, so canonical serialization is
+        correct and original bytes do not exist).
+        """
+        from headroom.proxy.helpers import (
+            log_outbound_request,
+            prepare_outbound_body_bytes,
+        )
+
         last_error = None
+        reasons = list(mutation_reasons or [])
+        outbound_bytes, source = prepare_outbound_body_bytes(
+            body=body,
+            original_body_bytes=original_body_bytes,
+            body_mutated=body_mutated,
+        )
+        outbound_headers = {**headers, "content-type": "application/json"}
+
+        log_outbound_request(
+            forwarder=forwarder_name,
+            method=method,
+            path=path_for_log or url,
+            body_bytes_count=len(outbound_bytes),
+            body_mutated=body_mutated,
+            mutation_reasons=reasons,
+            request_id=request_id,
+            source=source,
+        )
 
         for attempt in range(self.config.retry_max_attempts):
             try:
                 if stream:
                     # For streaming, we return early - retry happens at higher level
-                    return await self.http_client.post(url, json=body, headers=headers)  # type: ignore[union-attr]
+                    return await self.http_client.post(  # type: ignore[union-attr]
+                        url, content=outbound_bytes, headers=outbound_headers
+                    )
                 else:
-                    response = await self.http_client.post(url, json=body, headers=headers)  # type: ignore[union-attr]
+                    response = await self.http_client.post(  # type: ignore[union-attr]
+                        url, content=outbound_bytes, headers=outbound_headers
+                    )
 
                     # Don't retry client errors (4xx)
                     if 400 <= response.status_code < 500:

@@ -340,9 +340,10 @@ class AnthropicHandlerMixin:
         from headroom.proxy.helpers import (
             MAX_MESSAGE_ARRAY_LENGTH,
             MAX_REQUEST_BODY_SIZE,
+            BodyMutationTracker,
             _get_image_compressor,
-            _read_request_json,
             compute_turn_id,
+            read_request_json_with_bytes,
         )
         from headroom.proxy.models import RequestLog
         from headroom.proxy.modes import is_cache_mode, is_token_mode
@@ -481,10 +482,16 @@ class AnthropicHandlerMixin:
                     },
                 )
 
-            # Parse request
+            # Parse request — capture both the parsed dict AND the original
+            # bytes so the forwarder can pick byte-faithful passthrough when
+            # nothing mutated the body (PR-A3, fixes P0-2). The mutation
+            # tracker is updated by every transform site that touches the
+            # body (image compression, memory injection, message rewriting,
+            # tool sorting, etc.).
+            body_mutation_tracker = BodyMutationTracker()
             try:
                 async with stage_timer.measure("read_request_json"):
-                    body = await _read_request_json(request)
+                    body, original_body_bytes = await read_request_json_with_bytes(request)
             except (json.JSONDecodeError, ValueError) as e:
                 await _finalize_pre_upstream()
                 return JSONResponse(
@@ -741,6 +748,7 @@ class AnthropicHandlerMixin:
                     compressor = _get_image_compressor()
                     if compressor and compressor.has_images(messages):
                         messages = compressor.compress(messages, provider="anthropic")
+                        body_mutation_tracker.mark_mutated("image_compression")
                         if compressor.last_result:
                             logger.info(
                                 f"Image compression: {compressor.last_result.technique.value} "
@@ -1284,6 +1292,21 @@ class AnthropicHandlerMixin:
                 (time.perf_counter() - pre_upstream_started_at) * 1000.0,
             )
 
+            # Byte-faithful forwarder support (PR-A3, fixes P0-2). At this
+            # point body has been through every transform (image, compression,
+            # memory, tool sort, pipeline extensions). If a transform reported
+            # it touched the body, mark mutated; we additionally compare the
+            # final body against the parsed original bytes as a structural
+            # safety net so any silent mutation we missed still triggers
+            # canonical re-serialization.
+            if not body_mutation_tracker.mutated and original_body_bytes is not None:
+                try:
+                    parsed_original = json.loads(original_body_bytes)
+                    if parsed_original != body:
+                        body_mutation_tracker.mark_mutated("structural_diff_vs_original")
+                except (json.JSONDecodeError, ValueError):
+                    body_mutation_tracker.mark_mutated("original_unparseable")
+
             # Forward request - use Bedrock backend if configured, otherwise direct API
             if self.anthropic_backend is not None:
                 # Route through Bedrock backend
@@ -1466,10 +1489,24 @@ class AnthropicHandlerMixin:
                         pipeline_timing=pipeline_timing,
                         prefix_tracker=prefix_tracker,
                         original_messages=original_client_messages,
+                        original_body_bytes=original_body_bytes,
+                        body_mutated=body_mutation_tracker.mutated,
+                        mutation_reasons=body_mutation_tracker.reasons,
                     )
                 else:
                     async with stage_timer.measure("upstream_connect"):
-                        response = await self._retry_request("POST", url, headers, body)
+                        response = await self._retry_request(
+                            "POST",
+                            url,
+                            headers,
+                            body,
+                            original_body_bytes=original_body_bytes,
+                            body_mutated=body_mutation_tracker.mutated,
+                            mutation_reasons=body_mutation_tracker.reasons,
+                            request_id=request_id,
+                            forwarder_name="anthropic_messages",
+                            path_for_log="/v1/messages",
+                        )
                     self.pipeline_extensions.emit(
                         PipelineStage.POST_SEND,
                         operation="proxy.request",
@@ -1638,11 +1675,39 @@ class AnthropicHandlerMixin:
                                 f"CCR: Making continuation request with {len(msgs)} messages"
                             )
                             assert self.http_client is not None, "HTTP client not initialized"
+                            # Byte-faithful (PR-A3, fixes P0-2). The CCR
+                            # continuation body is synthesized by Headroom
+                            # so it is treated as mutated and goes through
+                            # the canonical serializer.
+                            from headroom.proxy.helpers import (
+                                log_outbound_request,
+                                prepare_outbound_body_bytes,
+                            )
+
+                            ccr_outbound_bytes, ccr_outbound_source = prepare_outbound_body_bytes(
+                                body=continuation_body,
+                                original_body_bytes=None,
+                                body_mutated=True,
+                            )
+                            ccr_outbound_headers = {
+                                **continuation_headers,
+                                "content-type": "application/json",
+                            }
+                            log_outbound_request(
+                                forwarder="anthropic_ccr_continuation",
+                                method="POST",
+                                path=url,
+                                body_bytes_count=len(ccr_outbound_bytes),
+                                body_mutated=True,
+                                mutation_reasons=["ccr_continuation"],
+                                request_id=request_id,
+                                source=ccr_outbound_source,
+                            )
                             try:
                                 cont_response = await self.http_client.post(
                                     url,
-                                    json=continuation_body,
-                                    headers=continuation_headers,
+                                    content=ccr_outbound_bytes,
+                                    headers=ccr_outbound_headers,
                                     timeout=httpx.Timeout(120.0),  # Override timeout for CCR
                                 )
                                 logger.info(
@@ -2202,7 +2267,18 @@ class AnthropicHandlerMixin:
         url = f"{self.ANTHROPIC_API_URL}/v1/messages/batches"
 
         try:
-            response = await self._retry_request("POST", url, headers, body)
+            # Body is always mutated for batch (compressed requests).
+            response = await self._retry_request(
+                "POST",
+                url,
+                headers,
+                body,
+                body_mutated=True,
+                mutation_reasons=["batch_compression"],
+                request_id=request_id,
+                forwarder_name="anthropic_batch",
+                path_for_log="/v1/messages/batches",
+            )
 
             # Record metrics
             await self.metrics.record_request(
