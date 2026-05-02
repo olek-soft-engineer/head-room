@@ -357,6 +357,48 @@ class OpenAIHandlerMixin:
         openai_prefix_tracker = self.session_tracker_store.get_or_create(
             openai_session_id, "openai"
         )
+
+        # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge.
+        # Same pattern as anthropic.py — read client value, union with
+        # session-seen tokens, update tracker. WS auto-injection of
+        # `responses_websockets=2026-02-06` lives on the WS handler;
+        # chat-completions has no Headroom-required tokens today, so the
+        # merge effectively just makes the client value byte-stable
+        # across turns.
+        from headroom.proxy.helpers import (
+            get_session_beta_tracker as _get_session_beta_tracker_chat,
+        )
+        from headroom.proxy.helpers import (
+            log_beta_header_merge as _log_beta_header_merge_chat,
+        )
+
+        _client_openai_beta = headers.get("openai-beta")
+        _client_openai_beta_count = (
+            len([t for t in (_client_openai_beta or "").split(",") if t.strip()])
+            if _client_openai_beta
+            else 0
+        )
+        _sticky_openai_beta = _get_session_beta_tracker_chat().record_and_get_sticky_betas(
+            provider="openai",
+            session_id=openai_session_id,
+            client_value=_client_openai_beta,
+        )
+        _sticky_openai_beta_count = (
+            len([t for t in _sticky_openai_beta.split(",") if t.strip()])
+            if _sticky_openai_beta
+            else 0
+        )
+        if _sticky_openai_beta and _sticky_openai_beta != (_client_openai_beta or ""):
+            headers["openai-beta"] = _sticky_openai_beta
+        _log_beta_header_merge_chat(
+            provider="openai",
+            session_id=openai_session_id,
+            client_betas_count=_client_openai_beta_count,
+            sticky_betas_count=_sticky_openai_beta_count,
+            headroom_added=[],
+            request_id=request_id,
+        )
+
         openai_frozen_count = openai_prefix_tracker.get_frozen_message_count()
         if is_cache_mode(self.config.mode):
             openai_frozen_count = self._strict_previous_turn_frozen_count(
@@ -1166,6 +1208,45 @@ class OpenAIHandlerMixin:
             request_id=request_id,
         )
 
+        # PR-A6 (P5-50, preps P0-6): session-sticky `OpenAI-Beta` merge
+        # for /v1/responses. Compute a session_id off the same store the
+        # chat handler uses so multi-endpoint clients within one
+        # conversation share the sticky-token set.
+        _responses_session_id = self.session_tracker_store.compute_session_id(
+            request, model, messages
+        )
+        from headroom.proxy.helpers import (
+            get_session_beta_tracker as _get_session_beta_tracker_resp,
+        )
+        from headroom.proxy.helpers import (
+            log_beta_header_merge as _log_beta_header_merge_resp,
+        )
+
+        _client_resp_beta = headers.get("openai-beta")
+        _client_resp_beta_count = (
+            len([t for t in (_client_resp_beta or "").split(",") if t.strip()])
+            if _client_resp_beta
+            else 0
+        )
+        _sticky_resp_beta = _get_session_beta_tracker_resp().record_and_get_sticky_betas(
+            provider="openai",
+            session_id=_responses_session_id,
+            client_value=_client_resp_beta,
+        )
+        _sticky_resp_beta_count = (
+            len([t for t in _sticky_resp_beta.split(",") if t.strip()]) if _sticky_resp_beta else 0
+        )
+        if _sticky_resp_beta and _sticky_resp_beta != (_client_resp_beta or ""):
+            headers["openai-beta"] = _sticky_resp_beta
+        _log_beta_header_merge_resp(
+            provider="openai",
+            session_id=_responses_session_id,
+            client_betas_count=_client_resp_beta_count,
+            sticky_betas_count=_sticky_resp_beta_count,
+            headroom_added=[],
+            request_id=request_id,
+        )
+
         # Memory: Get user ID when memory is enabled. Reads `request.headers`
         # directly because `headers` was stripped of `x-headroom-*` (PR-A5).
         memory_user_id: str | None = None
@@ -1707,9 +1788,59 @@ class OpenAIHandlerMixin:
         upstream_headers = await apply_copilot_api_auth(upstream_headers, url=upstream_url)
 
         # Ensure the required beta header is present — OpenAI returns 500 without it.
-        # Codex sends `responses_websockets=2026-02-06`; only inject if missing entirely.
-        if "openai-beta" not in _lower_headers:
-            upstream_headers["OpenAI-Beta"] = "responses_websockets=2026-02-06"
+        # PR-A6 (P5-50): use the deterministic `merge_openai_beta` helper
+        # so the auto-injected `responses_websockets=2026-02-06` is
+        # appended to the client's value (preserving order, deduping
+        # case-insensitively) rather than overwriting it. The
+        # SessionBetaTracker also records the merge so a future cross-
+        # connection sticky model can replay tokens by session_id.
+        from headroom.proxy.helpers import (
+            get_session_beta_tracker as _get_session_beta_tracker_ws,
+        )
+        from headroom.proxy.helpers import (
+            log_beta_header_merge as _log_beta_header_merge_ws,
+        )
+        from headroom.proxy.helpers import merge_openai_beta as _merge_openai_beta_ws
+
+        _ws_required_tokens = ["responses_websockets=2026-02-06"]
+        # Read the original (pre-merge) client value from the WS headers
+        # to preserve casing and ordering.
+        _ws_client_beta_value: str | None = None
+        for _k, _v in upstream_headers.items():
+            if _k.lower() == "openai-beta":
+                _ws_client_beta_value = _v
+                break
+        # Record session-stickiness BEFORE adding required tokens so the
+        # tracker stores the canonical client baseline.
+        _ws_sticky_beta = _get_session_beta_tracker_ws().record_and_get_sticky_betas(
+            provider="openai",
+            session_id=session_id,
+            client_value=_ws_client_beta_value,
+        )
+        _ws_merged_beta = _merge_openai_beta_ws(_ws_sticky_beta, _ws_required_tokens)
+        # Replace any existing case-variants of openai-beta with the
+        # canonical "OpenAI-Beta" key carrying the merged value.
+        _ws_existing_keys = [_k for _k in upstream_headers if _k.lower() == "openai-beta"]
+        for _k in _ws_existing_keys:
+            del upstream_headers[_k]
+        if _ws_merged_beta:
+            upstream_headers["OpenAI-Beta"] = _ws_merged_beta
+        _ws_client_beta_count = (
+            len([t for t in (_ws_client_beta_value or "").split(",") if t.strip()])
+            if _ws_client_beta_value
+            else 0
+        )
+        _ws_merged_beta_count = (
+            len([t for t in _ws_merged_beta.split(",") if t.strip()]) if _ws_merged_beta else 0
+        )
+        _log_beta_header_merge_ws(
+            provider="openai",
+            session_id=session_id,
+            client_betas_count=_ws_client_beta_count,
+            sticky_betas_count=_ws_merged_beta_count,
+            headroom_added=_ws_required_tokens,
+            request_id=request_id,
+        )
 
         logger.debug(
             f"[{request_id}] WS upstream headers: "

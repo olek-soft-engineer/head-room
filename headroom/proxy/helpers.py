@@ -15,6 +15,7 @@ import os
 import random
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -651,6 +652,325 @@ def log_outbound_headers(
         "event=outbound_headers forwarder=%s stripped_count=%d request_id=%s",
         forwarder,
         stripped_count,
+        request_id or "",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Beta-header merge + per-session stickiness (PR-A6 — fixes P5-50; preps P0-6).
+# ---------------------------------------------------------------------------
+#
+# Anthropic's `anthropic-beta` and OpenAI's `OpenAI-Beta` request headers
+# carry a comma-separated list of opt-in beta tokens. Two cache-killer
+# patterns motivated PR-A6:
+#
+#   1. Mid-session mutation: when memory is enabled the proxy historically
+#      did an ad-hoc concat of `context-management-2025-06-27` onto the
+#      client value (anthropic.py:1244-1248) — every variant produced a
+#      different byte sequence and the order was undefined when the same
+#      client value already contained a Headroom-required token.
+#
+#   2. Token drop-out across turns: clients (Claude Code, Codex CLI) MAY
+#      drop a beta token between turn N and turn N+1 even when the proxy
+#      mutated turn N to add it. The cache hot zone is positional, so the
+#      next turn's prefix bytes hash differently and the prefix-cache
+#      read misses.
+#
+# PR-A6 introduces:
+#   * `merge_anthropic_beta` / `merge_openai_beta`: deterministic, pure,
+#     order-preserving merge. Client tokens first (in their original order),
+#     then Headroom-required tokens (in the order passed). Dedupe is
+#     case-insensitive but preserves original casing of first occurrence.
+#     Per Anthropic guide §6.3 #6: sticky-on means we add but never reorder.
+#
+#   * `SessionBetaTracker`: bounded LRU cache keyed by `(provider,
+#     session_id)` tracking every beta token observed for that session.
+#     On every request we union the client value with previously-seen
+#     tokens and update the seen set — so a beta seen in turn N is
+#     present in turn N+1 even if the client drops it. LRU bound (default
+#     1000 sessions) prevents unbounded growth. Reentrant lock so future
+#     callers from inside another locked method don't self-deadlock.
+#
+# Operator opt-in `HEADROOM_BETA_HEADER_STICKY=disabled` short-circuits
+# the tracker (returns the client value verbatim). That mode is loud and
+# explicit per realignment build constraint #4 — NOT a silent fallback.
+
+_BETA_HEADER_STICKY_ENV = "HEADROOM_BETA_HEADER_STICKY"
+BetaHeaderStickyMode = Literal["enabled", "disabled"]
+_BETA_HEADER_STICKY_DEFAULT: BetaHeaderStickyMode = "enabled"
+
+_BETA_TRACKER_MAX_SESSIONS_ENV = "HEADROOM_BETA_TRACKER_MAX_SESSIONS"
+_BETA_TRACKER_MAX_SESSIONS_DEFAULT = 1000
+
+
+def get_beta_header_sticky_mode() -> BetaHeaderStickyMode:
+    """Return the active beta-header stickiness mode.
+
+    Read at request time so operators can flip behaviour without a
+    restart. Unknown values raise loudly per the no-silent-fallback
+    build constraint.
+    """
+    raw = os.environ.get(_BETA_HEADER_STICKY_ENV, "").strip().lower()
+    if not raw:
+        return _BETA_HEADER_STICKY_DEFAULT
+    if raw in ("enabled", "disabled"):
+        return cast(BetaHeaderStickyMode, raw)
+    raise ValueError(f"Invalid {_BETA_HEADER_STICKY_ENV}={raw!r}; expected 'enabled' or 'disabled'")
+
+
+def get_beta_tracker_max_sessions() -> int:
+    """Return the LRU bound for `SessionBetaTracker` (sessions cap)."""
+    raw = os.environ.get(_BETA_TRACKER_MAX_SESSIONS_ENV, "").strip()
+    if not raw:
+        return _BETA_TRACKER_MAX_SESSIONS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {_BETA_TRACKER_MAX_SESSIONS_ENV}={raw!r}; expected positive int"
+        ) from exc
+    if value <= 0:
+        raise ValueError(f"Invalid {_BETA_TRACKER_MAX_SESSIONS_ENV}={raw!r}; expected positive int")
+    return value
+
+
+def _split_beta_tokens(value: str | None) -> list[str]:
+    """Split a comma-separated beta-header value into trimmed tokens.
+
+    Empty/whitespace-only entries are dropped. Pure function, no regex.
+    """
+    if not value:
+        return []
+    out: list[str] = []
+    for raw in value.split(","):
+        token = raw.strip()
+        if token:
+            out.append(token)
+    return out
+
+
+def _merge_beta_tokens(client_value: str | None, headroom_required: list[str]) -> str:
+    """Shared deterministic merge for `anthropic-beta` / `OpenAI-Beta` tokens.
+
+    Rules (per Anthropic guide §6.3 #6 "sticky-on; add but never reorder"):
+
+    * Client tokens come first, in their original order.
+    * Headroom-required tokens append in the order given, skipping any
+      token already present (case-insensitive).
+    * Dedupe is case-insensitive but the FIRST occurrence's casing wins
+      (prevents drift when client uses one casing across turns).
+    * Returns ``""`` when both inputs are empty.
+
+    Pure function. No regex. No global state.
+    """
+    seen_lower: set[str] = set()
+    out: list[str] = []
+    for token in _split_beta_tokens(client_value):
+        lower = token.lower()
+        if lower in seen_lower:
+            continue
+        seen_lower.add(lower)
+        out.append(token)
+    for token in headroom_required:
+        if not token:
+            continue
+        token = token.strip()
+        if not token:
+            continue
+        lower = token.lower()
+        if lower in seen_lower:
+            continue
+        seen_lower.add(lower)
+        out.append(token)
+    return ",".join(out)
+
+
+def merge_anthropic_beta(client_value: str | None, headroom_required: list[str]) -> str:
+    """Merge client `anthropic-beta` value with Headroom-required tokens.
+
+    See `_merge_beta_tokens` for full semantics. Order is deterministic:
+    client tokens first (in their original order), then headroom tokens
+    (in the order passed). No sorting — sticky-on per Anthropic guide
+    §6.3 #6 means we add but never reorder. Dedupe is case-insensitive
+    but preserves the original casing of the first occurrence.
+
+    Returns ``""`` when both inputs are empty.
+    """
+    return _merge_beta_tokens(client_value, headroom_required)
+
+
+def merge_openai_beta(client_value: str | None, headroom_required: list[str]) -> str:
+    """Merge client `OpenAI-Beta` value with Headroom-required tokens.
+
+    Mirror of `merge_anthropic_beta`. Same semantics — the OpenAI header
+    follows the same comma-separated convention and the same cache-stable
+    rules apply.
+    """
+    return _merge_beta_tokens(client_value, headroom_required)
+
+
+class SessionBetaTracker:
+    """Bounded LRU tracker of beta-header tokens observed per (provider, session).
+
+    On every request:
+      * Read the client's beta-header value.
+      * Union with previously-seen tokens for this session (sticky-on).
+      * Update the session's seen set.
+      * Return the union (preserving first-seen order).
+
+    Bounded by `max_sessions` (default 1000) via `OrderedDict` LRU
+    eviction: hits move-to-end; overflow pops oldest. Reentrant lock so
+    future callers from inside another locked method don't self-deadlock
+    (mirrors `CompressionCache` pattern).
+
+    The tracker is provider-aware: the same `session_id` for Anthropic
+    and OpenAI keeps independent token sets (clients/upstreams differ on
+    which tokens are valid).
+    """
+
+    def __init__(self, max_sessions: int | None = None) -> None:
+        if max_sessions is None:
+            max_sessions = get_beta_tracker_max_sessions()
+        if max_sessions <= 0:
+            raise ValueError("max_sessions must be > 0")
+        self._max_sessions: int = max_sessions
+        # OrderedDict per `compression_cache.py` LRU pattern. Entries
+        # store the per-session ordered token list (preserving first-seen
+        # order). RLock allows future callers from inside another locked
+        # method to enter without self-deadlock.
+        self._lock = threading.RLock()
+        self._sessions: OrderedDict[tuple[str, str], list[str]] = OrderedDict()
+
+    @property
+    def active_sessions(self) -> int:
+        with self._lock:
+            return len(self._sessions)
+
+    def _key(self, provider: str, session_id: str) -> tuple[str, str]:
+        return (provider, session_id)
+
+    def record_and_get_sticky_betas(
+        self,
+        provider: str,
+        session_id: str,
+        client_value: str | None,
+    ) -> str:
+        """Union client tokens with session-seen tokens; update; return.
+
+        ``provider`` is the upstream identifier (``anthropic`` /
+        ``openai``). ``session_id`` is the proxy's per-conversation ID
+        (e.g. `SessionTrackerStore.compute_session_id` output for the
+        HTTP path; the WS handler's per-connection UUID for the WS
+        path — note WS sessions are short-lived and won't accumulate
+        cross-turn).
+
+        When `HEADROOM_BETA_HEADER_STICKY=disabled` returns the client
+        value verbatim (operator diagnostic opt-in; documented as a
+        per-deploy choice, NOT a silent fallback).
+
+        Returns the merged comma-separated value (possibly empty).
+        """
+        if not provider:
+            raise ValueError("provider must be non-empty")
+        if not session_id:
+            raise ValueError("session_id must be non-empty")
+
+        if get_beta_header_sticky_mode() == "disabled":
+            # Diagnostic mode — return the client value verbatim, do not
+            # touch tracker state. This is loud (operators read the env
+            # var) and per-deploy.
+            return (client_value or "").strip()
+
+        client_tokens = _split_beta_tokens(client_value)
+        key = self._key(provider, session_id)
+
+        with self._lock:
+            previous = self._sessions.get(key)
+            if previous is None:
+                merged_list: list[str] = []
+                seen_lower: set[str] = set()
+            else:
+                # Move-to-end on hit (LRU touch).
+                self._sessions.move_to_end(key)
+                merged_list = list(previous)
+                seen_lower = {t.lower() for t in merged_list}
+
+            # Append client tokens preserving order; first-seen casing wins.
+            for token in client_tokens:
+                lower = token.lower()
+                if lower in seen_lower:
+                    continue
+                seen_lower.add(lower)
+                merged_list.append(token)
+
+            self._sessions[key] = merged_list
+            self._sessions.move_to_end(key)
+
+            # Bound: evict oldest until at-or-below cap.
+            while len(self._sessions) > self._max_sessions:
+                self._sessions.popitem(last=False)
+
+            return ",".join(merged_list)
+
+    def reset(self) -> None:
+        """Clear all session state (test helper)."""
+        with self._lock:
+            self._sessions.clear()
+
+
+# Process-wide singleton. Lazily replaced by tests via `reset` /
+# `_reset_session_beta_tracker_for_test`. One tracker for both providers
+# — the (provider, session_id) key keeps namespaces independent.
+_session_beta_tracker_lock = threading.Lock()
+_session_beta_tracker: SessionBetaTracker | None = None
+
+
+def get_session_beta_tracker() -> SessionBetaTracker:
+    """Return the process-wide `SessionBetaTracker` singleton.
+
+    Lazily constructed so the env-var bound (`HEADROOM_BETA_TRACKER_MAX_SESSIONS`)
+    is honored at first use. Tests use `_reset_session_beta_tracker_for_test`.
+    """
+    global _session_beta_tracker
+    with _session_beta_tracker_lock:
+        if _session_beta_tracker is None:
+            _session_beta_tracker = SessionBetaTracker()
+        return _session_beta_tracker
+
+
+def _reset_session_beta_tracker_for_test() -> None:
+    """Clear the process-wide tracker (test-only)."""
+    global _session_beta_tracker
+    with _session_beta_tracker_lock:
+        _session_beta_tracker = None
+
+
+def log_beta_header_merge(
+    *,
+    provider: str,
+    session_id: str | None,
+    client_betas_count: int,
+    sticky_betas_count: int,
+    headroom_added: list[str],
+    request_id: str | None,
+) -> None:
+    """Structured log for every cache-affecting beta-header merge.
+
+    `headroom_added` is a list of public, documented beta tokens
+    (e.g. ``context-management-2025-06-27``,
+    ``responses_websockets=2026-02-06``) — safe to log. We intentionally
+    do NOT log the raw client value because beta tokens, while public,
+    can carry experiment IDs the user has not opted to share with
+    Headroom logs. Emitting counts only makes the decision auditable.
+    """
+    logger.info(
+        "event=beta_header_merge provider=%s session_id=%s "
+        "client_betas=%d sticky_betas=%d headroom_added=%s request_id=%s",
+        provider,
+        session_id or "",
+        client_betas_count,
+        sticky_betas_count,
+        ",".join(headroom_added) if headroom_added else "",
         request_id or "",
     )
 

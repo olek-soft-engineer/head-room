@@ -750,6 +750,51 @@ class AnthropicHandlerMixin:
                     frozen_message_count,
                 )
 
+            # PR-A6 (P5-50, preps P0-6): session-sticky `anthropic-beta` merge.
+            # Read the client's beta value (note: anthropic-beta is NOT
+            # an x-headroom-* header so it survived the A5 strip), union
+            # with previously-seen tokens for this session, and update
+            # the tracker. Memory-injection (below at line ~1244) uses
+            # `merge_anthropic_beta` to add `context-management-2025-06-27`
+            # on top of the sticky baseline. Order matters: session-sticky
+            # FIRST so we have the canonical baseline; memory injection
+            # adds Headroom-required tokens AFTER.
+            from headroom.proxy.helpers import (
+                get_session_beta_tracker,
+                log_beta_header_merge,
+            )
+
+            _client_beta_value = headers.get("anthropic-beta")
+            _client_beta_count = (
+                len([t for t in (_client_beta_value or "").split(",") if t.strip()])
+                if _client_beta_value
+                else 0
+            )
+            _sticky_beta_value = get_session_beta_tracker().record_and_get_sticky_betas(
+                provider="anthropic",
+                session_id=session_id,
+                client_value=_client_beta_value,
+            )
+            _sticky_beta_count = (
+                len([t for t in _sticky_beta_value.split(",") if t.strip()])
+                if _sticky_beta_value
+                else 0
+            )
+            if _sticky_beta_value and _sticky_beta_value != (_client_beta_value or ""):
+                headers["anthropic-beta"] = _sticky_beta_value
+            elif not _sticky_beta_value and "anthropic-beta" in headers:
+                # Sticky value can only equal "" when both client and
+                # session are empty; preserve the (absent) client state.
+                pass
+            log_beta_header_merge(
+                provider="anthropic",
+                session_id=session_id,
+                client_betas_count=_client_beta_count,
+                sticky_betas_count=_sticky_beta_count,
+                headroom_added=[],
+                request_id=request_id,
+            )
+
             # In cache mode, avoid rewriting any message body bytes. The latest user
             # turn becomes historical on the next request, so even "latest turn only"
             # rewrites can invalidate the next cache read when the client resends the
@@ -1236,18 +1281,55 @@ class AnthropicHandlerMixin:
                         ]
                         logger.info(f"[{request_id}] Memory: Injected tools: {tool_names}")
 
-                        # Add beta headers for native memory tool
+                        # Add beta headers for native memory tool. PR-A6
+                        # (P5-50): use the deterministic `merge_anthropic_beta`
+                        # helper instead of ad-hoc string concat. Order:
+                        # client tokens first (preserved from session-sticky
+                        # baseline above), then Headroom-required tokens.
+                        # The session tracker already recorded the client
+                        # value; we append Headroom-required tokens here so
+                        # the next turn re-applies them deterministically.
                         beta_headers = self.memory_handler.get_beta_headers()
                         if beta_headers:
+                            from headroom.proxy.helpers import (
+                                log_beta_header_merge as _log_beta_header_merge_mem,
+                            )
+                            from headroom.proxy.helpers import (
+                                merge_anthropic_beta,
+                            )
+
                             for key, value in beta_headers.items():
-                                # Merge with existing beta header if present
-                                existing = headers.get(key, "")
-                                if existing and value not in existing:
-                                    headers[key] = f"{existing},{value}"
-                                else:
+                                if key.lower() != "anthropic-beta":
+                                    # Defensive: memory handler currently
+                                    # only emits anthropic-beta. Any future
+                                    # provider-specific beta header would
+                                    # need its own merge helper.
                                     headers[key] = value
+                                    continue
+                                existing_value = headers.get(key, "")
+                                required_tokens = [t.strip() for t in value.split(",") if t.strip()]
+                                merged = merge_anthropic_beta(existing_value, required_tokens)
+                                _existing_count = (
+                                    len([t for t in existing_value.split(",") if t.strip()])
+                                    if existing_value
+                                    else 0
+                                )
+                                _merged_count = (
+                                    len([t for t in merged.split(",") if t.strip()])
+                                    if merged
+                                    else 0
+                                )
+                                headers[key] = merged
+                                _log_beta_header_merge_mem(
+                                    provider="anthropic",
+                                    session_id=session_id,
+                                    client_betas_count=_existing_count,
+                                    sticky_betas_count=_merged_count,
+                                    headroom_added=required_tokens,
+                                    request_id=request_id,
+                                )
                                 logger.info(
-                                    f"[{request_id}] Memory: Added beta header: {key}={headers[key]}"
+                                    f"[{request_id}] Memory: Added beta header: {key}={merged}"
                                 )
 
             if memory_context_injected or memory_tools_injected:
