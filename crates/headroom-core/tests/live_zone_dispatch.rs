@@ -12,7 +12,10 @@
 //! Plus the cache-safety invariant: bytes outside the rewritten
 //! block are byte-identical to the input (SHA-256 prefix + suffix).
 
-use headroom_core::transforms::{compress_anthropic_live_zone, AuthMode, BlockAction, LiveZoneOutcome};
+use headroom_core::transforms::live_zone::DEFAULT_MODEL;
+use headroom_core::transforms::{
+    compress_anthropic_live_zone, AuthMode, BlockAction, LiveZoneOutcome,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -21,7 +24,8 @@ fn body_of(value: Value) -> Vec<u8> {
 }
 
 fn dispatch(body: &[u8]) -> LiveZoneOutcome {
-    compress_anthropic_live_zone(body, 0, AuthMode::Payg).expect("dispatcher returns Ok on valid bodies")
+    compress_anthropic_live_zone(body, 0, AuthMode::Payg, DEFAULT_MODEL)
+        .expect("dispatcher returns Ok on valid bodies")
 }
 
 /// Find the byte range of the FIRST occurrence of `needle` inside
@@ -110,11 +114,18 @@ fn json_tool_result_routes_to_smart_crusher() {
             strategy,
             original_bytes,
             compressed_bytes,
+            original_tokens,
+            compressed_tokens,
         } => {
             assert_eq!(strategy, "smart_crusher", "expected SmartCrusher dispatch");
             assert!(
                 compressed_bytes < original_bytes,
                 "SmartCrusher must produce strictly smaller output ({compressed_bytes} < {original_bytes})"
+            );
+            assert!(
+                compressed_tokens < original_tokens,
+                "tokenizer-validated gate (PR-B4) must accept only token-shrinking output \
+                 ({compressed_tokens} < {original_tokens})"
             );
         }
         other => panic!("expected BlockAction::Compressed, got {other:?}"),
@@ -159,6 +170,7 @@ fn log_tool_result_routes_to_log_compressor() {
                     action,
                     BlockAction::NoCompressionApplied { .. }
                         | BlockAction::RejectedNotSmaller { .. }
+                        | BlockAction::BelowByteThreshold { .. }
                 ),
                 "log dispatch declined cleanly: {action:?}"
             );
@@ -178,6 +190,7 @@ fn log_tool_result_routes_to_log_compressor() {
             strategy,
             original_bytes,
             compressed_bytes,
+            ..
         } => {
             assert_eq!(strategy, "log_compressor");
             assert!(compressed_bytes < original_bytes);
@@ -189,15 +202,25 @@ fn log_tool_result_routes_to_log_compressor() {
 #[test]
 fn diff_tool_result_routes_to_diff_compressor() {
     // A unidiff with surrounding context the diff compressor can trim.
+    // Size kept comfortably above the 1 KiB GitDiff byte threshold
+    // (PR-B4) so the dispatch gate is exercised.
     let mut diff = String::from("diff --git a/foo.rs b/foo.rs\n--- a/foo.rs\n+++ b/foo.rs\n");
-    diff.push_str("@@ -1,40 +1,40 @@\n");
-    for i in 0..18 {
-        diff.push_str(&format!(" context line {i}\n"));
+    diff.push_str("@@ -1,80 +1,80 @@\n");
+    for i in 0..40 {
+        diff.push_str(&format!(" context line {i} with extra padding text\n"));
     }
-    diff.push_str("-old line\n+new line\n");
-    for i in 0..18 {
-        diff.push_str(&format!(" context line {}\n", i + 18));
+    diff.push_str("-old line that needs to be replaced\n+new line replacing the old one\n");
+    for i in 0..40 {
+        diff.push_str(&format!(
+            " context line {} with extra padding text\n",
+            i + 40
+        ));
     }
+    assert!(
+        diff.len() > 1024,
+        "diff fixture must be > 1 KiB to clear the GitDiff threshold; got {}",
+        diff.len()
+    );
 
     let (body, _) = body_with_tool_result(&diff);
     let out = dispatch(&body);
@@ -216,6 +239,7 @@ fn diff_tool_result_routes_to_diff_compressor() {
                     action,
                     BlockAction::NoCompressionApplied { .. }
                         | BlockAction::RejectedNotSmaller { .. }
+                        | BlockAction::BelowByteThreshold { .. }
                 ),
                 "diff dispatch declined cleanly: {action:?}"
             );
@@ -272,14 +296,25 @@ fn main() {
         .clone();
     match action {
         BlockAction::NoCompressionApplied { content_type } => {
-            // Detector may classify code-with-prose as PlainText; both
-            // outcomes are no-op for B3 so accept either tag.
+            // Source-code-shaped content above the SourceCode byte
+            // threshold (2 KiB) but below any active compressor:
+            // SmartCrusher / log / search / diff don't apply, and
+            // the Rust code-compressor port is not yet wired.
             assert!(
                 content_type == "source_code" || content_type == "text",
                 "unexpected content_type tag: {content_type}"
             );
         }
-        other => panic!("expected NoCompressionApplied, got {other:?}"),
+        BlockAction::BelowByteThreshold { content_type, .. } => {
+            // Detector may classify code-with-prose as PlainText
+            // (5 KiB threshold) — for ~2.6 KiB of mixed code/prose
+            // that still routes to no-op for B4. Pin the tag.
+            assert!(
+                content_type == "text" || content_type == "source_code",
+                "unexpected content_type tag: {content_type}"
+            );
+        }
+        other => panic!("expected NoCompressionApplied or BelowByteThreshold, got {other:?}"),
     }
 }
 

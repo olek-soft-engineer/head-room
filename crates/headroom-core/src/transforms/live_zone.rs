@@ -106,6 +106,7 @@ use super::diff_compressor::{DiffCompressor, DiffCompressorConfig};
 use super::log_compressor::{LogCompressor, LogCompressorConfig};
 use super::search_compressor::{SearchCompressor, SearchCompressorConfig};
 use super::smart_crusher::{SmartCrusher, SmartCrusherConfig};
+use crate::tokenizer::get_tokenizer;
 
 // ─── Tunable constants (no magic numbers in the dispatch logic) ────────
 
@@ -125,6 +126,63 @@ const EMPTY_QUERY: &str = "";
 /// Default relevance bias passed to scoring-aware compressors. Mirrors
 /// the OSS-default behaviour ("no bias").
 const DEFAULT_BIAS: f64 = 0.0;
+
+/// Default model name handed to the tokenizer registry when the proxy
+/// could not extract `body["model"]`. Matches the most-common
+/// production Claude model — chars-per-token estimator for `claude-*`
+/// is calibrated to 3.5 cpt; using a non-Claude model here would
+/// silently pick a different estimator density. PR-F3 will plumb the
+/// actual model from `body["model"]`; PR-B4 just establishes the
+/// signature.
+pub const DEFAULT_MODEL: &str = "claude-3-5-sonnet-20241022";
+
+// ─── Per-content-type byte thresholds ──────────────────────────────────
+//
+// Below these byte sizes the dispatcher does not even attempt
+// compression — the per-block overhead (tokenizer count, dispatcher
+// bookkeeping, log lines) costs more than the marginal token savings,
+// and tiny inputs almost never compress at all.
+//
+// Sourced from the spec (`REALIGNMENT/04-phase-B-live-zone.md::PR-B4`).
+// Pinned as `const` rather than a hard-coded `match` so the values are
+// grep-able and reviewable in one place.
+
+/// JSON-array tool_results below this size route to no-op (1 KiB).
+const THRESHOLD_JSON_ARRAY: usize = 1024;
+/// Build / log output below this size routes to no-op (512 B). Logs
+/// are the most repetitive content type so the threshold is the
+/// lowest of the bunch.
+const THRESHOLD_BUILD_OUTPUT: usize = 512;
+/// Search-result blocks below this size route to no-op (1 KiB).
+const THRESHOLD_SEARCH_RESULTS: usize = 1024;
+/// Git-diff blocks below this size route to no-op (1 KiB).
+const THRESHOLD_GIT_DIFF: usize = 1024;
+/// Source-code blocks below this size route to no-op (2 KiB). Pinned
+/// for the future Rust code-compressor port — currently unused
+/// because `ContentType::SourceCode` short-circuits to no-op above
+/// the dispatch (see `dispatch_compressor`).
+const THRESHOLD_SOURCE_CODE: usize = 2048;
+/// Plain-text blocks below this size route to no-op (5 KiB). Pinned
+/// for the future Kompress wiring (PR-B7 follow-up); currently unused.
+const THRESHOLD_PLAIN_TEXT: usize = 5120;
+/// HTML blocks have no compressor; threshold matches plain text so
+/// when an HTML compressor lands the value is already pinned.
+const THRESHOLD_HTML: usize = 5120;
+
+/// Map a content type to its byte threshold. Returning `usize` rather
+/// than an `Option` because every variant has a sensible default;
+/// `Html` is a no-op anyway so the threshold check never fires.
+fn threshold_for(content_type: ContentType) -> usize {
+    match content_type {
+        ContentType::JsonArray => THRESHOLD_JSON_ARRAY,
+        ContentType::BuildOutput => THRESHOLD_BUILD_OUTPUT,
+        ContentType::SearchResults => THRESHOLD_SEARCH_RESULTS,
+        ContentType::GitDiff => THRESHOLD_GIT_DIFF,
+        ContentType::SourceCode => THRESHOLD_SOURCE_CODE,
+        ContentType::PlainText => THRESHOLD_PLAIN_TEXT,
+        ContentType::Html => THRESHOLD_HTML,
+    }
+}
 
 // ─── Public types ──────────────────────────────────────────────────────
 
@@ -176,8 +234,10 @@ pub enum BlockAction {
         /// `"source_code"`, `"html"`, `"image"`, `"unknown"`, etc.
         content_type: String,
     },
-    /// A compressor ran and produced a smaller output that was
-    /// spliced into the body.
+    /// A compressor ran and produced a smaller output (in tokens, as
+    /// counted by the model's tokenizer) that was spliced into the
+    /// body. Both byte and token counts are reported so the proxy
+    /// can log the savings ratio in either currency.
     Compressed {
         /// Identifier of the compressor (`"smart_crusher"`,
         /// `"log_compressor"`, ...). Static so the manifest is
@@ -188,6 +248,14 @@ pub enum BlockAction {
         original_bytes: usize,
         /// Bytes of the replacement block content.
         compressed_bytes: usize,
+        /// Tokens in the original block content (per the model's
+        /// tokenizer).
+        original_tokens: usize,
+        /// Tokens in the replacement block content. Always strictly
+        /// less than `original_tokens` for this variant — the
+        /// tokenizer-validated rejection gate (PR-B4) maps the
+        /// `>=` case to `RejectedNotSmaller`.
+        compressed_tokens: usize,
     },
     /// A compressor was tried but failed loudly. Per project memory
     /// `feedback_no_silent_fallbacks.md`: surface the error in the
@@ -200,9 +268,10 @@ pub enum BlockAction {
         /// Human-readable error string (from `Display`).
         error: String,
     },
-    /// A compressor ran but produced output >= original. Cache
-    /// safety + "don't make it worse" → keep the original. PR-B4
-    /// swaps this byte-length proxy for a real tokenizer count.
+    /// A compressor ran but produced output that did not shrink the
+    /// token count. Cache safety + "don't make it worse" → keep the
+    /// original. PR-B4 wired the tokenizer-validated check; both
+    /// byte and token counts are reported for observability.
     RejectedNotSmaller {
         /// Identifier of the compressor that was rejected.
         strategy: &'static str,
@@ -210,6 +279,25 @@ pub enum BlockAction {
         original_bytes: usize,
         /// Would-be compressed-block-content size, bytes.
         compressed_bytes: usize,
+        /// Original block-content size, tokens.
+        original_tokens: usize,
+        /// Would-be compressed-block-content size, tokens. Always
+        /// `>= original_tokens` (otherwise this would be
+        /// `Compressed`).
+        compressed_tokens: usize,
+    },
+    /// The block content was below the per-content-type byte
+    /// threshold; no compressor was invoked. The dispatcher does
+    /// not even spin up the tokenizer for these — they're below the
+    /// per-call overhead so the marginal savings are negative.
+    BelowByteThreshold {
+        /// Detected content type — string tag matches
+        /// `ContentType::as_str`.
+        content_type: &'static str,
+        /// Bytes in the block content.
+        byte_count: usize,
+        /// Threshold (in bytes) the content failed to clear.
+        threshold_bytes: usize,
     },
     /// Block type is intentionally outside the live zone (e.g.
     /// `tool_use` → cache hot zone) and is excluded from dispatch.
@@ -388,6 +476,10 @@ fn diff_compressor() -> &'static DiffCompressor {
 /// - `frozen_message_count`: hot-zone floor. Indices `< floor` are
 ///   excluded from dispatch.
 /// - `_auth_mode`: reserved for PR-F2; B3 ignores it.
+/// - `model`: the upstream model name (e.g. `"claude-3-5-sonnet-20241022"`).
+///   Routes the tokenizer registry to the right backend for the
+///   per-block token-count check (PR-B4). Pass [`DEFAULT_MODEL`] when
+///   the proxy could not extract `body["model"]`.
 ///
 /// # Returns
 ///
@@ -400,6 +492,7 @@ pub fn compress_anthropic_live_zone(
     body_raw: &[u8],
     frozen_message_count: usize,
     _auth_mode: AuthMode,
+    model: &str,
 ) -> Result<LiveZoneOutcome, LiveZoneError> {
     let parsed: Value = serde_json::from_slice(body_raw).map_err(LiveZoneError::BodyNotJson)?;
     let messages = parsed
@@ -457,6 +550,13 @@ pub fn compress_anthropic_live_zone(
 
     let mut block_outcomes: Vec<BlockOutcome> = Vec::with_capacity(plan.len());
     let mut replacements: Vec<Replacement> = Vec::new();
+    // One tokenizer per request — `get_tokenizer` is cheap (it
+    // returns a `Box<dyn Tokenizer>` over either a tiktoken-rs handle
+    // or an estimator) but counting once per block is a hot path.
+    // PR-B4 only invokes the tokenizer on blocks that actually
+    // produced compressed output; the byte-threshold gate filters
+    // sub-threshold content first.
+    let tokenizer = get_tokenizer(model);
 
     for slot in plan {
         let outcome = match slot.kind {
@@ -474,66 +574,16 @@ pub fn compress_anthropic_live_zone(
                 content_byte_range,
             } => {
                 let detected = detect_content_type(&content_text);
-                let _detected_tag = detected.content_type.as_str();
-                let outcome: BlockOutcome =
-                    match dispatch_compressor(&content_text, detected.content_type) {
-                        DispatchResult::NoOp { content_type } => BlockOutcome {
-                            message_index: target_idx,
-                            block_index: Some(slot.block_index),
-                            block_type,
-                            action: BlockAction::NoCompressionApplied {
-                                content_type: content_type.to_string(),
-                            },
-                        },
-                        DispatchResult::Compressed {
-                            strategy,
-                            compressed,
-                        } => {
-                            let original_bytes = content_text.len();
-                            let compressed_bytes = compressed.len();
-                            if compressed_bytes >= original_bytes {
-                                // Byte-length gate (PR-B4 will replace
-                                // with a token-count gate). Without this
-                                // the dispatcher could ship a "compressed"
-                                // body bigger than the input.
-                                BlockOutcome {
-                                    message_index: target_idx,
-                                    block_index: Some(slot.block_index),
-                                    block_type,
-                                    action: BlockAction::RejectedNotSmaller {
-                                        strategy,
-                                        original_bytes,
-                                        compressed_bytes,
-                                    },
-                                }
-                            } else {
-                                // Encode replacement as a JSON string and
-                                // record it for the splice.
-                                let replacement_bytes = serde_json::to_vec(&compressed)
-                                    .expect("string is always JSON-encodable");
-                                replacements.push(Replacement {
-                                    range: content_byte_range,
-                                    replacement: replacement_bytes,
-                                });
-                                BlockOutcome {
-                                    message_index: target_idx,
-                                    block_index: Some(slot.block_index),
-                                    block_type,
-                                    action: BlockAction::Compressed {
-                                        strategy,
-                                        original_bytes,
-                                        compressed_bytes,
-                                    },
-                                }
-                            }
-                        }
-                        DispatchResult::Error { strategy, error } => BlockOutcome {
-                            message_index: target_idx,
-                            block_index: Some(slot.block_index),
-                            block_type,
-                            action: BlockAction::CompressorError { strategy, error },
-                        },
-                    };
+                let outcome: BlockOutcome = compress_one_block(
+                    &content_text,
+                    detected.content_type,
+                    content_byte_range,
+                    target_idx,
+                    Some(slot.block_index),
+                    block_type,
+                    tokenizer.as_ref(),
+                    &mut replacements,
+                );
                 outcome
             }
             SlotKind::StringContent {
@@ -541,58 +591,16 @@ pub fn compress_anthropic_live_zone(
                 content_byte_range,
             } => {
                 let detected = detect_content_type(&content_text);
-                match dispatch_compressor(&content_text, detected.content_type) {
-                    DispatchResult::NoOp { content_type } => BlockOutcome {
-                        message_index: target_idx,
-                        block_index: None,
-                        block_type: "string_content".to_string(),
-                        action: BlockAction::NoCompressionApplied {
-                            content_type: content_type.to_string(),
-                        },
-                    },
-                    DispatchResult::Compressed {
-                        strategy,
-                        compressed,
-                    } => {
-                        let original_bytes = content_text.len();
-                        let compressed_bytes = compressed.len();
-                        if compressed_bytes >= original_bytes {
-                            BlockOutcome {
-                                message_index: target_idx,
-                                block_index: None,
-                                block_type: "string_content".to_string(),
-                                action: BlockAction::RejectedNotSmaller {
-                                    strategy,
-                                    original_bytes,
-                                    compressed_bytes,
-                                },
-                            }
-                        } else {
-                            let replacement_bytes = serde_json::to_vec(&compressed)
-                                .expect("string is always JSON-encodable");
-                            replacements.push(Replacement {
-                                range: content_byte_range,
-                                replacement: replacement_bytes,
-                            });
-                            BlockOutcome {
-                                message_index: target_idx,
-                                block_index: None,
-                                block_type: "string_content".to_string(),
-                                action: BlockAction::Compressed {
-                                    strategy,
-                                    original_bytes,
-                                    compressed_bytes,
-                                },
-                            }
-                        }
-                    }
-                    DispatchResult::Error { strategy, error } => BlockOutcome {
-                        message_index: target_idx,
-                        block_index: None,
-                        block_type: "string_content".to_string(),
-                        action: BlockAction::CompressorError { strategy, error },
-                    },
-                }
+                compress_one_block(
+                    &content_text,
+                    detected.content_type,
+                    content_byte_range,
+                    target_idx,
+                    None,
+                    "string_content".to_string(),
+                    tokenizer.as_ref(),
+                    &mut replacements,
+                )
             }
         };
         block_outcomes.push(outcome);
@@ -643,6 +651,112 @@ pub fn compress_anthropic_live_zone(
 }
 
 // ─── Internal helpers ──────────────────────────────────────────────────
+
+/// Per-block dispatch shared by the array-of-blocks slot and the
+/// legacy string-content slot. Encapsulates the PR-B4 sequence:
+///
+/// 1. Per-content-type byte threshold — sub-threshold content is
+///    tagged `BelowByteThreshold` and the dispatcher does not even
+///    invoke a compressor.
+/// 2. Type-aware dispatch (`dispatch_compressor`).
+/// 3. Tokenizer-validated rejection — if `compressed_tokens >=
+///    original_tokens` keep the original and tag `RejectedNotSmaller`
+///    (note: tokens, not bytes, drive the gate).
+/// 4. Otherwise record the replacement and tag `Compressed`.
+#[allow(clippy::too_many_arguments)]
+fn compress_one_block(
+    content_text: &str,
+    content_type: ContentType,
+    content_byte_range: (usize, usize),
+    message_index: usize,
+    block_index: Option<usize>,
+    block_type: String,
+    tokenizer: &dyn crate::tokenizer::Tokenizer,
+    replacements: &mut Vec<Replacement>,
+) -> BlockOutcome {
+    // 1. Byte-threshold gate. Empty content always falls through to
+    //    `dispatch_compressor` (which short-circuits on empty), so
+    //    only check when the slot has real bytes — this preserves
+    //    the existing "tool_result with no inner content" pathway.
+    if !content_text.is_empty() && content_text.len() < threshold_for(content_type) {
+        return BlockOutcome {
+            message_index,
+            block_index,
+            block_type,
+            action: BlockAction::BelowByteThreshold {
+                content_type: content_type.as_str(),
+                byte_count: content_text.len(),
+                threshold_bytes: threshold_for(content_type),
+            },
+        };
+    }
+
+    match dispatch_compressor(content_text, content_type) {
+        DispatchResult::NoOp { content_type } => BlockOutcome {
+            message_index,
+            block_index,
+            block_type,
+            action: BlockAction::NoCompressionApplied {
+                content_type: content_type.to_string(),
+            },
+        },
+        DispatchResult::Compressed {
+            strategy,
+            compressed,
+        } => {
+            let original_bytes = content_text.len();
+            let compressed_bytes = compressed.len();
+            // 3. Tokenizer-validated rejection. Per PR-B4 spec we
+            //    count both the original and compressed strings
+            //    using the model's tokenizer; the compression is
+            //    accepted only when it shrinks the token count.
+            //    Bytes-shrinking-but-tokens-growing happens for
+            //    pathological inputs (e.g. dense base64 → tokenizer
+            //    fragments more aggressively after a transform).
+            let original_tokens = tokenizer.count_text(content_text);
+            let compressed_tokens = tokenizer.count_text(&compressed);
+            if compressed_tokens >= original_tokens {
+                BlockOutcome {
+                    message_index,
+                    block_index,
+                    block_type,
+                    action: BlockAction::RejectedNotSmaller {
+                        strategy,
+                        original_bytes,
+                        compressed_bytes,
+                        original_tokens,
+                        compressed_tokens,
+                    },
+                }
+            } else {
+                let replacement_bytes =
+                    serde_json::to_vec(&compressed).expect("string is always JSON-encodable");
+                replacements.push(Replacement {
+                    range: content_byte_range,
+                    replacement: replacement_bytes,
+                });
+                BlockOutcome {
+                    message_index,
+                    block_index,
+                    block_type,
+                    action: BlockAction::Compressed {
+                        strategy,
+                        original_bytes,
+                        compressed_bytes,
+                        original_tokens,
+                        compressed_tokens,
+                    },
+                }
+            }
+        }
+        DispatchResult::Error { strategy, error } => BlockOutcome {
+            message_index,
+            block_index,
+            block_type,
+            action: BlockAction::CompressorError { strategy, error },
+        },
+    }
+}
 
 /// Walk `messages` from the back, returning the index of the latest
 /// `role == "user"` message. Restricted to indices `>= floor`; if
@@ -1120,7 +1234,7 @@ mod tests {
     #[test]
     fn empty_messages_yields_no_change() {
         let b = body(json!({"model": "claude", "messages": []}));
-        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg).unwrap();
+        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
         match out {
             LiveZoneOutcome::NoChange { manifest } => {
                 assert_eq!(manifest.messages_total, 0);
@@ -1134,13 +1248,14 @@ mod tests {
     #[test]
     fn no_messages_field_errors() {
         let b = body(json!({"model": "claude"}));
-        let err = compress_anthropic_live_zone(&b, 0, AuthMode::Payg).unwrap_err();
+        let err = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap_err();
         assert!(matches!(err, LiveZoneError::NoMessagesArray));
     }
 
     #[test]
     fn invalid_json_errors() {
-        let err = compress_anthropic_live_zone(b"not json", 0, AuthMode::Payg).unwrap_err();
+        let err = compress_anthropic_live_zone(b"not json", 0, AuthMode::Payg, DEFAULT_MODEL)
+            .unwrap_err();
         assert!(matches!(err, LiveZoneError::BodyNotJson(_)));
     }
 
@@ -1157,7 +1272,7 @@ mod tests {
                 ]},
             ]
         }));
-        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg).unwrap();
+        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
         let manifest = match &out {
             LiveZoneOutcome::NoChange { manifest } => manifest,
             LiveZoneOutcome::Modified { manifest, .. } => manifest,
@@ -1183,7 +1298,7 @@ mod tests {
                 {"role": "user", "content": [{"type": "text", "text": "second"}]},
             ]
         }));
-        let out = compress_anthropic_live_zone(&b, 2, AuthMode::Payg).unwrap();
+        let out = compress_anthropic_live_zone(&b, 2, AuthMode::Payg, DEFAULT_MODEL).unwrap();
         let manifest = match &out {
             LiveZoneOutcome::NoChange { manifest } => manifest,
             _ => panic!("expected NoChange"),
@@ -1205,24 +1320,19 @@ mod tests {
                 ]
             }]
         }));
-        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg).unwrap();
+        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
         let actions = outcome_block_actions(&out);
         assert_eq!(actions.len(), 3);
-        // tool_result with tiny content → NoCompressionApplied (under threshold / detector returns plain text).
-        assert!(matches!(
-            actions[0],
-            BlockAction::NoCompressionApplied { .. }
-        ));
+        // tool_result with tiny content → BelowByteThreshold (1 byte < 5 KiB plain-text threshold).
+        assert!(matches!(actions[0], BlockAction::BelowByteThreshold { .. }));
         assert!(matches!(
             actions[1],
             BlockAction::Excluded {
                 reason: ExclusionReason::HotZoneBlockType
             }
         ));
-        assert!(matches!(
-            actions[2],
-            BlockAction::NoCompressionApplied { .. }
-        ));
+        // text block with "ok" → BelowByteThreshold (2 bytes < 5 KiB plain-text threshold).
+        assert!(matches!(actions[2], BlockAction::BelowByteThreshold { .. }));
     }
 
     #[test]
@@ -1230,16 +1340,17 @@ mod tests {
         let b = body(json!({
             "messages": [{"role": "user", "content": "just a string"}]
         }));
-        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg).unwrap();
+        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
         let manifest = match &out {
             LiveZoneOutcome::NoChange { manifest } => manifest,
             LiveZoneOutcome::Modified { manifest, .. } => manifest,
         };
         assert_eq!(manifest.block_outcomes.len(), 1);
         assert_eq!(manifest.block_outcomes[0].block_type, "string_content");
+        // 13 bytes of plain text is well below the 5 KiB plain-text threshold.
         assert!(matches!(
             manifest.block_outcomes[0].action,
-            BlockAction::NoCompressionApplied { .. }
+            BlockAction::BelowByteThreshold { .. }
         ));
     }
 
@@ -1248,7 +1359,7 @@ mod tests {
         let b = body(json!({
             "messages": [{"role": "assistant", "content": "hi"}]
         }));
-        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg).unwrap();
+        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
         let manifest = match &out {
             LiveZoneOutcome::NoChange { manifest } => manifest,
             _ => panic!("expected NoChange"),
@@ -1263,9 +1374,10 @@ mod tests {
         let b = body(json!({
             "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
         }));
-        let payg = compress_anthropic_live_zone(&b, 0, AuthMode::Payg).unwrap();
-        let oauth = compress_anthropic_live_zone(&b, 0, AuthMode::OAuth).unwrap();
-        let sub = compress_anthropic_live_zone(&b, 0, AuthMode::Subscription).unwrap();
+        let payg = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
+        let oauth = compress_anthropic_live_zone(&b, 0, AuthMode::OAuth, DEFAULT_MODEL).unwrap();
+        let sub =
+            compress_anthropic_live_zone(&b, 0, AuthMode::Subscription, DEFAULT_MODEL).unwrap();
         for o in [&payg, &oauth, &sub] {
             assert!(matches!(o, LiveZoneOutcome::NoChange { .. }));
         }
@@ -1283,7 +1395,7 @@ mod tests {
                 ]
             }]
         }));
-        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg).unwrap();
+        let out = compress_anthropic_live_zone(&b, 0, AuthMode::Payg, DEFAULT_MODEL).unwrap();
         assert!(matches!(out, LiveZoneOutcome::NoChange { .. }));
     }
 
@@ -1296,7 +1408,7 @@ mod tests {
                 {"role": "user", "content": "live"},
             ]
         }));
-        let out = compress_anthropic_live_zone(&b, 2, AuthMode::Payg).unwrap();
+        let out = compress_anthropic_live_zone(&b, 2, AuthMode::Payg, DEFAULT_MODEL).unwrap();
         let manifest = match &out {
             LiveZoneOutcome::NoChange { manifest } => manifest,
             LiveZoneOutcome::Modified { manifest, .. } => manifest,
@@ -1311,7 +1423,7 @@ mod tests {
         let b = body(json!({
             "messages": [{"role": "user", "content": "x"}]
         }));
-        let out = compress_anthropic_live_zone(&b, 99, AuthMode::Payg).unwrap();
+        let out = compress_anthropic_live_zone(&b, 99, AuthMode::Payg, DEFAULT_MODEL).unwrap();
         let manifest = match &out {
             LiveZoneOutcome::NoChange { manifest } => manifest,
             _ => panic!("expected NoChange"),

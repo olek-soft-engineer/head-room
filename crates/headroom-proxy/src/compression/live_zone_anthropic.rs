@@ -39,6 +39,7 @@
 //! SHA-256 prefix-and-suffix invariant in CI.
 
 use bytes::Bytes;
+use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
     compress_anthropic_live_zone, AuthMode, BlockAction, ExclusionReason, LiveZoneError,
     LiveZoneOutcome,
@@ -153,13 +154,28 @@ pub fn compress_anthropic_request(
 
     let frozen_count = resolve_frozen_count(&parsed, cache_control_policy, request_id);
 
+    // PR-B4: extract `body["model"]` so the live-zone dispatcher can
+    // route the tokenizer registry to the right backend for the
+    // per-block token-count rejection gate. Anthropic
+    // `/v1/messages` always carries a `model` string per the API
+    // schema, but the proxy never breaks on a missing field — we
+    // fall back to `DEFAULT_MODEL` (a Claude name, so the
+    // chars-per-token estimator picks the calibrated 3.5 cpt
+    // density) and continue.
+    let model = parsed
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(DEFAULT_MODEL);
+
     // Run the live-zone dispatcher. PR-B3 wires per-type compressors:
     // SmartCrusher / LogCompressor / SearchCompressor / DiffCompressor.
-    // The dispatcher returns `Modified` whenever at least one block
-    // was rewritten and `NoChange` otherwise (live zone empty, every
-    // compressor declined, or every compressor produced output that
-    // wasn't smaller than the input).
-    match compress_anthropic_live_zone(body, frozen_count, AuthMode::Payg) {
+    // PR-B4 added the per-content-type byte-threshold gate and the
+    // tokenizer-validated rejection check. The dispatcher returns
+    // `Modified` whenever at least one block was rewritten and
+    // `NoChange` otherwise (live zone empty, every compressor
+    // declined, or every compressor produced output whose token
+    // count was not strictly less than the input's).
+    match compress_anthropic_live_zone(body, frozen_count, AuthMode::Payg, model) {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
             let block_count = manifest.block_outcomes.len();
             let blocks_excluded = manifest
@@ -193,21 +209,28 @@ pub fn compress_anthropic_request(
         }
         Ok(LiveZoneOutcome::Modified { new_body, manifest }) => {
             // Aggregate manifest into the proxy's `Compressed` payload.
-            // PR-B3 reports byte-counts (not token counts); PR-B4
-            // upgrades the gate to a tokenizer-validated count and
-            // updates these fields with the real numbers.
+            // PR-B4 reports token counts via the same tokenizer the
+            // dispatcher used to gate per-block acceptance — so the
+            // saving the proxy logs is the saving the cache will
+            // actually see.
             let mut original_bytes_total: usize = 0;
             let mut compressed_bytes_total: usize = 0;
+            let mut original_tokens_total: usize = 0;
+            let mut compressed_tokens_total: usize = 0;
             let mut strategies: Vec<&'static str> = Vec::new();
             for entry in &manifest.block_outcomes {
                 if let BlockAction::Compressed {
                     strategy,
                     original_bytes,
                     compressed_bytes,
+                    original_tokens,
+                    compressed_tokens,
                 } = entry.action
                 {
                     original_bytes_total += original_bytes;
                     compressed_bytes_total += compressed_bytes;
+                    original_tokens_total += original_tokens;
+                    compressed_tokens_total += compressed_tokens;
                     if !strategies.contains(&strategy) {
                         strategies.push(strategy);
                     }
@@ -234,15 +257,15 @@ pub fn compress_anthropic_request(
                 live_zone_strategies = ?strategies,
                 live_zone_block_original_bytes = original_bytes_total,
                 live_zone_block_compressed_bytes = compressed_bytes_total,
+                live_zone_block_original_tokens = original_tokens_total,
+                live_zone_block_compressed_tokens = compressed_tokens_total,
+                model = model,
                 "anthropic live-zone dispatch"
             );
             Outcome::Compressed {
                 body: new_body_bytes,
-                // PR-B4 will replace these with tokenizer counts.
-                // For now report block-content byte counts so
-                // observers can compute the savings ratio.
-                tokens_before: original_bytes_total,
-                tokens_after: compressed_bytes_total,
+                tokens_before: original_tokens_total,
+                tokens_after: compressed_tokens_total,
                 strategies_applied: strategies,
                 // PR-B7 wires CCR retrieval-marker injection.
                 markers_inserted: Vec::new(),
