@@ -34,6 +34,7 @@
 
 pub mod anthropic;
 pub mod live_zone_anthropic;
+pub mod live_zone_openai;
 pub mod model_limits;
 
 // PR-A4 helper for cache-control floor derivation lives on the
@@ -43,17 +44,37 @@ pub mod model_limits;
 // `compress_anthropic_request` is sourced from the live-zone module.
 pub use anthropic::resolve_frozen_count;
 pub use live_zone_anthropic::{compress_anthropic_request, Outcome, PassthroughReason};
+pub use live_zone_openai::{
+    compress_openai_chat_request, should_skip_compression, SkipCompressionReason,
+};
+
+/// Which provider's compression dispatcher should run for a request
+/// path. PR-C2 wires `/v1/chat/completions`; future PRs add
+/// `/v1/responses`, Gemini, etc. Returning an enum (rather than a
+/// bare bool + string later) keeps the routing explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressibleEndpoint {
+    /// Anthropic `/v1/messages`.
+    AnthropicMessages,
+    /// OpenAI Chat Completions `/v1/chat/completions`.
+    OpenAiChatCompletions,
+}
 
 /// Does this request path target an LLM endpoint we know how to
-/// compress? Cheap pre-filter before buffering the body. Phase B
-/// reuses this to gate which paths get the live-zone dispatcher.
+/// compress? Cheap pre-filter before buffering the body.
 pub fn is_compressible_path(path: &str) -> bool {
-    // Exact-match the Anthropic Messages endpoint. Future providers
-    // get their own arms here. Avoid prefix-matching to keep the
-    // compression scope explicit — `/v1/messages/123` (a
-    // hypothetical future per-message endpoint) shouldn't accidentally
-    // get its body parsed as a chat-completions request.
-    path == "/v1/messages"
+    classify_compressible_path(path).is_some()
+}
+
+/// Classify a request path to its compression dispatcher (or `None`
+/// if no compressor handles it). Single match arm per provider keeps
+/// the cache scope explicit.
+pub fn classify_compressible_path(path: &str) -> Option<CompressibleEndpoint> {
+    match path {
+        "/v1/messages" => Some(CompressibleEndpoint::AnthropicMessages),
+        "/v1/chat/completions" => Some(CompressibleEndpoint::OpenAiChatCompletions),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -63,14 +84,28 @@ mod tests {
     #[test]
     fn anthropic_messages_path_matches() {
         assert!(is_compressible_path("/v1/messages"));
+        assert_eq!(
+            classify_compressible_path("/v1/messages"),
+            Some(CompressibleEndpoint::AnthropicMessages)
+        );
+    }
+
+    #[test]
+    fn openai_chat_path_matches() {
+        assert!(is_compressible_path("/v1/chat/completions"));
+        assert_eq!(
+            classify_compressible_path("/v1/chat/completions"),
+            Some(CompressibleEndpoint::OpenAiChatCompletions)
+        );
     }
 
     #[test]
     fn other_paths_skip() {
         assert!(!is_compressible_path("/v1/messages/123"));
-        assert!(!is_compressible_path("/v1/chat/completions"));
+        assert!(!is_compressible_path("/v1/responses"));
         assert!(!is_compressible_path("/healthz"));
         assert!(!is_compressible_path("/"));
         assert!(!is_compressible_path(""));
+        assert!(classify_compressible_path("/v1/responses").is_none());
     }
 }

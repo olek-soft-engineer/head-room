@@ -8,7 +8,7 @@ use axum::body::{to_bytes, Body};
 use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::Router;
 #[cfg(test)]
 use bytes::Bytes;
@@ -64,6 +64,17 @@ pub fn build_app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/healthz/upstream", get(healthz_upstream))
+        // PR-C2: explicit POST route for /v1/chat/completions. The
+        // handler buffers the body and re-injects it into
+        // `forward_http`, which runs the OpenAI live-zone gate
+        // alongside the existing Anthropic dispatcher. Non-POST
+        // methods (and other paths) still fall through to
+        // `catch_all` so the proxy stays a transparent reverse
+        // proxy for everything else.
+        .route(
+            "/v1/chat/completions",
+            post(crate::handlers::chat_completions::handle_chat_completions),
+        )
         .fallback(any(catch_all))
         .with_state(state)
 }
@@ -153,7 +164,7 @@ pub(crate) fn join_upstream_path(base: &url::Url, path: &str, query: Option<&str
 }
 
 /// Forward an HTTP request to the upstream and stream the response back.
-async fn forward_http(
+pub(crate) async fn forward_http(
     state: AppState,
     client_addr: SocketAddr,
     req: Request<Body>,
@@ -324,20 +335,55 @@ async fn forward_http(
             }
         };
 
-        // PR-B2: live-zone dispatcher is now wired. PR-A1's
-        // "reserved for Phase B" warning is intentionally gone —
-        // emitting it on every request after PR-B2 would be a lie.
-        // Run the live-zone dispatcher (PR-B2). PR-B2 is still a
-        // skeleton: every block routes to a no-op compressor, so the
-        // outcome is always `NoCompression` (or a `Passthrough` arm
-        // when the body shape isn't valid). PR-B3+ wire per-type
-        // compressors and start producing `Compressed`.
-        let outcome = compression::compress_anthropic_request(
-            &buffered,
-            state.config.compression_mode,
-            state.config.cache_control_auto_frozen,
-            &request_id,
-        );
+        // PR-C2: dispatch on the endpoint classification so each
+        // provider hits its own live-zone walker. PR-B2/B3/B4 wired
+        // the Anthropic dispatcher; PR-C2 adds the OpenAI Chat
+        // Completions sibling. The classification was already
+        // computed by `is_compressible_path` above; we re-classify
+        // here so a single-source `match` decides which dispatcher
+        // runs and what skip rules apply.
+        //
+        // Skip rules (per spec PR-C2):
+        // - OpenAI Chat: `n > 1` skips compression entirely (multiple
+        //   completions imply non-determinism scenarios). `tool_choice`
+        //   and `stream_options` are NOT skip conditions — they
+        //   round-trip byte-equal as a side effect of byte-range surgery.
+        // - Anthropic: no extra skip rules at this layer.
+        let endpoint = compression::classify_compressible_path(uri.path())
+            .expect("is_compressible_path guarded above");
+        let outcome = match endpoint {
+            compression::CompressibleEndpoint::AnthropicMessages => {
+                compression::compress_anthropic_request(
+                    &buffered,
+                    state.config.compression_mode,
+                    state.config.cache_control_auto_frozen,
+                    &request_id,
+                )
+            }
+            compression::CompressibleEndpoint::OpenAiChatCompletions => {
+                let skip = compression::should_skip_compression(&buffered);
+                if skip.is_skip() {
+                    tracing::info!(
+                        event = "compression_decision",
+                        request_id = %request_id,
+                        path = "/v1/chat/completions",
+                        method = "POST",
+                        compression_mode = state.config.compression_mode.as_str(),
+                        decision = "passthrough",
+                        reason = skip.as_log_str(),
+                        body_bytes = buffered.len(),
+                        "openai chat compression skipped pre-dispatch"
+                    );
+                    compression::Outcome::NoCompression
+                } else {
+                    compression::compress_openai_chat_request(
+                        &buffered,
+                        state.config.compression_mode,
+                        &request_id,
+                    )
+                }
+            }
+        };
 
         let body_to_send = match outcome {
             compression::Outcome::NoCompression => {

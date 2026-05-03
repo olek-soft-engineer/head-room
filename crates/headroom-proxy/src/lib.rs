@@ -4,6 +4,7 @@
 pub mod compression;
 pub mod config;
 pub mod error;
+pub mod handlers;
 pub mod headers;
 pub mod health;
 pub mod proxy;
