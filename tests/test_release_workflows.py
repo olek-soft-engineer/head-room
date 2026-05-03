@@ -41,12 +41,19 @@ def test_release_workflow_publishes_python_distributions_to_github_release() -> 
 def test_create_release_runs_after_successful_build_even_if_other_publishes_fail() -> None:
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
+    # Single-wheel maturin refactor (PR #360) added `build-wheels` (the
+    # cross-platform matrix that produces the linux/macos/aarch64 wheels)
+    # and `collect-dist` (aggregator that merges wheel artifacts + npm
+    # release-assets) between `build` and the publish jobs. create-release
+    # must wait for all of them.
     assert (
-        "needs: [detect-version, build, publish-pypi, publish-npm, publish-github-packages, publish-docker]"
+        "needs: [detect-version, build, build-wheels, collect-dist, publish-pypi, publish-npm, publish-github-packages, publish-docker]"
         in content
     )
     assert "always()" in content
     assert "needs.build.result == 'success'" in content
+    assert "needs.build-wheels.result == 'success'" in content
+    assert "needs.collect-dist.result == 'success'" in content
 
 
 def test_macos_native_wrapper_dependency_install_retries_pypi_downloads() -> None:
