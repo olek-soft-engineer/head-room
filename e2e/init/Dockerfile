@@ -22,11 +22,16 @@ COPY crates/ crates/
 COPY headroom/ headroom/
 
 ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+# Build for Python 3.11 to match Stage 2's `python:3.11-slim` runtime.
 RUN /opt/python/cp311-cp311/bin/pip install 'maturin>=1.5,<2.0' && \
     /opt/python/cp311-cp311/bin/maturin build --release --out /dist --interpreter python3.11
 
-# ─── Stage 2: node-based init e2e runtime ──────────────────────────────────
-FROM node:22-bookworm
+# ─── Stage 2: python runtime ───────────────────────────────────────────────
+# `python:3.11-slim` (now trixie, glibc 2.41) — see e2e/wrap/Dockerfile
+# for why we need glibc ≥ 2.38 (the wheel's `_core.so` references C23
+# symbols that bookworm's 2.36 doesn't export). The init e2e harness
+# only needs python (no node) — `headroom init -g <target>` is Python.
+FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PATH="/opt/headroom-venv/bin:${PATH}" \
@@ -38,11 +43,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
-      git \
-      python3 \
-      python3-pip \
-      python3-venv && \
-    ln -sf /usr/bin/python3 /usr/local/bin/python && \
+      git && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
@@ -61,7 +62,7 @@ COPY e2e/_lib ./e2e/_lib
 COPY e2e/init ./e2e/init
 
 RUN python -m venv /opt/headroom-venv && \
-    /opt/headroom-venv/bin/python -m pip install --upgrade "pip<25" && \
+    /opt/headroom-venv/bin/python -m pip install --upgrade pip && \
     /opt/headroom-venv/bin/python -m pip install "$(ls /tmp/wheels/headroom_ai-*.whl)[proxy]" && \
     /opt/headroom-venv/bin/python -c "from headroom._core import DiffCompressor; print('headroom._core OK')"
 

@@ -33,14 +33,27 @@ COPY headroom/ headroom/
 # Build the wheel with maturin. PYO3_USE_ABI3_FORWARD_COMPATIBILITY allows
 # building against Python 3.14+ until we bump pyo3 past 0.22.
 ENV PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+# Build for Python 3.11 — aider-chat==0.86.2 requires Python <3.12, and
+# trixie's default python3.13 is too new for aider. The manylinux image
+# has python interpreters for every version at /opt/python/cpXY-cpXY/.
+# Stage 2 uses `python:3.11-slim` (now trixie-based, glibc 2.41).
 RUN /opt/python/cp311-cp311/bin/pip install 'maturin>=1.5,<2.0' && \
     /opt/python/cp311-cp311/bin/maturin build --release --out /dist --interpreter python3.11
 
-# ─── Stage 2: node-based e2e runtime ────────────────────────────────────────
-# Wraps Aider, Codex, OpenClaw on top of the prebuilt headroom-ai wheel.
-# No rust/maturin needed at this stage — we just `pip install` the wheel
-# from stage 1.
-FROM node:22-bookworm
+# ─── Stage 2: python+node runtime ───────────────────────────────────────────
+# Base on `python:3.11-slim` (now trixie, glibc 2.41) instead of
+# `node:22-bookworm` (glibc 2.36): the wheel's `_core.so` references
+# three glibc 2.38+ C23 wrappers (`__isoc23_strtol{,l,ul}`) that one of
+# our transitive C/C++ deps emits during cc-rs compilation even when
+# built inside manylinux_2_28 (probably libstdc++'s `<cstdlib>` resolving
+# `std::strtoll` to the C23 variant when the toolchain has newer
+# headers). Bookworm's libc.so.6 doesn't export these wrappers, so
+# `import headroom._core` fails at runtime. Trixie's glibc 2.41 does.
+#
+# We need Python 3.11 here (aider-chat==0.86.2 requires Python <3.12).
+# Trixie's default `python3` is 3.13 — too new for aider. python:3.11-slim
+# gives us Python 3.11 + trixie glibc + apt access for installing Node.
+FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     AIDER_CHAT_VERSION=0.86.2 \
@@ -52,15 +65,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# Install Node.js 22 from NodeSource (matches what node:22-trixie gives,
+# but layered onto python:3.11-slim so we get py3.11 + node22 + glibc 2.41
+# in one image). Also install git for any package that clones at install.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
       git \
-      python3 \
-      python3-pip \
-      python3-venv && \
-    ln -sf /usr/bin/python3 /usr/local/bin/python && \
+      gnupg && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
