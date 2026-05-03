@@ -459,6 +459,9 @@ def test_ccr_system_instruction_injection_disabled_when_prefix_frozen(monkeypatc
             def process_request(self, messages, tools):  # noqa: ANN001
                 return messages, tools, False
 
+            def scan_for_markers(self, messages):  # noqa: ANN001
+                return []
+
         monkeypatch.setattr("headroom.ccr.CCRToolInjector", _FakeInjector)
 
         async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
@@ -522,6 +525,9 @@ def test_ccr_tool_injection_disabled_when_prefix_frozen(monkeypatch) -> None:
 
             def process_request(self, messages, tools):  # noqa: ANN001
                 return messages, tools, False
+
+            def scan_for_markers(self, messages):  # noqa: ANN001
+                return []
 
         monkeypatch.setattr("headroom.ccr.CCRToolInjector", _FakeInjector)
 

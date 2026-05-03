@@ -108,13 +108,27 @@ def test_tool_mode_skip_emits_structured_log(caplog: Any) -> None:
 
     Realignment build constraint: every cache-affecting decision is logged
     in the ``event=foo key=val`` style so operators can audit routing.
+
+    NOTE: caplog captures at the root logger via propagation. When other
+    tests in the suite trigger proxy startup, ``_setup_file_logging`` sets
+    ``headroom.propagate=False`` and attaches a file handler. The conftest
+    autouse reset is fragile against fixture ordering, so we attach
+    ``caplog.handler`` directly to the target logger here. That way the
+    capture works regardless of propagation state.
     """
     handler, _backend = _build_tool_mode_handler()
 
-    with caplog.at_level(logging.INFO, logger="headroom.proxy.memory_handler"):
+    target_logger = logging.getLogger("headroom.proxy.memory_handler")
+    previous_level = target_logger.level
+    target_logger.setLevel(logging.INFO)
+    target_logger.addHandler(caplog.handler)
+    try:
         result = asyncio.run(
             handler.search_and_format_context("alpha", [{"role": "user", "content": "hi"}])
         )
+    finally:
+        target_logger.removeHandler(caplog.handler)
+        target_logger.setLevel(previous_level)
 
     assert result is None
     skip_records = [r for r in caplog.records if "event=memory_mode_skip" in r.getMessage()]
