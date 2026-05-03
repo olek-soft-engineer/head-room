@@ -12,13 +12,31 @@ FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST} AS builder
 
 ARG UV_VERSION
 
+# build-essential / g++ for any C extension wheels uv may need to build
+# from source. curl + ca-certificates are required by the rustup
+# bootstrap below. Hotfix-A0 (Finding #2) added the rust toolchain so the
+# image actually carries `headroom._core`; previously the runtime image
+# shipped without the Rust extension and every compressed request fell
+# back to a Python-only path or no-op.
 RUN apt-get update && \
   apt-get install -y --no-install-recommends \
     build-essential \
     g++ \
+    curl \
+    ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
 RUN python -m pip install --no-cache-dir uv==${UV_VERSION}
+
+# Rust toolchain for the headroom._core extension build. Pinned via
+# rust-toolchain.toml at the repo root so this matches what local devs
+# build with. Installed as root before WORKDIR change so the env
+# additions stick for every subsequent RUN.
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/cargo/bin:${PATH}
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
 
 WORKDIR /build
 
@@ -34,6 +52,28 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY headroom/ headroom/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system --no-deps --reinstall-package headroom-ai .
+
+# Layer 3 (Hotfix-A0): build and install the Rust extension wheel. uv
+# already installed `maturin` as a transitive of the [proxy]/[code]
+# extras; if it didn't, install it explicitly here so the build never
+# silently skips.
+COPY crates/ crates/
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/build/target \
+    uv pip install --system maturin \
+    && maturin build --release -m crates/headroom-py/Cargo.toml --out /build/wheels \
+    && uv pip install --system --force-reinstall --no-deps /build/wheels/headroom_core_py-*.whl
+
+# Layer 4 (Hotfix-A0): verify the extension actually loads end-to-end
+# inside the build image. If this fails, the runtime image would fail
+# its lifespan smoke test on every restart — better to break the build
+# loudly here than ship a broken image.
+RUN python -c "from headroom._core import hello; \
+    marker = hello(); \
+    assert marker == 'headroom-core', f'expected headroom-core, got {marker!r}'; \
+    print(f'build-stage rust core verify OK: {marker}')"
 
 # ---- Runtime stage (python-slim): supports root/nonroot via build arg ----
 FROM python:${PYTHON_VERSION}-slim@${PYTHON_DIGEST} AS runtime-slim-base

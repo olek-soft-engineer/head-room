@@ -186,6 +186,93 @@ logger = logging.getLogger("headroom.proxy")
 
 _MULTI_WORKER_CONFIG_ENV = "HEADROOM_PROXY_CONFIG_JSON"
 
+# Env var that opts out of the Rust core deployment smoke test (Hotfix-A0).
+# Default behavior: hard-fail at startup if `headroom._core` is unimportable
+# (Finding #2 in HEADROOM_PROXY_LOG_FINDINGS_2026_05_03.md — production
+# deployment was silently running without the Rust extension and degrading
+# every compressed request to a Python-only path or a no-op).
+#
+# Set to the literal string "false" to start the proxy in degraded
+# Python-only mode. Any other value (including unset) keeps the
+# fail-loud behavior.
+_RUST_CORE_REQUIRED_ENV = "HEADROOM_REQUIRE_RUST_CORE"
+
+# sysexits.h(3) — EX_CONFIG. Process supervisors (systemd, k8s, docker)
+# treat this as a deliberate configuration failure rather than a crash, so
+# they won't restart-loop on a broken deployment.
+_EXIT_CONFIG = 78
+
+
+def _check_rust_core() -> tuple[str, str | None]:
+    """Verify the Rust extension `headroom._core` is loadable at startup.
+
+    Returns a `(status, error)` tuple:
+      - ``("loaded", None)``     — `headroom._core.hello()` returned the
+        expected sentinel.
+      - ``("disabled", reason)`` — opt-out env var was set; proxy starts
+        in Python-only degraded mode. `reason` carries the underlying
+        import error (or ``None`` if the import actually succeeded).
+      - ``("missing", reason)``  — never returned: this branch calls
+        ``sys.exit(78)`` so the proxy refuses to start. The branch exists
+        only as a typed sentinel for callers that want to reason about
+        all three states (e.g. health endpoints).
+
+    Behavior is gated by the ``HEADROOM_REQUIRE_RUST_CORE`` env var:
+    any value other than ``"false"`` (case-insensitive) keeps the
+    fail-loud default.
+    """
+    require = os.environ.get(_RUST_CORE_REQUIRED_ENV, "true").strip().lower() != "false"
+    try:
+        from headroom._core import hello as _rust_hello
+
+        marker = _rust_hello()
+    except Exception as exc:  # ImportError, but also any init-time PyO3 failure
+        reason = f"{type(exc).__name__}: {exc}"
+        if not require:
+            logger.warning(
+                "event=rust_core_disabled reason=%r opt_out_env=%s=false mode=python_only_degraded",
+                reason,
+                _RUST_CORE_REQUIRED_ENV,
+            )
+            return ("disabled", reason)
+        # Fail loud. Print to stderr in addition to logging so operators
+        # see it even if the logging handler is mis-configured.
+        msg = (
+            f"FATAL: Rust extension `headroom._core` not loadable.\n"
+            f"    error: {reason}\n"
+            f"    fix:   `make build-wheel && pip install --force-reinstall "
+            f"target/wheels/headroom_*.whl`\n"
+            f"    opt-out: set {_RUST_CORE_REQUIRED_ENV}=false to start in "
+            f"degraded Python-only mode\n"
+        )
+        logger.error("event=rust_core_missing reason=%r action=exit_78", reason)
+        print(msg, file=sys.stderr, flush=True)
+        sys.exit(_EXIT_CONFIG)
+
+    # Import succeeded; sanity-check the marker so we catch a stale or
+    # mis-linked .so where the symbol name resolves but returns garbage.
+    if marker != "headroom-core":
+        reason = f"unexpected marker {marker!r}"
+        if not require:
+            logger.warning(
+                "event=rust_core_disabled reason=%r opt_out_env=%s=false",
+                reason,
+                _RUST_CORE_REQUIRED_ENV,
+            )
+            return ("disabled", reason)
+        msg = (
+            f"FATAL: Rust extension `headroom._core` is loaded but the "
+            f"marker function returned {marker!r}; expected 'headroom-core'.\n"
+            f"    fix:   rebuild: `make build-wheel && pip install "
+            f"--force-reinstall target/wheels/headroom_*.whl`\n"
+        )
+        logger.error("event=rust_core_marker_mismatch marker=%r action=exit_78", marker)
+        print(msg, file=sys.stderr, flush=True)
+        sys.exit(_EXIT_CONFIG)
+
+    logger.info("event=rust_core_loaded marker=%r", marker)
+    return ("loaded", None)
+
 
 # Compression pipeline timeout in seconds
 
@@ -1258,6 +1345,17 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # type: ignore[no-untyped-def]
+        # Hotfix-A0: Rust core deployment smoke test. Refuse to accept
+        # traffic if the Rust extension is missing unless the operator
+        # explicitly opted out with HEADROOM_REQUIRE_RUST_CORE=false. See
+        # Finding #2 in HEADROOM_PROXY_LOG_FINDINGS_2026_05_03.md.
+        # `_check_rust_core` either returns ("loaded"|"disabled", _) or
+        # calls `sys.exit(78)` — execution past this line implies the
+        # rust_core_status is recorded.
+        _rust_core_status, _rust_core_error = _check_rust_core()
+        app.state.rust_core_status = _rust_core_status
+        app.state.rust_core_error = _rust_core_error
+
         configure_otel_metrics(OTelMetricsConfig.from_env(default_service_name="headroom-proxy"))
         configure_langfuse_tracing(
             LangfuseTracingConfig.from_env(default_service_name="headroom-proxy")
@@ -1315,6 +1413,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     app.state.started_at = None
     app.state.ready = False
     app.state.startup_error = None
+    # Set by the lifespan startup smoke test (`_check_rust_core`). Default
+    # "missing" means lifespan hasn't run yet — anything reading /health
+    # before startup completes (rare; lifespan runs before the first
+    # request) sees an honest "missing" rather than a stale "loaded".
+    app.state.rust_core_status = "missing"
+    app.state.rust_core_error = None
 
     def _iso_utc_now() -> str:
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1432,7 +1536,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "uptime_seconds": _uptime_seconds(),
             "checks": checks,
             "runtime": _runtime_payload(),
+            # Hotfix-A0: surface rust core load state so operators can alert
+            # on `rust_core != "loaded"` (Finding #2).
+            "rust_core": getattr(app.state, "rust_core_status", "missing"),
         }
+        rust_core_error = getattr(app.state, "rust_core_error", None)
+        if rust_core_error:
+            payload["rust_core_error"] = rust_core_error
         deployment_profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE")
         if deployment_profile:
             payload["deployment"] = {
