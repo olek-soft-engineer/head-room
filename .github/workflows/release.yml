@@ -54,6 +54,8 @@ concurrency:
 jobs:
   detect-version:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.ver.outputs.version }}
       npm_version: ${{ steps.ver.outputs.npm_version }}
@@ -78,6 +80,8 @@ jobs:
   build:
     needs: [detect-version]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -164,6 +168,12 @@ jobs:
   # — one atomic install via `pip install headroom-ai`.
   build-wheels:
     needs: [detect-version, build]
+    # Minimal privilege: this job only checks out source, builds wheels,
+    # and uploads them as artifacts. It doesn't push, write packages, or
+    # mutate releases — `contents: read` is sufficient. Mitigates CodeQL
+    # alert "actions/missing-workflow-permissions" (CWE-275).
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -225,6 +235,8 @@ jobs:
   collect-dist:
     needs: [build, build-wheels]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
@@ -288,6 +300,10 @@ jobs:
     needs: [detect-version, build]
     if: github.event.inputs.dry_run != 'true' && vars.NPM_SKIP != 'true'
     runs-on: ubuntu-latest
+    # Publishes to npmjs.org via NPM_TOKEN secret; no GITHUB_TOKEN
+    # write permissions needed.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
