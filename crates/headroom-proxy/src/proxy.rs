@@ -75,6 +75,14 @@ pub fn build_app(state: AppState) -> Router {
             "/v1/chat/completions",
             post(crate::handlers::chat_completions::handle_chat_completions),
         )
+        // PR-C3: explicit POST route for /v1/responses. Same forward
+        // pattern as /v1/chat/completions — the handler buffers the
+        // body, then `forward_http`'s gate dispatches to the
+        // Responses live-zone walker via `compress_openai_responses_request`.
+        .route(
+            "/v1/responses",
+            post(crate::handlers::responses::handle_responses),
+        )
         .fallback(any(catch_all))
         .with_state(state)
 }
@@ -382,6 +390,18 @@ pub(crate) async fn forward_http(
                         &request_id,
                     )
                 }
+            }
+            // PR-C3: OpenAI Responses (`/v1/responses`). The Responses
+            // dispatcher walks an explicitly-typed `input` array and
+            // only rewrites the latest of each compressible `*_output`
+            // kind plus the latest `message` text. Cache hot zone is
+            // every other item type (passthrough verbatim).
+            compression::CompressibleEndpoint::OpenAiResponses => {
+                compression::compress_openai_responses_request(
+                    &buffered,
+                    state.config.compression_mode,
+                    &request_id,
+                )
             }
         };
 

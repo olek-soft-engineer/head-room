@@ -35,6 +35,7 @@
 pub mod anthropic;
 pub mod live_zone_anthropic;
 pub mod live_zone_openai;
+pub mod live_zone_responses;
 pub mod model_limits;
 
 // PR-A4 helper for cache-control floor derivation lives on the
@@ -47,17 +48,21 @@ pub use live_zone_anthropic::{compress_anthropic_request, Outcome, PassthroughRe
 pub use live_zone_openai::{
     compress_openai_chat_request, should_skip_compression, SkipCompressionReason,
 };
+pub use live_zone_responses::compress_openai_responses_request;
 
 /// Which provider's compression dispatcher should run for a request
-/// path. PR-C2 wires `/v1/chat/completions`; future PRs add
-/// `/v1/responses`, Gemini, etc. Returning an enum (rather than a
-/// bare bool + string later) keeps the routing explicit.
+/// path. PR-C2 wired `/v1/chat/completions`; PR-C3 adds
+/// `/v1/responses`. Future PRs add Gemini etc. Returning an enum
+/// (rather than a bare bool + string later) keeps the routing
+/// explicit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressibleEndpoint {
     /// Anthropic `/v1/messages`.
     AnthropicMessages,
     /// OpenAI Chat Completions `/v1/chat/completions`.
     OpenAiChatCompletions,
+    /// OpenAI Responses `/v1/responses`.
+    OpenAiResponses,
 }
 
 /// Does this request path target an LLM endpoint we know how to
@@ -73,6 +78,7 @@ pub fn classify_compressible_path(path: &str) -> Option<CompressibleEndpoint> {
     match path {
         "/v1/messages" => Some(CompressibleEndpoint::AnthropicMessages),
         "/v1/chat/completions" => Some(CompressibleEndpoint::OpenAiChatCompletions),
+        "/v1/responses" => Some(CompressibleEndpoint::OpenAiResponses),
         _ => None,
     }
 }
@@ -100,12 +106,20 @@ mod tests {
     }
 
     #[test]
+    fn openai_responses_path_matches() {
+        assert!(is_compressible_path("/v1/responses"));
+        assert_eq!(
+            classify_compressible_path("/v1/responses"),
+            Some(CompressibleEndpoint::OpenAiResponses)
+        );
+    }
+
+    #[test]
     fn other_paths_skip() {
         assert!(!is_compressible_path("/v1/messages/123"));
-        assert!(!is_compressible_path("/v1/responses"));
+        assert!(!is_compressible_path("/v1/responses/123"));
         assert!(!is_compressible_path("/healthz"));
         assert!(!is_compressible_path("/"));
         assert!(!is_compressible_path(""));
-        assert!(classify_compressible_path("/v1/responses").is_none());
     }
 }
