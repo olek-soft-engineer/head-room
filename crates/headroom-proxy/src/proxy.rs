@@ -17,6 +17,9 @@ use futures_util::{StreamExt as _, TryStreamExt};
 use http_body_util::BodyExt;
 
 use crate::cache_stabilization;
+use crate::cache_stabilization::drift_detector::{
+    compute_structural_hash, derive_session_key, observe_drift, ApiKind, DriftState,
+};
 use crate::compression;
 use crate::config::Config;
 use crate::error::ProxyError;
@@ -48,7 +51,21 @@ pub struct AppState {
     /// log so failures are LOUD — no silent fallback to unsigned
     /// requests.
     pub bedrock_credentials: Option<Arc<aws_credential_types::Credentials>>,
+    /// PR-E6: per-session structural-hash LRU for the cache-bust
+    /// drift detector. Bounded to 1000 sessions in production. The
+    /// detector is read-only — observing it never mutates the
+    /// request body — so this can be cloned freely into every handler
+    /// path that buffers the body.
+    pub drift_state: DriftState,
 }
+
+/// PR-E6: maximum number of sessions tracked by the drift detector
+/// LRU. Picked so that a noisy test fleet of 1000 distinct API keys
+/// stays in cache for at least one full turn before the oldest
+/// evicts. Operators with larger fleets can bump this; the memory
+/// cost per entry is ~150 bytes (key string + 96-byte StructuralHash
+/// + LRU overhead).
+const DRIFT_DETECTOR_CAPACITY: usize = 1000;
 
 impl AppState {
     pub fn new(config: Config) -> Result<Self, ProxyError> {
@@ -67,6 +84,7 @@ impl AppState {
             config: Arc::new(config),
             client,
             bedrock_credentials: None,
+            drift_state: DriftState::new(DRIFT_DETECTOR_CAPACITY),
         })
     }
 
@@ -430,6 +448,19 @@ pub(crate) async fn forward_http(
         && compression::is_compressible_path(uri.path())
         && is_application_json(req.headers());
 
+    // PR-E6: capture a header snapshot BEFORE the body is consumed so
+    // the drift detector can derive a per-session key from
+    // `Authorization`/`x-api-key`/`User-Agent`. `req` will be moved
+    // into either `to_bytes(req.into_body())` (buffered branch) or
+    // `req.into_body().into_data_stream()` (streaming branch); both
+    // discard the headers along with the body. Snapshot here keeps
+    // both branches clean.
+    let headers_snapshot = if should_intercept {
+        Some(req.headers().clone())
+    } else {
+        None
+    };
+
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .map_err(|e| ProxyError::InvalidHeader(e.to_string()))?;
 
@@ -498,26 +529,56 @@ pub(crate) async fn forward_http(
         let endpoint = compression::classify_compressible_path(uri.path())
             .expect("is_compressible_path guarded above");
 
-        // PR-E5: volatile-content detector. Parses the buffered
-        // body once and walks it read-only, emitting one structured
-        // WARN log per finding (capped at 10) when the customer's
-        // cached prefix contains content that busts prompt-cache
-        // hits (timestamps, UUIDs, ID-named fields). Strictly
-        // observation-only — never mutates the body. Cheap parse
-        // failure (malformed JSON) is silently skipped here; the
-        // dispatcher below logs its own parse-error decision. This
-        // call is intentionally placed BEFORE dispatch so detection
-        // runs regardless of whether the dispatcher returns
-        // `NoCompression`, `Compressed`, or `Passthrough`.
+        // PR-E5 + PR-E6: cache-stabilization observability hooks.
+        // Both run READ-ONLY against the buffered body and emit
+        // structured logs only — passthrough invariant from Phase A
+        // is preserved. Parsing happens once and is shared. Cheap
+        // parse failure (malformed JSON) silently skips both
+        // detectors; the dispatcher below logs its own parse-error
+        // decision. The hooks run regardless of whether the
+        // dispatcher returns `NoCompression`, `Compressed`, or
+        // `Passthrough`.
+        //
+        // Bedrock and other shape-mismatched paths skip the drift
+        // detector specifically; their wire shape is different
+        // enough that a canonical-bytes hash would compare apples
+        // to oranges. The volatile detector handles its own
+        // shape-dispatch via `ApiKind::from_endpoint`.
         if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&buffered) {
-            let api_kind = cache_stabilization::volatile_detector::ApiKind::from_endpoint(endpoint);
-            let findings =
-                cache_stabilization::volatile_detector::detect_volatile_content(&parsed, api_kind);
+            // PR-E5: volatile-content detector. Emits one WARN per
+            // finding (capped at 10) for content that busts cache
+            // (timestamps, UUIDs, ID-named fields).
+            let volatile_kind =
+                cache_stabilization::volatile_detector::ApiKind::from_endpoint(endpoint);
+            let findings = cache_stabilization::volatile_detector::detect_volatile_content(
+                &parsed,
+                volatile_kind,
+            );
             if !findings.is_empty() {
                 cache_stabilization::volatile_detector::emit_volatile_warnings(
                     &findings,
                     &request_id,
                 );
+            }
+
+            // PR-E6: cache-bust drift detector. SHA-256 fingerprints
+            // the cache hot zone (system / tools / first 3 messages);
+            // a mismatch between consecutive turns of the same session
+            // emits a `cache_drift_observed` event so operators see
+            // invisible cache busts.
+            let drift_kind = match endpoint {
+                compression::CompressibleEndpoint::AnthropicMessages => Some(ApiKind::Anthropic),
+                compression::CompressibleEndpoint::OpenAiChatCompletions => {
+                    Some(ApiKind::OpenAiChat)
+                }
+                compression::CompressibleEndpoint::OpenAiResponses => {
+                    Some(ApiKind::OpenAiResponses)
+                }
+            };
+            if let (Some(kind), Some(headers)) = (drift_kind, headers_snapshot.as_ref()) {
+                let session_key = derive_session_key(headers, &client_addr);
+                let hash = compute_structural_hash(&parsed, kind);
+                observe_drift(&state.drift_state, &session_key, hash);
             }
         }
         let outcome = match endpoint {

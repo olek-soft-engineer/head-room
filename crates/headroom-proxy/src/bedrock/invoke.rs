@@ -543,6 +543,10 @@ mod tests {
             config: std::sync::Arc::new(config),
             client: reqwest::Client::new(),
             bedrock_credentials: None,
+            // PR-E6: small capacity is fine — the Bedrock URL builder
+            // unit test never observes drift, but `AppState` requires
+            // the field to be populated.
+            drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"
             .parse()
@@ -569,6 +573,9 @@ mod tests {
             config: std::sync::Arc::new(config),
             client: reqwest::Client::new(),
             bedrock_credentials: None,
+            // PR-E6: see above — drift detector is unused by this
+            // test; we just satisfy the struct shape.
+            drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"
             .parse()
