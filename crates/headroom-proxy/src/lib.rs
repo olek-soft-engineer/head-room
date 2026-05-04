@@ -2,6 +2,7 @@
 //! Headroom proxy. Used by both `main.rs` and the integration tests.
 
 pub mod bedrock;
+pub mod cache_stabilization;
 pub mod compression;
 pub mod config;
 pub mod error;
