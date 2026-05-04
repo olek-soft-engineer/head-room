@@ -443,6 +443,50 @@ def test_docker_per_arch_build_specifies_image_name_in_output() -> None:
     )
 
 
+def test_sdist_build_conditional_keyed_on_target_not_os() -> None:
+    """STRUCTURAL INVARIANT: the sdist build's `if` conditional must
+    key on `matrix.target`, not `matrix.os`.
+
+    Background: PR #376 changed the wheel matrix from `os: ubuntu-latest`
+    to `os: ubuntu-24.04` (explicit pinning, no semantic change in
+    practice). It silently broke the sdist build, whose `if` was
+    `matrix.os == 'ubuntu-latest' && matrix.target == 'x86_64-unknown-linux-gnu'`
+    — the literal `'ubuntu-latest'` no longer matched. Sdist never
+    built, `release-assets/*.tar.gz` was empty, and the create-release
+    job failed `gh release upload release-assets/*.tar.gz` with
+    "no matches found".
+
+    The fix is to key the conditional on `matrix.target` only — sdist
+    is platform-independent, so any single matrix row is a fine host.
+    `target` is more semantically meaningful than `os` here AND is
+    decoupled from any future host-runner rename.
+
+    This test pins the `target`-only conditional so a future "let's
+    add `os` back to the conditional for clarity" refactor will fail
+    at PR time, not 8 minutes into a release.
+    """
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    # Locate the "Build sdist" step.
+    sdist_marker = "name: Build sdist"
+    assert sdist_marker in content, "sdist build step missing from release.yml"
+
+    # Walk forward to the next `if:` line — that's the conditional.
+    sdist_idx = content.index(sdist_marker)
+    if_idx = content.index("if:", sdist_idx)
+    if_line_end = content.index("\n", if_idx)
+    if_line = content[if_idx:if_line_end]
+
+    # Must reference `matrix.target`. Must NOT reference `matrix.os`.
+    assert "matrix.target == 'x86_64-unknown-linux-gnu'" in if_line, (
+        f"sdist build conditional must check `matrix.target`; got: {if_line!r}"
+    )
+    assert "matrix.os" not in if_line, (
+        f"sdist build conditional must NOT depend on `matrix.os` — that's "
+        f"how PR #376 silently disabled the sdist build. Got: {if_line!r}"
+    )
+
+
 def test_npm_publish_jobs_do_not_download_dist_artifact() -> None:
     """`publish-npm` and `publish-github-packages` `npm pack`+`npm publish`
     directly from the checked-out source tree; they never read the
