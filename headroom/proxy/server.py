@@ -1997,14 +1997,28 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     @app.get("/subscription-window")
     async def subscription_window():
-        """Current Anthropic subscription window utilisation and Headroom contribution."""
+        """Current Anthropic subscription window utilisation and Headroom contribution.
+
+        Issue #281: the Anthropic OAuth usage API is polled every 5 minutes
+        (aggressive polling risks 429s / OAuth-token flagging), so the cached
+        ``utilization_pct`` lags reality by up to one poll interval. When the
+        user's 5-hour window rolls over between two polls the dashboard would
+        otherwise render the OLD window's percentage. We:
+
+        1. Optionally trigger a 60s-floored singleton poll on dashboard load
+           (bounded across users, well within Anthropic tolerance).
+        2. Render via :meth:`SubscriptionTracker.render_state`, which
+           synthesizes post-reset windows from local transcript-derived
+           token counts when ``now >= window.resets_at``.
+        """
         tracker = get_subscription_tracker()
         if tracker is None:
             return JSONResponse(
                 status_code=503,
                 content={"error": "Subscription tracking is not enabled"},
             )
-        return JSONResponse(content=tracker.state)
+        await tracker.maybe_poll_on_demand()
+        return JSONResponse(content=tracker.render_state())
 
     @app.get("/quota")
     async def quota():
