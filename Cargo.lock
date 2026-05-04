@@ -1879,6 +1879,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "lru",
+ "md-5",
  "pin-project-lite",
  "prometheus",
  "proptest",

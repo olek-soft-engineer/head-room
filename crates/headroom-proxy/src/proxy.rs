@@ -661,6 +661,7 @@ pub(crate) async fn forward_http(
                     compression::compress_openai_chat_request(
                         &buffered,
                         state.config.compression_mode,
+                        auth_mode,
                         &request_id,
                     )
                 }
@@ -674,6 +675,7 @@ pub(crate) async fn forward_http(
                 compression::compress_openai_responses_request(
                     &buffered,
                     state.config.compression_mode,
+                    auth_mode,
                     &request_id,
                 )
             }
