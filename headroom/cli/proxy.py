@@ -12,6 +12,13 @@ from headroom.proxy.modes import PROXY_MODE_TOKEN, normalize_proxy_mode
 from .main import main
 
 
+def _get_env_bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.lower() in ("true", "1", "yes", "on")
+
+
 @main.command()
 @click.option(
     "--host",
@@ -90,6 +97,14 @@ from .main import main
 @click.option("--no-optimize", is_flag=True, help="Disable optimization (passthrough mode)")
 @click.option("--no-cache", is_flag=True, help="Disable semantic caching")
 @click.option("--no-rate-limit", is_flag=True, help="Disable rate limiting")
+@click.option(
+    "--code-aware",
+    is_flag=True,
+    help=(
+        "Enable code-aware compression in the proxy (env: HEADROOM_CODE_AWARE_ENABLED). "
+        "Code-aware remains off by default."
+    ),
+)
 @click.option(
     "--proxy-extension",
     "proxy_extension",
@@ -348,6 +363,7 @@ def proxy(
     no_optimize: bool,
     no_cache: bool,
     no_rate_limit: bool,
+    code_aware: bool,
     proxy_extension: tuple[str, ...],
     no_subscription_tracking: bool,
     subscription_poll_interval: int | None,
@@ -516,6 +532,7 @@ def proxy(
         budget_limit_usd=budget,
         # Code graph: live file watcher for incremental reindexing
         code_graph_watcher=code_graph,
+        code_aware_enabled=code_aware or _get_env_bool("HEADROOM_CODE_AWARE_ENABLED", False),
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
         read_lifecycle=not no_read_lifecycle,
         # Memory System (Multi-Provider with auto-detection)
