@@ -971,6 +971,9 @@ mod tests {
             config: std::sync::Arc::new(config),
             client: reqwest::Client::new(),
             bedrock_credentials: None,
+            // PR-E6: drift detector is unused by this URL-builder
+            // unit test; small capacity to satisfy the struct shape.
+            drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke-with-response-stream"
             .parse()
