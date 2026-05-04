@@ -297,6 +297,114 @@ def test_build_wheels_matrix_excludes_intel_macos() -> None:
     assert "macos-15-intel" not in matrix_os
 
 
+def test_aarch64_wheel_uses_native_arm64_runner() -> None:
+    """STRUCTURAL INVARIANT: the aarch64 wheel matrix row must run on a
+    native arm64 runner (`ubuntu-24.04-arm`), NOT a QEMU-emulated x64
+    runner (`ubuntu-latest`).
+
+    Pre-#377 we built the aarch64 wheel on `ubuntu-latest` (x86_64) inside
+    `manylinux_2_28_aarch64` via QEMU emulation, taking ~50–60 min. Native
+    arm64 GitHub-hosted runners (GA Jan 2025, free for public repos) drop
+    QEMU and complete the same build in ~10 min.
+
+    A future "let me unify all wheel rows on `ubuntu-latest`" refactor
+    would silently re-introduce QEMU and slow CI back down — this test
+    pins the runner.
+    """
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    bw_start = content.index("\n  build-wheels:")
+    bw_end = content.index("\n  collect-dist:")
+    body = content[bw_start:bw_end]
+
+    # Walk the matrix.include rows. Each row is a contiguous block of
+    # `key: value` lines starting with `os:` (the first key in our
+    # convention). Pair `os:` with the immediately-following `target:`
+    # so we can assert per-row.
+    rows: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for raw in body.splitlines():
+        stripped = raw.lstrip()
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith("- os:"):
+            if current:
+                rows.append(current)
+            current = {"os": stripped.split(":", 1)[1].strip()}
+        elif stripped.startswith("target:") and current:
+            current["target"] = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("manylinux:") and current:
+            current["manylinux"] = stripped.split(":", 1)[1].strip()
+    if current:
+        rows.append(current)
+
+    aarch64_linux = [r for r in rows if r.get("target") == "aarch64-unknown-linux-gnu"]
+    assert len(aarch64_linux) == 1, f"expected exactly one aarch64-linux row; got {aarch64_linux}"
+    assert aarch64_linux[0]["os"] == "ubuntu-24.04-arm", (
+        f"aarch64-unknown-linux-gnu must run on native arm64 runner "
+        f"`ubuntu-24.04-arm`, not {aarch64_linux[0]['os']!r}. Reverting "
+        f"to `ubuntu-latest` re-introduces QEMU emulation and ~6× slower "
+        f"wheel builds."
+    )
+
+    # The amd64 Linux row should also be pinned to ubuntu-24.04 (not
+    # `ubuntu-latest`, which is a moving target). Pinning keeps the
+    # wheel-build environment reproducible across runner image rolls.
+    amd64_linux = [r for r in rows if r.get("target") == "x86_64-unknown-linux-gnu"]
+    assert len(amd64_linux) == 1
+    assert amd64_linux[0]["os"] == "ubuntu-24.04", (
+        f"x86_64-unknown-linux-gnu should pin `ubuntu-24.04`, not "
+        f"{amd64_linux[0]['os']!r} — `ubuntu-latest` is a moving alias "
+        f"and reproducibility benefits from explicit pinning."
+    )
+
+
+def test_docker_workflow_builds_on_native_arch_runners() -> None:
+    """STRUCTURAL INVARIANT: the docker variant build must fan out per
+    arch onto native runners — `linux/amd64` on `ubuntu-24.04`,
+    `linux/arm64` on `ubuntu-24.04-arm`. No QEMU.
+
+    Pre-#377 each variant ran `docker bake` with
+    `platforms = ["linux/amd64","linux/arm64"]` on a single x64 runner
+    using QEMU for arm64 emulation — ~1h per variant. Splitting into
+    16 native single-arch builds (8 variants × 2 arches) + a manifest
+    merge job per variant cuts wall-clock to ~10 min and removes the
+    QEMU surface that contributed to transient build failures.
+    """
+    content = (ROOT / ".github" / "workflows" / "docker.yml").read_text(encoding="utf-8")
+
+    # The fan-out job must exist with both runners in its arch matrix.
+    assert "docker-build:" in content, "docker-build fan-out job missing"
+    assert "runs_on: ubuntu-24.04, platform: linux/amd64" in content, (
+        "amd64 arch matrix entry must bind ubuntu-24.04 (native x86_64)"
+    )
+    assert "runs_on: ubuntu-24.04-arm, platform: linux/arm64" in content, (
+        "arm64 arch matrix entry must bind ubuntu-24.04-arm (native aarch64)"
+    )
+
+    # Per-arch builds must push by digest only — tags belong on the
+    # multi-arch manifest, applied later by docker-manifest.
+    assert "push-by-digest=true,name-canonical=true,push=true" in content, (
+        "per-arch builds must push by digest only; tags applied at manifest merge step"
+    )
+
+    # The QEMU action must NOT be invoked anywhere — its presence would
+    # mean someone re-introduced an emulated build path.
+    non_comment = "\n".join(
+        line for line in content.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert "docker/setup-qemu-action" not in non_comment, (
+        "docker.yml must not invoke `docker/setup-qemu-action` — native "
+        "arm64 runners replaced QEMU. A new reference here means someone "
+        "re-emulated arm64 on an x64 runner."
+    )
+
+    # Manifest merge job must exist and depend on docker-build.
+    assert "docker-manifest:" in content
+    assert "needs: docker-build" in content
+    assert "docker buildx imagetools create" in content
+
+
 def test_npm_publish_jobs_do_not_download_dist_artifact() -> None:
     """`publish-npm` and `publish-github-packages` `npm pack`+`npm publish`
     directly from the checked-out source tree; they never read the
