@@ -405,6 +405,44 @@ def test_docker_workflow_builds_on_native_arch_runners() -> None:
     assert "docker buildx imagetools create" in content
 
 
+def test_docker_per_arch_build_specifies_image_name_in_output() -> None:
+    """STRUCTURAL INVARIANT: the per-arch bake's `*.output` spec must
+    include `name=<registry>/<image>` — without it, buildx fails with
+    the misleading `ERROR: tag is needed when pushing to registry`.
+
+    Background: pre-#377 each docker variant ran with bake-file-tags
+    (multi-arch tagged push), which gave bake the registry/image name
+    via the tag strings. PR #376 split into per-arch fan-out and
+    correctly removed bake-file-tags from the per-arch step (tags
+    belong on the multi-arch manifest, not on per-arch images). But
+    that left bake without ANY reference for the push target — no
+    tags AND no explicit `name=` in the output spec.
+
+    The first release after #376 merged failed every docker-build job
+    with "ERROR: tag is needed when pushing to registry". The fix is
+    to explicitly pass `name=<registry>/<image>` in the output spec
+    so bake knows the push target without needing tags.
+
+    A future refactor that removes the explicit name (e.g., "we
+    already have labels, surely buildx can figure it out") will
+    silently re-break this. This test pins it.
+    """
+    content = (ROOT / ".github" / "workflows" / "docker.yml").read_text(encoding="utf-8")
+
+    # Find the per-arch build's *.output set line. Must contain
+    # `name=` with the registry+image-name expression.
+    output_line_present = (
+        "*.output=type=image,name=${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true"
+        in content
+    )
+    assert output_line_present, (
+        "per-arch bake `*.output` must include `name=<registry>/<image>`. "
+        "Without it, buildx fails the push with 'tag is needed when pushing "
+        "to registry' because no tags AND no explicit name = no push target. "
+        "This is a regression of the docker-build break right after PR #376."
+    )
+
+
 def test_npm_publish_jobs_do_not_download_dist_artifact() -> None:
     """`publish-npm` and `publish-github-packages` `npm pack`+`npm publish`
     directly from the checked-out source tree; they never read the
