@@ -16,6 +16,7 @@ use futures_util::{StreamExt as _, TryStreamExt};
 #[cfg(test)]
 use http_body_util::BodyExt;
 
+use crate::cache_stabilization;
 use crate::compression;
 use crate::config::Config;
 use crate::error::ProxyError;
@@ -496,6 +497,29 @@ pub(crate) async fn forward_http(
         // - Anthropic: no extra skip rules at this layer.
         let endpoint = compression::classify_compressible_path(uri.path())
             .expect("is_compressible_path guarded above");
+
+        // PR-E5: volatile-content detector. Parses the buffered
+        // body once and walks it read-only, emitting one structured
+        // WARN log per finding (capped at 10) when the customer's
+        // cached prefix contains content that busts prompt-cache
+        // hits (timestamps, UUIDs, ID-named fields). Strictly
+        // observation-only — never mutates the body. Cheap parse
+        // failure (malformed JSON) is silently skipped here; the
+        // dispatcher below logs its own parse-error decision. This
+        // call is intentionally placed BEFORE dispatch so detection
+        // runs regardless of whether the dispatcher returns
+        // `NoCompression`, `Compressed`, or `Passthrough`.
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&buffered) {
+            let api_kind = cache_stabilization::volatile_detector::ApiKind::from_endpoint(endpoint);
+            let findings =
+                cache_stabilization::volatile_detector::detect_volatile_content(&parsed, api_kind);
+            if !findings.is_empty() {
+                cache_stabilization::volatile_detector::emit_volatile_warnings(
+                    &findings,
+                    &request_id,
+                );
+            }
+        }
         let outcome = match endpoint {
             compression::CompressibleEndpoint::AnthropicMessages => {
                 compression::compress_anthropic_request(
