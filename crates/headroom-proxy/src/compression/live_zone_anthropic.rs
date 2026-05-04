@@ -51,7 +51,7 @@ use crate::cache_stabilization::anthropic_cache_control::{
     auto_place_anthropic_cache_control, AutoPlaceOutcome, SkipReason,
 };
 use crate::cache_stabilization::tool_def_normalize::{
-    any_tool_has_cache_control, sort_tools_deterministically,
+    any_tool_has_cache_control, sort_schema_keys_recursive, sort_tools_deterministically,
 };
 use crate::compression::resolve_frozen_count;
 use crate::config::{CacheControlAutoFrozen, CompressionMode};
@@ -178,14 +178,20 @@ pub fn compress_anthropic_request(
     //
     //   1. PR-E1 — sort `tools[]` alphabetically by name.
     //      Skipped if any tool carries a `cache_control` marker.
-    //   2. PR-E3 — auto-place a `cache_control` marker on the
+    //   2. PR-E2 — recursively sort JSON Schema object keys inside
+    //      every tool's `input_schema`. No marker check (markers
+    //      live on the tool object, not inside the schema, so
+    //      sorting schema keys never moves the marker).
+    //   3. PR-E3 — auto-place a `cache_control` marker on the
     //      (now-sorted) last tool. Skipped if any marker is already
     //      present anywhere in the body.
     //
     // Why this order: E1 must run before E3 so E3 places its marker
     // on the deterministic "last tool after sort". If E3 ran first,
     // E1 would correctly skip on `marker_present` but the marker
-    // would be on a non-deterministic tool.
+    // would be on a non-deterministic tool. E2 sits between E1 and
+    // E3 because schema key order doesn't interact with marker
+    // placement at all.
     //
     // OAuth and Subscription auth modes pass through byte-equal —
     // mutating their bytes can look like cache-evasion to the
@@ -195,9 +201,9 @@ pub fn compress_anthropic_request(
     // dashboards can see how often each policy fires in production.
     // Each apply emits `eN_applied` with diagnostic fields.
 
-    // PR-E1: sort tools[] in-place on the parsed value.
-    let normalization_applied =
-        normalize_tool_definitions(&mut parsed, auth_mode, request_id);
+    // PR-E1 + PR-E2: sort tools[] and schema keys in-place on the
+    // parsed value.
+    let normalization_applied = normalize_tool_definitions(&mut parsed, auth_mode, request_id);
 
     // PR-E3: auto-place anthropic cache_control on the last tool.
     let mut e3_locations: Vec<String> = Vec::new();
@@ -489,19 +495,15 @@ pub fn compress_anthropic_request(
 /// dispatch body. Each `bool` is `true` only when the gate cleared AND
 /// the operation produced a byte-different result. Used by the caller
 /// to attribute strategies on the `Outcome::Compressed` payload.
-///
-/// Currently carries a single field for PR-E1; PR-E2 lands in the
-/// follow-up commit and adds `e2_schema_sort` here. Keeping the flag
-/// set in a struct (rather than a bare `bool`) means the second commit
-/// is a pure addition.
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct NormalizationApplied {
     pub e1_tool_sort: bool,
+    pub e2_schema_sort: bool,
 }
 
 impl NormalizationApplied {
     pub(super) fn any(self) -> bool {
-        self.e1_tool_sort
+        self.e1_tool_sort || self.e2_schema_sort
     }
 
     pub(super) fn strategies(self) -> Vec<&'static str> {
@@ -509,16 +511,23 @@ impl NormalizationApplied {
         if self.e1_tool_sort {
             out.push("tool_array_sort");
         }
+        if self.e2_schema_sort {
+            out.push("schema_key_sort");
+        }
         out
     }
 }
 
-/// Apply PR-E1 (tool-array sort) in-place on the parsed body when
-/// the auth-mode + marker gates clear.
+/// Apply PR-E1 (tool-array sort) and PR-E2 (schema-key sort) in-place
+/// on the parsed body when the auth-mode + marker gates clear.
 ///
 /// The caller owns re-serialization (because PR-E3 may also mutate
 /// the same parsed value before bytes are produced). Returns a flag
 /// set indicating which Phase E normalization step actually ran.
+///
+/// PR-E1 (sort) is additionally skipped when any tool already carries
+/// a `cache_control` marker; PR-E2 still runs in that case because
+/// sorting schema keys never moves the marker.
 ///
 /// Every gate skip emits a structured `tracing::info!` event so
 /// dashboards can see how often each policy fires in production.
@@ -527,10 +536,10 @@ pub(super) fn normalize_tool_definitions(
     auth_mode: RequestAuthMode,
     request_id: &str,
 ) -> NormalizationApplied {
-    // Auth-mode gate first — PR-E1 mutates request bytes, which is
-    // only safe under PAYG. OAuth and Subscription clients pass
-    // through byte-equal so the proxy never looks like a cache-
-    // evasion intermediary to the upstream.
+    // Auth-mode gate first — both PR-E1 and PR-E2 mutate request
+    // bytes, which is only safe under PAYG. OAuth and Subscription
+    // clients pass through byte-equal so the proxy never looks
+    // like a cache-evasion intermediary to the upstream.
     if !matches!(auth_mode, RequestAuthMode::Payg) {
         tracing::info!(
             event = "e1_skipped",
@@ -539,6 +548,14 @@ pub(super) fn normalize_tool_definitions(
             reason = "auth_mode",
             auth_mode = auth_mode.as_str(),
             "tool-array sort skipped: non-PAYG auth mode passes through byte-equal"
+        );
+        tracing::info!(
+            event = "e2_skipped",
+            request_id = %request_id,
+            path = "/v1/messages",
+            reason = "auth_mode",
+            auth_mode = auth_mode.as_str(),
+            "schema-key sort skipped: non-PAYG auth mode passes through byte-equal"
         );
         return NormalizationApplied::default();
     }
@@ -556,8 +573,11 @@ pub(super) fn normalize_tool_definitions(
 
     // PR-E1 marker check. Reordering tools when any tool already
     // carries `cache_control` shifts what's "before" the marker and
-    // silently changes cache scope. Skip the sort and pass through.
-    if any_tool_has_cache_control(tools_in) {
+    // silently changes cache scope. Skip the SORT (E1); E2 still
+    // runs because sorting schema keys does not move the marker
+    // (which lives on the tool object itself, not inside the schema).
+    let marker_present = any_tool_has_cache_control(tools_in);
+    if marker_present {
         tracing::info!(
             event = "e1_skipped",
             request_id = %request_id,
@@ -567,7 +587,6 @@ pub(super) fn normalize_tool_definitions(
             "tool-array sort skipped: customer cache_control marker present \
              on at least one tool; preserving customer-intentional order"
         );
-        return NormalizationApplied::default();
     }
 
     let tools = parsed
@@ -576,14 +595,45 @@ pub(super) fn normalize_tool_definitions(
         .expect("tools array verified above");
 
     let mut applied = NormalizationApplied::default();
-    applied.e1_tool_sort = sort_tools_deterministically(tools);
-    if applied.e1_tool_sort {
+
+    if !marker_present {
+        applied.e1_tool_sort = sort_tools_deterministically(tools);
+        if applied.e1_tool_sort {
+            tracing::info!(
+                event = "e1_applied",
+                request_id = %request_id,
+                path = "/v1/messages",
+                tool_count = tools.len(),
+                "tool-array sort applied: tools reordered alphabetically by name"
+            );
+        }
+    }
+
+    // PR-E2: sort each tool's `input_schema` keys recursively.
+    // Anthropic schema lives at `tool.input_schema`. Tools without
+    // an `input_schema` field are silently skipped — that is a
+    // valid Anthropic shape (e.g. zero-argument tools).
+    for tool in tools.iter_mut() {
+        let Some(schema) = tool.get_mut("input_schema") else {
+            continue;
+        };
+        // We compare bytes before / after to detect whether the
+        // sort actually moved any keys (idempotent re-runs report
+        // `false` and the caller surfaces no event for the no-op).
+        let before = serde_json::to_vec(schema).unwrap_or_default();
+        sort_schema_keys_recursive(schema);
+        let after = serde_json::to_vec(schema).unwrap_or_default();
+        if before != after {
+            applied.e2_schema_sort = true;
+        }
+    }
+    if applied.e2_schema_sort {
         tracing::info!(
-            event = "e1_applied",
+            event = "e2_applied",
             request_id = %request_id,
             path = "/v1/messages",
             tool_count = tools.len(),
-            "tool-array sort applied: tools reordered alphabetically by name"
+            "schema-key sort applied: input_schema keys rewritten in alphabetic order"
         );
     }
 
@@ -1035,6 +1085,111 @@ mod tests {
     }
 
     #[test]
+    fn e2_sorts_input_schema_keys_when_payg() {
+        // PAYG, single tool with shuffled input_schema keys → sort
+        // should fire (e2 strategy).
+        let body = body_of(serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hi"}
+                ]}
+            ],
+            "tools": [
+                {
+                    "name": "search",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "filters": {"type": "object"},
+                        },
+                        "required": ["query"],
+                    },
+                },
+            ],
+        }));
+        let out = compress_anthropic_request(
+            &body,
+            CompressionMode::LiveZone,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
+            "req-e2-1",
+        );
+        match out {
+            Outcome::Compressed {
+                body: new_body,
+                strategies_applied,
+                ..
+            } => {
+                assert!(
+                    strategies_applied.contains(&"schema_key_sort"),
+                    "expected schema_key_sort strategy, got: {strategies_applied:?}",
+                );
+                let parsed: Value = serde_json::from_slice(&new_body).unwrap();
+                let schema = &parsed["tools"][0]["input_schema"];
+                // Inspect the top-level key sequence directly via the
+                // serde_json::Map so we don't accidentally match nested
+                // `"type"` occurrences in `find()` calls.
+                let map = schema.as_object().unwrap();
+                let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+                assert_eq!(
+                    keys,
+                    vec!["properties", "required", "type"],
+                    "input_schema top-level keys must be alphabetic; got: {keys:?}"
+                );
+            }
+            other => panic!("expected Compressed with schema sort, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn e2_runs_even_when_marker_blocks_e1() {
+        // PAYG, marker present (E1 skipped), but E2 still runs and
+        // mutates schema keys. The dispatch surface should report
+        // only `schema_key_sort`, never `tool_array_sort`.
+        let body = body_of(serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hi"}
+                ]}
+            ],
+            "tools": [
+                {
+                    "name": "search",
+                    "cache_control": {"type": "ephemeral"},
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                    },
+                },
+            ],
+        }));
+        let out = compress_anthropic_request(
+            &body,
+            CompressionMode::LiveZone,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
+            "req-e2-2",
+        );
+        match out {
+            Outcome::Compressed {
+                strategies_applied, ..
+            } => {
+                assert!(strategies_applied.contains(&"schema_key_sort"));
+                assert!(
+                    !strategies_applied.contains(&"tool_array_sort"),
+                    "E1 must skip when marker is present; got {strategies_applied:?}",
+                );
+            }
+            other => panic!("expected Compressed with schema sort, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn e1_already_sorted_idempotent() {
         // Tools in alphabetic order already — E1 sort is a no-op.
         // E3 still fires (no customer marker, PAYG, has tools), so
@@ -1076,7 +1231,9 @@ mod tests {
                      {strategies_applied:?}",
                 );
             }
-            other => panic!("expected Compressed (E3 fires) for already-sorted tools, got {other:?}"),
+            other => {
+                panic!("expected Compressed (E3 fires) for already-sorted tools, got {other:?}")
+            }
         }
     }
 }

@@ -28,9 +28,13 @@
 //!   `cache_drift_observed` when consecutive requests on the same
 //!   session disagree on any of the three dimensions.
 //! - [`tool_def_normalize`] — PR-E1 / PR-E2: sorts `tools[]`
-//!   alphabetically by name; recursively sorts JSON Schema object
-//!   keys inside each tool's `input_schema`. PAYG-only; skipped when
-//!   any tool already carries `cache_control`.
+//!   alphabetically by name (PR-E1) and recursively sorts JSON
+//!   Schema object keys inside each tool's `input_schema` /
+//!   `function.parameters` (PR-E2). PAYG-only. PR-E1 additionally
+//!   skips when any tool already carries a top-level
+//!   `cache_control` marker; PR-E2 has no marker check because
+//!   sorting schema keys never moves the marker (which lives on
+//!   the tool object, not inside the schema).
 //! - [`anthropic_cache_control`] — PR-E3: on PAYG-classified
 //!   requests where the customer hasn't placed any `cache_control`
 //!   marker, auto-inserts one ephemeral marker on the last tool

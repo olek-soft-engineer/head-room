@@ -58,17 +58,22 @@ use serde_json::Value;
 ///
 /// # Stability
 ///
-/// Uses `Vec::sort_by` (a stable sort: equal keys preserve original
-/// order). Two unnamed tools that happen to MD5-collide will keep their
+/// Uses a stable sort (`sort_by_key`): equal keys preserve original
+/// order. Two unnamed tools that happen to MD5-collide will keep their
 /// original relative order — collision is astronomically rare for any
 /// realistic input but the contract still holds.
-pub fn sort_tools_deterministically(tools: &mut Vec<Value>) -> bool {
+///
+/// The slice signature (`&mut [Value]`) is preferred over `&mut
+/// Vec<Value>` per clippy's `ptr_arg` guidance: callers can pass
+/// either a `Vec` or any `&mut [Value]`, and we don't need
+/// `Vec`-specific operations.
+pub fn sort_tools_deterministically(tools: &mut [Value]) -> bool {
     // Capture the pre-sort key sequence so the return-value contract
     // (`true` iff anything moved) is exact. We compare keys, not full
     // values, because the sort is by key — equal-key swaps would not
     // affect cache bytes.
     let before: Vec<String> = tools.iter().map(sort_key).collect();
-    tools.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+    tools.sort_by_key(sort_key);
     let after: Vec<String> = tools.iter().map(sort_key).collect();
     before != after
 }
@@ -131,9 +136,80 @@ fn sort_key(tool: &Value) -> String {
 /// caught — but they would also not be position-dependent, so the
 /// safety contract still holds.
 pub fn any_tool_has_cache_control(tools: &[Value]) -> bool {
-    tools
-        .iter()
-        .any(|tool| tool.get("cache_control").is_some())
+    tools.iter().any(|tool| tool.get("cache_control").is_some())
+}
+
+/// Recursively sort the keys of every JSON object node in `value`,
+/// in place. PR-E2.
+///
+/// JSON Schema permits arbitrary key order, but cache hits require
+/// byte-identical bytes. Different SDK serializers emit keys in
+/// different orders (some sort, some preserve insertion, some are
+/// hash-randomized). This walker rewrites every `Value::Object` with
+/// keys in alphabetic order so the same logical schema serializes
+/// to the same bytes regardless of upstream serializer behaviour.
+///
+/// # Array semantics
+///
+/// JSON Schema arrays are ordered. `oneOf`, `anyOf`, `allOf`,
+/// `prefixItems`, and `enum` all carry semantic meaning in the
+/// element order — so this walker recurses into arrays element by
+/// element but does NOT reorder the arrays themselves. (Reordering
+/// `oneOf` would be a no-op semantically but would still change
+/// bytes; we preserve customer order to honour intent.)
+///
+/// # Idempotency
+///
+/// Sorting an already-sorted map yields byte-identical output: we
+/// rebuild a fresh `serde_json::Map` populated in alphabetic order,
+/// and `Map` (with the workspace `preserve_order` feature) emits
+/// keys in insertion order. So the second pass produces the same
+/// `Map` literal.
+///
+/// # Marker safety
+///
+/// Unlike PR-E1, this function has no `cache_control`-marker check.
+/// The Anthropic API places `cache_control` on the tool *object* itself
+/// (`{"name": ..., "cache_control": {...}, "input_schema": {...}}`),
+/// not inside `input_schema`. Sorting keys inside `input_schema` does
+/// not move the marker, so the customer's cache-breakpoint intent is
+/// preserved either way. The caller is therefore free to pass a
+/// schema for any tool, marker-bearing or not.
+pub fn sort_schema_keys_recursive(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            // Recurse first so children are normalized before we
+            // rebuild the parent. Order of recursion doesn't affect
+            // correctness (each child is independent) but doing it
+            // first means the parent's sorted Map is built once over
+            // already-sorted children — no repeated work.
+            for (_k, v) in map.iter_mut() {
+                sort_schema_keys_recursive(v);
+            }
+            // Collect existing entries, sort by key, rebuild the
+            // map. Cloning is unavoidable: `serde_json::Map` does
+            // not expose an in-place key reorder. The clone is a
+            // shallow Value clone — children were already mutated
+            // in place above so we don't lose the recursive sort.
+            let mut entries: Vec<(String, Value)> =
+                map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            map.clear();
+            for (k, v) in entries {
+                map.insert(k, v);
+            }
+        }
+        Value::Array(items) => {
+            // Preserve array order — JSON Schema arrays are ordered.
+            // Recurse into each element so nested objects inside the
+            // array still get key-sorted.
+            for item in items.iter_mut() {
+                sort_schema_keys_recursive(item);
+            }
+        }
+        // Strings, numbers, booleans, null have no keys to sort.
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -293,5 +369,146 @@ mod tests {
             sort_tools_deterministically(&mut tools);
             prop_assert_eq!(tools.len(), len_before);
         }
+    }
+
+    // ─── E2: sort_schema_keys_recursive ───────────────────────────
+
+    #[test]
+    fn sorts_top_level_object_keys() {
+        let mut value = json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+        });
+        sort_schema_keys_recursive(&mut value);
+        let serialized = serde_json::to_string(&value).unwrap();
+        let p_pos = serialized.find("\"properties\"").unwrap();
+        let r_pos = serialized.find("\"required\"").unwrap();
+        let t_pos = serialized.find("\"type\"").unwrap();
+        assert!(
+            p_pos < r_pos && r_pos < t_pos,
+            "expected alphabetic order properties < required < type, got: {serialized}"
+        );
+    }
+
+    #[test]
+    fn sorts_nested_property_keys() {
+        let mut value = json!({
+            "type": "object",
+            "properties": {
+                "z_field": {"type": "string"},
+                "a_field": {"type": "integer"},
+                "m_field": {"type": "boolean"},
+            },
+        });
+        sort_schema_keys_recursive(&mut value);
+        let serialized = serde_json::to_string(&value).unwrap();
+        let a_pos = serialized.find("\"a_field\"").unwrap();
+        let m_pos = serialized.find("\"m_field\"").unwrap();
+        let z_pos = serialized.find("\"z_field\"").unwrap();
+        assert!(
+            a_pos < m_pos && m_pos < z_pos,
+            "nested property keys must be sorted alphabetically; got: {serialized}"
+        );
+    }
+
+    #[test]
+    fn preserves_array_order_in_oneof() {
+        let mut value = json!({
+            "oneOf": [
+                {"const": "third"},
+                {"const": "first"},
+                {"const": "second"},
+            ],
+        });
+        sort_schema_keys_recursive(&mut value);
+        let arr = value.get("oneOf").and_then(Value::as_array).unwrap();
+        let consts: Vec<&str> = arr
+            .iter()
+            .map(|v| v.get("const").and_then(Value::as_str).unwrap())
+            .collect();
+        assert_eq!(
+            consts,
+            vec!["third", "first", "second"],
+            "JSON Schema arrays (oneOf) must preserve element order"
+        );
+    }
+
+    #[test]
+    fn idempotent_resort_schema() {
+        let mut value = json!({
+            "type": "object",
+            "properties": {
+                "z": {"type": "integer", "default": 1, "description": "z field"},
+                "a": {"type": "string", "minLength": 1, "default": "x"},
+            },
+            "additionalProperties": false,
+            "required": ["a", "z"],
+        });
+        sort_schema_keys_recursive(&mut value);
+        let bytes_first = serde_json::to_vec(&value).unwrap();
+        sort_schema_keys_recursive(&mut value);
+        let bytes_second = serde_json::to_vec(&value).unwrap();
+        assert_eq!(
+            bytes_first, bytes_second,
+            "second sort over already-sorted schema must be a byte-equal no-op"
+        );
+    }
+
+    #[test]
+    fn does_not_alter_arrays_within_arrays() {
+        // Nested arrays preserve order at every level.
+        let mut value = json!({
+            "examples": [
+                [3, 1, 2],
+                ["c", "a", "b"],
+            ],
+        });
+        sort_schema_keys_recursive(&mut value);
+        let outer = value.get("examples").and_then(Value::as_array).unwrap();
+        let inner_nums: Vec<i64> = outer[0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        assert_eq!(inner_nums, vec![3, 1, 2]);
+        let inner_strs: Vec<&str> = outer[1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(inner_strs, vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn handles_deeply_nested_schemas() {
+        let mut value = json!({
+            "type": "object",
+            "properties": {
+                "outer": {
+                    "type": "object",
+                    "properties": {
+                        "inner": {
+                            "type": "object",
+                            "properties": {
+                                "z_deep": {"type": "string"},
+                                "a_deep": {"type": "integer"},
+                            },
+                            "required": ["z_deep", "a_deep"],
+                        },
+                    },
+                },
+            },
+        });
+        sort_schema_keys_recursive(&mut value);
+        let serialized = serde_json::to_string(&value).unwrap();
+        let a_pos = serialized.find("\"a_deep\"").unwrap();
+        let z_pos = serialized.find("\"z_deep\"").unwrap();
+        assert!(
+            a_pos < z_pos,
+            "deeply-nested keys must be sorted alphabetically; got: {serialized}"
+        );
     }
 }

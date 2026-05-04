@@ -40,7 +40,7 @@ use headroom_core::transforms::{
 use serde_json::Value;
 
 use crate::cache_stabilization::tool_def_normalize::{
-    any_tool_has_cache_control, sort_tools_deterministically,
+    any_tool_has_cache_control, sort_schema_keys_recursive, sort_tools_deterministically,
 };
 use crate::compression::{Outcome, PassthroughReason};
 use crate::config::CompressionMode;
@@ -286,16 +286,16 @@ pub fn compress_openai_responses_request(
 
 /// Tracks which Phase E normalization steps mutated the dispatch
 /// body for the Responses path. Sibling of the same struct in
-/// `live_zone_anthropic` and `live_zone_openai`. Currently a single
-/// flag for PR-E1; PR-E2 lands a second flag in the follow-up commit.
+/// `live_zone_anthropic` and `live_zone_openai`.
 #[derive(Debug, Clone, Copy, Default)]
 struct NormalizationApplied {
     e1_tool_sort: bool,
+    e2_schema_sort: bool,
 }
 
 impl NormalizationApplied {
     fn any(self) -> bool {
-        self.e1_tool_sort
+        self.e1_tool_sort || self.e2_schema_sort
     }
 
     fn strategies(self) -> Vec<&'static str> {
@@ -303,14 +303,22 @@ impl NormalizationApplied {
         if self.e1_tool_sort {
             out.push("tool_array_sort");
         }
+        if self.e2_schema_sort {
+            out.push("schema_key_sort");
+        }
         out
     }
 }
 
-/// Apply PR-E1 (tool-array sort) to a Responses request body when
-/// the auth-mode + marker gates clear. Mirrors the same gate logic
-/// as the Anthropic / Chat Completions walkers — same skip events,
-/// same outcome shape, same byte-equal passthrough on non-PAYG.
+/// Apply PR-E1 (tool-array sort) and PR-E2 (schema-key sort) to a
+/// Responses request body when the auth-mode + marker gates clear.
+/// Mirrors the same gate logic as the Anthropic / Chat Completions
+/// walkers — same skip events, same outcome shape, same byte-equal
+/// passthrough on non-PAYG.
+///
+/// Responses tools nest the schema at `tool.function.parameters`
+/// (same as OpenAI Chat Completions, distinct from Anthropic's
+/// `tool.input_schema`).
 fn normalize_tool_definitions_responses(
     body: &Bytes,
     parsed: &Value,
@@ -326,6 +334,14 @@ fn normalize_tool_definitions_responses(
             auth_mode = auth_mode.as_str(),
             "tool-array sort skipped: non-PAYG auth mode passes through byte-equal"
         );
+        tracing::info!(
+            event = "e2_skipped",
+            request_id = %request_id,
+            path = "/v1/responses",
+            reason = "auth_mode",
+            auth_mode = auth_mode.as_str(),
+            "schema-key sort skipped: non-PAYG auth mode passes through byte-equal"
+        );
         return (body.clone(), NormalizationApplied::default());
     }
 
@@ -336,7 +352,8 @@ fn normalize_tool_definitions_responses(
         return (body.clone(), NormalizationApplied::default());
     }
 
-    if any_tool_has_cache_control(tools_in) {
+    let marker_present = any_tool_has_cache_control(tools_in);
+    if marker_present {
         tracing::info!(
             event = "e1_skipped",
             request_id = %request_id,
@@ -346,7 +363,6 @@ fn normalize_tool_definitions_responses(
             "tool-array sort skipped: customer cache_control marker present \
              on at least one tool; preserving customer-intentional order"
         );
-        return (body.clone(), NormalizationApplied::default());
     }
 
     let mut working = parsed.clone();
@@ -356,14 +372,42 @@ fn normalize_tool_definitions_responses(
         .expect("tools array verified above");
 
     let mut applied = NormalizationApplied::default();
-    applied.e1_tool_sort = sort_tools_deterministically(tools);
-    if applied.e1_tool_sort {
+
+    if !marker_present {
+        applied.e1_tool_sort = sort_tools_deterministically(tools);
+        if applied.e1_tool_sort {
+            tracing::info!(
+                event = "e1_applied",
+                request_id = %request_id,
+                path = "/v1/responses",
+                tool_count = tools.len(),
+                "tool-array sort applied: tools reordered alphabetically by name"
+            );
+        }
+    }
+
+    // PR-E2: Responses tool schema lives at `tool.function.parameters`.
+    for tool in tools.iter_mut() {
+        let Some(parameters) = tool
+            .get_mut("function")
+            .and_then(|f| f.get_mut("parameters"))
+        else {
+            continue;
+        };
+        let before = serde_json::to_vec(parameters).unwrap_or_default();
+        sort_schema_keys_recursive(parameters);
+        let after = serde_json::to_vec(parameters).unwrap_or_default();
+        if before != after {
+            applied.e2_schema_sort = true;
+        }
+    }
+    if applied.e2_schema_sort {
         tracing::info!(
-            event = "e1_applied",
+            event = "e2_applied",
             request_id = %request_id,
             path = "/v1/responses",
             tool_count = tools.len(),
-            "tool-array sort applied: tools reordered alphabetically by name"
+            "schema-key sort applied: function.parameters keys rewritten in alphabetic order"
         );
     }
 
