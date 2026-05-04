@@ -110,10 +110,30 @@ relevance = [
     "numpy>=1.24.0",
 ]
 # Image compression (ML-based routing + OCR)
+#
+# OCR backend uses ONNX Runtime regardless of Python version. The
+# rapidocr ecosystem split into two flavors after 1.4.x:
+#   * rapidocr-onnxruntime 1.4.x — bundled-ORT package, capped at
+#     Python <3.13 by its requires-python metadata. Drop-in for our
+#     existing v1 tuple-shaped API call.
+#   * rapidocr 3.x — engine-agnostic core, supports Python 3.13+.
+#     Returns a RapidOCROutput dataclass (txts, scores, boxes, ...).
+#     Needs `onnxruntime` installed separately to use the ORT backend.
+#
+# `headroom/image/compressor.py` adapts both API shapes at runtime via
+# a try/except cascade. See issue #372 for context.
 image = [
     "pillow>=10.0.0",
     "sentencepiece>=0.1.99",  # Required by SigLIP tokenizer (SiglipTokenizer)
-    "rapidocr-onnxruntime>=1.4.0",  # ONNX-native OCR for text extraction from images (~15MB models)
+    # Python 3.6–3.12: keep the proven ORT-bundled package directly.
+    # ~15 MB ONNX models auto-downloaded on first use.
+    "rapidocr-onnxruntime>=1.4.0,<2; python_version<'3.13'",
+    # Python 3.13+: rapidocr-onnxruntime is unavailable (its wheels
+    # declare requires-python<3.13). Use the successor `rapidocr` 3.x
+    # core + `onnxruntime` engine; same ORT backend, just split into
+    # two packages. Total install size and inference speed unchanged.
+    "rapidocr>=3.0,<4; python_version>='3.13'",
+    "onnxruntime>=1.7,<2; python_version>='3.13'",
 ]
 # Report generation
 reports = [
