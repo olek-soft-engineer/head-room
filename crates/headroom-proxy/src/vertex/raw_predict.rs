@@ -220,10 +220,16 @@ pub(crate) async fn forward_vertex_request(
     // (and any other non-`messages` top-level field) round-trips
     // byte-equal. Compression off → buffered bytes used unchanged.
     let body_to_send = if state.config.compression {
+        // PR-E3: Vertex uses GCP ADC bearer-token auth downstream, not
+        // Anthropic credentials, so the PAYG/OAuth/subscription
+        // classification doesn't apply. Hard-code `AuthMode::OAuth` to
+        // skip E3 cache_control auto-placement (and any other PAYG-only
+        // mutation). Live-zone compression itself continues to run.
         let outcome = compression::compress_anthropic_request(
             &buffered,
             state.config.compression_mode,
             state.config.cache_control_auto_frozen,
+            headroom_core::auth_mode::AuthMode::OAuth,
             &request_id,
         );
         match outcome {

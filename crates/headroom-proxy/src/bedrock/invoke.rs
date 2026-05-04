@@ -377,10 +377,17 @@ fn run_anthropic_compression(body: &Bytes, state: &AppState, request_id: &str) -
         "bedrock invoke: envelope validated; dispatching to live-zone compressor"
     );
 
+    // PR-E3: Bedrock uses IAM-signed AWS SigV4 downstream. Inbound
+    // requests to the proxy may or may not carry their own auth, but
+    // Bedrock itself is a subscription/IAM channel — never PAYG —
+    // so we hard-code `RequestAuthMode::OAuth` to skip E3
+    // cache_control auto-placement. This keeps the Bedrock byte
+    // contract stable; live-zone compression continues to run.
     let outcome = compress_anthropic_request(
         body,
         state.config.compression_mode,
         state.config.cache_control_auto_frozen,
+        headroom_core::auth_mode::AuthMode::OAuth,
         request_id,
     );
     match outcome {

@@ -841,10 +841,13 @@ fn run_anthropic_compression(body: &Bytes, state: &AppState, request_id: &str) -
         return body.clone();
     }
 
+    // PR-E3: Bedrock channel hard-codes OAuth so cache_control
+    // auto-placement is skipped (see invoke.rs for rationale).
     let outcome = compress_anthropic_request(
         body,
         state.config.compression_mode,
         state.config.cache_control_auto_frozen,
+        headroom_core::auth_mode::AuthMode::OAuth,
         request_id,
     );
     match outcome {
