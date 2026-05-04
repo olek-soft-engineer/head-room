@@ -124,11 +124,17 @@ jobs:
           # tells buildx to push the per-platform manifest with no tags
           # — only the digest is recorded — so multiple per-arch builds
           # can coexist in the registry until the manifest job stitches
-          # them. GHA cache is scoped per (variant, arch) so the two
-          # arches don't fight over the same cache key.
+          # them. `name=<registry>/<image>` is REQUIRED here: with no
+          # `bake-file-tags` in scope (tags belong on the manifest, not
+          # per-arch), bake has no way to know the push target without
+          # the explicit `name=`. Removing it surfaces as the
+          # misleading "ERROR: tag is needed when pushing to registry"
+          # — see PR #378 (regression from #376). GHA cache is scoped
+          # per (variant, arch) so the two arches don't fight over the
+          # same cache key.
           set: |
             *.platform=${{ matrix.arch.platform }}
-            *.output=type=image,push-by-digest=true,name-canonical=true,push=true
+            *.output=type=image,name=${{ env.REGISTRY }}/${{ steps.image-name.outputs.image_name }},push-by-digest=true,name-canonical=true,push=true
             *.cache-from=type=gha,scope=${{ matrix.variant.name || 'root' }}-${{ matrix.arch.name }}
             *.cache-to=type=gha,mode=max,scope=${{ matrix.variant.name || 'root' }}-${{ matrix.arch.name }}
 
