@@ -71,6 +71,11 @@ sha2 = "0.10"
 # is the de-facto Rust LRU crate; minimal surface, no dependencies of
 # our own beyond `hashbrown` (which we already pull transitively).
 lru = "0.12"
+# PR-D4: GCP Application Default Credentials → bearer token for
+# Vertex `:rawPredict` / `:streamRawPredict`. See workspace
+# Cargo.toml for rationale.
+gcp_auth = { workspace = true }
+async-trait = "0.1"
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

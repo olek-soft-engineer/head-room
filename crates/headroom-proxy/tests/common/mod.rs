@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use headroom_proxy::vertex::TokenSource;
 use headroom_proxy::{build_app, AppState, Config};
 use tokio::sync::oneshot;
 use url::Url;
@@ -51,6 +52,9 @@ where
 /// Start a proxy with both a Config customizer and an AppState
 /// post-processor. PR-D1: tests that exercise the Bedrock route
 /// inject credentials via `with_bedrock_credentials` here.
+/// PR-D4: Vertex tests inject a `StaticTokenSource` via
+/// `install_static_token_source` here (chain-style) so they never
+/// hit real GCP.
 #[allow(dead_code)]
 pub async fn start_proxy_with_state<F, G>(
     upstream: &str,
@@ -86,6 +90,20 @@ where
         shutdown: Some(tx),
         task,
     }
+}
+
+/// Convenience: replace the default `vertex_token_source` with a
+/// `StaticTokenSource` returning the supplied bearer string. Used by
+/// the PR-D4 Vertex integration tests so they never hit real GCP.
+#[allow(dead_code)]
+/// PR-D4: chain-style helper to install a `StaticTokenSource` on an
+/// `AppState`. Returns the modified state so it composes with
+/// `start_proxy_with_state`'s `FnOnce(AppState) -> AppState`.
+pub fn install_static_token_source(mut state: AppState, bearer: &str) -> AppState {
+    state.vertex_token_source = Arc::new(headroom_proxy::vertex::StaticTokenSource::new(
+        bearer.to_string(),
+    )) as Arc<dyn TokenSource>;
+    state
 }
 
 /// Hold a reference to the config so dead_code doesn't strip its use.

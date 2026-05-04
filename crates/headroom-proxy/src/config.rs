@@ -370,6 +370,39 @@ pub struct CliArgs {
         action = clap::ArgAction::Set,
     )]
     pub bedrock_validate_eventstream_crc: bool,
+
+    /// Phase D PR-D4: GCP Vertex region for the publisher path
+    /// (`{region}-aiplatform.googleapis.com`). Default `us-central1`
+    /// (matches the GCP-published default region for Anthropic
+    /// publisher models). The proxy does NOT auto-construct the
+    /// regional URL — that's an `--upstream` decision the operator
+    /// makes once at startup. This flag is exposed for structured
+    /// logging + observability so dashboards can group Vertex traffic
+    /// by region without parsing the upstream URL.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_VERTEX_REGION`
+    /// env var → default (`us-central1`).
+    #[arg(
+        long = "vertex-region",
+        env = "HEADROOM_PROXY_VERTEX_REGION",
+        default_value = "us-central1"
+    )]
+    pub vertex_region: String,
+
+    /// Phase D PR-D4: OAuth scope to request from GCP ADC. Defaults
+    /// to `cloud-platform`, the broad scope `gcloud` itself uses for
+    /// ADC. Operators with tighter IAM postures can scope down to
+    /// `cloud-platform.read-only` etc., but Vertex `:rawPredict`
+    /// requires write so most deployments use the default.
+    ///
+    /// Source priority: CLI flag → `HEADROOM_PROXY_VERTEX_ADC_SCOPE`
+    /// env var → default (`cloud-platform`).
+    #[arg(
+        long = "vertex-adc-scope",
+        env = "HEADROOM_PROXY_VERTEX_ADC_SCOPE",
+        default_value = "https://www.googleapis.com/auth/cloud-platform"
+    )]
+    pub vertex_adc_scope: String,
 }
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -441,6 +474,14 @@ pub struct Config {
     /// PR-D2: validate prelude + message CRC32 on inbound Bedrock
     /// EventStream frames. Default `true`. Off only for debugging.
     pub bedrock_validate_eventstream_crc: bool,
+    /// PR-D4: GCP Vertex region tag (e.g. `us-central1`). Surfaced
+    /// in structured logs only — the actual upstream URL comes from
+    /// `Config::upstream`. Operators set this so observability
+    /// dashboards can group Vertex traffic by region.
+    pub vertex_region: String,
+    /// PR-D4: GCP ADC OAuth scope used when fetching the bearer
+    /// token. Default `https://www.googleapis.com/auth/cloud-platform`.
+    pub vertex_adc_scope: String,
 }
 
 impl Config {
@@ -474,6 +515,8 @@ impl Config {
             bedrock_endpoint: args.bedrock_endpoint,
             aws_profile: args.aws_profile,
             bedrock_validate_eventstream_crc: args.bedrock_validate_eventstream_crc,
+            vertex_region: args.vertex_region,
+            vertex_adc_scope: args.vertex_adc_scope,
         }
     }
 
@@ -515,6 +558,10 @@ impl Config {
             // PR-D2: production default — validate every CRC. Tests
             // that exercise corruption paths flip this off per-case.
             bedrock_validate_eventstream_crc: true,
+            // PR-D4: default Vertex region (used for log tagging
+            // only; the upstream URL is `upstream`).
+            vertex_region: "us-central1".to_string(),
+            vertex_adc_scope: "https://www.googleapis.com/auth/cloud-platform".to_string(),
         }
     }
 }

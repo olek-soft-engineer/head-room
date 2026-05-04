@@ -974,6 +974,12 @@ mod tests {
             // PR-E6: drift detector is unused by this URL-builder
             // unit test; small capacity to satisfy the struct shape.
             drift_state: crate::cache_stabilization::drift_detector::DriftState::new(8),
+            // PR-D4: unit tests for the Bedrock URL builder don't
+            // touch the Vertex route, but `AppState` is one struct
+            // — supply a dummy token source so the test compiles.
+            vertex_token_source: std::sync::Arc::new(crate::vertex::StaticTokenSource::new(
+                "test".to_string(),
+            )),
         };
         let uri: Uri = "/model/anthropic.claude-3-haiku-20240307-v1:0/invoke-with-response-stream"
             .parse()
