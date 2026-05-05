@@ -3,13 +3,18 @@
 //! The realignment plan (`REALIGNMENT/07-phase-E-cache-stabilization.md`)
 //! groups every cache-stabilization mechanism behind one module so
 //! operators searching for "what does Headroom do to keep prompt
-//! caches warm" land in one place. Phase E PRs in this module sit
-//! *next to* the request path — either as observers
-//! (volatile_detector, drift_detector) or as PAYG-gated mutators
-//! (openai_cache_key, anthropic cache_control). The Phase A
-//! "passthrough is sacred" invariant still holds: mutators MUST
-//! gate on `AuthMode::Payg` at their call sites before invoking
-//! any function that mutates the body. Observers never mutate.
+//! caches warm" land in one place. Phase E PRs in this module either:
+//!
+//! - **Observe** inbound bodies and emit structured warnings so
+//!   customers can see why their prompt-cache hit rate is degrading
+//!   ([`volatile_detector`], PR-E5; [`drift_detector`], PR-E6). These
+//!   never mutate request bytes.
+//! - **Normalize** request bytes to make cache hits deterministic
+//!   under PAYG mode ([`tool_def_normalize`], PR-E1 / PR-E2;
+//!   [`anthropic_cache_control`], PR-E3; [`openai_cache_key`], PR-E4).
+//!   These mutate bytes only when the auth-mode gate and per-policy
+//!   preconditions (e.g. no customer `cache_control` marker) all clear;
+//!   OAuth and Subscription always passthrough.
 //!
 //! Currently shipped:
 //!
@@ -22,6 +27,14 @@
 //!   `cache_drift_first_request` on first sight and
 //!   `cache_drift_observed` when consecutive requests on the same
 //!   session disagree on any of the three dimensions.
+//! - [`tool_def_normalize`] — PR-E1 / PR-E2: sorts `tools[]`
+//!   alphabetically by name (PR-E1) and recursively sorts JSON
+//!   Schema object keys inside each tool's `input_schema` /
+//!   `function.parameters` (PR-E2). PAYG-only. PR-E1 additionally
+//!   skips when any tool already carries a top-level
+//!   `cache_control` marker; PR-E2 has no marker check because
+//!   sorting schema keys never moves the marker (which lives on
+//!   the tool object, not inside the schema).
 //! - [`anthropic_cache_control`] — PR-E3: on PAYG-classified
 //!   requests where the customer hasn't placed any `cache_control`
 //!   marker, auto-inserts one ephemeral marker on the last tool
@@ -36,13 +49,13 @@
 //!   cache lookup to a tenant-stable identity. **Mutates the body**
 //!   (only on PAYG) — see its docs for the gating contract.
 //!
-//! Future PRs (E1 — tool-array sort, E2 — JSON Schema key sort, E3 —
-//! `cache_control` auto-placement) hang sibling submodules off this
-//! same `mod.rs`. Conflict resolution between parallel Phase E PRs
-//! is intentionally trivial: each detector lives in its own file,
-//! the only shared surface is this `mod.rs`'s `pub mod` list.
+//! Sibling PRs hang additional submodules off this `mod.rs`. Conflict
+//! resolution between parallel Phase E PRs is intentionally trivial:
+//! each lives in its own file, the only shared surface is this
+//! `mod.rs`'s `pub mod` list.
 
 pub mod anthropic_cache_control;
 pub mod drift_detector;
 pub mod openai_cache_key;
+pub mod tool_def_normalize;
 pub mod volatile_detector;

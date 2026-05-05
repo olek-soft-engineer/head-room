@@ -77,6 +77,13 @@ lru = "0.12"
 # Cargo.toml for rationale.
 gcp_auth = { workspace = true }
 async-trait = "0.1"
+# Phase E PR-E1: tool array deterministic sort uses MD5 of canonical
+# JSON as a fallback sort key for unnamed tools. MD5 is sufficient
+# because the value is opaque and only used for stable in-process
+# ordering — never persisted, never compared cross-host. Same crate
+# the core uses for the CCR cache_key, so no additional hash backend
+# enters the dep tree.
+md-5 = "0.10"
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
