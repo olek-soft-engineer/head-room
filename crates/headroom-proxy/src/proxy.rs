@@ -31,6 +31,7 @@ use crate::websocket::ws_handler;
 // path for downstream handlers that read the value back out of
 // `req.extensions()` (Phase F PR-F2/F3/F4).
 use headroom_core::auth_mode::{classify as classify_auth_mode, AuthMode};
+use headroom_core::compression_policy::CompressionPolicy;
 
 /// Shared state passed to every handler.
 ///
@@ -390,6 +391,17 @@ pub(crate) async fn forward_http(
     let auth_mode = classify_auth_mode(req.headers());
     req.extensions_mut().insert(auth_mode);
 
+    // Phase F PR-F2.1, c2/6: derive the per-mode CompressionPolicy at
+    // request entry and stash alongside auth_mode. Storing the policy
+    // (not just auth_mode) in extensions lets downstream stages read
+    // the gate they need directly — no per-stage `for_mode` call.
+    // F2.1 c2/6 only writes the policy; the dispatcher gates on
+    // `policy.live_zone_compression_enabled()` (currently always true,
+    // so no behaviour change). c4/6 flips the gate to read
+    // `live_zone_only` and `cache_aligner_enabled` for real.
+    let policy = CompressionPolicy::for_mode(auth_mode);
+    req.extensions_mut().insert(policy);
+
     // Per PR-A1: structured entry log. The `auth_mode` field is now
     // populated with the real classification result (Phase F PR-F1
     // replaces the prior `auth_mode_placeholder = "unknown"`). Body
@@ -404,6 +416,18 @@ pub(crate) async fn forward_http(
         path = %path_for_log,
         content_length_bytes = ?body_bytes_hint,
         "request received"
+    );
+
+    // F2.1 c2/6: emit the policy that the request will run under so
+    // F2.2 has bake-time data to tune from. One log per request,
+    // structured fields so it joins on auth_mode + request_id.
+    tracing::debug!(
+        event = "policy_selected",
+        request_id = %request_id,
+        auth_mode = auth_mode.as_str(),
+        live_zone_only = policy.live_zone_only,
+        cache_aligner_enabled = policy.cache_aligner_enabled,
+        "compression policy resolved"
     );
 
     let upstream_url = build_upstream_url(&state.config.upstream, &uri)?;
