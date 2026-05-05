@@ -316,6 +316,23 @@ class TestSubscriptionRouting:
         assert "openai_base_url" not in cleaned
         assert 'model = "gpt-4o"' in cleaned
 
+    def test_no_env_key_in_injected_provider(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """env_key must be absent so Codex doesn't require OPENAI_API_KEY.
+
+        Codex treats env_key as a hard requirement — if the env var is missing
+        it throws "Missing environment variable" at startup.  Subscription
+        (ChatGPT Plus) users don't have OPENAI_API_KEY set, so injecting
+        env_key breaks them (issue #393).
+        """
+        _set_test_home(monkeypatch, tmp_path)
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        content = (tmp_path / ".codex" / "config.toml").read_text()
+        assert "env_key" not in content
+
 
 # ---------------------------------------------------------------------------
 # Integration tests: full `headroom wrap codex` / `headroom unwrap codex`
