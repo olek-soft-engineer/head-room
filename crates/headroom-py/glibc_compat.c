@@ -9,16 +9,16 @@
  * implementations of strtol*. When you compile C/C++ code with a
  * recent toolchain (gcc >= 13) and the headers see C23/C++23 mode
  * (or `_GNU_SOURCE`), `<stdlib.h>` redirects every call to
- * `strtoll(...)` to `__isoc23_strtoll(...)` via a transparent inline.
+ * `strtoll(...)` to `__isoc23_strtoll(...)` via a transparent
+ * `__REDIRECT_NTH` attribute.
  *
  * The ONNX Runtime prebuilt artifacts that we statically link
  * (downloaded by `ort-download-binaries-rustls-tls` via fastembed)
- * are compiled with gcc-14.2.1 on a glibc >= 2.38 toolchain. They
+ * are compiled with gcc-14.2.1 on a glibc-2.38+ host. They
  * therefore reference `__isoc23_*` symbols. Our wheel build runs
- * in `manylinux_2_28` (glibc 2.28 baseline) but the linker doesn't
- * complain because these are deferred (DT_NEEDED-style) symbols
- * resolved at runtime — and the manylinux_2_28 host's glibc has
- * them, so the link-time check passes.
+ * in `manylinux_2_28` (glibc 2.28 baseline), so the link is fine
+ * — the linker doesn't validate that ALL referenced symbols
+ * exist in the target glibc, only that the SONAME matches.
  *
  * On the END USER's runtime, however, glibc < 2.38 has none of
  * these symbols, and `import headroom._core` fails with:
@@ -31,17 +31,50 @@
  * The fix
  * -------
  *
- * Define the four `__isoc23_*` symbols as weak aliases for the
- * older `strtoll` family. The dynamic linker resolves symbols in
- * library load order: when glibc has the strong symbol (>=2.38)
- * its definition wins; when it doesn't (<2.38) our weak symbol
- * is used. Either way, `_core.so` loads.
+ * Provide local, statically-linked-into-_core.so definitions of the
+ * four `__isoc23_*` symbols that delegate to the older `strtol*`
+ * family (which exists in EVERY glibc the manylinux_2_28 floor
+ * targets). The static linker resolves ORT's UND `__isoc23_*`
+ * references against these definitions inside `_core.so`.
  *
- * The C23 vs pre-C23 behavioural difference is binary-literal
- * support: `__isoc23_strtoll` accepts strings like "0b1010"
- * whereas `strtoll` returns 0 for those. Our static-link callsites
- * (deep inside ORT's protobuf parsers) only pass decimal /
- * hexadecimal numerics, so the fallback is functionally identical.
+ * Two implementation traps to avoid (both bit PR #384's first iter):
+ *
+ * 1. NO `__attribute__((alias("strtol")))`. GCC requires the alias
+ *    target to be defined in the same translation unit; `strtol` is
+ *    in libc.so.6, NOT this .c file, so GCC errors at compile time:
+ *      glibc_compat.c: error: '__isoc23_strtol' aliased to undefined symbol 'strtol'
+ *
+ * 2. NO `#include <stdlib.h>`. On the manylinux_2_28 build host the
+ *    toolchain is recent enough that `<stdlib.h>` may apply the
+ *    `__REDIRECT_NTH(strtol, ..., __isoc23_strtol)` rewrite when
+ *    `_GNU_SOURCE` is implicit. If we included it, our call to
+ *    `strtol(...)` inside `__isoc23_strtol` would be silently
+ *    rewritten to call `__isoc23_strtol` itself — infinite recursion
+ *    on glibc 2.38+ and stack overflow on first use. Forward-declare
+ *    the older POSIX prototypes ourselves so the call goes to the
+ *    actual unredirected symbol.
+ *
+ * Behavioural caveat
+ * ------------------
+ *
+ * The C23 `__isoc23_strtoll` accepts binary-literal input ("0b1010")
+ * which the older `strtoll` rejects. Our call sites are deep inside
+ * ORT's protobuf parsing, which only feeds decimal/hex strings, so
+ * the fallback is functionally identical for our use. If a future
+ * statically-linked library DOES depend on binary-literal parsing
+ * we'd need to reimplement the parser; for now this shim is sound.
+ *
+ * Symbol-resolution semantics
+ * ---------------------------
+ *
+ * Once `_core.so` is dlopen'd by Python, lookups of `__isoc23_strtoll`
+ * by code inside `_core.so` go through the dynamic linker. On glibc
+ * 2.38+, libc.so.6 (which is in the global scope, loaded by
+ * Python's executable) has the strong symbol — it wins, our local
+ * definition is shadowed but harmless. On glibc < 2.38, libc.so.6
+ * has no such symbol; the dynamic linker falls back to
+ * `_core.so`'s local symbol — ours wins. Either way, the symbol
+ * resolves and `import headroom._core` succeeds.
  *
  * References:
  * - https://sourceware.org/glibc/wiki/Release/2.38
@@ -50,19 +83,32 @@
  *   surfaced this on user installs.
  *
  * This file is compiled and linked into `_core.so` only on Linux
- * (gated in build.rs). macOS and Windows have neither glibc nor
- * this symbol family.
+ * with the GNU libc env (gated in build.rs). macOS and Windows
+ * have neither glibc nor this symbol family.
  */
 
-#include <stdlib.h>
+/*
+ * Forward declarations for the actual (pre-C23) glibc strtol family.
+ * Deliberately NOT pulled from <stdlib.h> — see trap #2 above.
+ * These prototypes match POSIX 1003.1-2008.
+ */
+extern long strtol(const char *nptr, char **endptr, int base);
+extern long long strtoll(const char *nptr, char **endptr, int base);
+extern unsigned long strtoul(const char *nptr, char **endptr, int base);
+extern unsigned long long strtoull(const char *nptr, char **endptr, int base);
 
-#define ALIAS_TO(target) \
-    __attribute__((weak, alias(#target)))
+long __isoc23_strtol(const char *nptr, char **endptr, int base) {
+    return strtol(nptr, endptr, base);
+}
 
-long __isoc23_strtol(const char *nptr, char **endptr, int base) ALIAS_TO(strtol);
+long long __isoc23_strtoll(const char *nptr, char **endptr, int base) {
+    return strtoll(nptr, endptr, base);
+}
 
-long long __isoc23_strtoll(const char *nptr, char **endptr, int base) ALIAS_TO(strtoll);
+unsigned long __isoc23_strtoul(const char *nptr, char **endptr, int base) {
+    return strtoul(nptr, endptr, base);
+}
 
-unsigned long __isoc23_strtoul(const char *nptr, char **endptr, int base) ALIAS_TO(strtoul);
-
-unsigned long long __isoc23_strtoull(const char *nptr, char **endptr, int base) ALIAS_TO(strtoull);
+unsigned long long __isoc23_strtoull(const char *nptr, char **endptr, int base) {
+    return strtoull(nptr, endptr, base);
+}
