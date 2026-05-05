@@ -264,6 +264,25 @@ jobs:
           command: sdist
           args: --out dist
 
+      # Audit each Linux wheel's dynamic symbol references against its
+      # declared manylinux glibc floor. Catches the bug class from
+      # issue #355 (#386): a manylinux_2_28 wheel that ends up
+      # referencing `__isoc23_strtoll` (glibc 2.38+) because a
+      # statically-linked C++ dep was compiled with a recent toolchain.
+      # The build host has glibc 2.38 so the link succeeds and CI
+      # passes — but every customer with libc < 2.38 sees
+      # `ImportError: undefined symbol: __isoc23_strtoll` at
+      # `import headroom._core`. The script compares every UND symbol
+      # against the wheel's manylinux tag and fails the release if
+      # any symbol exceeds the floor.
+      - name: Audit wheel glibc symbols (Linux only)
+        if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
+        run: |
+          set -e
+          for whl in dist/*.whl; do
+            python3 scripts/audit_wheel_glibc_symbols.py "$whl"
+          done
+
       - name: Upload wheels artifact
         uses: actions/upload-artifact@v4
         with:
