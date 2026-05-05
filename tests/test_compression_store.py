@@ -1249,11 +1249,26 @@ class TestHashCollisionDetection:
         # Should not have collision warning
         assert "Hash collision detected" not in caplog.text
 
-    def test_hash_uses_md5_truncated(self, store: CompressionStore):
-        """Hash is MD5 truncated to 24 characters (fast, non-crypto)."""
+    def test_hash_uses_sha256_truncated(self, store: CompressionStore):
+        """Hash is SHA-256 truncated to 24 characters.
+
+        Switched from MD5[:24] in PR #395 to silence CodeQL's
+        py/weak-sensitive-data-hashing rule. SHA-256[:24] gives the
+        same 96-bit collision space (~280 trillion entries for 50%
+        collision under birthday bound) and is FIPS-clean. The cache
+        is in-memory, so changing the hash function on upgrade has no
+        persistence-side effect.
+        """
         content = "test content"
-        expected_hash = hashlib.md5(content.encode()).hexdigest()[:24]  # nosec B324
+        expected_hash = hashlib.sha256(content.encode()).hexdigest()[:24]
 
         hash_key = store.store(original=content, compressed="[]")
 
-        assert hash_key == expected_hash
+        assert hash_key == expected_hash, (
+            "compression_store key must be SHA-256(original)[:24]. "
+            "If this test fails because the hash function was changed, "
+            "verify that no caller (incl. /v1/retrieve consumers) "
+            "depends on the specific MD5/SHA-256 value — the cache is "
+            "in-memory so upgrade-time mismatch is fine, but external "
+            "systems that hash-and-lookup independently need to match."
+        )
