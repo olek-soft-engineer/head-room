@@ -331,8 +331,184 @@ jobs:
           name: release-assets-merged
           path: release-assets/
 
+  # ─── Wheel smoke-import gate ───────────────────────────────────────────────
+  # Issue #355's bug class: `manylinux_2_28` wheels that build cleanly,
+  # pass clippy/tests on the build host, pass auditwheel — and then
+  # fail to import on a customer's box because of a runtime symbol
+  # mismatch (#355: `__isoc23_strtoll` from gcc-14 ORT prebuilts;
+  # earlier #371: openssl-sys's C23 wrappers).
+  #
+  # This job spins up a matrix of representative customer environments
+  # — the manylinux floor we promise + common older/newer glibc + macOS
+  # native — and runs the actual `import headroom._core` check the
+  # proxy's `_check_rust_core` does at startup. Failure here BLOCKS
+  # publish-pypi, publish-docker, and create-release. Better to find
+  # a broken wheel here than 8 minutes after `pypa/gh-action-pypi-publish`
+  # has already pushed it to the world.
+  #
+  # See also `scripts/audit_wheel_glibc_symbols.py` (the static-symbol
+  # gate added in PR #384). The audit catches symbol references above
+  # the floor; this smoke matrix catches the dynamic-link failures
+  # that survive the static check (linker order quirks, runtime
+  # dlopen RPATH issues, missing transitive native deps).
+  smoke-import-wheels:
+    needs: [build-wheels]
+    if: github.event.inputs.dry_run != 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — span manylinux floor + customer glibcs.
+          # `quay.io/pypa/manylinux_2_28_x86_64` is the floor we
+          # promise; if the wheel fails here, our manylinux tag is
+          # a lie. `ubuntu:22.04` (glibc 2.35) is the environment
+          # from issue #355's reporter. `ubuntu:20.04` (glibc 2.31)
+          # covers older still-supported LTS.
+          - { runner: ubuntu-24.04, image: "quay.io/pypa/manylinux_2_28_x86_64", python: "3.11", wheel_target: x86_64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-x86_64-unknown-linux-gnu, glibc_label: "2.28-floor" }
+          - { runner: ubuntu-24.04, image: "ubuntu:22.04", python: "3.12", wheel_target: x86_64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-x86_64-unknown-linux-gnu, glibc_label: "2.35" }
+          - { runner: ubuntu-24.04, image: "ubuntu:20.04", python: "3.10", wheel_target: x86_64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-x86_64-unknown-linux-gnu, glibc_label: "2.31" }
+          # Linux aarch64 — floor + one customer env. Native arm64
+          # runners (PR #376) host the container.
+          - { runner: ubuntu-24.04-arm, image: "quay.io/pypa/manylinux_2_28_aarch64", python: "3.11", wheel_target: aarch64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-arm-aarch64-unknown-linux-gnu, glibc_label: "2.28-floor" }
+          - { runner: ubuntu-24.04-arm, image: "ubuntu:22.04", python: "3.12", wheel_target: aarch64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-arm-aarch64-unknown-linux-gnu, glibc_label: "2.35" }
+          # macOS arm64 — runs natively on the host runner; no
+          # container. Apple Silicon is the only macOS target we
+          # ship today (Intel macOS dropped in PR #371 — ort-sys
+          # has no x86_64-apple-darwin prebuilts).
+          - { runner: macos-14, image: "", python: "3.13", wheel_target: aarch64-apple-darwin, wheel_artifact: wheels-macos-14-aarch64-apple-darwin, glibc_label: "" }
+
+    steps:
+      - name: Download wheels artifact for this target
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.wheel_artifact }}
+          path: dist/
+
+      - name: Smoke-import wheel inside container (Linux)
+        if: matrix.image != ''
+        env:
+          IMAGE: ${{ matrix.image }}
+          PYTHON_VERSION: ${{ matrix.python }}
+          WHEEL_TARGET: ${{ matrix.wheel_target }}
+          GLIBC_LABEL: ${{ matrix.glibc_label }}
+        run: |
+          set -e
+          # The container script intentionally avoids `<<EOF` heredoc
+          # interpolation by passing values via env vars — keeps the
+          # shell quoting straightforward and makes failure modes
+          # easier to debug.
+          docker run --rm \
+            -v "$(pwd)/dist:/wheels:ro" \
+            -e PYTHON_VERSION="$PYTHON_VERSION" \
+            -e WHEEL_TARGET="$WHEEL_TARGET" \
+            -e GLIBC_LABEL="$GLIBC_LABEL" \
+            "$IMAGE" \
+            bash -ec '
+              set -e
+              echo "=== smoke-import: image=$0 python=$PYTHON_VERSION glibc=$GLIBC_LABEL target=$WHEEL_TARGET ===" "'"$IMAGE"'"
+
+              # Locate a Python interpreter matching the requested
+              # version. manylinux images ship interpreters under
+              # /opt/python/cp{XY}-cp{XY}/bin/; ubuntu/debian images
+              # need an apt-get install.
+              py_tag=cp$(echo "$PYTHON_VERSION" | tr -d .)
+              if [ -d /opt/python ]; then
+                python_bin="/opt/python/${py_tag}-${py_tag}/bin/python"
+                if [ ! -x "$python_bin" ]; then
+                  echo "ERROR: $python_bin missing in $0" "'"$IMAGE"'" >&2
+                  ls -la /opt/python >&2
+                  exit 1
+                fi
+              elif command -v apt-get >/dev/null 2>&1; then
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get update -qq
+                # ubuntu:20.04s default repo only ships 3.8; 3.10 lives
+                # in deadsnakes. Add it on demand. ubuntu:22.04 has
+                # 3.10/3.11 in main and 3.12 via deadsnakes.
+                apt-get install -y -qq --no-install-recommends ca-certificates software-properties-common >/dev/null
+                add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 || true
+                apt-get update -qq
+                apt-get install -y -qq --no-install-recommends \
+                  "python$PYTHON_VERSION" \
+                  "python$PYTHON_VERSION-venv" \
+                  "python$PYTHON_VERSION-distutils" >/dev/null 2>&1 \
+                || apt-get install -y -qq --no-install-recommends \
+                  "python$PYTHON_VERSION" \
+                  "python$PYTHON_VERSION-venv" >/dev/null
+                python_bin="python$PYTHON_VERSION"
+              else
+                echo "ERROR: image has neither /opt/python nor apt-get" >&2
+                exit 1
+              fi
+              "$python_bin" --version
+
+              # Print glibc version so failures show what we are
+              # actually testing against.
+              ldd --version | head -1 || true
+
+              # Pick the wheel that matches python version + arch.
+              case "$WHEEL_TARGET" in
+                x86_64-unknown-linux-gnu)  arch_tag=manylinux_2_28_x86_64 ;;
+                aarch64-unknown-linux-gnu) arch_tag=manylinux_2_28_aarch64 ;;
+                *) echo "ERROR: unknown wheel target $WHEEL_TARGET" >&2; exit 1 ;;
+              esac
+              whl=$(find /wheels -maxdepth 1 -type f -name "headroom_ai-*-${py_tag}-${py_tag}-${arch_tag}.whl" -print -quit)
+              if [ -z "$whl" ]; then
+                echo "ERROR: no wheel matching python=$PYTHON_VERSION arch=$arch_tag in /wheels/" >&2
+                find /wheels -maxdepth 1 -type f -printf "%f\n" >&2
+                exit 1
+              fi
+              echo "Installing: $whl"
+
+              "$python_bin" -m venv /tmp/venv
+              /tmp/venv/bin/pip install --quiet --upgrade pip
+              /tmp/venv/bin/pip install --quiet "$whl"
+
+              # The actual smoke check — mirrors the proxy
+              # `_check_rust_core` path that fails with exit-78 on
+              # broken wheels. If this `import` fails the whole
+              # release is held.
+              /tmp/venv/bin/python - <<PY
+              import sys
+              import headroom
+              from headroom._core import hello as _rust_hello
+              print(f"smoke-import OK: python={sys.version_info[:3]} hello={_rust_hello()}")
+              PY
+            '
+
+      - name: Smoke-import wheel on macOS host
+        if: matrix.image == ''
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          set -e
+          py_tag=cp$(echo "$PYTHON_VERSION" | tr -d .)
+          # macOS wheels are tagged macosx_*_arm64 (Apple Silicon only).
+          whl=$(find dist -maxdepth 1 -type f -name "headroom_ai-*-${py_tag}-${py_tag}-macosx_*_arm64.whl" -print -quit)
+          if [ -z "$whl" ]; then
+            echo "ERROR: no macOS wheel matching python=$PYTHON_VERSION"
+            find dist -maxdepth 1 -type f -exec basename {} \;
+            exit 1
+          fi
+          echo "Installing: $whl"
+
+          # Use the system python at the requested minor version. The
+          # macos-14 runner image preinstalls multiple Python versions.
+          "python$PYTHON_VERSION" -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet --upgrade pip
+          /tmp/venv/bin/pip install --quiet "$whl"
+          /tmp/venv/bin/python - <<'PY'
+          import sys
+          import headroom
+          from headroom._core import hello as _rust_hello
+          print(f"smoke-import OK: python={sys.version_info[:3]} hello={_rust_hello()}")
+          PY
+
   publish-pypi:
-    needs: [collect-dist]
+    needs: [collect-dist, smoke-import-wheels]
     if: github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
     environment: pypi  # NOTE: environment name must be a literal; update here if the GitHub environment name changes
     runs-on: ubuntu-latest
@@ -518,7 +694,12 @@ jobs:
           echo "::notice::One or more GitHub Package Registry publishes failed. Check GITHUB_TOKEN permissions and package scope/repository settings. Set GH_PACKAGES_SKIP=true to skip."
 
   publish-docker:
-    needs: [detect-version]
+    # Wait for the smoke-import gate. The docker images bundle the
+    # same wheels we publish to PyPI; a wheel that can't import
+    # cleanly on the manylinux floor will also fail the docker
+    # image's `pip install` step. Failing here ~3 minutes earlier
+    # than docker-build saves the matrix's wall-clock budget.
+    needs: [detect-version, smoke-import-wheels]
     if: github.event.inputs.dry_run != 'true'
     permissions:
       contents: read
@@ -530,7 +711,7 @@ jobs:
       enable_ref_tags: false
 
   create-release:
-    needs: [detect-version, build, build-wheels, collect-dist, publish-pypi, publish-npm, publish-github-packages, publish-docker]
+    needs: [detect-version, build, build-wheels, collect-dist, smoke-import-wheels, publish-pypi, publish-npm, publish-github-packages, publish-docker]
     if: >-
       ${{
         always() &&
@@ -538,7 +719,8 @@ jobs:
         needs.detect-version.result == 'success' &&
         needs.build.result == 'success' &&
         needs.build-wheels.result == 'success' &&
-        needs.collect-dist.result == 'success'
+        needs.collect-dist.result == 'success' &&
+        needs.smoke-import-wheels.result == 'success'
       }}
     runs-on: ubuntu-latest
     permissions:

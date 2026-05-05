@@ -46,14 +46,20 @@ def test_create_release_runs_after_successful_build_even_if_other_publishes_fail
     # and `collect-dist` (aggregator that merges wheel artifacts + npm
     # release-assets) between `build` and the publish jobs. create-release
     # must wait for all of them.
+    # PR #387 (X1) added `smoke-import-wheels` — the runtime gate that
+    # actually loads the wheel on a customer-representative environment
+    # before publish. create-release must wait for it AND require its
+    # success in the `if:` block (otherwise `always()` would let the
+    # release proceed even when the smoke gate failed).
     assert (
-        "needs: [detect-version, build, build-wheels, collect-dist, publish-pypi, publish-npm, publish-github-packages, publish-docker]"
+        "needs: [detect-version, build, build-wheels, collect-dist, smoke-import-wheels, publish-pypi, publish-npm, publish-github-packages, publish-docker]"
         in content
     )
     assert "always()" in content
     assert "needs.build.result == 'success'" in content
     assert "needs.build-wheels.result == 'success'" in content
     assert "needs.collect-dist.result == 'success'" in content
+    assert "needs.smoke-import-wheels.result == 'success'" in content
 
 
 def test_macos_native_wrapper_dependency_install_retries_pypi_downloads() -> None:
@@ -564,6 +570,115 @@ def test_release_workflow_audits_wheel_glibc_symbols() -> None:
     )
     assert "Audit wheel glibc symbols (Linux only)" in content, (
         "audit step name has been renamed; update both this test and the workflow"
+    )
+
+
+def test_release_workflow_has_smoke_import_wheel_gate() -> None:
+    """STRUCTURAL INVARIANT: release.yml runs the just-built wheels
+    through `import headroom._core` on a matrix of representative
+    customer environments BEFORE publishing to PyPI / pushing to
+    GHCR / cutting a GitHub Release.
+
+    This is the X1 gate from the post-#355 hardening plan. Issue #355
+    plus its three follow-on hotfixes (#384/#385/#386) all share a
+    pattern: the wheel is technically valid (clippy passes, tests
+    pass, auditwheel is happy) but fails to import on a customer's
+    box because of a runtime symbol mismatch. Static gates can't
+    catch that — only actually loading the .so does.
+
+    Required matrix coverage:
+    - manylinux floor we promise (`manylinux_2_28_x86_64` and
+      `manylinux_2_28_aarch64`). If these fail, our manylinux tag
+      is a lie.
+    - At least one customer-representative glibc per arch (Ubuntu
+      LTS, the issue #355 reporter's environment).
+    - macOS native (Apple Silicon).
+
+    Required gating: `publish-pypi`, `publish-docker`, AND
+    `create-release` must all `needs:` smoke-import-wheels. A
+    smoke failure has to BLOCK publish, not just produce a
+    notification.
+
+    A future "remove this slow CI step that always passes anyway"
+    refactor — exactly the impulse that landed us PR #382's sdist
+    gap and PR #386's link-order surprise — fails this test at
+    PR time.
+    """
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    # The job itself must exist.
+    assert "\n  smoke-import-wheels:" in content, (
+        "release.yml must define a `smoke-import-wheels` job. This is the "
+        "X1 gate that catches runtime symbol mismatches in the published "
+        "wheel before it hits PyPI. Issue #355 + #384/#385/#386 are the "
+        "canonical reason this gate exists."
+    )
+
+    # Required matrix entries — pin both the floor (manylinux_2_28)
+    # and at least one customer environment per arch.
+    required_matrix_substrings = [
+        # manylinux floor for x86_64 — pins what we promise customers.
+        'image: "quay.io/pypa/manylinux_2_28_x86_64"',
+        # manylinux floor for aarch64 — would have caught PR #386.
+        'image: "quay.io/pypa/manylinux_2_28_aarch64"',
+        # At least one Ubuntu LTS — issue #355's environment was
+        # ubuntu:22.04 + Python 3.12.
+        'image: "ubuntu:22.04"',
+        # macOS native (no container) — Apple Silicon wheel.
+        "runner: macos-14",
+    ]
+    for sub in required_matrix_substrings:
+        assert sub in content, (
+            f"smoke matrix missing required entry: {sub!r}. The matrix "
+            f"must cover the manylinux floor + at least one customer-"
+            f"representative environment per arch + macOS native."
+        )
+
+    # Gating: publish-pypi must wait for the smoke job.
+    publish_pypi_idx = content.index("\n  publish-pypi:")
+    next_job_idx = content.index("\n  publish-npm:", publish_pypi_idx)
+    publish_pypi_block = content[publish_pypi_idx:next_job_idx]
+    assert "smoke-import-wheels" in publish_pypi_block, (
+        "publish-pypi must `needs: [..., smoke-import-wheels]` — without "
+        "the dependency, a broken wheel can be published before the "
+        "smoke job has even finished. The whole point of X1 is that it "
+        "BLOCKS publish."
+    )
+
+    # Same for publish-docker.
+    publish_docker_idx = content.index("\n  publish-docker:")
+    next_idx = content.index("\n  create-release:", publish_docker_idx)
+    publish_docker_block = content[publish_docker_idx:next_idx]
+    assert "smoke-import-wheels" in publish_docker_block, (
+        "publish-docker must `needs: [..., smoke-import-wheels]` — the "
+        "docker image bundles the same wheels; a broken wheel will fail "
+        "the docker build's `pip install` 3 minutes later anyway. "
+        "Failing fast in smoke saves matrix budget."
+    )
+
+    # And create-release.
+    create_release_idx = content.index("\n  create-release:")
+    create_release_block = content[create_release_idx:]
+    assert "smoke-import-wheels" in create_release_block, (
+        "create-release must `needs: [..., smoke-import-wheels]` and gate on its success"
+    )
+    assert "needs.smoke-import-wheels.result == 'success'" in create_release_block, (
+        "create-release's `if:` must explicitly require "
+        "`needs.smoke-import-wheels.result == 'success'` — without "
+        "this, `always()` would let the release proceed even if the "
+        "smoke gate failed."
+    )
+
+    # The actual import command must hit `from headroom._core import hello`
+    # — this is the same call the proxy's `_check_rust_core` makes on
+    # startup (per `headroom/proxy/server.py` and the issue #355 backtrace).
+    # Anything else (e.g. just `import headroom`) fails to exercise the
+    # Rust _core.so binary.
+    assert "from headroom._core import hello" in content, (
+        "smoke-import command must call `from headroom._core import hello` "
+        "— that's what the proxy does at startup. A weaker check (e.g. "
+        "`import headroom`) wouldn't exercise the .so and wouldn't catch "
+        "the bugs the gate exists for."
     )
 
 
