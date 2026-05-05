@@ -119,6 +119,55 @@ impl CacheControlAutoFrozen {
     }
 }
 
+/// Phase F PR-F2.1 c3/6: feature flag for the per-auth-mode
+/// `CompressionPolicy` enforcement.
+///
+/// `disabled` (default until c6/6): the proxy still classifies
+/// `auth_mode` and derives a `CompressionPolicy` for telemetry, but
+/// every dispatcher and transform behaves as if the mode were `Payg`
+/// — bit-for-bit current behaviour.
+///
+/// `enabled`: the policy struct's per-mode values take effect. For
+/// Subscription specifically, the cache aligner is skipped and the
+/// dispatcher gates on `policy.live_zone_compression_enabled()` (a
+/// no-op in F2.1 since that helper currently always returns `true`,
+/// but kept as a hook so F2.2 can flip without touching call sites).
+///
+/// Why a flag at all: F2.1 lands behind a default-disabled gate so
+/// commits 4 and 5 of the PR don't ship behaviour change to default
+/// users. Operators can flip this on for dogfooding before commit 6
+/// flips the default. Rollback: flip the env var back to `disabled`
+/// — instant if config is hot-reloaded, redeploy otherwise.
+///
+/// Source priority: CLI flag →
+/// `HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT` env var →
+/// default (`disabled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "snake_case")]
+pub enum AuthModePolicyEnforcement {
+    /// Per-mode policy IS enforced. Subscription users see no
+    /// cache_aligner; the dispatcher reads
+    /// `policy.live_zone_compression_enabled()`.
+    Enabled,
+    /// Per-mode policy IS NOT enforced. Every mode runs the PAYG
+    /// pipeline, identical to pre-F2.1 behaviour. Default in F2.1
+    /// commits 1–5 so the feature is dogfood-only until c6/6.
+    Disabled,
+}
+
+impl AuthModePolicyEnforcement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthModePolicyEnforcement::Enabled => "enabled",
+            AuthModePolicyEnforcement::Disabled => "disabled",
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        matches!(self, AuthModePolicyEnforcement::Enabled)
+    }
+}
+
 impl CompressionMode {
     /// Stable snake_case name suitable for log fields. Avoids relying
     /// on `Debug` (which renders `Off`/`LiveZone`) or `Display`
@@ -238,6 +287,21 @@ pub struct CliArgs {
         default_value_t = CacheControlAutoFrozen::Enabled,
     )]
     pub cache_control_auto_frozen: CacheControlAutoFrozen,
+
+    /// Phase F PR-F2.1 c3/6: gate the per-auth-mode `CompressionPolicy`
+    /// enforcement. Default `disabled`: F2.1 c1–c5 ship behaviour-
+    /// identical to current main. c6/6 flips the default to `enabled`.
+    ///
+    /// Source priority: CLI flag →
+    /// `HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT` env var →
+    /// default (`disabled` in c3–c5, `enabled` from c6/6 onward).
+    #[arg(
+        long = "auth-mode-policy-enforcement",
+        env = "HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT",
+        value_enum,
+        default_value_t = AuthModePolicyEnforcement::Disabled,
+    )]
+    pub auth_mode_policy_enforcement: AuthModePolicyEnforcement,
 
     /// Strip internal `x-headroom-*` headers from upstream-bound
     /// requests (PR-A5, fixes P5-49). Default `enabled`. The `disabled`
@@ -444,6 +508,9 @@ pub struct Config {
     /// adds the derivation function (`compute_frozen_count`); Phase
     /// B's dispatcher consumes the resolved value here.
     pub cache_control_auto_frozen: CacheControlAutoFrozen,
+    /// Phase F PR-F2.1 c3/6: gate per-auth-mode `CompressionPolicy`
+    /// enforcement. `Disabled` until c6/6 flips the default.
+    pub auth_mode_policy_enforcement: AuthModePolicyEnforcement,
     /// Whether to strip internal `x-headroom-*` headers from
     /// upstream-bound requests. PR-A5 default-on guard against
     /// fingerprinting / leakage of internal flags.
@@ -507,6 +574,7 @@ impl Config {
             compression_max_body_bytes,
             compression_mode: args.compression_mode,
             cache_control_auto_frozen: args.cache_control_auto_frozen,
+            auth_mode_policy_enforcement: args.auth_mode_policy_enforcement,
             strip_internal_headers: args.strip_internal_headers,
             enable_responses_streaming: args.enable_responses_streaming,
             enable_conversations_passthrough: args.enable_conversations_passthrough,
@@ -538,6 +606,11 @@ impl Config {
             // Match production default so the cache-control walker is
             // exercised under test without per-test opt-in.
             cache_control_auto_frozen: CacheControlAutoFrozen::Enabled,
+            // F2.1 default: enforcement off so existing tests (which
+            // expect PAYG-style behaviour for every auth mode) stay
+            // green without per-test opt-out. F2.1's own integration
+            // tests opt-IN per-case to assert the enforcement path.
+            auth_mode_policy_enforcement: AuthModePolicyEnforcement::Disabled,
             // Production default: strip internal `x-headroom-*` headers
             // from upstream-bound requests. Tests opt out per-case via
             // `start_proxy_with`.
