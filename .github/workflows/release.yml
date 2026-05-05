@@ -455,10 +455,10 @@ jobs:
                 aarch64-unknown-linux-gnu) arch_tag=manylinux_2_28_aarch64 ;;
                 *) echo "ERROR: unknown wheel target $WHEEL_TARGET" >&2; exit 1 ;;
               esac
-              whl=$(ls /wheels/headroom_ai-*-${py_tag}-${py_tag}-${arch_tag}.whl 2>/dev/null | head -1)
+              whl=$(find /wheels -maxdepth 1 -type f -name "headroom_ai-*-${py_tag}-${py_tag}-${arch_tag}.whl" -print -quit)
               if [ -z "$whl" ]; then
                 echo "ERROR: no wheel matching python=$PYTHON_VERSION arch=$arch_tag in /wheels/" >&2
-                ls -la /wheels/ >&2
+                find /wheels -maxdepth 1 -type f -printf "%f\n" >&2
                 exit 1
               fi
               echo "Installing: $whl"
@@ -487,10 +487,10 @@ jobs:
           set -e
           py_tag=cp$(echo "$PYTHON_VERSION" | tr -d .)
           # macOS wheels are tagged macosx_*_arm64 (Apple Silicon only).
-          whl=$(ls dist/headroom_ai-*-${py_tag}-${py_tag}-macosx_*_arm64.whl 2>/dev/null | head -1)
+          whl=$(find dist -maxdepth 1 -type f -name "headroom_ai-*-${py_tag}-${py_tag}-macosx_*_arm64.whl" -print -quit)
           if [ -z "$whl" ]; then
             echo "ERROR: no macOS wheel matching python=$PYTHON_VERSION"
-            ls -la dist/
+            find dist -maxdepth 1 -type f -exec basename {} \;
             exit 1
           fi
           echo "Installing: $whl"
