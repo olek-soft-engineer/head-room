@@ -710,3 +710,112 @@ def test_npm_publish_jobs_do_not_download_dist_artifact() -> None:
             f"its own tarball and the speculative download fails when "
             f"collect-dist hasn't run."
         )
+
+
+def test_release_workflow_runs_dry_run_on_pull_request() -> None:
+    """X2: the release workflow MUST trigger on `pull_request` for paths
+    that change wheel-layout / release pipeline so the wheel matrix +
+    smoke-import gate run BEFORE merge.
+
+    Issues this gate would have caught at PR time instead of after-merge:
+    - #379 (docker bake `name=` regression in PR #376)
+    - #382 (sdist os-mismatch — `ubuntu-latest` → `ubuntu-24.04` rename)
+    - #384 / #385 / #386 (glibc shim iterations — alias, link-order)
+    - #387's heredoc-indent regression that broke main on first release
+      run after merge
+
+    Required:
+    1. `pull_request:` trigger present.
+    2. Path filter is narrow enough to skip source-only PRs to
+       `crates/headroom-core` / `crates/headroom-proxy` (where wheel
+       layout doesn't change), but wide enough to cover release.yml,
+       docker.yml, headroom-py crate, pyproject.toml, root Cargo.
+    3. publish-pypi / publish-npm / publish-github-packages /
+       publish-docker / create-release ALL gate on
+       `github.event_name != 'pull_request'` so a PR run never
+       publishes anything — the dry-run is build+smoke only.
+    4. concurrency.group is namespaced by PR number for PR runs and by
+       ref_name for main runs, AND cancel-in-progress is true for PR
+       runs (rapid PR pushes cancel stale dry-runs) and false for main
+       runs (a tag-push release should never be cancelled mid-flight).
+
+    A future "lighten CI by dropping the dry-run" refactor — exactly
+    the impulse that gave us PR #382 and PR #387 — fails this test
+    at PR time.
+    """
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    # 1. pull_request trigger present.
+    on_block_end = content.index("\nconcurrency:")
+    on_block = content[:on_block_end]
+    assert "\n  pull_request:" in on_block, (
+        "release.yml must trigger on `pull_request` so the wheel matrix + "
+        "smoke-import gate run BEFORE merge. Without this, wheel-layout / "
+        "release-pipeline regressions are only caught after the tag is "
+        "pushed and main is broken (see #382, #387 for canonical examples)."
+    )
+
+    # 2. Path filter covers wheel-layout-affecting paths.
+    pr_idx = content.index("\n  pull_request:")
+    pr_end = content.index("\n  workflow_dispatch:", pr_idx)
+    pr_block = content[pr_idx:pr_end]
+    required_paths = [
+        ".github/workflows/release.yml",
+        ".github/workflows/docker.yml",
+        "crates/headroom-py/**",
+        "pyproject.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+    ]
+    for path in required_paths:
+        assert f'"{path}"' in pr_block, (
+            f"pull_request path filter missing {path!r}. The dry-run must "
+            f"trigger when this path changes — otherwise a regression in "
+            f"that file lands on main without exercising the wheel matrix."
+        )
+
+    # 3. Each publish job + create-release gates on event_name != pull_request.
+    publish_jobs = [
+        ("publish-pypi", "\n  publish-npm:"),
+        ("publish-npm", "\n  publish-github-packages:"),
+        ("publish-github-packages", "\n  publish-docker:"),
+        ("publish-docker", "\n  create-release:"),
+    ]
+    for job_name, next_marker in publish_jobs:
+        start = content.index(f"\n  {job_name}:")
+        end = content.index(next_marker, start)
+        body = content[start:end]
+        assert "github.event_name != 'pull_request'" in body, (
+            f"{job_name} must gate on `github.event_name != 'pull_request'`. "
+            f"Without this gate, a PR dry-run would attempt to publish — "
+            f"in the best case the publish credentials are missing and the "
+            f"job fails noisily; in the worst case it succeeds and a "
+            f"non-merged PR ships to PyPI / npm / GHCR."
+        )
+
+    create_release_idx = content.index("\n  create-release:")
+    create_release_block = content[create_release_idx:]
+    assert "github.event_name != 'pull_request'" in create_release_block, (
+        "create-release must gate on `github.event_name != 'pull_request'`. "
+        "Without it, a PR dry-run would cut a GitHub Release for an unmerged "
+        "branch."
+    )
+
+    # 4. Concurrency: PR runs use a per-PR group and DO cancel-in-progress;
+    #    main runs use ref_name and DO NOT cancel.
+    concurrency_idx = content.index("\nconcurrency:")
+    jobs_idx = content.index("\njobs:", concurrency_idx)
+    concurrency_block = content[concurrency_idx:jobs_idx]
+
+    assert "github.event.pull_request.number" in concurrency_block, (
+        "concurrency.group must include the PR number for pull_request runs "
+        "(via `format('pr-{0}', github.event.pull_request.number)`) — "
+        "otherwise PR runs collide with each other or with main."
+    )
+    assert "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in concurrency_block, (
+        "concurrency.cancel-in-progress must be conditional: TRUE for "
+        "pull_request (rapid PR pushes shouldn't queue N parallel wheel "
+        "builds) and FALSE for main (a tag-push release that's mid-flight "
+        "must not be cancelled — partial PyPI/Docker state is worse than "
+        "a slow CI queue)."
+    )
