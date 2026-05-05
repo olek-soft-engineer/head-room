@@ -63,7 +63,8 @@ prometheus = { version = "0.13", default-features = false }
 # tools, early messages) for cache-bust drift detection. Already in
 # the dev-dependencies (and pulled transitively by `aws-sigv4` via
 # `aws-smithy-runtime-api`); promoted here to a direct, normal-build
-# dependency so the drift detector compiles outside `cfg(test)`.
+# dependency so the drift detector compiles outside `cfg(test)`. Also
+# used by PR-E4 for `prompt_cache_key` derivation.
 sha2 = "0.10"
 # PR-E6: bounded session-scoped cache of structural hashes. The
 # detector evicts the oldest session at 1000 entries — we never want

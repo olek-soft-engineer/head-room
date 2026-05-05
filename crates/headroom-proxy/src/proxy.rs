@@ -30,7 +30,7 @@ use crate::websocket::ws_handler;
 // site self-documenting. `AuthMode` is re-exported under the same
 // path for downstream handlers that read the value back out of
 // `req.extensions()` (Phase F PR-F2/F3/F4).
-use headroom_core::auth_mode::classify as classify_auth_mode;
+use headroom_core::auth_mode::{classify as classify_auth_mode, AuthMode};
 
 /// Shared state passed to every handler.
 ///
@@ -731,6 +731,40 @@ pub(crate) async fn forward_http(
             }
         };
 
+        // PR-E4: OpenAI `prompt_cache_key` auto-injection.
+        //
+        // Universal safety contract: only mutate when the caller
+        // is on `AuthMode::Payg`. OAuth/Subscription bytes flow
+        // through byte-equal — those clients cannot afford
+        // synthesised cache keys (OAuth scopes pin to
+        // `(account, model, session)` and subscription clients
+        // are programmatically fingerprinted by the upstream).
+        //
+        // The injector also self-skips when the customer has
+        // already set a non-empty `prompt_cache_key`. Every skip
+        // path emits a structured `e4_skipped` event so cache-hit
+        // dashboards can attribute miss rates to gating reasons
+        // rather than guessing.
+        let body_to_send = match endpoint {
+            compression::CompressibleEndpoint::OpenAiChatCompletions
+            | compression::CompressibleEndpoint::OpenAiResponses => {
+                let shape = match endpoint {
+                    compression::CompressibleEndpoint::OpenAiResponses => {
+                        cache_stabilization::openai_cache_key::OpenAiShape::Responses
+                    }
+                    _ => cache_stabilization::openai_cache_key::OpenAiShape::ChatCompletions,
+                };
+                maybe_inject_openai_prompt_cache_key(
+                    body_to_send,
+                    shape,
+                    auth_mode,
+                    &request_id,
+                    &path_for_log,
+                )
+            }
+            compression::CompressibleEndpoint::AnthropicMessages => body_to_send,
+        };
+
         // Forward the (Phase A: identical) buffered bytes. reqwest
         // sets its own Content-Length from the body bytes — the
         // existing `build_forward_request_headers` already strips
@@ -940,6 +974,119 @@ fn is_sse_response(headers: &http::HeaderMap) -> bool {
             media_type.eq_ignore_ascii_case("text/event-stream")
         })
         .unwrap_or(false)
+}
+
+/// PR-E4: OpenAI `prompt_cache_key` auto-injection helper.
+///
+/// Gates on [`AuthMode::Payg`] and the in-body
+/// `prompt_cache_key` skip rule, parses the body once, mutates if
+/// appropriate, and re-serialises. Returns the original `body` on
+/// any non-applicable path — every error / skip leaves the bytes
+/// untouched (Phase A passthrough invariant).
+///
+/// Logs `e4_skipped` for each skip reason and `e4_applied` with
+/// only the first [`KEY_PREFIX_LOG_LEN`] hex chars of the key
+/// (never the full key, which is identifying material).
+///
+/// [`KEY_PREFIX_LOG_LEN`]: cache_stabilization::openai_cache_key::KEY_PREFIX_LOG_LEN
+fn maybe_inject_openai_prompt_cache_key(
+    body: bytes::Bytes,
+    shape: cache_stabilization::openai_cache_key::OpenAiShape,
+    auth_mode: AuthMode,
+    request_id: &str,
+    path: &str,
+) -> bytes::Bytes {
+    use cache_stabilization::openai_cache_key::{
+        inject_prompt_cache_key, InjectOutcome, SkipReason,
+    };
+
+    // Auth-mode gate: only PAYG bodies are eligible. OAuth /
+    // Subscription requests pass through byte-equal — synthesised
+    // cache keys would look like cache-evasion to the upstream
+    // and could void OAuth scopes pinned to `(account, model,
+    // session)`.
+    if !matches!(auth_mode, AuthMode::Payg) {
+        tracing::info!(
+            event = "e4_skipped",
+            request_id = %request_id,
+            path = %path,
+            reason = "auth_mode",
+            auth_mode = auth_mode.as_str(),
+            "PR-E4: skipped prompt_cache_key injection (non-PAYG auth mode)"
+        );
+        return body;
+    }
+
+    // Parse for the inject step. Failure here is silent — the
+    // dispatcher above already logged the parse outcome on its
+    // own decision path; we don't want to double-log. The body
+    // round-trips unchanged.
+    let mut parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return body;
+        }
+    };
+
+    match inject_prompt_cache_key(&mut parsed, shape) {
+        InjectOutcome::Applied { key_prefix } => {
+            // Re-serialise. If serialization fails (would be very
+            // unusual — we just successfully parsed), fall back
+            // to the original bytes. No-silent-fallback rule: log
+            // it loudly so a regression can't hide.
+            match serde_json::to_vec(&parsed) {
+                Ok(buf) => {
+                    tracing::info!(
+                        event = "e4_applied",
+                        request_id = %request_id,
+                        path = %path,
+                        key_prefix = %key_prefix,
+                        body_bytes_in = body.len(),
+                        body_bytes_out = buf.len(),
+                        "PR-E4: injected prompt_cache_key"
+                    );
+                    bytes::Bytes::from(buf)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        event = "e4_serialize_error",
+                        request_id = %request_id,
+                        path = %path,
+                        error = %e,
+                        "PR-E4: re-serialize after injection failed; forwarding original bytes"
+                    );
+                    body
+                }
+            }
+        }
+        InjectOutcome::Skipped { reason } => {
+            // Log only the customer-visible KeyPresent skip; the
+            // NotAnObject skip is structurally impossible past
+            // the dispatcher gate but is surfaced separately for
+            // operators chasing pathological inputs.
+            match reason {
+                SkipReason::KeyPresent => {
+                    tracing::info!(
+                        event = "e4_skipped",
+                        request_id = %request_id,
+                        path = %path,
+                        reason = SkipReason::KeyPresent.as_str(),
+                        "PR-E4: skipped prompt_cache_key injection (customer-set value preserved)"
+                    );
+                }
+                SkipReason::NotAnObject => {
+                    tracing::warn!(
+                        event = "e4_skipped",
+                        request_id = %request_id,
+                        path = %path,
+                        reason = SkipReason::NotAnObject.as_str(),
+                        "PR-E4: body is not a JSON object; passthrough"
+                    );
+                }
+            }
+            body
+        }
+    }
 }
 
 /// Drive the per-provider state machine over a stream of byte chunks.

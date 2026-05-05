@@ -4,10 +4,12 @@
 //! groups every cache-stabilization mechanism behind one module so
 //! operators searching for "what does Headroom do to keep prompt
 //! caches warm" land in one place. Phase E PRs in this module sit
-//! *next to* the request path — never on it. They observe inbound
-//! bodies and emit structured logs so customers can see why their
-//! prompt-cache hit rate is degrading. Nothing in here mutates
-//! request bytes; the cache-safety invariant from Phase A still holds.
+//! *next to* the request path — either as observers
+//! (volatile_detector, drift_detector) or as PAYG-gated mutators
+//! (openai_cache_key, anthropic cache_control). The Phase A
+//! "passthrough is sacred" invariant still holds: mutators MUST
+//! gate on `AuthMode::Payg` at their call sites before invoking
+//! any function that mutates the body. Observers never mutate.
 //!
 //! Currently shipped:
 //!
@@ -28,14 +30,19 @@
 //!   learning Anthropic's marker API. **Mutates request bytes**;
 //!   gated on auth_mode == PAYG and the absence of any pre-existing
 //!   marker.
+//! - [`openai_cache_key`] — PR-E4: on PAYG OpenAI requests where the
+//!   customer has not set `prompt_cache_key`, derive a stable key from
+//!   `(model, system, tools)` and inject it so the upstream pins
+//!   cache lookup to a tenant-stable identity. **Mutates the body**
+//!   (only on PAYG) — see its docs for the gating contract.
 //!
 //! Future PRs (E1 — tool-array sort, E2 — JSON Schema key sort, E3 —
-//! `cache_control` auto-placement, E4 — `prompt_cache_key` injection)
-//! hang sibling submodules off this same `mod.rs`. Conflict
-//! resolution between parallel Phase E PRs is intentionally trivial:
-//! each detector lives in its own file, the only shared surface is
-//! this `mod.rs`'s `pub mod` list.
+//! `cache_control` auto-placement) hang sibling submodules off this
+//! same `mod.rs`. Conflict resolution between parallel Phase E PRs
+//! is intentionally trivial: each detector lives in its own file,
+//! the only shared surface is this `mod.rs`'s `pub mod` list.
 
 pub mod anthropic_cache_control;
 pub mod drift_detector;
+pub mod openai_cache_key;
 pub mod volatile_detector;
