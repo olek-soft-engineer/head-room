@@ -1,4 +1,4 @@
-// Compile a tiny C shim that provides weak aliases for the C23
+// Compile a tiny C shim that provides local definitions of the C23
 // strtol family (`__isoc23_strtol`, `__isoc23_strtoll`, etc.).
 //
 // glibc < 2.38 doesn't ship these symbols. Static dependencies in
@@ -6,8 +6,10 @@
 // with gcc 14.x) reference them, so without this shim the wheel
 // fails to import on Ubuntu 22.04, Conda envs with libc 2.35, etc.
 //
-// See `glibc_compat.c` for the full background. The shim is
-// Linux-only — macOS and Windows don't ship glibc.
+// See `glibc_compat.c` for the full background, including the two
+// implementation traps (no `alias` attribute, no `<stdlib.h>`).
+// The shim is Linux/glibc-only — macOS, Windows, and musl don't
+// ship glibc and don't reference `__isoc23_*`.
 //
 // Issue: #355 (https://github.com/chopratejas/headroom/issues/355)
 
@@ -31,10 +33,5 @@ fn main() {
         // already 35 MiB.
         .flag_if_supported("-fPIC")
         .opt_level(2)
-        // Suppress GCC's "weak attribute, alias to symbol that may
-        // not exist" warning. `strtoll` etc. always exist; the
-        // weak attribute is for OUR `__isoc23_*` definitions, not
-        // for the alias targets.
-        .flag_if_supported("-Wno-attribute-alias")
         .compile("headroom_glibc_compat");
 }
