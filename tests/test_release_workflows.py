@@ -487,6 +487,86 @@ def test_sdist_build_conditional_keyed_on_target_not_os() -> None:
     )
 
 
+def test_glibc_compat_shim_present_in_headroom_py() -> None:
+    """STRUCTURAL INVARIANT: the headroom-py crate ships a glibc-2.38
+    compatibility shim that defines weak `__isoc23_*` aliases.
+
+    Issue #355 (https://github.com/chopratejas/headroom/issues/355) —
+    the published wheel's `_core.so` references `__isoc23_strtoll`
+    (glibc 2.38+) because we statically link prebuilt ONNX Runtime
+    artifacts compiled with gcc 14. Users with libc < 2.38 (Ubuntu
+    22.04, most Conda envs, Debian 11/12) hit:
+
+        ImportError: undefined symbol: __isoc23_strtoll
+
+    The fix is `crates/headroom-py/glibc_compat.c` which provides
+    weak-alias definitions for the four `__isoc23_*` symbols,
+    delegating to the older `strtol*` family. `build.rs` compiles
+    the shim into `_core.so` on Linux/glibc only.
+
+    A future "let me drop this weird C file, surely it's dead code"
+    refactor would silently re-introduce the import failure for
+    every user on glibc < 2.38. This test pins all three load-bearing
+    pieces (the .c file, the build.rs trigger, the [build-dependencies]
+    cc dep).
+    """
+    headroom_py_dir = ROOT / "crates" / "headroom-py"
+
+    shim = headroom_py_dir / "glibc_compat.c"
+    assert shim.exists(), (
+        "crates/headroom-py/glibc_compat.c is missing — without it, "
+        "`_core.so` fails to import on every glibc < 2.38 host. See "
+        "issue #355 for the full bug class. NEVER delete this file "
+        "without confirming via `scripts/audit_wheel_glibc_symbols.py` "
+        "that the wheel no longer references __isoc23_* symbols."
+    )
+    shim_content = shim.read_text(encoding="utf-8")
+    for sym in ("__isoc23_strtol", "__isoc23_strtoll", "__isoc23_strtoul", "__isoc23_strtoull"):
+        assert sym in shim_content, f"shim missing alias for {sym}"
+
+    build_rs = headroom_py_dir / "build.rs"
+    assert build_rs.exists(), "crates/headroom-py/build.rs is missing"
+    build_rs_content = build_rs.read_text(encoding="utf-8")
+    assert "glibc_compat.c" in build_rs_content, (
+        "build.rs must reference glibc_compat.c — otherwise Cargo "
+        "skips the shim and the wheel's `_core.so` ships without it."
+    )
+
+    cargo_toml = (headroom_py_dir / "Cargo.toml").read_text(encoding="utf-8")
+    assert 'build = "build.rs"' in cargo_toml, (
+        'headroom-py/Cargo.toml must declare `build = "build.rs"` — '
+        "Cargo only auto-detects build.rs when this is set; without "
+        "it, the shim never compiles."
+    )
+    assert "[build-dependencies]" in cargo_toml and 'cc = "1"' in cargo_toml, (
+        'headroom-py/Cargo.toml must declare `cc = "1"` in '
+        "[build-dependencies] for build.rs to compile the C shim."
+    )
+
+
+def test_release_workflow_audits_wheel_glibc_symbols() -> None:
+    """STRUCTURAL INVARIANT: the release workflow audits each Linux
+    wheel for symbol references that exceed its manylinux glibc floor.
+
+    Companion to `test_glibc_compat_shim_present_in_headroom_py` —
+    the shim is the FIX, this audit is the GATE. Without the audit,
+    a future toolchain bump in the prebuilt ORT artifacts (or any
+    other statically-linked C/C++ dep) could re-introduce a
+    post-floor symbol that our current shim doesn't cover. The audit
+    catches that at release time, before publish-pypi.
+    """
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    assert "audit_wheel_glibc_symbols.py" in content, (
+        "release.yml must invoke `scripts/audit_wheel_glibc_symbols.py` "
+        "on every Linux wheel before publish. Without it, regressions "
+        "of issue #355's bug class ship to PyPI silently."
+    )
+    assert "Audit wheel glibc symbols (Linux only)" in content, (
+        "audit step name has been renamed; update both this test and the workflow"
+    )
+
+
 def test_npm_publish_jobs_do_not_download_dist_artifact() -> None:
     """`publish-npm` and `publish-github-packages` `npm pack`+`npm publish`
     directly from the checked-out source tree; they never read the

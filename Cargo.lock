@@ -1904,6 +1904,7 @@ dependencies = [
 name = "headroom-py"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "headroom-core",
  "pyo3",
  "serde_json",
