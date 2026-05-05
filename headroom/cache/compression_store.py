@@ -199,7 +199,7 @@ class CompressionStore:
             compression_strategy: Strategy used for compression.
             ttl: Custom TTL in seconds (uses default if not specified).
             explicit_hash: Use this exact hex hash as the storage key
-                instead of computing MD5(original)[:24]. Required when
+                instead of computing SHA-256(original)[:24]. Required when
                 the marker that points at this entry was emitted by a
                 producer with its own hash function (e.g. SmartCrusher's
                 Rust row-drop path uses SHA-256[:12]). If not a hex
@@ -210,28 +210,35 @@ class CompressionStore:
         Returns:
             Hash key for retrieving this content.
         """
-        # Generate hash from original content. Default: MD5[:24] of the
+        # Generate hash from original content. Default: SHA-256[:24] of the
         # original. When the caller provides `explicit_hash`, use it
         # verbatim — required when the hash that ends up in the prompt
         # marker is produced by another component (e.g. the Rust
         # SmartCrusher row-drop path emits SHA-256[:12], which the
         # Python store has to mirror so /v1/retrieve resolves it).
-        # CRITICAL FIX #5: Use 24 chars (96 bits) instead of 16 (64 bits) for better
-        # collision resistance. Birthday paradox: 50% collision at sqrt(2^n) entries.
-        # - 64 bits: ~4 billion entries for 50% collision
-        # - 96 bits: ~280 trillion entries for 50% collision
+        # 24 chars (96 bits) was chosen for collision resistance under the
+        # birthday bound: 50% collision probability at ~280 trillion entries
+        # (2^48), versus ~4 billion (2^32) for the previous 16-char default.
         if explicit_hash is not None:
             # Validate as hex. Bail loudly per `feedback_no_silent_fallbacks`
-            # — silently falling back to MD5 when the caller asked for a
-            # specific key would defeat the marker/store consistency we're
-            # trying to preserve.
+            # — silently falling back to the default hash when the caller
+            # asked for a specific key would defeat the marker/store
+            # consistency we're trying to preserve.
             if not explicit_hash or not all(c in "0123456789abcdefABCDEF" for c in explicit_hash):
                 raise ValueError(
                     f"explicit_hash must be a non-empty hex string, got {explicit_hash!r}"
                 )
             hash_key = explicit_hash.lower()
         else:
-            hash_key = hashlib.md5(original.encode()).hexdigest()[:24]  # nosec B324
+            # SHA-256 truncated to 24 hex chars (96 bits) — same collision
+            # space as the MD5[:24] this replaced. Switched from MD5 in
+            # PR #395 to silence CodeQL's `py/weak-sensitive-data-hashing`
+            # rule (the `usedforsecurity=False` parameter and the `lgtm`
+            # comment marker both failed to suppress it). The cache is
+            # in-memory, so changing the hash function on upgrade has no
+            # persistence-side effect — the same content always hashes
+            # deterministically under whichever function is in use.
+            hash_key = hashlib.sha256(original.encode()).hexdigest()[:24]
 
         entry = CompressionEntry(
             hash=hash_key,
