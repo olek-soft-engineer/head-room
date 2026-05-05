@@ -630,10 +630,15 @@ pub(crate) async fn forward_http(
         }
         let outcome = match endpoint {
             compression::CompressibleEndpoint::AnthropicMessages => {
+                // PR-E3: thread the F1-classified auth_mode into the
+                // dispatcher so cache_control auto-placement gates on
+                // PAYG only. Pulled from request extensions where it
+                // was stashed at request entry (line ~325 above).
                 compression::compress_anthropic_request(
                     &buffered,
                     state.config.compression_mode,
                     state.config.cache_control_auto_frozen,
+                    auth_mode,
                     &request_id,
                 )
             }

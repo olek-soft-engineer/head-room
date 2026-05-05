@@ -39,12 +39,16 @@
 //! SHA-256 prefix-and-suffix invariant in CI.
 
 use bytes::Bytes;
+use headroom_core::auth_mode::AuthMode as RequestAuthMode;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
     compress_anthropic_live_zone, AuthMode, BlockAction, ExclusionReason, LiveZoneError,
     LiveZoneOutcome,
 };
 
+use crate::cache_stabilization::anthropic_cache_control::{
+    auto_place_anthropic_cache_control, AutoPlaceOutcome, SkipReason,
+};
 use crate::compression::resolve_frozen_count;
 use crate::config::{CacheControlAutoFrozen, CompressionMode};
 
@@ -107,11 +111,19 @@ pub enum PassthroughReason {
 ///   `frozen_message_count` from explicit `cache_control` markers
 ///   in the body. Disabled → floor=0 (everything is in the live
 ///   zone).
+/// - `auth_mode`: F1's [`RequestAuthMode`] classification of the
+///   inbound request. PR-E3 gates `cache_control` auto-placement
+///   on `Payg` only — OAuth and Subscription modes pass through
+///   byte-equal (mutating their bytes risks looking like
+///   cache-evasion to the upstream). The live-zone dispatcher
+///   itself still runs on every mode in PR-B/C; the auth-mode
+///   gate is local to PR-E3.
 /// - `request_id`: per-request id used for log correlation.
 pub fn compress_anthropic_request(
     body: &Bytes,
     mode: CompressionMode,
     cache_control_policy: CacheControlAutoFrozen,
+    auth_mode: RequestAuthMode,
     request_id: &str,
 ) -> Outcome {
     if matches!(mode, CompressionMode::Off) {
@@ -133,7 +145,7 @@ pub fn compress_anthropic_request(
     // Mode is LiveZone. Resolve the cache-hot floor first; this is
     // the only place the body is parsed at all when the policy is
     // Disabled (resolve_frozen_count short-circuits).
-    let parsed: serde_json::Value = match serde_json::from_slice(body) {
+    let mut parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => {
             tracing::warn!(
@@ -153,6 +165,114 @@ pub fn compress_anthropic_request(
     };
 
     let frozen_count = resolve_frozen_count(&parsed, cache_control_policy, request_id);
+
+    // ── PR-E3: Anthropic cache_control auto-placement ─────────────
+    //
+    // Gate 1 (auth-mode): only PAYG. Mutating bytes on OAuth /
+    // subscription would look like cache-evasion to the upstream.
+    // Gate 2 (customer-placement-wins): handled inside
+    // `auto_place_anthropic_cache_control` — if any marker exists
+    // anywhere in the body we return Skipped { MarkerPresent }.
+    //
+    // When Applied, we re-serialize the parsed body and use the
+    // new bytes for the rest of the pipeline. The live-zone
+    // dispatcher will re-parse internally — this costs one extra
+    // serialize on the (rare) Applied path; on the Skipped /
+    // non-PAYG paths we don't touch the bytes at all.
+    let mut e3_body_bytes: Option<Bytes> = None;
+    let mut e3_locations: Vec<String> = Vec::new();
+    let e3_skipped: bool;
+    if matches!(auth_mode, RequestAuthMode::Payg) {
+        match auto_place_anthropic_cache_control(&mut parsed) {
+            AutoPlaceOutcome::Applied {
+                placed_count,
+                locations,
+            } => {
+                e3_skipped = false;
+                if placed_count > 0 {
+                    match serde_json::to_vec(&parsed) {
+                        Ok(v) => {
+                            tracing::info!(
+                                event = "e3_applied",
+                                request_id = %request_id,
+                                path = "/v1/messages",
+                                placed_count = placed_count,
+                                locations = ?locations,
+                                "auto-placed anthropic cache_control marker(s)"
+                            );
+                            e3_body_bytes = Some(Bytes::from(v));
+                            e3_locations = locations;
+                        }
+                        Err(err) => {
+                            // We just parsed successfully; serialize
+                            // failure is unreachable in practice. If
+                            // it ever fires, fall back to the
+                            // original body bytes — never poison the
+                            // request. Loud log so operators notice.
+                            tracing::error!(
+                                event = "e3_serialize_failed",
+                                request_id = %request_id,
+                                path = "/v1/messages",
+                                error = %err,
+                                "auto-placement mutated parsed body but \
+                                 serialize-back failed; forwarding original bytes"
+                            );
+                        }
+                    }
+                } else {
+                    // Applied with placed_count = 0 means "ran but
+                    // nothing to do" (no tools array, empty array,
+                    // or the last tool wasn't an object). Emit a
+                    // distinct event so dashboards can spot the
+                    // we-tried-but-no-target branch.
+                    tracing::info!(
+                        event = "e3_no_target",
+                        request_id = %request_id,
+                        path = "/v1/messages",
+                        "auto-placement ran but found no tool slot to mark"
+                    );
+                }
+            }
+            AutoPlaceOutcome::Skipped {
+                reason: SkipReason::MarkerPresent,
+            } => {
+                e3_skipped = true;
+                tracing::info!(
+                    event = "e3_skipped",
+                    request_id = %request_id,
+                    path = "/v1/messages",
+                    reason = SkipReason::MarkerPresent.as_str(),
+                    "customer-placed cache_control marker(s) present; auto-placement skipped"
+                );
+            }
+            AutoPlaceOutcome::Skipped {
+                reason: SkipReason::AuthMode,
+            } => {
+                // The function never returns AuthMode itself — that
+                // gate lives in this caller. Defensive arm so the
+                // match is exhaustive across the public enum.
+                e3_skipped = true;
+            }
+        }
+    } else {
+        e3_skipped = true;
+        tracing::info!(
+            event = "e3_skipped",
+            request_id = %request_id,
+            path = "/v1/messages",
+            reason = SkipReason::AuthMode.as_str(),
+            auth_mode = auth_mode.as_str(),
+            "non-PAYG auth mode; cache_control auto-placement skipped"
+        );
+    }
+    // Suppress dead-code warnings on the local; we keep the variable
+    // so future telemetry can surface the OAuth/Subscription pass
+    // counts without re-deriving them.
+    let _ = e3_skipped;
+
+    // For the rest of the pipeline, use the E3-modified bytes when
+    // E3 applied, else the original buffer.
+    let working_body: Bytes = e3_body_bytes.clone().unwrap_or_else(|| body.clone());
 
     // PR-B4: extract `body["model"]` so the live-zone dispatcher can
     // route the tokenizer registry to the right backend for the
@@ -175,7 +295,7 @@ pub fn compress_anthropic_request(
     // `NoChange` otherwise (live zone empty, every compressor
     // declined, or every compressor produced output whose token
     // count was not strictly less than the input's).
-    match compress_anthropic_live_zone(body, frozen_count, AuthMode::Payg, model) {
+    match compress_anthropic_live_zone(&working_body, frozen_count, AuthMode::Payg, model) {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
             let block_count = manifest.block_outcomes.len();
             let blocks_excluded = manifest
@@ -205,7 +325,23 @@ pub fn compress_anthropic_request(
                 live_zone_blocks_excluded = blocks_excluded,
                 "anthropic live-zone dispatch"
             );
-            Outcome::NoCompression
+            // If E3 applied, we still need to forward the modified
+            // bytes even though the live-zone dispatcher made no
+            // additional changes. Translate to `Compressed` so the
+            // proxy substitutes the body — `tokens_*` are zero
+            // because no token-bearing block was rewritten;
+            // `markers_inserted` carries the E3 placement locations.
+            if let Some(new_body) = e3_body_bytes {
+                Outcome::Compressed {
+                    body: new_body,
+                    tokens_before: 0,
+                    tokens_after: 0,
+                    strategies_applied: vec!["e3_anthropic_cache_control"],
+                    markers_inserted: e3_locations,
+                }
+            } else {
+                Outcome::NoCompression
+            }
         }
         Ok(LiveZoneOutcome::Modified { new_body, manifest }) => {
             // Aggregate manifest into the proxy's `Compressed` payload.
@@ -320,6 +456,7 @@ mod tests {
             &body,
             CompressionMode::Off,
             CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
             "req-1",
         );
         match out {
@@ -337,6 +474,7 @@ mod tests {
             &body,
             CompressionMode::LiveZone,
             CacheControlAutoFrozen::Enabled,
+            RequestAuthMode::Payg,
             "req-2",
         );
         match out {
@@ -354,6 +492,7 @@ mod tests {
             &body,
             CompressionMode::LiveZone,
             CacheControlAutoFrozen::Enabled,
+            RequestAuthMode::Payg,
             "req-3",
         );
         match out {
@@ -379,6 +518,7 @@ mod tests {
             &body,
             CompressionMode::LiveZone,
             CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
             "req-4",
         );
         match out {
@@ -394,6 +534,7 @@ mod tests {
             &body,
             CompressionMode::LiveZone,
             CacheControlAutoFrozen::Enabled,
+            RequestAuthMode::Payg,
             "req-5",
         );
         match out {
@@ -411,6 +552,11 @@ mod tests {
         // dispatcher will treat the entire array as live zone.
         // (PR-B2: still returns NoCompression — this test pins the
         // policy plumbing rather than compression behaviour.)
+        //
+        // The body carries a cache_control marker on a message
+        // block, so PR-E3's `MarkerPresent` gate also fires —
+        // result: still NoCompression (no E3 placement, no
+        // live-zone change).
         let body = body_of(serde_json::json!({
             "messages": [
                 {
@@ -425,11 +571,146 @@ mod tests {
             &body,
             CompressionMode::LiveZone,
             CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
             "req-6",
         );
         match out {
             Outcome::NoCompression => {}
             other => panic!("expected NoCompression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_e3_payg_with_tools_and_no_markers_returns_compressed_with_marker() {
+        // PR-E3 happy path: PAYG body with one tool and no markers
+        // anywhere → dispatcher inserts a marker on the last tool
+        // and returns Compressed with the new bytes.
+        let original = serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "tools": [
+                {"name": "search", "description": "search the web"}
+            ],
+            "messages": [
+                {"role": "user", "content": "hi"}
+            ],
+        });
+        let body = body_of(original);
+        let out = compress_anthropic_request(
+            &body,
+            CompressionMode::LiveZone,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
+            "req-e3-1",
+        );
+        match out {
+            Outcome::Compressed {
+                body: new_body,
+                strategies_applied,
+                markers_inserted,
+                ..
+            } => {
+                assert_eq!(strategies_applied, vec!["e3_anthropic_cache_control"]);
+                assert_eq!(markers_inserted, vec!["tools[0]".to_string()]);
+                let parsed: serde_json::Value =
+                    serde_json::from_slice(&new_body).expect("re-parse new body");
+                assert_eq!(
+                    parsed.pointer("/tools/0/cache_control"),
+                    Some(&serde_json::json!({"type": "ephemeral"})),
+                    "marker must be present on last tool",
+                );
+            }
+            other => panic!("expected Compressed{{e3_…}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_e3_oauth_skips_auto_placement() {
+        // OAuth → mutating bytes is unsafe → never auto-place. With
+        // no other reason for the dispatcher to mutate, we get
+        // NoCompression.
+        let body = body_of(serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "tools": [{"name": "search", "description": "search"}],
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        let out = compress_anthropic_request(
+            &body,
+            CompressionMode::LiveZone,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::OAuth,
+            "req-e3-2",
+        );
+        match out {
+            Outcome::NoCompression => {}
+            other => panic!("expected NoCompression on OAuth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_e3_subscription_skips_auto_placement() {
+        let body = body_of(serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "tools": [{"name": "search", "description": "search"}],
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        let out = compress_anthropic_request(
+            &body,
+            CompressionMode::LiveZone,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Subscription,
+            "req-e3-3",
+        );
+        match out {
+            Outcome::NoCompression => {}
+            other => panic!("expected NoCompression on Subscription, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_e3_payg_with_existing_marker_skips() {
+        // Customer placed a marker on the only tool. Skip E3.
+        let body = body_of(serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "tools": [
+                {
+                    "name": "search",
+                    "description": "search",
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        let out = compress_anthropic_request(
+            &body,
+            CompressionMode::LiveZone,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
+            "req-e3-4",
+        );
+        match out {
+            Outcome::NoCompression => {}
+            other => panic!("expected NoCompression on customer-placed marker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pr_e3_payg_no_tools_returns_no_compression() {
+        // PAYG, no markers, no tools → E3 has nothing to place.
+        // No bytes mutated → NoCompression.
+        let body = body_of(serde_json::json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+        let out = compress_anthropic_request(
+            &body,
+            CompressionMode::LiveZone,
+            CacheControlAutoFrozen::Disabled,
+            RequestAuthMode::Payg,
+            "req-e3-5",
+        );
+        match out {
+            Outcome::NoCompression => {}
+            other => panic!("expected NoCompression on no-tools PAYG body, got {other:?}"),
         }
     }
 }

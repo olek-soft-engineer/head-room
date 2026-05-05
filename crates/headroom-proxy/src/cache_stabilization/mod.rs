@@ -20,6 +20,14 @@
 //!   `cache_drift_first_request` on first sight and
 //!   `cache_drift_observed` when consecutive requests on the same
 //!   session disagree on any of the three dimensions.
+//! - [`anthropic_cache_control`] — PR-E3: on PAYG-classified
+//!   requests where the customer hasn't placed any `cache_control`
+//!   marker, auto-inserts one ephemeral marker on the last tool
+//!   definition so unsophisticated callers (hand-rolled SDK code,
+//!   smaller agents, plain `curl`) get prompt-cache hits without
+//!   learning Anthropic's marker API. **Mutates request bytes**;
+//!   gated on auth_mode == PAYG and the absence of any pre-existing
+//!   marker.
 //!
 //! Future PRs (E1 — tool-array sort, E2 — JSON Schema key sort, E3 —
 //! `cache_control` auto-placement, E4 — `prompt_cache_key` injection)
@@ -28,5 +36,6 @@
 //! each detector lives in its own file, the only shared surface is
 //! this `mod.rs`'s `pub mod` list.
 
+pub mod anthropic_cache_control;
 pub mod drift_detector;
 pub mod volatile_detector;
