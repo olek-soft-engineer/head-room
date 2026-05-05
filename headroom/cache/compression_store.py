@@ -181,6 +181,7 @@ class CompressionStore:
         tool_signature_hash: str | None = None,
         compression_strategy: str | None = None,
         ttl: int | None = None,
+        explicit_hash: str | None = None,
     ) -> str:
         """Store compressed content and return hash for retrieval.
 
@@ -197,16 +198,40 @@ class CompressionStore:
             tool_signature_hash: Hash from ToolSignature for TOIN correlation.
             compression_strategy: Strategy used for compression.
             ttl: Custom TTL in seconds (uses default if not specified).
+            explicit_hash: Use this exact hex hash as the storage key
+                instead of computing MD5(original)[:24]. Required when
+                the marker that points at this entry was emitted by a
+                producer with its own hash function (e.g. SmartCrusher's
+                Rust row-drop path uses SHA-256[:12]). If not a hex
+                string, raises ``ValueError``. The marker hash and the
+                store key MUST match — otherwise ``/v1/retrieve/{hash}``
+                returns 404 even though the data is present.
 
         Returns:
             Hash key for retrieving this content.
         """
-        # Generate hash from original content
+        # Generate hash from original content. Default: MD5[:24] of the
+        # original. When the caller provides `explicit_hash`, use it
+        # verbatim — required when the hash that ends up in the prompt
+        # marker is produced by another component (e.g. the Rust
+        # SmartCrusher row-drop path emits SHA-256[:12], which the
+        # Python store has to mirror so /v1/retrieve resolves it).
         # CRITICAL FIX #5: Use 24 chars (96 bits) instead of 16 (64 bits) for better
         # collision resistance. Birthday paradox: 50% collision at sqrt(2^n) entries.
         # - 64 bits: ~4 billion entries for 50% collision
         # - 96 bits: ~280 trillion entries for 50% collision
-        hash_key = hashlib.md5(original.encode()).hexdigest()[:24]  # nosec B324
+        if explicit_hash is not None:
+            # Validate as hex. Bail loudly per `feedback_no_silent_fallbacks`
+            # — silently falling back to MD5 when the caller asked for a
+            # specific key would defeat the marker/store consistency we're
+            # trying to preserve.
+            if not explicit_hash or not all(c in "0123456789abcdefABCDEF" for c in explicit_hash):
+                raise ValueError(
+                    f"explicit_hash must be a non-empty hex string, got {explicit_hash!r}"
+                )
+            hash_key = explicit_hash.lower()
+        else:
+            hash_key = hashlib.md5(original.encode()).hexdigest()[:24]  # nosec B324
 
         entry = CompressionEntry(
             hash=hash_key,
