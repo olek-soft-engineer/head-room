@@ -195,9 +195,11 @@ class TestInjectAndRestoreRoundTrip:
         # provider-table block.  Re-wrapping must not duplicate them.
         assert content.count(wrap_mod._CODEX_TOP_LEVEL_MARKER) == 2
         assert content.count(wrap_mod._CODEX_END_MARKER) == 2
-        # Latest port is honoured.
+        # Latest port is honoured in both keys.
         assert 'base_url = "http://127.0.0.1:9999/v1"' in content
+        assert 'openai_base_url = "http://127.0.0.1:9999/v1"' in content
         assert 'base_url = "http://127.0.0.1:8787/v1"' not in content
+        assert 'openai_base_url = "http://127.0.0.1:8787/v1"' not in content
         # User's original content is preserved.
         assert 'model = "gpt-4o"' in content
 
@@ -254,6 +256,65 @@ class TestInjectAndRestoreRoundTrip:
 
         assert status == "restored"
         assert config_file.read_text() == malformed
+
+
+# ---------------------------------------------------------------------------
+# Subscription routing: openai_base_url intercepts ChatGPT plan traffic
+# ---------------------------------------------------------------------------
+
+
+class TestSubscriptionRouting:
+    """Codex subscription (ChatGPT plan) bypasses OPENAI_BASE_URL and the
+    custom model_provider; it uses the built-in ``openai`` provider whose
+    base_url defaults to ``https://chatgpt.com/backend-api/codex``.
+    Setting ``openai_base_url`` overrides that default for all auth modes."""
+
+    def test_inject_writes_openai_base_url(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        content = (tmp_path / ".codex" / "config.toml").read_text()
+        assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content
+
+    def test_openai_base_url_port_updates_on_rewrap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+
+        wrap_mod._inject_codex_provider_config(8787)
+        wrap_mod._inject_codex_provider_config(9999)
+
+        content = (tmp_path / ".codex" / "config.toml").read_text()
+        assert 'openai_base_url = "http://127.0.0.1:9999/v1"' in content
+        assert 'openai_base_url = "http://127.0.0.1:8787/v1"' not in content
+
+    def test_openai_base_url_removed_on_unwrap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        original = '[profiles.default]\nmodel = "gpt-4o"\n'
+        config_file.write_text(original)
+
+        wrap_mod._inject_codex_provider_config(8787)
+        assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in config_file.read_text()
+
+        wrap_mod._restore_codex_provider_config()
+        assert config_file.read_text() == original
+
+    def test_strip_cleans_orphaned_openai_base_url(self) -> None:
+        """Safety net: orphaned openai_base_url lines are cleaned up."""
+        content = (
+            '[profiles.default]\nmodel = "gpt-4o"\nopenai_base_url = "http://127.0.0.1:8787/v1"\n'
+        )
+        cleaned = wrap_mod._strip_codex_headroom_blocks(content)
+        assert "openai_base_url" not in cleaned
+        assert 'model = "gpt-4o"' in cleaned
 
 
 # ---------------------------------------------------------------------------
