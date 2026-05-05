@@ -247,8 +247,18 @@ jobs:
           # builds for 3.14+ until we bump PyO3 (tracked separately).
           PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
 
+      # Build sdist exactly once across the matrix. We key the
+      # conditional on `target` only — sdist is platform-independent
+      # so any single matrix row is a fine host. Earlier this
+      # conditional was `matrix.os == 'ubuntu-latest' && matrix.target
+      # == 'x86_64-unknown-linux-gnu'`. PR #376 pinned `os` to
+      # `ubuntu-24.04` (instead of the moving `ubuntu-latest` alias)
+      # and silently broke this `if`, so sdist never built and
+      # `gh release upload release-assets/*.tar.gz` failed with
+      # "no matches found". Keying on `target` decouples the sdist
+      # build from any future `os` rename.
       - name: Build sdist (linux x86_64 only — sdist is platform-independent)
-        if: matrix.os == 'ubuntu-latest' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
