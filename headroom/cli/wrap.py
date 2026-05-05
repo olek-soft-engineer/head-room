@@ -457,9 +457,14 @@ def _strip_codex_headroom_blocks(content: str) -> str:
     content = content.replace(_CODEX_TOP_LEVEL_MARKER + "\n", "")
     content = content.replace(_CODEX_END_MARKER + "\n", "")
 
-    # Strip any leftover top-level `model_provider = "headroom"` line, which
-    # older versions of `wrap codex` wrote outside the marker block.
+    # Strip any leftover top-level keys that older (or crashed) versions of
+    # `wrap codex` may have written outside the marker block.
     content = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", content)
+    content = re.sub(
+        r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
+        "",
+        content,
+    )
 
     # Strip any orphaned `[model_providers.headroom]` table with the fields we
     # write.  We only remove it if the table is recognisably ours (base_url
@@ -537,10 +542,20 @@ def _prepare_wrap_rtk(verbose: bool = False, *, label: str | None = None) -> Pat
 def _inject_codex_provider_config(port: int) -> None:
     """Inject a Headroom model provider into Codex's config.toml.
 
-    Codex ignores OPENAI_BASE_URL for WebSocket transport unless a custom
-    provider declares ``supports_websockets = true``.  This writes a
-    ``[model_providers.headroom]`` section that routes both HTTP and WS
-    through the proxy, and sets ``model_provider = "headroom"``.
+    Two keys are written in the top-level block:
+
+    * ``model_provider = "headroom"`` — selects the custom provider for
+      API-key mode traffic.
+    * ``openai_base_url = "http://127.0.0.1:{port}/v1"`` — overrides the
+      built-in ``openai`` provider's base URL.  This is the critical key for
+      **subscription (ChatGPT plan) users**: Codex detects subscription auth
+      and routes through the built-in ``openai`` provider regardless of
+      ``model_provider``, so without this override it bypasses the proxy and
+      hits ``https://chatgpt.com/backend-api/codex`` directly.
+
+    A ``[model_providers.headroom]`` section is also written with
+    ``supports_websockets = true`` so that WebSocket transport (used by
+    default) also flows through the proxy for API-key users.
 
     Safe to call multiple times — the injected block is fully replaced on
     each call, so re-running with a different ``port`` updates the config.
@@ -558,14 +573,16 @@ def _inject_codex_provider_config(port: int) -> None:
     # stripping them is unambiguous and never consumes user content that
     # happens to sit between the two.
     top_level_block = (
-        f'{_CODEX_TOP_LEVEL_MARKER}\nmodel_provider = "headroom"\n{_CODEX_END_MARKER}\n'
+        f"{_CODEX_TOP_LEVEL_MARKER}\n"
+        f'model_provider = "headroom"\n'
+        f'openai_base_url = "http://127.0.0.1:{port}/v1"\n'
+        f"{_CODEX_END_MARKER}\n"
     )
     provider_section = (
         f"{_CODEX_TOP_LEVEL_MARKER}\n"
         "[model_providers.headroom]\n"
         'name = "OpenAI via Headroom proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
-        f'env_key = "OPENAI_API_KEY"\n'
         f"requires_openai_auth = true\n"
         f"supports_websockets = true\n"
         f"{_CODEX_END_MARKER}\n"
@@ -596,7 +613,10 @@ def _inject_codex_provider_config(port: int) -> None:
             content = top_level_block + "\n" + provider_section
 
         config_file.write_text(content)
-        click.echo(f"  Codex config: injected Headroom provider (WS + HTTP) into {config_file}")
+        click.echo(
+            f"  Codex config: injected Headroom provider (WS + HTTP, API-key + subscription)"
+            f" into {config_file}"
+        )
     except Exception as e:
         click.echo(f"  Warning: could not update Codex config: {e}")
 
