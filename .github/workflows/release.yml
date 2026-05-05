@@ -37,6 +37,22 @@ on:
       - ".actrc.local.example"
       - ".env.act.example"
       - ".github/act/**"
+  # X2: PR-time release dry-run. Trigger on PRs that touch release-
+  # critical paths so the wheel matrix + smoke-import gate run BEFORE
+  # merge — not after the tag is pushed and main is broken. Path
+  # filter is deliberately narrow: source-only PRs to headroom-core
+  # / headroom-proxy don't change wheel layout, so they don't need
+  # the dry-run. Issues this would have caught: #379 (docker bake
+  # name=), #382 (sdist os-mismatch), #384/#385/#386 (glibc shim
+  # iterations), #387's own shellcheck regression.
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/docker.yml"
+      - "crates/headroom-py/**"
+      - "pyproject.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
   workflow_dispatch:
     inputs:
       version:
@@ -48,8 +64,13 @@ on:
         default: false
 
 concurrency:
-  group: release-${{ github.ref_name }}
-  cancel-in-progress: false
+  # Main release runs are namespaced by ref_name and never cancel
+  # (cancel-in-progress: false) — losing a tag-push release mid-flight
+  # would mean PyPI/Docker get partial state. PR dry-runs are
+  # namespaced by PR number and DO cancel: rapid PR pushes shouldn't
+  # spawn N parallel wheel builds, only the latest matters.
+  group: release-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   detect-version:
@@ -365,11 +386,22 @@ jobs:
           # `quay.io/pypa/manylinux_2_28_x86_64` is the floor we
           # promise; if the wheel fails here, our manylinux tag is
           # a lie. `ubuntu:22.04` (glibc 2.35) is the environment
-          # from issue #355's reporter. `ubuntu:20.04` (glibc 2.31)
-          # covers older still-supported LTS.
+          # from issue #355's reporter.
+          #
+          # NOTE: `ubuntu:20.04 + python 3.10` was a third entry,
+          # dropped on PR #396 because the deadsnakes PPA install
+          # path stopped reliably provisioning python3.10-venv on
+          # focal once Ubuntu 20.04 hit End of Standard Support
+          # (May 2025). The failure mode was an apt-get error, NOT
+          # a wheel-import error — i.e. the test environment, not
+          # the wheel. Promising the wheel works on glibc 2.31 in
+          # CI now requires either ESM-tier images or pinning a
+          # specific deadsnakes snapshot, neither of which we want
+          # owning. Manylinux 2.28 (glibc 2.28) is still the floor
+          # we promise; ubuntu:22.04 covers the most-reported
+          # customer environment.
           - { runner: ubuntu-24.04, image: "quay.io/pypa/manylinux_2_28_x86_64", python: "3.11", wheel_target: x86_64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-x86_64-unknown-linux-gnu, glibc_label: "2.28-floor" }
           - { runner: ubuntu-24.04, image: "ubuntu:22.04", python: "3.12", wheel_target: x86_64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-x86_64-unknown-linux-gnu, glibc_label: "2.35" }
-          - { runner: ubuntu-24.04, image: "ubuntu:20.04", python: "3.10", wheel_target: x86_64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-x86_64-unknown-linux-gnu, glibc_label: "2.31" }
           # Linux aarch64 — floor + one customer env. Native arm64
           # runners (PR #376) host the container.
           - { runner: ubuntu-24.04-arm, image: "quay.io/pypa/manylinux_2_28_aarch64", python: "3.11", wheel_target: aarch64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-arm-aarch64-unknown-linux-gnu, glibc_label: "2.28-floor" }
@@ -530,7 +562,10 @@ jobs:
 
   publish-pypi:
     needs: [collect-dist, smoke-import-wheels]
-    if: github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
+    # X2: skip on pull_request — dry-run only verifies build+smoke,
+    # never publishes. The other two predicates remain (workflow_dispatch
+    # dry_run, vars-level skip).
+    if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.PYPI_SKIP != 'true'
     environment: pypi  # NOTE: environment name must be a literal; update here if the GitHub environment name changes
     runs-on: ubuntu-latest
     permissions:
@@ -554,7 +589,7 @@ jobs:
 
   publish-npm:
     needs: [detect-version, build]
-    if: github.event.inputs.dry_run != 'true' && vars.NPM_SKIP != 'true'
+    if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.NPM_SKIP != 'true'
     runs-on: ubuntu-latest
     # Publishes to npmjs.org via NPM_TOKEN secret; no GITHUB_TOKEN
     # write permissions needed.
@@ -611,7 +646,7 @@ jobs:
 
   publish-github-packages:
     needs: [detect-version, build]
-    if: github.event.inputs.dry_run != 'true' && vars.GH_PACKAGES_SKIP != 'true'
+    if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true' && vars.GH_PACKAGES_SKIP != 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -721,7 +756,7 @@ jobs:
     # image's `pip install` step. Failing here ~3 minutes earlier
     # than docker-build saves the matrix's wall-clock budget.
     needs: [detect-version, smoke-import-wheels]
-    if: github.event.inputs.dry_run != 'true'
+    if: github.event_name != 'pull_request' && github.event.inputs.dry_run != 'true'
     permissions:
       contents: read
       packages: write
@@ -736,6 +771,7 @@ jobs:
     if: >-
       ${{
         always() &&
+        github.event_name != 'pull_request' &&
         github.event.inputs.dry_run != 'true' &&
         needs.detect-version.result == 'success' &&
         needs.build.result == 'success' &&
