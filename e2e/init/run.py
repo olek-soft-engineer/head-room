@@ -137,6 +137,11 @@ def _verify_codex_local(ctx: CaseContext) -> None:
 
     if 'base_url = "http://127.0.0.1:9012/v1"' not in config:
         raise AssertionError("Codex config should point at the requested proxy port (9012)")
+    if 'env_key = "OPENAI_API_KEY"' in config:
+        raise AssertionError("Codex local init should preserve OAuth and never inject env_key")
+    for expected in ("requires_openai_auth = true", "supports_websockets = true"):
+        if expected not in config:
+            raise AssertionError(f"Codex local init missing {expected!r}")
     if config.count("[features]") != 1:
         raise AssertionError("Codex config should keep a single [features] table")
     if "codex_hooks = true" not in config:
@@ -170,6 +175,11 @@ def _verify_codex_global(ctx: CaseContext) -> None:
     config = (ctx.home / ".codex" / "config.toml").read_text(encoding="utf-8")
     if 'base_url = "http://127.0.0.1:8787/v1"' not in config:
         raise AssertionError("Codex user config should point at port 8787 by default")
+    if 'env_key = "OPENAI_API_KEY"' in config:
+        raise AssertionError("Codex global init should preserve OAuth and never inject env_key")
+    for expected in ("requires_openai_auth = true", "supports_websockets = true"):
+        if expected not in config:
+            raise AssertionError(f"Codex global init missing {expected!r}")
     if "codex_hooks = true" not in config:
         raise AssertionError("Codex user config should enable codex_hooks")
     hooks = json.loads((ctx.home / ".codex" / "hooks.json").read_text(encoding="utf-8"))

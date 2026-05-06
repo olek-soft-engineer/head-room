@@ -70,6 +70,8 @@ def test_apply_and_revert_codex_provider_scope(monkeypatch, tmp_path: Path) -> N
     content = config_path.read_text()
     assert 'model_provider = "headroom"' in content
     assert 'base_url = "http://127.0.0.1:8787/v1"' in content
+    assert 'env_key = "OPENAI_API_KEY"' not in content
+    assert "requires_openai_auth = true" in content
 
     assert mutation is not None
     revert_codex_provider_scope(mutation, manifest)
@@ -107,7 +109,6 @@ def test_apply_codex_provider_scope_replaces_existing_managed_block(
         "[model_providers.headroom]\n"
         'name = "Headroom persistent proxy"\n'
         'base_url = "http://127.0.0.1:1111/v1"\n'
-        'env_key = "OPENAI_API_KEY"\n'
         "requires_openai_auth = true\n"
         "supports_websockets = true\n"
         "# --- end Headroom persistent provider ---\n"
@@ -122,6 +123,7 @@ def test_apply_codex_provider_scope_replaces_existing_managed_block(
     assert content.count("# --- Headroom persistent provider ---") == 1
     assert 'base_url = "http://127.0.0.1:9999/v1"' in content
     assert 'base_url = "http://127.0.0.1:1111/v1"' not in content
+    assert 'env_key = "OPENAI_API_KEY"' not in content
 
 
 def test_apply_codex_provider_scope_creates_new_config_when_missing(

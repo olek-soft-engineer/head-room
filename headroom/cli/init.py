@@ -28,6 +28,7 @@ from headroom.install.runtime import (
 )
 from headroom.install.state import load_manifest, save_manifest
 from headroom.install.supervisors import start_supervisor
+from headroom.providers.codex.install import build_provider_section as build_codex_provider_section
 
 from .main import main
 
@@ -212,13 +213,12 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
     block = (
         f"{_CODEX_PROVIDER_MARKER_START}\n"
         'model_provider = "headroom"\n\n'
-        "[model_providers.headroom]\n"
-        'name = "Headroom init proxy"\n'
-        f'base_url = "http://127.0.0.1:{port}/v1"\n'
-        'env_key = "OPENAI_API_KEY"\n'
-        "requires_openai_auth = true\n"
-        "supports_websockets = true\n"
-        f"{_CODEX_PROVIDER_MARKER_END}"
+        + build_codex_provider_section(
+            port=port,
+            name="Headroom init proxy",
+            include_markers=False,
+        )
+        + f"{_CODEX_PROVIDER_MARKER_END}"
     )
     content = path.read_text(encoding="utf-8") if path.exists() else ""
     content = _replace_marker_block(

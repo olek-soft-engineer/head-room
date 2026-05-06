@@ -203,6 +203,7 @@ def test_init_codex_merges_feature_flag_into_existing_table(monkeypatch, tmp_pat
     assert 'base_url = "http://127.0.0.1:9000/v1"' in content
     assert content.count("[features]") == 1
     assert "codex_hooks = true" in content
+    assert 'env_key = "OPENAI_API_KEY"' not in content
     hooks = json.loads((tmp_path / ".codex" / "hooks.json").read_text(encoding="utf-8"))
     assert "--profile init-local-demo" in hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     assert "init hook ensure" in hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
@@ -436,6 +437,7 @@ def test_ensure_codex_provider_replaces_existing_marker(monkeypatch, tmp_path: P
     assert content.count(init_cli._CODEX_PROVIDER_MARKER_START) == 1
     assert 'base_url = "http://127.0.0.1:9100/v1"' in content
     assert "old = true" not in content
+    assert 'env_key = "OPENAI_API_KEY"' not in content
 
 
 def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_path: Path) -> None:
