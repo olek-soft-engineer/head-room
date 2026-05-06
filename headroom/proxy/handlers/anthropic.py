@@ -846,6 +846,18 @@ class AnthropicHandlerMixin:
                         else None
                     )
 
+                    # F2.1 c5/5: derive the per-request CompressionPolicy
+                    # from the auth_mode classified at request entry. The
+                    # policy short-circuits CacheAligner for subscription
+                    # users (closes the cache-instability complaints in
+                    # #327/#388). When the enforcement env var is off, the
+                    # policy collapses to PAYG so behaviour is unchanged.
+                    # Hoisted here so all three pipeline.apply call sites
+                    # (token / non-cache / cache-delta) see the same policy.
+                    from headroom.transforms.compression_policy import resolve_policy
+
+                    compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
+
                     if is_token_mode(self.config.mode):
                         comp_cache = self._get_compression_cache(session_id)
 
@@ -890,6 +902,7 @@ class AnthropicHandlerMixin:
                                     frozen_message_count=frozen_message_count,
                                     biases=biases,
                                     request_id=request_id,
+                                    compression_policy=compression_policy,
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
                             )
@@ -929,6 +942,7 @@ class AnthropicHandlerMixin:
                                     frozen_message_count=frozen_message_count,
                                     biases=biases,
                                     request_id=request_id,
+                                    compression_policy=compression_policy,
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
                             )
@@ -959,6 +973,7 @@ class AnthropicHandlerMixin:
                                         frozen_message_count=0,
                                         biases=biases,
                                         request_id=request_id,
+                                        compression_policy=compression_policy,
                                     ),
                                     timeout=COMPRESSION_TIMEOUT_SECONDS,
                                 )

@@ -42,8 +42,7 @@ use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_anthropic_live_zone, AuthMode, BlockAction, ExclusionReason, LiveZoneError,
-    LiveZoneOutcome,
+    compress_anthropic_live_zone, BlockAction, ExclusionReason, LiveZoneError, LiveZoneOutcome,
 };
 use serde_json::Value;
 
@@ -326,7 +325,14 @@ pub fn compress_anthropic_request(
     // `NoChange` otherwise (live zone empty, every compressor
     // declined, or every compressor produced output whose token
     // count was not strictly less than the input's).
-    match compress_anthropic_live_zone(&dispatch_body, frozen_count, AuthMode::Payg, model) {
+    // F2.1 c2/6: forward F1's classified auth_mode into the dispatcher
+    // instead of the hard-coded `Payg`. The dispatcher itself doesn't
+    // change behaviour by mode in F2.1 (live-zone compression runs for
+    // every mode — closing #327/#388 means subscription users keep
+    // getting compression, not losing it). The plumbing here lets
+    // F2.2 vary per-block thresholds by mode without touching this
+    // call site again.
+    match compress_anthropic_live_zone(&dispatch_body, frozen_count, auth_mode.into(), model) {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
             let block_count = manifest.block_outcomes.len();
             let blocks_excluded = manifest

@@ -32,7 +32,7 @@ use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_openai_chat_live_zone, AuthMode, BlockAction, LiveZoneError, LiveZoneOutcome,
+    compress_openai_chat_live_zone, BlockAction, LiveZoneError, LiveZoneOutcome,
 };
 use serde_json::Value;
 
@@ -132,7 +132,10 @@ pub fn compress_openai_chat_request(
     let (dispatch_body, normalization_applied) =
         normalize_tool_definitions_openai_chat(body, &parsed, auth_mode, request_id);
 
-    match compress_openai_chat_live_zone(&dispatch_body, AuthMode::Payg, model) {
+    // F2.1 c2/6: forward F1's classified auth_mode into the dispatcher
+    // instead of the hard-coded `Payg`. See live_zone_anthropic.rs for
+    // the rationale — same wiring on the OpenAI chat path.
+    match compress_openai_chat_live_zone(&dispatch_body, auth_mode.into(), model) {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
             tracing::info!(
                 event = "compression_decision",

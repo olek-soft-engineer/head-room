@@ -422,6 +422,14 @@ class OpenAIHandlerMixin:
             try:
                 context_limit = self.openai_provider.get_context_limit(model)
 
+                # F2.1 c5/5: per-request CompressionPolicy. Hoisted out of
+                # the is_token_mode branch so the else (non-token) branch
+                # below can pass it through too. See the equivalent block
+                # in handlers/anthropic.py.
+                from headroom.transforms.compression_policy import resolve_policy
+
+                compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
+
                 if is_token_mode(self.config.mode):
                     comp_cache = self._get_compression_cache(openai_session_id)
 
@@ -439,6 +447,7 @@ class OpenAIHandlerMixin:
                             context=extract_user_query(working_messages),
                             frozen_message_count=openai_frozen_count,
                             biases=_hook_biases,
+                            compression_policy=compression_policy,
                         ),
                         timeout=COMPRESSION_TIMEOUT_SECONDS,
                     )
@@ -462,6 +471,7 @@ class OpenAIHandlerMixin:
                             context=extract_user_query(messages),
                             frozen_message_count=openai_frozen_count,
                             biases=_hook_biases,
+                            compression_policy=compression_policy,
                         ),
                         timeout=COMPRESSION_TIMEOUT_SECONDS,
                     )

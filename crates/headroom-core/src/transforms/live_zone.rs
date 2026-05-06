@@ -227,6 +227,22 @@ impl AuthMode {
     }
 }
 
+/// Map F1's classifier output (`crate::auth_mode::AuthMode`) to the
+/// dispatcher-local enum. The two enums differ only by `Unknown` (the
+/// dispatcher carries a sentinel for the case where a stored
+/// recommendation row didn't include an auth tag); F1 always returns
+/// one of the three real classes, so this `From` is total and
+/// infallible.
+impl From<crate::auth_mode::AuthMode> for AuthMode {
+    fn from(mode: crate::auth_mode::AuthMode) -> Self {
+        match mode {
+            crate::auth_mode::AuthMode::Payg => AuthMode::Payg,
+            crate::auth_mode::AuthMode::OAuth => AuthMode::OAuth,
+            crate::auth_mode::AuthMode::Subscription => AuthMode::Subscription,
+        }
+    }
+}
+
 /// Per-block decision recorded for observability. Independent of
 /// whether the body was actually rewritten.
 #[derive(Debug, Clone)]
