@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **PyPI install clarity and release gating.** Documented `pipx --python python3.13`
+  for environments where unsupported Python wheel tags cause older-version
+  resolution, made PyPI publish failures block GitHub Releases unless
+  `PYPI_SKIP=true`, and added an sdist `LICENSE` invariant.
+
 - **`Learned: error recovery` section in MEMORY.md no longer bloats with
   stale, one-shot, or contradictory entries.** The matchers paired up
   unrelated tool calls (e.g. `state.rs` and `lib.rs` in the same dir

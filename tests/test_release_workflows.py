@@ -38,7 +38,7 @@ def test_release_workflow_publishes_python_distributions_to_github_release() -> 
     assert 'gh release upload "$TAG" release-assets/*.tgz --clobber' in content
 
 
-def test_create_release_runs_after_successful_build_even_if_other_publishes_fail() -> None:
+def test_create_release_requires_successful_build_and_pypi_publish() -> None:
     content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
     # Single-wheel maturin refactor (PR #360) added `build-wheels` (the
@@ -60,6 +60,7 @@ def test_create_release_runs_after_successful_build_even_if_other_publishes_fail
     assert "needs.build-wheels.result == 'success'" in content
     assert "needs.collect-dist.result == 'success'" in content
     assert "needs.smoke-import-wheels.result == 'success'" in content
+    assert "(vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')" in content
 
 
 def test_macos_native_wrapper_dependency_install_retries_pypi_downloads() -> None:
@@ -491,6 +492,46 @@ def test_sdist_build_conditional_keyed_on_target_not_os() -> None:
         f"sdist build conditional must NOT depend on `matrix.os` — that's "
         f"how PR #376 silently disabled the sdist build. Got: {if_line!r}"
     )
+
+
+def test_release_workflow_verifies_versions_before_build_outputs() -> None:
+    """Release sync must be followed by an explicit cross-package version gate."""
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    assert "scripts/verify-versions.py" in content
+    assert "scripts/version-sync.py" in content
+    assert content.count("python scripts/verify-versions.py") >= 2
+
+    first_sync = content.index("python scripts/version-sync.py --version")
+    first_verify = content.index("python scripts/verify-versions.py", first_sync)
+    changelog = content.index("name: Run changelog generation", first_verify)
+    assert first_sync < first_verify < changelog
+
+    second_sync = content.index("python scripts/version-sync.py --version", first_verify)
+    second_verify = content.index("python scripts/verify-versions.py", second_sync)
+    build_wheels = content.index("name: Build wheels", second_verify)
+    assert second_sync < second_verify < build_wheels
+
+
+def test_sdist_license_is_packaged_and_verified_before_upload() -> None:
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    release_yml = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    assert 'include = [{ path = "LICENSE", format = "sdist" }]' in pyproject
+    assert "name: Verify sdist includes top-level LICENSE" in release_yml
+    assert 'license_path = f"{root}/LICENSE"' in release_yml
+
+
+def test_pypi_publish_failure_blocks_github_release() -> None:
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    pypi_job_start = content.index("publish-pypi:")
+    npm_job_start = content.index("publish-npm:", pypi_job_start)
+    pypi_job = content[pypi_job_start:npm_job_start]
+
+    assert "uses: pypa/gh-action-pypi-publish@release/v1" in pypi_job
+    assert "continue-on-error: true" not in pypi_job
+    assert "(vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')" in content
 
 
 def test_glibc_compat_shim_present_in_headroom_py() -> None:
