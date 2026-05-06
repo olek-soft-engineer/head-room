@@ -42,8 +42,7 @@ use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_anthropic_live_zone, BlockAction, ExclusionReason, LiveZoneError,
-    LiveZoneOutcome,
+    compress_anthropic_live_zone, BlockAction, ExclusionReason, LiveZoneError, LiveZoneOutcome,
 };
 use serde_json::Value;
 
