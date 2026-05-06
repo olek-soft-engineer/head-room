@@ -553,10 +553,6 @@ def _inject_codex_provider_config(port: int) -> None:
       ``model_provider``, so without this override it bypasses the proxy and
       hits ``https://chatgpt.com/backend-api/codex`` directly.
 
-    A ``[model_providers.headroom]`` section is also written with
-    ``supports_websockets = true`` so that WebSocket transport (used by
-    default) also flows through the proxy for API-key users.
-
     Safe to call multiple times — the injected block is fully replaced on
     each call, so re-running with a different ``port`` updates the config.
     Before the first injection, the pre-wrap file is snapshotted to
@@ -583,7 +579,6 @@ def _inject_codex_provider_config(port: int) -> None:
         "[model_providers.headroom]\n"
         'name = "OpenAI via Headroom proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
-        f"requires_openai_auth = true\n"
         f"supports_websockets = true\n"
         f"{_CODEX_END_MARKER}\n"
     )
@@ -613,10 +608,7 @@ def _inject_codex_provider_config(port: int) -> None:
             content = top_level_block + "\n" + provider_section
 
         config_file.write_text(content)
-        click.echo(
-            f"  Codex config: injected Headroom provider (WS + HTTP, API-key + subscription)"
-            f" into {config_file}"
-        )
+        click.echo(f"  Codex config: injected Headroom provider (WS + HTTP) into {config_file}")
     except Exception as e:
         click.echo(f"  Warning: could not update Codex config: {e}")
 
