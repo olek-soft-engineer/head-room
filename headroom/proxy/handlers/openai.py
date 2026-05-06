@@ -1915,9 +1915,14 @@ class OpenAIHandlerMixin:
                 # deregister / metrics / stage-timings emission as usual.
                 return
 
-            # PR-C5: WebSocket /v1/responses no longer compresses in Python.
-            # The Rust handler covers item-aware compression; the WS first
-            # frame is now passed through unmodified.
+            # PR-C5 retired Python compression on this path expecting the
+            # standalone Rust proxy binary to take over. That binary is not
+            # deployed by the CLI today (`headroom proxy` runs only Python
+            # via uvicorn). Hot-fix follow-up to PR #406: the first frame
+            # is now compressed via the inline PyO3 binding right before
+            # upstream send (see the compression block further below).
+            # Subsequent client→upstream frames in the relay loop remain
+            # unmodified — multi-frame compression is a separate follow-up.
             body: dict[str, Any] = {}
             tokens_saved = 0
             try:
@@ -2062,6 +2067,76 @@ class OpenAIHandlerMixin:
                     first_msg_raw = json.dumps(body)
                 except Exception as e:
                     logger.warning(f"[{request_id}] WS Memory injection failed: {e}")
+
+            # Hot-fix follow-up to PR #406 — inline Rust compression on the
+            # WS first frame before forwarding upstream. PR #406 enabled
+            # the same call for HTTP /v1/responses; PR-C5's "WS-side
+            # compression is a follow-up" note is closed here. Codex
+            # subscription users default to WebSocket transport for
+            # /v1/responses (proxy-confirmed via #409 reviewer testing),
+            # so without this call subscription traffic flows through
+            # Headroom uncompressed.
+            #
+            # The first frame may be either:
+            #   • {"type": "response.create", "response": {...payload...}}
+            #   • the payload directly (older shapes)
+            # We unwrap, compress the inner payload via the PyO3 dispatcher,
+            # and re-wrap so both shapes work.
+            #
+            # Re-parses from `first_msg_raw` rather than reusing `body`
+            # because `body` may be partially mutated if memory injection
+            # raised an exception above (in which case `first_msg_raw` is
+            # the canonical pre-memory bytes that will actually be sent
+            # upstream). The PyO3 binding never raises (passthrough on
+            # internal errors), but we wrap the call site in try/except
+            # anyway so a JSON-shape edge case can never break the WS
+            # session.
+            if self.config.optimize:
+                try:
+                    from headroom._core import (
+                        compress_openai_responses_live_zone as _rust_compress_responses,
+                    )
+
+                    _ws_auth_mode = classify_auth_mode(ws_headers)
+                    try:
+                        _send_body = json.loads(first_msg_raw)
+                    except json.JSONDecodeError:
+                        _send_body = None
+
+                    if isinstance(_send_body, dict):
+                        _wrapped = "response" in _send_body and isinstance(
+                            _send_body["response"], dict
+                        )
+                        _inner = _send_body["response"] if _wrapped else _send_body
+                        _model = (_inner.get("model") if isinstance(_inner, dict) else None) or ""
+
+                        _inner_bytes = json.dumps(_inner).encode("utf-8")
+                        _new_bytes, _modified = _rust_compress_responses(
+                            _inner_bytes,
+                            _ws_auth_mode.value,
+                            _model,
+                        )
+                        if _modified:
+                            try:
+                                _new_inner = json.loads(_new_bytes)
+                            except json.JSONDecodeError:
+                                _new_inner = None
+                            if isinstance(_new_inner, dict):
+                                if _wrapped:
+                                    _send_body["response"] = _new_inner
+                                else:
+                                    _send_body = _new_inner
+                                first_msg_raw = json.dumps(_send_body)
+                                logger.info(
+                                    f"[{request_id}] WS /v1/responses compressed "
+                                    f"{len(_inner_bytes):,}→{len(_new_bytes):,} bytes "
+                                    f"(auth_mode={_ws_auth_mode.value})"
+                                )
+                except Exception as _ce:
+                    logger.warning(
+                        f"[{request_id}] WS /v1/responses compression failed; "
+                        f"forwarding original frame: {type(_ce).__name__}: {_ce}"
+                    )
 
             # --- Connect to upstream OpenAI WebSocket ---
             logger.info(f"[{request_id}] WS /v1/responses connecting to {upstream_url}")
