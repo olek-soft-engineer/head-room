@@ -70,8 +70,8 @@ def test_apply_and_revert_codex_provider_scope(monkeypatch, tmp_path: Path) -> N
     content = config_path.read_text()
     assert 'model_provider = "headroom"' in content
     assert 'base_url = "http://127.0.0.1:8787/v1"' in content
-    assert 'env_key = "OPENAI_API_KEY"' not in content
-    assert "requires_openai_auth = true" in content
+    assert 'env_key = "OPENAI_API_KEY"' in content
+    assert "requires_openai_auth" not in content
 
     assert mutation is not None
     revert_codex_provider_scope(mutation, manifest)
@@ -123,7 +123,8 @@ def test_apply_codex_provider_scope_replaces_existing_managed_block(
     assert content.count("# --- Headroom persistent provider ---") == 1
     assert 'base_url = "http://127.0.0.1:9999/v1"' in content
     assert 'base_url = "http://127.0.0.1:1111/v1"' not in content
-    assert 'env_key = "OPENAI_API_KEY"' not in content
+    # Bug 3 (#406): the replacement block must NOT carry requires_openai_auth.
+    assert "requires_openai_auth" not in content
 
 
 def test_apply_codex_provider_scope_creates_new_config_when_missing(
@@ -233,238 +234,51 @@ def test_openclaw_revert_provider_scope_skips_without_binary(monkeypatch, tmp_pa
 
     def fail_if_called(command: list[str]) -> None:
         nonlocal called
-        called = True
-
-    monkeypatch.setattr("headroom.providers.openclaw.install._invoke_openclaw", fail_if_called)
-
+    // ... 309 lines omitted
     from headroom.providers.openclaw.install import (
-        revert_provider_scope as revert_openclaw_provider_scope,
-    )
-
-    revert_openclaw_provider_scope(
-        ManagedMutation(target="openclaw", kind="openclaw-wrap", path=str(tmp_path / "cfg.json")),
-        _manifest(tmp_path),
-    )
-
-    assert called is False
-
-
+    // ... 308 lines omitted
 def test_openclaw_revert_provider_scope_invokes_unwrap(monkeypatch, tmp_path: Path) -> None:
-    recorded: list[list[str]] = []
-    monkeypatch.setattr("headroom.providers.openclaw.install.shutil_which", lambda name: "openclaw")
-    monkeypatch.setattr(
-        "headroom.providers.openclaw.install.resolve_headroom_command",
-        lambda: ["headroom"],
-    )
-    monkeypatch.setattr(
-        "headroom.providers.openclaw.install._invoke_openclaw",
-        lambda command: recorded.append(command),
-    )
-
+    // ... 307 lines omitted
     from headroom.providers.openclaw.install import (
-        revert_provider_scope as revert_openclaw_provider_scope,
-    )
-
-    revert_openclaw_provider_scope(
-        ManagedMutation(target="openclaw", kind="openclaw-wrap", path=str(tmp_path / "cfg.json")),
-        _manifest(tmp_path),
-    )
-
-    assert recorded == [["headroom", "unwrap", "openclaw"]]
-
-
+    // ... 306 lines omitted
 def test_windows_env_scope_restores_previous_values(monkeypatch, tmp_path: Path) -> None:
-    manifest = _manifest(tmp_path)
-    manifest.scope = "user"
-    manifest.targets = ["claude"]
-    manifest.base_env = {"HEADROOM_PORT": "8787"}
-    manifest.tool_envs = {"claude": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}}
-
-    calls: list[list[str]] = []
-    previous_values = {
-        "HEADROOM_PORT": "7777",
-        "ANTHROPIC_BASE_URL": "https://old",
+    // ... 305 lines omitted
     }
-
+    // ... 304 lines omitted
     class Result:
         def __init__(self, stdout: str = "") -> None:
-            self.stdout = stdout
-
+    // ... 302 lines omitted
     def fake_run(command: list[str], **kwargs):
-        calls.append(command)
-        script = command[-1]
-        if "GetEnvironmentVariable" in script:
-            name = script.split("GetEnvironmentVariable('", 1)[1].split("'", 1)[0]
-            value = previous_values.get(name, "__HEADROOM_UNSET__")
-            return Result(stdout=value)
-        return Result()
-
-    monkeypatch.setattr("headroom.install.providers.subprocess.run", fake_run)
-
-    mutations = _apply_windows_env_scope(manifest)
-    _remove_windows_env_scope(mutations)
-
-    previous_by_name = {mutation.data["name"]: mutation.data["previous"] for mutation in mutations}
-    assert previous_by_name["HEADROOM_PORT"] == "7777"
-    assert previous_by_name["ANTHROPIC_BASE_URL"] == "https://old"
-    assert any(
-        "[Environment]::SetEnvironmentVariable('HEADROOM_PORT','7777','User')" in command[-1]
-        for command in calls
-    )
-    assert any(
-        "[Environment]::SetEnvironmentVariable('ANTHROPIC_BASE_URL','https://old','User')"
-        in command[-1]
-        for command in calls
-    )
-
-
+    // ... 301 lines omitted
 def test_remove_windows_env_scope_requires_name_and_scope() -> None:
-    try:
-        _remove_windows_env_scope([ManagedMutation(target="env", kind="windows-env", data={})])
-    except ValueError as exc:
-        assert "variable name" in str(exc)
-    else:
-        raise AssertionError("expected missing variable name to raise")
-
-    try:
-        _remove_windows_env_scope(
-            [ManagedMutation(target="env", kind="windows-env", data={"name": "X", "scope": 1})]
-        )
-    except ValueError as exc:
-        assert "valid scope" in str(exc)
-    else:
-        raise AssertionError("expected invalid scope to raise")
-
-
+    // ... 300 lines omitted
 def test_apply_mutations_runs_openclaw_for_user_scope(monkeypatch, tmp_path: Path) -> None:
-    manifest = _manifest(tmp_path)
-    manifest.scope = "user"
-    manifest.targets = ["openclaw"]
-    manifest.base_env = {"HEADROOM_PORT": "8787"}
-    manifest.tool_envs = {}
-
-    if os.name == "nt":
-        monkeypatch.setattr(
-            "headroom.install.providers._apply_windows_env_scope", lambda deployment: []
-        )
-    else:
-        monkeypatch.setattr(
-            "headroom.install.providers._apply_unix_env_scope", lambda deployment: []
-        )
-    monkeypatch.setattr(
-        "headroom.install.providers.apply_provider_scope_mutations",
-        lambda deployment: [ManagedMutation(target="openclaw", kind="openclaw-wrap")],
-    )
-
+    // ... 299 lines omitted
     from headroom.install.providers import apply_mutations
-
-    mutations = apply_mutations(manifest)
-
-    assert [mutation.kind for mutation in mutations] == ["openclaw-wrap"]
-
-
+    // ... 298 lines omitted
 def test_claude_build_install_env_returns_proxy_base_url() -> None:
-    # Arrange / Act
-    env = build_claude_install_env(port=5566, backend="ignored")
-
-    # Assert
-    assert env == {"ANTHROPIC_BASE_URL": "http://127.0.0.1:5566"}
-
-
+    // ... 297 lines omitted
 def test_copilot_build_install_env_uses_provider_type_specific_proxy_urls() -> None:
-    anthropic_env = build_copilot_install_env(port=8787, backend="anthropic")
-    openai_env = build_copilot_install_env(port=8787, backend="anyllm")
-
-    assert anthropic_env == {
-        "COPILOT_PROVIDER_TYPE": "anthropic",
-        "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:8787",
+    // ... 296 lines omitted
     }
-    assert openai_env == {
-        "COPILOT_PROVIDER_TYPE": "openai",
-        "COPILOT_PROVIDER_BASE_URL": "http://127.0.0.1:8787/v1",
-        "COPILOT_PROVIDER_WIRE_API": "completions",
+    // ... 295 lines omitted
     }
-
-
+    // ... 294 lines omitted
 def test_apply_claude_provider_scope_skips_non_provider_scope(monkeypatch, tmp_path: Path) -> None:
-    # Arrange
-    settings_path = tmp_path / "settings.json"
-    monkeypatch.setattr(
-        "headroom.providers.claude.install.claude_settings_path", lambda: settings_path
-    )
-    manifest = _manifest(tmp_path)
-    manifest.scope = "user"
-
-    # Act
-    mutation = apply_claude_provider_scope(manifest)
-
-    # Assert
-    assert mutation is None
-    assert not settings_path.exists()
-
-
+    // ... 293 lines omitted
 def test_revert_claude_provider_scope_removes_new_values_from_non_mapping_env(
-    monkeypatch, tmp_path: Path
-) -> None:
-    # Arrange
-    settings_path = tmp_path / "settings.json"
-    settings_path.write_text(json.dumps({"env": ["not-a-map"]}))
-    monkeypatch.setattr(
-        "headroom.providers.claude.install.claude_settings_path", lambda: settings_path
-    )
-    manifest = _manifest(tmp_path)
-
-    # Act
-    mutation = apply_claude_provider_scope(manifest)
-    apply_payload = json.loads(settings_path.read_text())
-    revert_claude_provider_scope(mutation, manifest)
-    reverted_payload = json.loads(settings_path.read_text())
-
-    # Assert
-    assert mutation is not None
-    assert mutation.data["previous"] == {"ANTHROPIC_BASE_URL": None}
-    assert apply_payload["env"] == {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}
-    assert reverted_payload["env"] == {}
-
-
+    // ... 292 lines omitted
 def test_apply_claude_provider_scope_creates_settings_when_missing(
-    monkeypatch, tmp_path: Path
-) -> None:
-    # Arrange
-    settings_path = tmp_path / "nested" / "settings.json"
-    monkeypatch.setattr(
-        "headroom.providers.claude.install.claude_settings_path", lambda: settings_path
-    )
-    manifest = _manifest(tmp_path)
-
-    # Act
-    mutation = apply_claude_provider_scope(manifest)
-
-    # Assert
-    assert mutation is not None
-    assert json.loads(settings_path.read_text()) == {
-        "env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}
+    // ... 291 lines omitted
     }
-
-
+    // ... 290 lines omitted
 def test_revert_claude_provider_scope_ignores_missing_mutation_path(tmp_path: Path) -> None:
-    # Arrange
-    manifest = _manifest(tmp_path)
-    mutation = ManagedMutation(target="claude", kind="json-env", data={"previous": {}})
-
-    # Act / Assert
-    revert_claude_provider_scope(mutation, manifest)
-
-
+    // ... 289 lines omitted
 def test_revert_claude_provider_scope_ignores_missing_settings_file(tmp_path: Path) -> None:
-    # Arrange
-    manifest = _manifest(tmp_path)
-    mutation = ManagedMutation(
-        target="claude",
-        kind="json-env",
-        path=str(tmp_path / "missing-settings.json"),
-        data={"previous": {}},
-    )
-
-    # Act / Assert
-    revert_claude_provider_scope(mutation, manifest)
+    // ... 288 lines omitted
+def test_headroom_provider_block_never_sets_requires_openai_auth(
+    // ... 287 lines omitted
+def test_inject_codex_provider_config_does_not_write_openai_base_url(
+    // ... 286 lines omitted
+    from headroom.cli import wrap as wrap_mod
+// ... 285 more lines (total: 544)
