@@ -489,7 +489,8 @@ def test_headroom_provider_block_never_sets_requires_openai_auth(
     for port in (8787, 9999):
         config_path = tmp_path / f"config_{port}.toml"
         monkeypatch.setattr(
-            "headroom.providers.codex.install.codex_config_path", lambda: config_path
+            "headroom.providers.codex.install.codex_config_path",
+            lambda _p=config_path: _p,
         )
         manifest = _manifest(tmp_path)
         manifest.port = port

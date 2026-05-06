@@ -563,8 +563,12 @@ def verify_codex_wrap(
         'env_key = "OPENAI_API_KEY"' not in config,
         "Codex wrap should preserve OAuth and never inject env_key",
     )
-    for expected in ("requires_openai_auth = true", "supports_websockets = true"):
-        assert_true(expected in config, f"Codex wrap missing {expected!r}")
+    # Bug 3 (#406): requires_openai_auth must be absent from headroom provider blocks.
+    assert_true(
+        "requires_openai_auth" not in config,
+        "Codex wrap must NOT inject requires_openai_auth into the headroom provider block",
+    )
+    assert_true("supports_websockets = true" in config, "Codex wrap missing 'supports_websockets = true'")
 
     entries = read_jsonl(log_dir / "codex.jsonl")
     assert_true(len(entries) > 0, "Codex shim should have been invoked")
