@@ -1475,6 +1475,43 @@ class OpenAIHandlerMixin:
         else:
             url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/responses")
 
+        # Hot-fix (post-PR-C5): re-enable /v1/responses compression via the
+        # PyO3 inline call to the Rust live-zone dispatcher. PR-C5 retired
+        # the Python pipeline expecting that the standalone
+        # `crates/headroom-proxy` Rust binary would sit in front of the
+        # Python proxy and compress here. That binary is not deployed by
+        # the CLI today (`headroom proxy`, `headroom wrap codex` both run
+        # only the Python proxy), so /v1/responses traffic has been
+        # uncompressed since v0.20.16. This call closes that gap by
+        # invoking the same dispatcher in-process via `headroom._core`.
+        # All policy gating already happened upstream (auth_mode classify,
+        # CompressionPolicy resolve at request entry).
+        if self.config.optimize:
+            try:
+                from headroom._core import (
+                    compress_openai_responses_live_zone as _rust_compress_responses,
+                )
+
+                _input_bytes = json.dumps(body).encode("utf-8")
+                _new_bytes, _modified = _rust_compress_responses(
+                    _input_bytes,
+                    auth_mode.value,
+                    model,
+                )
+                if _modified:
+                    body = json.loads(_new_bytes)
+                    transforms_applied = list(transforms_applied) + ["openai_responses_live_zone"]
+                    logger.info(
+                        f"[{request_id}] /v1/responses compressed "
+                        f"{len(_input_bytes):,}→{len(_new_bytes):,} bytes "
+                        f"(auth_mode={auth_mode.value})"
+                    )
+            except Exception as _e:
+                logger.warning(
+                    f"[{request_id}] /v1/responses compression failed; "
+                    f"forwarding original body: {type(_e).__name__}: {_e}"
+                )
+
         try:
             if stream:
                 # Streaming for Responses API uses semantic events
