@@ -70,7 +70,7 @@ def test_apply_and_revert_codex_provider_scope(monkeypatch, tmp_path: Path) -> N
     content = config_path.read_text()
     assert 'model_provider = "headroom"' in content
     assert 'base_url = "http://127.0.0.1:8787/v1"' in content
-    assert 'env_key = "OPENAI_API_KEY"' in content
+    assert 'env_key = "OPENAI_API_KEY"' not in content
     assert "requires_openai_auth" not in content
 
     assert mutation is not None

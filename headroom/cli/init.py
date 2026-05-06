@@ -253,7 +253,6 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
         "[model_providers.headroom]\n"
         'name = "Headroom init proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
-        'env_key = "OPENAI_API_KEY"\n'
         "supports_websockets = true\n"
         f"{_CODEX_PROVIDER_MARKER_END}"
     )

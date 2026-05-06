@@ -52,7 +52,6 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
         "[model_providers.headroom]\n"
         'name = "Headroom persistent proxy"\n'
         f'base_url = "{proxy_base_url(manifest.port)}"\n'
-        'env_key = "OPENAI_API_KEY"\n'
         "supports_websockets = true\n"
         f"{_CODEX_MARKER_END}\n"
     )
