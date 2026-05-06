@@ -606,3 +606,84 @@ def test_unwrap_removes_top_level_openai_base_url(
         f"got:\n{stripped}"
     )
     assert 'model = "gpt-4o"' in stripped
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 (#406): openai_base_url must appear in persistent-install and init paths
+# ---------------------------------------------------------------------------
+
+
+def test_apply_provider_scope_writes_openai_base_url(monkeypatch, tmp_path: Path) -> None:
+    """apply_provider_scope must write openai_base_url at the top level (not inside
+    a [model_providers.*] block) so subscription (ChatGPT plan) users are routed
+    through headroom regardless of which entry point they used."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('model = "gpt-4o"\n')
+    monkeypatch.setattr("headroom.providers.codex.install.codex_config_path", lambda: config_path)
+    manifest = _manifest(tmp_path)
+    manifest.port = 8787
+
+    apply_codex_provider_scope(manifest)
+
+    content = config_path.read_text()
+    # Must be present as a top-level key.
+    assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content, (
+        f"openai_base_url missing from persistent-install config:\n{content}"
+    )
+    # Must NOT be inside any [model_providers.*] block — the key must appear
+    # before the first [section] header that follows it.
+    lines = content.splitlines()
+    in_provider_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_provider_section = True
+        if in_provider_section and stripped.startswith("openai_base_url"):
+            raise AssertionError(
+                f"openai_base_url appeared inside a section block:\n{content}"
+            )
+    # Bug 3 regression: requires_openai_auth must NOT appear.
+    assert "requires_openai_auth" not in content, (
+        f"requires_openai_auth must not be present in config:\n{content}"
+    )
+
+
+def test_persistent_install_strip_removes_openai_base_url(monkeypatch, tmp_path: Path) -> None:
+    """revert_provider_scope must remove openai_base_url during uninstall, and
+    must also clean up orphaned openai_base_url lines left by a crashed install."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('model = "gpt-4o"\n')
+    monkeypatch.setattr("headroom.providers.codex.install.codex_config_path", lambda: config_path)
+    manifest = _manifest(tmp_path)
+    manifest.port = 8787
+
+    mutation = apply_codex_provider_scope(manifest)
+    assert mutation is not None
+    assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in config_path.read_text()
+
+    revert_codex_provider_scope(mutation, manifest)
+
+    reverted = config_path.read_text()
+    assert "openai_base_url" not in reverted, (
+        f"openai_base_url must be removed after revert:\n{reverted}"
+    )
+    assert "requires_openai_auth" not in reverted
+    # User's original content must survive.
+    assert 'model = "gpt-4o"' in reverted
+
+    # Also verify orphan-cleanup path: revert on a config where openai_base_url
+    # was left outside the marker block (crash-recovery scenario).
+    config_path.write_text(
+        'model = "gpt-4o"\n'
+        'openai_base_url = "http://127.0.0.1:8787/v1"\n'
+        'model_provider = "headroom"\n'
+    )
+    revert_codex_provider_scope(
+        ManagedMutation(target="codex", kind="toml-block", path=str(config_path)),
+        manifest,
+    )
+    orphan_reverted = config_path.read_text()
+    assert "openai_base_url" not in orphan_reverted, (
+        f"orphaned openai_base_url must be removed by revert:\n{orphan_reverted}"
+    )
+    assert 'model = "gpt-4o"' in orphan_reverted

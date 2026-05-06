@@ -17,6 +17,20 @@ _CODEX_PATTERN = re.compile(
     re.DOTALL,
 )
 
+# Orphan-key patterns: strip any top-level keys that a crashed or partial write
+# may have left outside the marker block.
+_ORPHAN_MODEL_PROVIDER = re.compile(
+    r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n'
+)
+_ORPHAN_OPENAI_BASE_URL = re.compile(
+    r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n'
+)
+_ORPHAN_HEADROOM_TABLE = re.compile(
+    r"(?ms)^\[model_providers\.headroom\][^\[]*?"
+    r'base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[^\[]*?'
+    r"(?=^\[|\Z)"
+)
+
 
 def build_install_env(*, port: int, backend: str) -> dict[str, str]:
     """Build the persistent install environment for Codex."""
@@ -33,7 +47,8 @@ def apply_provider_scope(manifest: DeploymentManifest) -> ManagedMutation | None
     path.parent.mkdir(parents=True, exist_ok=True)
     section = (
         f"{_CODEX_MARKER_START}\n"
-        'model_provider = "headroom"\n\n'
+        'model_provider = "headroom"\n'
+        f'openai_base_url = "{proxy_base_url(manifest.port)}"\n\n'
         "[model_providers.headroom]\n"
         'name = "Headroom persistent proxy"\n'
         f'base_url = "{proxy_base_url(manifest.port)}"\n'
@@ -62,6 +77,12 @@ def revert_provider_scope(mutation: ManagedMutation, manifest: DeploymentManifes
     if not path.exists():
         return
     content = path.read_text()
-    if _CODEX_MARKER_START not in content:
-        return
-    path.write_text(_CODEX_PATTERN.sub("", content).strip() + "\n")
+    # Remove the managed marker block.
+    if _CODEX_MARKER_START in content:
+        content = _CODEX_PATTERN.sub("", content)
+    # Strip any orphan top-level keys that a crashed or partial write may have
+    # left outside the marker block (mirrors wrap.py _strip_codex_headroom_blocks).
+    content = _ORPHAN_MODEL_PROVIDER.sub("", content)
+    content = _ORPHAN_OPENAI_BASE_URL.sub("", content)
+    content = _ORPHAN_HEADROOM_TABLE.sub("", content)
+    path.write_text(content.strip() + "\n")

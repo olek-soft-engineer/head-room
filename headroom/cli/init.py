@@ -207,11 +207,49 @@ def _replace_marker_block(content: str, marker_start: str, marker_end: str, bloc
     return (content.rstrip() + "\n\n" + block.strip() + "\n").lstrip()
 
 
+def _strip_codex_init_block(content: str) -> str:
+    """Remove all Headroom init-managed blocks and orphan keys from a Codex config.toml string."""
+    import re
+
+    # Remove any provider marker → end marker span, possibly repeated.
+    while _CODEX_PROVIDER_MARKER_START in content and _CODEX_PROVIDER_MARKER_END in content:
+        start = content.index(_CODEX_PROVIDER_MARKER_START)
+        end_idx = content.index(_CODEX_PROVIDER_MARKER_END, start)
+        if end_idx < start:
+            break
+        end = end_idx + len(_CODEX_PROVIDER_MARKER_END)
+        content = content[:start].rstrip("\n") + "\n" + content[end:].lstrip("\n")
+
+    # Remove stale unpaired markers.
+    content = content.replace(_CODEX_PROVIDER_MARKER_START + "\n", "")
+    content = content.replace(_CODEX_PROVIDER_MARKER_END + "\n", "")
+
+    # Strip any orphan top-level keys that a crashed or partial write may have
+    # left outside the marker block.
+    content = re.sub(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n', "", content)
+    content = re.sub(
+        r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n',
+        "",
+        content,
+    )
+
+    # Strip any orphaned [model_providers.headroom] table that is recognisably ours.
+    orphan_headroom_table = re.compile(
+        r"(?ms)^\[model_providers\.headroom\][^\[]*?"
+        r'base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[^\[]*?'
+        r"(?=^\[|\Z)"
+    )
+    content = orphan_headroom_table.sub("", content)
+
+    return content.lstrip("\n").rstrip() + "\n" if content.strip() else ""
+
+
 def _ensure_codex_provider(path: Path, port: int) -> None:
     logger.debug("ensure codex provider block: %s (port=%s)", path, port)
     block = (
         f"{_CODEX_PROVIDER_MARKER_START}\n"
-        'model_provider = "headroom"\n\n'
+        'model_provider = "headroom"\n'
+        f'openai_base_url = "http://127.0.0.1:{port}/v1"\n\n'
         "[model_providers.headroom]\n"
         'name = "Headroom init proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'

@@ -925,3 +925,70 @@ def test_init_hook_ensure_uses_explicit_profile(monkeypatch) -> None:
 
     assert result.exit_code == 0, result.output
     assert ensured == ["init-explicit"]
+
+
+# ---------------------------------------------------------------------------
+# Bug 3 (#406): _ensure_codex_provider must inject openai_base_url
+# ---------------------------------------------------------------------------
+
+
+def test_init_codex_writes_openai_base_url(monkeypatch, tmp_path: Path) -> None:
+    """_ensure_codex_provider must write openai_base_url at the top level so that
+    subscription (ChatGPT plan) users are routed through headroom even when the
+    init entry point is used instead of wrap."""
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / ".codex" / "config.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    content = path.read_text(encoding="utf-8")
+    assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content, (
+        f"openai_base_url missing from init codex config:\n{content}"
+    )
+    # Must NOT appear inside a [section] block.
+    lines = content.splitlines()
+    in_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_section = True
+        if in_section and stripped.startswith("openai_base_url"):
+            raise AssertionError(
+                f"openai_base_url appeared inside a section block in init output:\n{content}"
+            )
+    # Bug 3 regression guard.
+    assert "requires_openai_auth" not in content, (
+        f"requires_openai_auth must not appear in init codex config:\n{content}"
+    )
+
+
+def test_init_codex_strip_removes_openai_base_url(monkeypatch, tmp_path: Path) -> None:
+    """_strip_codex_init_block must remove both the managed block and any orphaned
+    openai_base_url lines left by a crashed or partial init."""
+    init_cli, _ = _load_init_module(monkeypatch)
+
+    # Normal install-then-strip cycle.
+    path = tmp_path / "config.toml"
+    path.write_text('model = "gpt-4o"\n', encoding="utf-8")
+    init_cli._ensure_codex_provider(path, 8787)
+    assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in path.read_text(encoding="utf-8")
+
+    stripped = init_cli._strip_codex_init_block(path.read_text(encoding="utf-8"))
+    assert "openai_base_url" not in stripped, (
+        f"_strip_codex_init_block must remove openai_base_url after install:\n{stripped}"
+    )
+    assert "requires_openai_auth" not in stripped
+    assert 'model = "gpt-4o"' in stripped
+
+    # Orphan-cleanup path: openai_base_url left outside marker block.
+    orphan_content = (
+        'model = "gpt-4o"\n'
+        'openai_base_url = "http://127.0.0.1:8787/v1"\n'
+        'model_provider = "headroom"\n'
+    )
+    orphan_stripped = init_cli._strip_codex_init_block(orphan_content)
+    assert "openai_base_url" not in orphan_stripped, (
+        f"_strip_codex_init_block must remove orphaned openai_base_url:\n{orphan_stripped}"
+    )
+    assert 'model = "gpt-4o"' in orphan_stripped
