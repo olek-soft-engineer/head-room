@@ -51,6 +51,8 @@ on:
       - ".github/workflows/docker.yml"
       - "crates/headroom-py/**"
       - "pyproject.toml"
+      - "scripts/verify-versions.py"
+      - "scripts/version-sync.py"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -121,6 +123,10 @@ jobs:
       - name: Sync version to package files
         run: |
           python scripts/version-sync.py --version ${{ needs.detect-version.outputs.npm_version }}
+
+      - name: Verify package versions are synchronized
+        run: |
+          python scripts/verify-versions.py
 
       - name: Run changelog generation
         run: |
@@ -249,6 +255,10 @@ jobs:
         run: |
           python scripts/version-sync.py --version ${{ needs.detect-version.outputs.npm_version }}
 
+      - name: Verify package versions are synchronized
+        run: |
+          python scripts/verify-versions.py
+
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -284,6 +294,32 @@ jobs:
         with:
           command: sdist
           args: --out dist
+
+      - name: Verify sdist includes top-level LICENSE
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+
+          sdists = sorted(Path("dist").glob("*.tar.gz"))
+          if len(sdists) != 1:
+              raise SystemExit(f"expected exactly one sdist in dist/, found {len(sdists)}")
+
+          with tarfile.open(sdists[0], "r:gz") as archive:
+              names = archive.getnames()
+
+          roots = {name.split("/", 1)[0] for name in names if "/" in name}
+          if len(roots) != 1:
+              raise SystemExit(f"expected one sdist root directory, found {sorted(roots)}")
+
+          root = roots.pop()
+          license_path = f"{root}/LICENSE"
+          if license_path not in names:
+              raise SystemExit(f"{sdists[0].name} is missing {license_path}")
+
+          print(f"sdist LICENSE OK: {license_path}")
+          PY
 
       # Audit each Linux wheel's dynamic symbol references against its
       # declared manylinux glibc floor. Catches the bug class from
@@ -580,12 +616,6 @@ jobs:
       - name: Publish ${{ env.PYPI_PACKAGE }} to PyPI
         id: pypi-publish
         uses: pypa/gh-action-pypi-publish@release/v1
-        continue-on-error: true
-
-      - name: PyPI publish notice
-        if: steps.pypi-publish.outcome == 'failure'
-        run: |
-          echo "::notice::PyPI publish skipped — OIDC trusted publisher not configured for this repo. See: https://pypi.org/trusted-publishers/ — Set PYPI_SKIP=true in repo Variables to suppress this notice."
 
   publish-npm:
     needs: [detect-version, build]
@@ -777,7 +807,8 @@ jobs:
         needs.build.result == 'success' &&
         needs.build-wheels.result == 'success' &&
         needs.collect-dist.result == 'success' &&
-        needs.smoke-import-wheels.result == 'success'
+        needs.smoke-import-wheels.result == 'success' &&
+        (vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')
       }}
     runs-on: ubuntu-latest
     permissions:

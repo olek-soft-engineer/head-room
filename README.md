@@ -43,6 +43,13 @@ headroom wrap aider       # Aider
 headroom wrap copilot     # GitHub Copilot CLI
 ```
 
+Using `pipx`? Current release wheels are built for Python 3.10 through 3.13, so
+choose a supported interpreter explicitly:
+
+```bash
+pipx install --python python3.13 "headroom-ai[all]"
+```
+
 **Drop it into your own code — Python or TypeScript:**
 
 ```python
