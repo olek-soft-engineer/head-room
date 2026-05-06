@@ -508,14 +508,20 @@ def test_headroom_provider_block_never_sets_requires_openai_auth(
         assert "[model_providers.headroom]" in content
 
 
-def test_inject_codex_provider_config_does_not_write_openai_base_url(
+def test_inject_codex_provider_config_writes_openai_base_url(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """_inject_codex_provider_config must NOT write a top-level openai_base_url key.
+    """_inject_codex_provider_config MUST write a top-level openai_base_url key.
 
-    Bug 3 (#406): injecting openai_base_url at the top level of config.toml
-    causes ChatGPT/subscription users to bypass headroom and ride the built-in
-    openai provider directly.  The field must be absent after injection.
+    Bug 3 (#406) has two halves:
+    1. Strip ``requires_openai_auth`` from the headroom provider block (done in 3ca48d3).
+    2. Inject ``openai_base_url`` at the top level so subscription (ChatGPT plan)
+       users are also routed through headroom.
+
+    Without the top-level ``openai_base_url`` override, Codex subscription mode
+    uses the built-in ``openai`` provider with ``chatgpt.com/backend-api/codex``
+    as the base URL, bypassing the proxy entirely.  This key is the only way to
+    intercept subscription traffic.
     """
     from headroom.cli import wrap as wrap_mod
 
@@ -529,10 +535,12 @@ def test_inject_codex_provider_config_does_not_write_openai_base_url(
     assert config_file.exists(), "inject must create ~/.codex/config.toml"
     content = config_file.read_text()
 
-    # The top-level openai_base_url key must be absent.  Its presence would
-    # bypass headroom for subscription/ChatGPT users.
-    assert "openai_base_url" not in content, (
-        "openai_base_url must not appear in config.toml after injection; "
+    # The top-level openai_base_url key must be present at exactly this value.
+    # Any port drift (e.g. 9999) will break subscription routing and must cause
+    # this test to fail.
+    assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content, (
+        "openai_base_url must appear at the top level of config.toml after injection "
+        "so that Codex subscription (ChatGPT plan) users are routed through headroom; "
         f"got:\n{content}"
     )
     # Sanity: the provider block is actually there.
@@ -543,3 +551,58 @@ def test_inject_codex_provider_config_does_not_write_openai_base_url(
         "requires_openai_auth must be absent from the injected provider block; "
         f"got:\n{content}"
     )
+    # openai_base_url must be in the top-level block, NOT inside [model_providers.*]
+    lines = content.splitlines()
+    in_provider_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_provider_section = stripped.startswith("[model_providers")
+        if in_provider_section and stripped.startswith("openai_base_url"):
+            raise AssertionError(
+                f"openai_base_url must be top-level, not inside a [model_providers.*] section; "
+                f"found it inside a provider section. Config:\n{content}"
+            )
+
+
+def test_unwrap_removes_top_level_openai_base_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """After unwrap, the top-level openai_base_url key must be gone.
+
+    Verifies that ``_restore_codex_provider_config`` (unwrap) removes the
+    ``openai_base_url`` key so orphaned entries don't accumulate between
+    wrap/unwrap cycles.
+    """
+    from headroom.cli import wrap as wrap_mod
+
+    home = tmp_path
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+    wrap_mod._inject_codex_provider_config(8787)
+    config_file = home / ".codex" / "config.toml"
+    assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in config_file.read_text()
+
+    wrap_mod._restore_codex_provider_config()
+
+    # After unwrap the file should be gone (no prior content) or cleaned.
+    if config_file.exists():
+        content = config_file.read_text()
+        assert "openai_base_url" not in content, (
+            "openai_base_url must not remain in config.toml after unwrap; "
+            f"got:\n{content}"
+        )
+    # Also verify via _strip_codex_headroom_blocks directly — the orphan-cleanup
+    # path is exercised when there is no backup file (crash-recovery path).
+    orphan_content = (
+        'model = "gpt-4o"\n'
+        'openai_base_url = "http://127.0.0.1:8787/v1"\n'
+        'model_provider = "headroom"\n'
+    )
+    stripped = wrap_mod._strip_codex_headroom_blocks(orphan_content)
+    assert "openai_base_url" not in stripped, (
+        "_strip_codex_headroom_blocks must remove orphaned openai_base_url lines; "
+        f"got:\n{stripped}"
+    )
+    assert 'model = "gpt-4o"' in stripped

@@ -542,10 +542,16 @@ def _prepare_wrap_rtk(verbose: bool = False, *, label: str | None = None) -> Pat
 def _inject_codex_provider_config(port: int) -> None:
     """Inject a Headroom model provider into Codex's config.toml.
 
-    Codex ignores OPENAI_BASE_URL for WebSocket transport unless a custom
-    provider declares ``supports_websockets = true``.  This writes a
-    ``[model_providers.headroom]`` section that routes both HTTP and WS
-    through the proxy, and sets ``model_provider = "headroom"``.
+    Two keys are written in the top-level block:
+
+    * ``model_provider = "headroom"`` — selects the custom provider for
+      API-key mode traffic.
+    * ``openai_base_url = "http://127.0.0.1:{port}/v1"`` — overrides the
+      built-in ``openai`` provider's base URL.  This is the critical key for
+      **subscription (ChatGPT plan) users**: Codex detects subscription auth
+      and routes through the built-in ``openai`` provider regardless of
+      ``model_provider``, so without this override it bypasses the proxy and
+      hits ``https://chatgpt.com/backend-api/codex`` directly.
 
     Safe to call multiple times — the injected block is fully replaced on
     each call, so re-running with a different ``port`` updates the config.
@@ -563,7 +569,10 @@ def _inject_codex_provider_config(port: int) -> None:
     # stripping them is unambiguous and never consumes user content that
     # happens to sit between the two.
     top_level_block = (
-        f'{_CODEX_TOP_LEVEL_MARKER}\nmodel_provider = "headroom"\n{_CODEX_END_MARKER}\n'
+        f"{_CODEX_TOP_LEVEL_MARKER}\n"
+        f'model_provider = "headroom"\n'
+        f'openai_base_url = "http://127.0.0.1:{port}/v1"\n'
+        f"{_CODEX_END_MARKER}\n"
     )
     provider_section = (
         f"{_CODEX_TOP_LEVEL_MARKER}\n"
