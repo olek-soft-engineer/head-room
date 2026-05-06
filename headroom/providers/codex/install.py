@@ -19,9 +19,7 @@ _CODEX_PATTERN = re.compile(
 
 # Orphan-key patterns: strip any top-level keys that a crashed or partial write
 # may have left outside the marker block.
-_ORPHAN_MODEL_PROVIDER = re.compile(
-    r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n'
-)
+_ORPHAN_MODEL_PROVIDER = re.compile(r'(?m)^[ \t]*model_provider[ \t]*=[ \t]*"headroom"[ \t]*\r?\n')
 _ORPHAN_OPENAI_BASE_URL = re.compile(
     r'(?m)^[ \t]*openai_base_url[ \t]*=[ \t]*"http://127\.0\.0\.1:\d+/v1"[ \t]*\r?\n'
 )

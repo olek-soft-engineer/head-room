@@ -568,7 +568,9 @@ def verify_codex_wrap(
         "requires_openai_auth" not in config,
         "Codex wrap must NOT inject requires_openai_auth into the headroom provider block",
     )
-    assert_true("supports_websockets = true" in config, "Codex wrap missing 'supports_websockets = true'")
+    assert_true(
+        "supports_websockets = true" in config, "Codex wrap missing 'supports_websockets = true'"
+    )
 
     entries = read_jsonl(log_dir / "codex.jsonl")
     assert_true(len(entries) > 0, "Codex shim should have been invoked")

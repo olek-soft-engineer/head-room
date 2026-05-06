@@ -549,8 +549,7 @@ def test_inject_codex_provider_config_writes_openai_base_url(
     assert 'base_url = "http://127.0.0.1:8787/v1"' in content
     # requires_openai_auth must also be absent (bug 3 regression guard).
     assert "requires_openai_auth" not in content, (
-        "requires_openai_auth must be absent from the injected provider block; "
-        f"got:\n{content}"
+        f"requires_openai_auth must be absent from the injected provider block; got:\n{content}"
     )
     # openai_base_url must be in the top-level block, NOT inside [model_providers.*]
     lines = content.splitlines()
@@ -591,8 +590,7 @@ def test_unwrap_removes_top_level_openai_base_url(
     if config_file.exists():
         content = config_file.read_text()
         assert "openai_base_url" not in content, (
-            "openai_base_url must not remain in config.toml after unwrap; "
-            f"got:\n{content}"
+            f"openai_base_url must not remain in config.toml after unwrap; got:\n{content}"
         )
     # Also verify via _strip_codex_headroom_blocks directly — the orphan-cleanup
     # path is exercised when there is no backup file (crash-recovery path).
@@ -603,8 +601,7 @@ def test_unwrap_removes_top_level_openai_base_url(
     )
     stripped = wrap_mod._strip_codex_headroom_blocks(orphan_content)
     assert "openai_base_url" not in stripped, (
-        "_strip_codex_headroom_blocks must remove orphaned openai_base_url lines; "
-        f"got:\n{stripped}"
+        f"_strip_codex_headroom_blocks must remove orphaned openai_base_url lines; got:\n{stripped}"
     )
     assert 'model = "gpt-4o"' in stripped
 
@@ -640,9 +637,7 @@ def test_apply_provider_scope_writes_openai_base_url(monkeypatch, tmp_path: Path
         if stripped.startswith("["):
             in_provider_section = True
         if in_provider_section and stripped.startswith("openai_base_url"):
-            raise AssertionError(
-                f"openai_base_url appeared inside a section block:\n{content}"
-            )
+            raise AssertionError(f"openai_base_url appeared inside a section block:\n{content}")
     # Bug 3 regression: requires_openai_auth must NOT appear.
     assert "requires_openai_auth" not in content, (
         f"requires_openai_auth must not be present in config:\n{content}"
