@@ -288,18 +288,20 @@ pub struct CliArgs {
     )]
     pub cache_control_auto_frozen: CacheControlAutoFrozen,
 
-    /// Phase F PR-F2.1 c3/6: gate the per-auth-mode `CompressionPolicy`
-    /// enforcement. Default `disabled`: F2.1 c1–c5 ship behaviour-
-    /// identical to current main. c6/6 flips the default to `enabled`.
+    /// Phase F PR-F2.1 c5/5: per-auth-mode `CompressionPolicy`
+    /// enforcement is now ON by default. Subscription users skip
+    /// CacheAligner; PAYG/OAuth keep current behaviour. Operators
+    /// can flip back to `disabled` via the env var if F2.1 surfaces
+    /// any subscription regression.
     ///
     /// Source priority: CLI flag →
     /// `HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT` env var →
-    /// default (`disabled` in c3–c5, `enabled` from c6/6 onward).
+    /// default (`enabled` from c5/5 onward).
     #[arg(
         long = "auth-mode-policy-enforcement",
         env = "HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT",
         value_enum,
-        default_value_t = AuthModePolicyEnforcement::Disabled,
+        default_value_t = AuthModePolicyEnforcement::Enabled,
     )]
     pub auth_mode_policy_enforcement: AuthModePolicyEnforcement,
 
@@ -606,10 +608,14 @@ impl Config {
             // Match production default so the cache-control walker is
             // exercised under test without per-test opt-in.
             cache_control_auto_frozen: CacheControlAutoFrozen::Enabled,
-            // F2.1 default: enforcement off so existing tests (which
-            // expect PAYG-style behaviour for every auth mode) stay
-            // green without per-test opt-out. F2.1's own integration
-            // tests opt-IN per-case to assert the enforcement path.
+            // F2.1 c5/5: enforcement is ON by default in production
+            // (Config::from_cli inherits the CliArgs default which is
+            // `Enabled`). For tests, we keep `Disabled` so the
+            // existing PAYG-shaped test expectations stay green
+            // without per-test opt-out — F2.1's regression tests
+            // opt-IN to enforcement explicitly. If you're writing a
+            // new test that needs to exercise the enforcement-on
+            // path, set this field to `Enabled` in your test setup.
             auth_mode_policy_enforcement: AuthModePolicyEnforcement::Disabled,
             // Production default: strip internal `x-headroom-*` headers
             // from upstream-bound requests. Tests opt out per-case via

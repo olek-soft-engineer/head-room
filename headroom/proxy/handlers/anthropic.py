@@ -880,6 +880,17 @@ class AnthropicHandlerMixin:
                         # Record all tool_results in the verified frozen prefix as stable
                         comp_cache.mark_stable_from_messages(messages, frozen_message_count)
 
+                        # F2.1 c5/5: derive the per-request CompressionPolicy
+                        # from the auth_mode classified at request entry. The
+                        # policy short-circuits CacheAligner for subscription
+                        # users (closes the cache-instability complaints in
+                        # #327/#388). When the enforcement env var is off, the
+                        # policy collapses to PAYG so behaviour is unchanged.
+                        from headroom.transforms.compression_policy import resolve_policy
+
+                        compression_policy = resolve_policy(
+                            getattr(request.state, "auth_mode", None)
+                        )
                         async with stage_timer.measure("compression_first_stage"):
                             result = await self._run_compression_in_executor(
                                 lambda: self.anthropic_pipeline.apply(
@@ -890,6 +901,7 @@ class AnthropicHandlerMixin:
                                     frozen_message_count=frozen_message_count,
                                     biases=biases,
                                     request_id=request_id,
+                                    compression_policy=compression_policy,
                                 ),
                                 timeout=COMPRESSION_TIMEOUT_SECONDS,
                             )

@@ -431,6 +431,11 @@ class OpenAIHandlerMixin:
                     # Re-freeze boundary
                     openai_frozen_count = comp_cache.compute_frozen_count(messages)
 
+                    # F2.1 c5/5: per-request CompressionPolicy. See the
+                    # equivalent block in handlers/anthropic.py.
+                    from headroom.transforms.compression_policy import resolve_policy
+
+                    compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
                     result = await self._run_compression_in_executor(
                         lambda: self.openai_pipeline.apply(
                             messages=working_messages,
@@ -439,6 +444,7 @@ class OpenAIHandlerMixin:
                             context=extract_user_query(working_messages),
                             frozen_message_count=openai_frozen_count,
                             biases=_hook_biases,
+                            compression_policy=compression_policy,
                         ),
                         timeout=COMPRESSION_TIMEOUT_SECONDS,
                     )
@@ -462,6 +468,7 @@ class OpenAIHandlerMixin:
                             context=extract_user_query(messages),
                             frozen_message_count=openai_frozen_count,
                             biases=_hook_biases,
+                            compression_policy=compression_policy,
                         ),
                         timeout=COMPRESSION_TIMEOUT_SECONDS,
                     )

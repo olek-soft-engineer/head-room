@@ -18,6 +18,7 @@ docstring.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from headroom.proxy.auth_mode import AuthMode
@@ -78,3 +79,43 @@ def policy_default_payg() -> CompressionPolicy:
     enforcement-on and enforcement-off paths.
     """
     return policy_for_mode(AuthMode.PAYG)
+
+
+_ENFORCEMENT_ENV = "HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT"
+
+
+def is_enforcement_enabled() -> bool:
+    """Read the enforcement flag from the environment.
+
+    Same env var the Rust proxy reads (``Config::auth_mode_policy_enforcement``)
+    so the two paths stay in lockstep with one operator switch.
+    Default (when unset): ``True`` from F2.1 c5/5 onward, matching
+    the Rust default after the c5 flip.
+
+    NOT cached — read every call so an operator can flip the env var
+    in a hot-reload scenario. The cost is one ``dict.get`` per call,
+    well below noise.
+    """
+    val = os.environ.get(_ENFORCEMENT_ENV, "enabled").strip().lower()
+    # Same set of off-values the telemetry beacon honours
+    # (`headroom/telemetry/beacon.py::_OFF_VALUES`) so operators don't
+    # have to remember a different vocabulary per flag.
+    return val not in ("disabled", "off", "false", "0", "no")
+
+
+def resolve_policy(auth_mode: AuthMode | None) -> CompressionPolicy:
+    """Resolve the effective ``CompressionPolicy`` for a request.
+
+    - If the enforcement flag is off, returns PAYG-equivalent
+      regardless of the classified auth mode.
+    - If the enforcement flag is on and ``auth_mode`` is ``None``,
+      returns PAYG-equivalent (defensive default for the unclassified
+      / batch-row path).
+    - Otherwise returns the per-mode policy.
+
+    This is the single public entry point handlers should call when
+    deriving the policy from a request's classification result.
+    """
+    if auth_mode is None or not is_enforcement_enabled():
+        return policy_default_payg()
+    return policy_for_mode(auth_mode)
