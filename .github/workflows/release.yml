@@ -616,6 +616,15 @@ jobs:
       - name: Publish ${{ env.PYPI_PACKAGE }} to PyPI
         id: pypi-publish
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Idempotent re-runs: when a wheel filename for the computed
+          # version is already on PyPI (e.g. a previous push to main
+          # already published this version, or this run's computed
+          # semver hasn't bumped past the last release), treat the
+          # existing file as a no-op instead of a hard failure. PyPA's
+          # recommended pattern for release workflows that may run
+          # multiple times against the same version.
+          skip-existing: true
 
   publish-npm:
     needs: [detect-version, build]
