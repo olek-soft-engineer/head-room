@@ -295,10 +295,23 @@ jobs:
           command: sdist
           args: --out dist
 
-      - name: Verify sdist includes top-level LICENSE
+      - name: Verify sdist license-file metadata matches tarball contents
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           python - <<'PY'
+          # PyPI rejects sdists whose `License-File:` metadata entries
+          # (PEP 639) reference files that aren't physically present
+          # in the tarball: `400 License-File X does not exist in
+          # distribution file ... at <root>/X`. This check catches
+          # that divergence before upload by parsing PKG-INFO's
+          # License-File lines and asserting each one resolves to a
+          # real tarball member. Issue trail: sdist publish broke at
+          # v0.20.16 when the hatch -> maturin migration in 2a91cbb
+          # dropped NOTICE from the sdist `include` list while PEP 639
+          # still emitted it as a License-File. Was masked for ~22
+          # releases by an earlier twine "File already exists" failure
+          # on duplicate wheels; surfaced once PR #412 added
+          # skip-existing.
           from pathlib import Path
           import tarfile
 
@@ -307,18 +320,37 @@ jobs:
               raise SystemExit(f"expected exactly one sdist in dist/, found {len(sdists)}")
 
           with tarfile.open(sdists[0], "r:gz") as archive:
-              names = archive.getnames()
+              names = set(archive.getnames())
+              roots = {name.split("/", 1)[0] for name in names if "/" in name}
+              if len(roots) != 1:
+                  raise SystemExit(f"expected one sdist root directory, found {sorted(roots)}")
+              root = roots.pop()
 
-          roots = {name.split("/", 1)[0] for name in names if "/" in name}
-          if len(roots) != 1:
-              raise SystemExit(f"expected one sdist root directory, found {sorted(roots)}")
+              pkg_info_path = f"{root}/PKG-INFO"
+              member = archive.getmember(pkg_info_path)
+              fh = archive.extractfile(member)
+              if fh is None:
+                  raise SystemExit(f"could not read {pkg_info_path} from {sdists[0].name}")
+              pkg_info = fh.read().decode("utf-8")
 
-          root = roots.pop()
-          license_path = f"{root}/LICENSE"
-          if license_path not in names:
-              raise SystemExit(f"{sdists[0].name} is missing {license_path}")
+          declared = []
+          for line in pkg_info.splitlines():
+              if not line.strip():
+                  break  # headers ended (blank line separator); rest is README body
+              if line.startswith("License-File:"):
+                  declared.append(line.split(":", 1)[1].strip())
 
-          print(f"sdist LICENSE OK: {license_path}")
+          if not declared:
+              raise SystemExit(f"{sdists[0].name} PKG-INFO declares no License-File entries - expected at least LICENSE")
+
+          missing = [name for name in declared if f"{root}/{name}" not in names]
+          if missing:
+              raise SystemExit(
+                  f"{sdists[0].name} declares License-File entries that are missing from the tarball: {missing}. "
+                  f"Add them to `[tool.maturin].include` with `format = \"sdist\"`."
+              )
+
+          print(f"sdist License-File metadata OK ({len(declared)} files, all present): {declared}")
           PY
 
       # Audit each Linux wheel's dynamic symbol references against its
