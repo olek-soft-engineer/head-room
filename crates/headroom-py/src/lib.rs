@@ -1498,7 +1498,7 @@ fn compress_openai_responses_live_zone(
     body: &[u8],
     auth_mode: &str,
     model: &str,
-) -> (Py<PyBytes>, bool) {
+) -> (Py<PyBytes>, bool, u64, Vec<String>) {
     let mode = match auth_mode.to_ascii_lowercase().as_str() {
         "payg" => RustLiveZoneAuthMode::Payg,
         "oauth" => RustLiveZoneAuthMode::OAuth,
@@ -1512,17 +1512,41 @@ fn compress_openai_responses_live_zone(
     };
 
     match rust_compress_openai_responses_live_zone(body, mode, model_str) {
-        Ok(LiveZoneOutcome::NoChange { .. }) => (PyBytes::new_bound(py, body).unbind(), false),
-        Ok(LiveZoneOutcome::Modified { new_body, .. }) => {
+        Ok(LiveZoneOutcome::NoChange { manifest }) => {
+            let saved = manifest.tokens_saved() as u64;
+            let transforms: Vec<String> = manifest
+                .transforms_applied()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            (
+                PyBytes::new_bound(py, body).unbind(),
+                false,
+                saved,
+                transforms,
+            )
+        }
+        Ok(LiveZoneOutcome::Modified { new_body, manifest }) => {
             // `RawValue::get` returns the underlying serialized JSON
             // as `&str`; bytes are valid UTF-8 by construction.
             let bytes = new_body.get().as_bytes();
-            (PyBytes::new_bound(py, bytes).unbind(), true)
+            let saved = manifest.tokens_saved() as u64;
+            let transforms: Vec<String> = manifest
+                .transforms_applied()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            (
+                PyBytes::new_bound(py, bytes).unbind(),
+                true,
+                saved,
+                transforms,
+            )
         }
         Err(_) => {
             // BodyNotJson / NoMessagesArray are non-fatal: nothing to
             // compress, fall through to passthrough byte-for-byte.
-            (PyBytes::new_bound(py, body).unbind(), false)
+            (PyBytes::new_bound(py, body).unbind(), false, 0, Vec::new())
         }
     }
 }

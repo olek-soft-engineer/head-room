@@ -48,21 +48,21 @@ class TestPassthroughCases:
     def test_not_json_passthrough(self):
         compress = _ensure_binding()
         body = b"this is not JSON at all"
-        out, modified = compress(body, "payg", "gpt-4o-mini")
+        out, modified, _saved, _transforms = compress(body, "payg", "gpt-4o-mini")
         assert out == body
         assert modified is False
 
     def test_no_input_array_passthrough(self):
         compress = _ensure_binding()
         body = json.dumps({"model": "gpt-4o-mini"}).encode()
-        out, modified = compress(body, "payg", "gpt-4o-mini")
+        out, modified, _saved, _transforms = compress(body, "payg", "gpt-4o-mini")
         assert out == body
         assert modified is False
 
     def test_empty_input_array_passthrough(self):
         compress = _ensure_binding()
         body = json.dumps({"model": "gpt-4o-mini", "input": []}).encode()
-        out, modified = compress(body, "payg", "gpt-4o-mini")
+        out, modified, _saved, _transforms = compress(body, "payg", "gpt-4o-mini")
         assert out == body
         assert modified is False
 
@@ -76,7 +76,7 @@ class TestPassthroughCases:
                 "input": [{"type": "message", "role": "user", "content": "hi"}],
             }
         ).encode()
-        out, modified = compress(body, "payg", "gpt-4o-mini")
+        out, modified, _saved, _transforms = compress(body, "payg", "gpt-4o-mini")
         assert modified is False
         # Body should be byte-equal (passthrough, not re-serialized).
         assert out == body
@@ -94,7 +94,7 @@ class TestAuthModeAccepted:
         compress = _ensure_binding()
         body = json.dumps({"model": "gpt-4o-mini", "input": []}).encode()
         # Should not raise on any string input.
-        out, modified = compress(body, auth_mode, "gpt-4o-mini")
+        out, modified, _saved, _transforms = compress(body, auth_mode, "gpt-4o-mini")
         assert isinstance(out, bytes)
         assert modified is False
 
@@ -105,7 +105,7 @@ class TestModelDefault:
     def test_empty_model_uses_default(self):
         compress = _ensure_binding()
         body = json.dumps({"input": []}).encode()
-        out, modified = compress(body, "payg", "")
+        out, modified, _saved, _transforms = compress(body, "payg", "")
         assert isinstance(out, bytes)
         assert modified is False
 
@@ -118,12 +118,78 @@ class TestNoExceptionsLeak:
 
     def test_garbage_bytes_no_raise(self):
         compress = _ensure_binding()
-        out, modified = compress(b"\xff\xfe\x00\xff", "payg", "gpt-4o-mini")
+        out, modified, _saved, _transforms = compress(b"\xff\xfe\x00\xff", "payg", "gpt-4o-mini")
         assert modified is False
         assert out == b"\xff\xfe\x00\xff"
 
     def test_empty_body_no_raise(self):
         compress = _ensure_binding()
-        out, modified = compress(b"", "payg", "gpt-4o-mini")
+        out, modified, _saved, _transforms = compress(b"", "payg", "gpt-4o-mini")
         assert modified is False
         assert out == b""
+
+
+class TestTelemetryFields:
+    """The 4-tuple return surfaces ``tokens_saved`` (sum of
+    `original_tokens − compressed_tokens` across the manifest's
+    Compressed outcomes) and ``transforms_applied`` (deduplicated list
+    of compressor strategy names). The Python proxy uses these to
+    populate /transformations/feed and the dashboard's per-request log
+    without recounting tokens. See `crates/headroom-core/src/transforms/
+    live_zone.rs::CompressionManifest::tokens_saved` /
+    `::transforms_applied`."""
+
+    def test_no_change_returns_zero_savings_and_empty_transforms(self):
+        compress = _ensure_binding()
+        body = json.dumps({"model": "gpt-4o-mini", "input": []}).encode()
+        out, modified, saved, transforms = compress(body, "payg", "gpt-4o-mini")
+        assert modified is False
+        assert out == body
+        assert saved == 0
+        assert transforms == []
+
+    def test_field_types(self):
+        """Pin the wire shape so downstream callers don't break."""
+        compress = _ensure_binding()
+        body = json.dumps({"model": "gpt-4o-mini", "input": []}).encode()
+        result = compress(body, "payg", "gpt-4o-mini")
+        assert isinstance(result, tuple)
+        assert len(result) == 4
+        out, modified, saved, transforms = result
+        assert isinstance(out, bytes)
+        assert isinstance(modified, bool)
+        assert isinstance(saved, int)
+        assert isinstance(transforms, list)
+        assert all(isinstance(t, str) for t in transforms)
+
+    def test_large_local_shell_output_compresses_with_telemetry(self):
+        """End-to-end check: a payload large enough to clear the
+        per-item byte threshold produces ``modified=True`` plus a
+        non-zero ``tokens_saved`` and a populated ``transforms``
+        list. Mirrors the shape in the Rust crate's
+        ``large_log_output_compressed`` test."""
+        compress = _ensure_binding()
+        log_body = "".join(
+            f"[2024-01-01 00:00:00] INFO compile.rs:42 building module foo_{i}\n"
+            for i in range(400)
+        )
+        assert len(log_body) > 2048
+        body = json.dumps(
+            {
+                "model": "gpt-4o",
+                "input": [
+                    {
+                        "type": "local_shell_call_output",
+                        "call_id": "c1",
+                        "output": log_body,
+                    }
+                ],
+            }
+        ).encode()
+        out, modified, saved, transforms = compress(body, "payg", "gpt-4o")
+        assert modified is True
+        assert saved > 0
+        assert transforms, "expected at least one strategy in transforms"
+        new_doc = json.loads(out)
+        assert new_doc["input"][0]["type"] == "local_shell_call_output"
+        assert len(new_doc["input"][0]["output"]) < len(log_body)

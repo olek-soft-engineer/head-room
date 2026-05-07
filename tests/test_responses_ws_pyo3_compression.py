@@ -60,7 +60,7 @@ def _ws_compress_first_frame(
     model = (inner.get("model") if isinstance(inner, dict) else None) or ""
 
     inner_bytes = json.dumps(inner).encode("utf-8")
-    new_bytes, modified = compress(inner_bytes, auth_mode_value, model)
+    new_bytes, modified, _saved, _transforms = compress(inner_bytes, auth_mode_value, model)
     if not modified:
         return first_msg_raw, False
 
