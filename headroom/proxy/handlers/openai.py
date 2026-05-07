@@ -1091,6 +1091,16 @@ class OpenAIHandlerMixin:
 
                 get_codex_rate_limit_state().update_from_headers(dict(response.headers))
 
+                # Tag the metric/log with auth_mode + endpoint so the
+                # dashboard can break down by client class (PAYG vs
+                # subscription vs OAuth) without re-classifying.
+                _auth_mode_chat = getattr(request.state, "auth_mode", None)
+                _chat_log_tags = {
+                    **(tags or {}),
+                    "auth_mode": _auth_mode_chat.value if _auth_mode_chat else "payg",
+                    "endpoint": "chat_completions",
+                }
+
                 await self.metrics.record_request(
                     provider="openai",
                     model=model,
@@ -1104,6 +1114,41 @@ class OpenAIHandlerMixin:
                     cache_read_tokens=cache_read_tokens,
                     uncached_input_tokens=uncached_input_tokens,
                 )
+
+                # Per-request log entry for /transformations/feed +
+                # /stats `recent_requests`. Without this the dashboard
+                # only shows aggregates for non-streaming OpenAI traffic.
+                # Mirror of the streaming.py + anthropic.py wiring.
+                if getattr(self, "logger", None) is not None:
+                    from headroom.proxy.helpers import compute_turn_id
+                    from headroom.proxy.models import RequestLog
+
+                    self.logger.log(
+                        RequestLog(
+                            request_id=request_id,
+                            timestamp=datetime.now().isoformat(),
+                            provider="openai",
+                            model=model,
+                            input_tokens_original=original_tokens,
+                            input_tokens_optimized=optimized_tokens,
+                            output_tokens=output_tokens,
+                            tokens_saved=tokens_saved,
+                            savings_percent=(tokens_saved / original_tokens * 100)
+                            if original_tokens > 0
+                            else 0,
+                            optimization_latency_ms=optimization_latency,
+                            total_latency_ms=total_latency,
+                            tags=_chat_log_tags,
+                            cache_hit=False,
+                            transforms_applied=transforms_applied,
+                            request_messages=body.get("messages")
+                            if getattr(self.config, "log_full_messages", False)
+                            else None,
+                            turn_id=compute_turn_id(
+                                model, body.get("system"), body.get("messages")
+                            ),
+                        )
+                    )
 
                 if tokens_saved > 0:
                     logger.info(
@@ -1493,18 +1538,34 @@ class OpenAIHandlerMixin:
                 )
 
                 _input_bytes = json.dumps(body).encode("utf-8")
-                _new_bytes, _modified = _rust_compress_responses(
+                (
+                    _new_bytes,
+                    _modified,
+                    _rust_tokens_saved,
+                    _rust_transforms,
+                ) = _rust_compress_responses(
                     _input_bytes,
                     auth_mode.value,
                     model,
                 )
                 if _modified:
                     body = json.loads(_new_bytes)
-                    transforms_applied = list(transforms_applied) + ["openai_responses_live_zone"]
+                    tokens_saved = int(_rust_tokens_saved)
+                    optimized_tokens = max(0, original_tokens - tokens_saved)
+                    transforms_applied = [
+                        "openai_responses_live_zone",
+                        *_rust_transforms,
+                        *list(transforms_applied),
+                    ]
                     logger.info(
-                        f"[{request_id}] /v1/responses compressed "
-                        f"{len(_input_bytes):,}→{len(_new_bytes):,} bytes "
-                        f"(auth_mode={auth_mode.value})"
+                        "[%s] /v1/responses compressed %d→%d bytes "
+                        "(%d tokens saved, auth_mode=%s, transforms=%s)",
+                        request_id,
+                        len(_input_bytes),
+                        len(_new_bytes),
+                        tokens_saved,
+                        auth_mode.value,
+                        transforms_applied,
                     )
             except Exception as _e:
                 logger.warning(
@@ -1625,6 +1686,12 @@ class OpenAIHandlerMixin:
                 if self.cost_tracker:
                     self.cost_tracker.record_tokens(model, tokens_saved, total_input_tokens)
 
+                _resp_log_tags = {
+                    **(tags or {}),
+                    "auth_mode": auth_mode.value if auth_mode else "payg",
+                    "endpoint": "responses_http",
+                }
+
                 await self.metrics.record_request(
                     provider="openai",
                     model=model,
@@ -1634,6 +1701,39 @@ class OpenAIHandlerMixin:
                     latency_ms=total_latency,
                     overhead_ms=optimization_latency,
                 )
+
+                # Per-request log entry for /transformations/feed +
+                # /stats `recent_requests`. Mirror of streaming.py /
+                # anthropic.py wiring; without this the dashboard's
+                # per-request feed misses every Codex HTTP turn.
+                if getattr(self, "logger", None) is not None:
+                    from headroom.proxy.helpers import compute_turn_id
+                    from headroom.proxy.models import RequestLog
+
+                    self.logger.log(
+                        RequestLog(
+                            request_id=request_id,
+                            timestamp=datetime.now().isoformat(),
+                            provider="openai",
+                            model=model,
+                            input_tokens_original=original_tokens,
+                            input_tokens_optimized=optimized_tokens,
+                            output_tokens=output_tokens,
+                            tokens_saved=tokens_saved,
+                            savings_percent=(tokens_saved / original_tokens * 100)
+                            if original_tokens > 0
+                            else 0,
+                            optimization_latency_ms=optimization_latency,
+                            total_latency_ms=total_latency,
+                            tags=_resp_log_tags,
+                            cache_hit=False,
+                            transforms_applied=transforms_applied,
+                            request_messages=messages
+                            if getattr(self.config, "log_full_messages", False)
+                            else None,
+                            turn_id=compute_turn_id(model, body.get("instructions"), messages),
+                        )
+                    )
 
                 logger.info(f"[{request_id}] /v1/responses {model}: {total_input_tokens:,} tokens")
 
@@ -1707,6 +1807,13 @@ class OpenAIHandlerMixin:
 
         # Forward client headers to upstream, adding required OpenAI-Beta header
         ws_headers = dict(websocket.headers)
+        # Extract per-request tags from headers up front so the
+        # session-end RequestLog can attach them. `_extract_tags` is
+        # the same helper the HTTP handlers use; on a WebSocket the
+        # tags come from `x-headroom-tag-*` headers in the upgrade
+        # handshake. Returns `{}` when no tags are present.
+        _extract_ws_tags = getattr(self, "_extract_tags", None)
+        ws_tags = _extract_ws_tags(ws_headers) if callable(_extract_ws_tags) else {}
 
         # Extract subprotocol from client — this is an application-level negotiation
         # that MUST be forwarded end-to-end (unlike sec-websocket-key which is per-connection).
@@ -1921,10 +2028,14 @@ class OpenAIHandlerMixin:
             # via uvicorn). Hot-fix follow-up to PR #406: the first frame
             # is now compressed via the inline PyO3 binding right before
             # upstream send (see the compression block further below).
-            # Subsequent client→upstream frames in the relay loop remain
-            # unmodified — multi-frame compression is a separate follow-up.
+            # Subsequent client→upstream frames are now ALSO compressed
+            # via `_maybe_compress_response_create_frame` in
+            # `_client_to_upstream` so long-lived subscription Codex
+            # sessions get savings on every turn, not just the first.
             body: dict[str, Any] = {}
             tokens_saved = 0
+            transforms_applied: list[str] = []
+            ws_frames_compressed = 0
             try:
                 body = json.loads(first_msg_raw)
             except json.JSONDecodeError:
@@ -2111,7 +2222,12 @@ class OpenAIHandlerMixin:
                         _model = (_inner.get("model") if isinstance(_inner, dict) else None) or ""
 
                         _inner_bytes = json.dumps(_inner).encode("utf-8")
-                        _new_bytes, _modified = _rust_compress_responses(
+                        (
+                            _new_bytes,
+                            _modified,
+                            _ws_rust_saved,
+                            _ws_rust_transforms,
+                        ) = _rust_compress_responses(
                             _inner_bytes,
                             _ws_auth_mode.value,
                             _model,
@@ -2127,10 +2243,23 @@ class OpenAIHandlerMixin:
                                 else:
                                     _send_body = _new_inner
                                 first_msg_raw = json.dumps(_send_body)
+                                tokens_saved += int(_ws_rust_saved)
+                                for _t in (
+                                    "openai_responses_ws_live_zone",
+                                    *list(_ws_rust_transforms),
+                                ):
+                                    if _t not in transforms_applied:
+                                        transforms_applied.append(_t)
                                 logger.info(
-                                    f"[{request_id}] WS /v1/responses compressed "
-                                    f"{len(_inner_bytes):,}→{len(_new_bytes):,} bytes "
-                                    f"(auth_mode={_ws_auth_mode.value})"
+                                    "[%s] WS /v1/responses compressed "
+                                    "%d→%d bytes (%d tokens saved, "
+                                    "auth_mode=%s, transforms=%s)",
+                                    request_id,
+                                    len(_inner_bytes),
+                                    len(_new_bytes),
+                                    int(_ws_rust_saved),
+                                    _ws_auth_mode.value,
+                                    transforms_applied,
                                 )
                 except Exception as _ce:
                     logger.warning(
@@ -2192,11 +2321,107 @@ class OpenAIHandlerMixin:
                         upstream_relay_error: BaseException | None = None
                         client_relay_error: BaseException | None = None
 
+                        async def _maybe_compress_response_create_frame(
+                            raw_msg: str,
+                        ) -> str:
+                            """Compress a single client→upstream frame
+                            when its `type` is `response.create`. Other
+                            event types (response.cancel, session.update,
+                            etc.) pass through unchanged. Errors are
+                            warned and the original frame is returned —
+                            fail loud in logs, fail safe on the wire.
+                            Updates outer-scope ``tokens_saved``,
+                            ``transforms_applied``, and
+                            ``ws_frames_compressed`` so the session-end
+                            log reports cumulative savings across all
+                            frames in the WS session.
+                            """
+                            nonlocal tokens_saved, transforms_applied
+                            nonlocal ws_frames_compressed
+                            if not self.config.optimize:
+                                return raw_msg
+                            try:
+                                parsed_frame = json.loads(raw_msg)
+                            except json.JSONDecodeError:
+                                return raw_msg
+                            if (
+                                not isinstance(parsed_frame, dict)
+                                or parsed_frame.get("type") != "response.create"
+                            ):
+                                return raw_msg
+                            wrapped_frame = isinstance(parsed_frame.get("response"), dict)
+                            inner_payload = (
+                                parsed_frame["response"] if wrapped_frame else parsed_frame
+                            )
+                            if not isinstance(inner_payload, dict):
+                                return raw_msg
+                            try:
+                                from headroom._core import (
+                                    compress_openai_responses_live_zone as _ws_frame_compress,
+                                )
+
+                                inner_bytes = json.dumps(inner_payload).encode("utf-8")
+                                model_for_frame = inner_payload.get("model") or ""
+                                _frame_auth_mode = classify_auth_mode(ws_headers)
+                                (
+                                    new_inner_bytes,
+                                    modified,
+                                    rust_saved,
+                                    rust_transforms,
+                                ) = _ws_frame_compress(
+                                    inner_bytes,
+                                    _frame_auth_mode.value,
+                                    model_for_frame,
+                                )
+                            except Exception as _frame_err:
+                                logger.warning(
+                                    "[%s] WS /v1/responses frame compression "
+                                    "failed; forwarding original: %s: %s",
+                                    request_id,
+                                    type(_frame_err).__name__,
+                                    _frame_err,
+                                )
+                                return raw_msg
+                            if not modified:
+                                return raw_msg
+                            try:
+                                new_inner = json.loads(new_inner_bytes)
+                            except json.JSONDecodeError:
+                                return raw_msg
+                            if not isinstance(new_inner, dict):
+                                return raw_msg
+                            if wrapped_frame:
+                                parsed_frame["response"] = new_inner
+                                rewritten = json.dumps(parsed_frame)
+                            else:
+                                rewritten = json.dumps(new_inner)
+                            tokens_saved += int(rust_saved)
+                            for t in (
+                                "openai_responses_ws_live_zone",
+                                *list(rust_transforms),
+                            ):
+                                if t not in transforms_applied:
+                                    transforms_applied.append(t)
+                            ws_frames_compressed += 1
+                            logger.info(
+                                "[%s] WS /v1/responses frame compressed "
+                                "%d→%d bytes (%d tokens saved, "
+                                "auth_mode=%s, frame=%d)",
+                                request_id,
+                                len(inner_bytes),
+                                len(new_inner_bytes),
+                                int(rust_saved),
+                                _frame_auth_mode.value,
+                                ws_frames_compressed,
+                            )
+                            return rewritten
+
                         async def _client_to_upstream() -> None:
                             nonlocal client_relay_error
                             try:
                                 while True:
                                     msg = await websocket.receive_text()
+                                    msg = await _maybe_compress_response_create_frame(msg)
                                     await upstream.send(msg)
                             except asyncio.CancelledError:
                                 # Explicit cancel from the outer
@@ -2577,16 +2802,80 @@ class OpenAIHandlerMixin:
                     websocket, body, first_msg_raw, upstream_headers, request_id
                 )
 
-            # Record metrics
-            if tokens_saved > 0:
-                model_name = body.get("model", "unknown") if isinstance(body, dict) else "unknown"
-                await self.metrics.record_request(
-                    provider="openai",
-                    model=model_name,
-                    input_tokens=0,
-                    output_tokens=0,
-                    tokens_saved=tokens_saved,
-                    latency_ms=0,
+            # ── WS session-end metric + RequestLog ──────────────────
+            #
+            # Unconditional (was previously gated on `tokens_saved>0`,
+            # which made first-frame no-changes invisible). We record
+            # one entry per WS session that aggregates `tokens_saved`
+            # across every `response.create` frame compressed by the
+            # first-frame block + `_maybe_compress_response_create_frame`.
+            # The RequestLog entry mirrors the streaming.py /
+            # anthropic.py shape so /transformations/feed surfaces
+            # Codex WS turns.
+            ws_session_duration_ms = (time.perf_counter() - session_started_at) * 1000.0
+            ws_inner_for_telemetry: dict[str, Any] = (
+                body.get("response", body) if isinstance(body, dict) else {}
+            )
+            if not isinstance(ws_inner_for_telemetry, dict):
+                ws_inner_for_telemetry = {}
+            model_name = (
+                ws_inner_for_telemetry.get("model")
+                or (body.get("model") if isinstance(body, dict) else None)
+                or "unknown"
+            )
+            _final_auth_mode = classify_auth_mode(ws_headers)
+            ws_session_tags = {
+                **(ws_tags or {}),
+                "auth_mode": _final_auth_mode.value,
+                "endpoint": "responses_ws",
+                "ws_frames_compressed": str(ws_frames_compressed),
+            }
+            await self.metrics.record_request(
+                provider="openai",
+                model=model_name,
+                input_tokens=0,
+                output_tokens=0,
+                tokens_saved=tokens_saved,
+                latency_ms=ws_session_duration_ms,
+            )
+            if getattr(self, "logger", None) is not None:
+                from headroom.proxy.helpers import compute_turn_id
+                from headroom.proxy.models import RequestLog
+
+                ws_messages_for_log: list[dict[str, Any]] = []
+                ws_input_for_log = ws_inner_for_telemetry.get("input")
+                ws_instructions_for_log = ws_inner_for_telemetry.get("instructions")
+                if isinstance(ws_instructions_for_log, str) and ws_instructions_for_log:
+                    ws_messages_for_log.append(
+                        {"role": "system", "content": ws_instructions_for_log}
+                    )
+                if isinstance(ws_input_for_log, str) and ws_input_for_log:
+                    ws_messages_for_log.append({"role": "user", "content": ws_input_for_log})
+                self.logger.log(
+                    RequestLog(
+                        request_id=request_id,
+                        timestamp=datetime.now().isoformat(),
+                        provider="openai",
+                        model=model_name,
+                        input_tokens_original=0,
+                        input_tokens_optimized=0,
+                        output_tokens=0,
+                        tokens_saved=tokens_saved,
+                        savings_percent=0.0,
+                        optimization_latency_ms=0.0,
+                        total_latency_ms=ws_session_duration_ms,
+                        tags=ws_session_tags,
+                        cache_hit=False,
+                        transforms_applied=transforms_applied,
+                        request_messages=ws_messages_for_log
+                        if getattr(self.config, "log_full_messages", False)
+                        else None,
+                        turn_id=compute_turn_id(
+                            model_name,
+                            ws_instructions_for_log,
+                            ws_messages_for_log,
+                        ),
+                    )
                 )
 
         except Exception as e:

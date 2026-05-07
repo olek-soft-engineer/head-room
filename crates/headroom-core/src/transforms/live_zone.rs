@@ -390,6 +390,42 @@ impl CompressionManifest {
             .iter()
             .any(|b| matches!(b.action, BlockAction::Compressed { .. }))
     }
+
+    /// Aggregate `original_tokens − compressed_tokens` across every
+    /// `BlockAction::Compressed` outcome. Zero when no block was
+    /// rewritten. Saturating subtraction guards against the
+    /// theoretically-impossible case where a `Compressed` variant
+    /// reports compressed > original (the dispatcher's
+    /// `RejectedNotSmaller` gate should make this unreachable, but the
+    /// saturating arithmetic keeps callers panic-free).
+    pub fn tokens_saved(&self) -> usize {
+        self.block_outcomes
+            .iter()
+            .filter_map(|b| match &b.action {
+                BlockAction::Compressed {
+                    original_tokens,
+                    compressed_tokens,
+                    ..
+                } => Some(original_tokens.saturating_sub(*compressed_tokens)),
+                _ => None,
+            })
+            .sum()
+    }
+
+    /// Distinct compressor strategies that actually produced rewritten
+    /// output, in first-seen order. Mirrors what the proxy logs as
+    /// `transforms_applied`. Empty when no block was rewritten.
+    pub fn transforms_applied(&self) -> Vec<&'static str> {
+        let mut seen: Vec<&'static str> = Vec::new();
+        for b in &self.block_outcomes {
+            if let BlockAction::Compressed { strategy, .. } = &b.action {
+                if !seen.contains(strategy) {
+                    seen.push(*strategy);
+                }
+            }
+        }
+        seen
+    }
 }
 
 /// Outcome of dispatching the live zone.
@@ -1553,6 +1589,111 @@ mod tests {
         };
         assert_eq!(manifest.messages_below_frozen_floor, 1);
         assert_eq!(manifest.latest_user_message_index, None);
+    }
+
+    // ─── Manifest accessor helpers (consumed by PyO3 binding) ─────────
+
+    fn make_manifest(actions: Vec<BlockAction>) -> CompressionManifest {
+        CompressionManifest {
+            messages_total: actions.len(),
+            messages_below_frozen_floor: 0,
+            latest_user_message_index: None,
+            block_outcomes: actions
+                .into_iter()
+                .enumerate()
+                .map(|(i, a)| BlockOutcome {
+                    message_index: i,
+                    block_index: None,
+                    block_type: "test".to_string(),
+                    action: a,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn tokens_saved_zero_for_empty_manifest() {
+        let m = CompressionManifest::empty();
+        assert_eq!(m.tokens_saved(), 0);
+        assert!(m.transforms_applied().is_empty());
+    }
+
+    #[test]
+    fn tokens_saved_sums_compressed_outcomes_only() {
+        let m = make_manifest(vec![
+            BlockAction::Compressed {
+                strategy: "smart_crusher",
+                original_bytes: 0,
+                compressed_bytes: 0,
+                original_tokens: 100,
+                compressed_tokens: 30,
+            },
+            BlockAction::NoCompressionApplied {
+                content_type: "image".to_string(),
+            },
+            BlockAction::Compressed {
+                strategy: "log_compressor",
+                original_bytes: 0,
+                compressed_bytes: 0,
+                original_tokens: 200,
+                compressed_tokens: 50,
+            },
+            BlockAction::RejectedNotSmaller {
+                strategy: "smart_crusher",
+                original_bytes: 0,
+                compressed_bytes: 0,
+                original_tokens: 80,
+                compressed_tokens: 90,
+            },
+        ]);
+        // 70 + 150 = 220; rejected variant must not contribute.
+        assert_eq!(m.tokens_saved(), 220);
+    }
+
+    #[test]
+    fn transforms_applied_dedup_first_seen_order() {
+        let m = make_manifest(vec![
+            BlockAction::Compressed {
+                strategy: "log_compressor",
+                original_bytes: 0,
+                compressed_bytes: 0,
+                original_tokens: 50,
+                compressed_tokens: 10,
+            },
+            BlockAction::Compressed {
+                strategy: "smart_crusher",
+                original_bytes: 0,
+                compressed_bytes: 0,
+                original_tokens: 50,
+                compressed_tokens: 10,
+            },
+            BlockAction::Compressed {
+                strategy: "log_compressor",
+                original_bytes: 0,
+                compressed_bytes: 0,
+                original_tokens: 50,
+                compressed_tokens: 10,
+            },
+        ]);
+        assert_eq!(
+            m.transforms_applied(),
+            vec!["log_compressor", "smart_crusher"]
+        );
+    }
+
+    #[test]
+    fn tokens_saved_saturates_when_compressed_exceeds_original() {
+        // Defensive — the dispatcher's RejectedNotSmaller gate should
+        // make this unreachable, but the helper must not panic if a
+        // future caller hand-constructs such a manifest.
+        let m = make_manifest(vec![BlockAction::Compressed {
+            strategy: "smart_crusher",
+            original_bytes: 0,
+            compressed_bytes: 0,
+            original_tokens: 10,
+            compressed_tokens: 50,
+        }]);
+        assert_eq!(m.tokens_saved(), 0);
     }
 }
 
