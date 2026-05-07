@@ -1298,13 +1298,28 @@ def wrap() -> None:
     the target tool so all API calls route through Headroom automatically.
 
     \b
-    Supported tools:
+    Supported tools (one Click subcommand per tool):
         headroom wrap claude              # Claude Code (Anthropic)
-        headroom wrap copilot -- --model claude-sonnet-4-20250514
         headroom wrap codex               # OpenAI Codex CLI
+        headroom wrap copilot -- --model claude-sonnet-4-20250514
         headroom wrap aider               # Aider
         headroom wrap cursor              # Cursor (prints config instructions)
         headroom wrap openclaw            # OpenClaw plugin bootstrap
+
+    \b
+    `wrap` vs `proxy`:
+        - `headroom wrap <tool>` — convenience: starts the proxy for you,
+          sets the right env vars, and launches the wrapped CLI.
+        - `headroom proxy` — just the proxy. Use this with any
+          OpenAI/Anthropic-compatible client by setting
+          ANTHROPIC_BASE_URL / OPENAI_BASE_URL yourself. Required for
+          tools without a dedicated `wrap` subcommand
+          (e.g. opencode, Cline, Continue).
+
+    \b
+    Note: `headroom wrap opencode` does NOT exist. For opencode, run
+    `headroom proxy` and point opencode at it via OPENAI_BASE_URL.
+    `openclaw` is a separate tool — different from opencode.
     """
 
 

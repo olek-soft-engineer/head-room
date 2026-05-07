@@ -59,9 +59,9 @@ headroom proxy --no-ccr-responses
 # Disable proactive expansion
 headroom proxy --no-ccr-expansion
 
-# Enable LLMLingua ML compression
-headroom proxy --llmlingua
-headroom proxy --llmlingua --llmlingua-device cuda --llmlingua-rate 0.4
+# (The earlier --llmlingua flag was retired in 0.9.x and replaced by
+# Kompress (ModernBERT). See `wiki/transforms.md` for the current
+# opt-in path via the `[ml]` extra.)
 ```
 
 ### All Options

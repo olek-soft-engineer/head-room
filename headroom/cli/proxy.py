@@ -62,7 +62,11 @@ from .main import main
 @click.option(
     "--mode",
     default=None,
+    metavar="[token|cache]",
     type=click.Choice(
+        # Canonical modes first; legacy aliases follow for backward compatibility.
+        # `metavar` above hides the alias clutter from --help; users see "[token|cache]"
+        # while internal callers passing "token_mode"/"cost_savings"/etc. still validate.
         [
             "token",
             "cache",
@@ -71,12 +75,15 @@ from .main import main
             "token_savings",
             "cost_savings",
             "token_headroom",
-        ]
+        ],
+        case_sensitive=False,
     ),
     help=(
-        "Optimization mode: token (prioritize compression) or cache "
-        "(freeze prior turns for prefix-cache stability). "
-        "Legacy aliases are accepted. Default: token. Env: HEADROOM_MODE"
+        "Optimization mode (default: token).\n"
+        "  token  — prioritize compression; prior turns may be rewritten for max savings.\n"
+        "  cache  — freeze prior turns to maximise provider prefix-cache hit rate.\n"
+        "Legacy aliases (token_mode, token_savings, token_headroom, cache_mode, "
+        "cost_savings) are still accepted. Env: HEADROOM_MODE."
     ),
 )
 @click.option(
@@ -184,11 +191,32 @@ from .main import main
     envvar="HEADROOM_BUDGET",
     help="Daily budget limit in USD (env: HEADROOM_BUDGET)",
 )
-# Code graph: indexes project + watches files for live reindex via codebase-memory-mcp
+# Code-aware compression (AST-based, requires `pip install headroom-ai[code]`).
+# Pair of flags so users can override the env-var default in either direction.
+# We resolve HEADROOM_CODE_AWARE_ENABLED in the body (not via Click's envvar=),
+# because Click's envvar handling for paired bool flags is brittle in older
+# Click versions.
+@click.option(
+    "--code-aware/--no-code-aware",
+    "code_aware_flag",
+    default=None,
+    help=(
+        "Enable/disable AST-based code compression. Requires the optional "
+        "tree-sitter dependency: pip install headroom-ai[code]. "
+        "Default: disabled. Env: HEADROOM_CODE_AWARE_ENABLED=1 to enable."
+    ),
+)
+# Code graph: indexes project + watches files for live reindex via codebase-memory-mcp.
+# Only useful when the proxy is launched from a project root — it indexes the
+# current working directory.
 @click.option(
     "--code-graph",
     is_flag=True,
-    help="Enable code graph intelligence (indexes project, watches files for live reindex via codebase-memory-mcp)",
+    help=(
+        "Enable code graph intelligence: indexes the current working directory "
+        "and watches files for live reindex via codebase-memory-mcp. Only useful "
+        "when the proxy is launched from a project root."
+    ),
 )
 # Read lifecycle (ON by default: compresses stale/superseded Read outputs)
 @click.option(
@@ -359,6 +387,7 @@ def proxy(
     log_file: str | None,
     log_messages: bool,
     budget: float | None,
+    code_aware_flag: bool | None,
     code_graph: bool,
     no_read_lifecycle: bool,
     memory: bool,
@@ -514,6 +543,17 @@ def proxy(
         log_full_messages=log_messages
         or os.environ.get("HEADROOM_LOG_MESSAGES", "").lower() in ("true", "1", "yes", "on"),
         budget_limit_usd=budget,
+        # Code-aware compression resolution:
+        # 1. Explicit --code-aware / --no-code-aware always wins.
+        # 2. Otherwise read HEADROOM_CODE_AWARE_ENABLED (truthy = on).
+        # 3. Otherwise default off — matches the prior cli/proxy.py behavior so
+        #    existing users see no change unless they opt in.
+        code_aware_enabled=(
+            bool(code_aware_flag)
+            if code_aware_flag is not None
+            else os.environ.get("HEADROOM_CODE_AWARE_ENABLED", "").strip().lower()
+            in ("true", "1", "yes", "on")
+        ),
         # Code graph: live file watcher for incremental reindexing
         code_graph_watcher=code_graph,
         # Read lifecycle: ON by default (use --no-read-lifecycle to disable)
@@ -660,6 +700,13 @@ Memory (Multi-Provider):
             f"(available: {','.join(_ext_available)})"
         )
 
+    # Code-aware status line — same logic the inner banner uses, surfaced here
+    # so the click-CLI banner is a complete picture (avoids the dual-banner
+    # confusion this branch retired).
+    from headroom.proxy.server import _get_code_aware_banner_status
+
+    code_aware_line = f"  Code-Aware:   {_get_code_aware_banner_status(config)}"
+
     click.echo(f"""
 ╔═══════════════════════════════════════════════════════════════════════╗
 ║                         HEADROOM PROXY                                 ║
@@ -675,6 +722,7 @@ Starting proxy server...
   Rate Limit:   {"ENABLED" if config.rate_limit_enabled else "DISABLED"}
   Memory:       {memory_status}
   License:      {license_status}
+{code_aware_line}
 {extensions_line}
 {stateless_line}{telemetry_line}
 {backend_section}
@@ -700,11 +748,15 @@ Press Ctrl+C to stop.
 """)
 
     try:
-        run_kwargs: dict[str, int] = {}
+        run_kwargs: dict[str, Any] = {}
         if workers != 1:
             run_kwargs["workers"] = workers
         if limit_concurrency != 1000:
             run_kwargs["limit_concurrency"] = limit_concurrency
+        # Suppress run_server's legacy banner — the click CLI already printed
+        # a richer one above. Direct `python -m headroom.proxy.server` keeps
+        # the legacy banner via run_server's default.
+        run_kwargs["print_banner"] = False
         run_server(config, **run_kwargs)
     except KeyboardInterrupt:
         click.echo("\nShutting down...")

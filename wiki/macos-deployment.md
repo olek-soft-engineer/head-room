@@ -202,21 +202,14 @@ Configure additional options in the plist `EnvironmentVariables` section:
     <key>ANTHROPIC_API_KEY</key>
     <string>sk-ant-...</string>
 
-    <!-- Optional: Enable LLMLingua compression -->
-    <key>HEADROOM_COMPRESSION_PROVIDER</key>
-    <string>llmlingua</string>
-
-    <!-- Optional: LLMLingua device (auto, cuda, cpu, mps) -->
-    <key>HEADROOM_LLMLINGUA_DEVICE</key>
-    <string>mps</string>
 </dict>
 ```
 
-**Note:** LLMLingua requires additional installation:
-
-```bash
-pip install headroom-ai[llmlingua]
-```
+**Note:** The earlier LLMLingua-2 launch-agent variables
+(`HEADROOM_COMPRESSION_PROVIDER=llmlingua`, `HEADROOM_LLMLINGUA_DEVICE`,
+the `headroom-ai[llmlingua]` extra) were retired with the
+`--llmlingua` flag. For ML compression today, install the `[ml]`
+extra and follow `wiki/transforms.md`.
 
 ### Crash Recovery
 
@@ -683,4 +676,4 @@ A: The LaunchAgent setup is Anthropic-specific. For other providers, see [proxy.
 
 **Q: Does this work with Apple Silicon (M1/M2/M3)?**
 
-A: Yes, fully compatible. For LLMLingua compression, use `--llmlingua-device mps` for Apple Silicon acceleration.
+A: Yes, fully compatible. ML compression (Kompress, opt-in via `headroom-ai[ml]`) auto-detects MPS on Apple Silicon.

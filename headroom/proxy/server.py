@@ -2598,14 +2598,15 @@ def _get_code_aware_banner_status(config: ProxyConfig) -> str:
             return "NOT INSTALLED (pip install headroom-ai[code])"
     else:
         if is_tree_sitter_available():
-            return "DISABLED (remove --no-code-aware to enable)"
-        return "DISABLED"
+            return "DISABLED (--code-aware or HEADROOM_CODE_AWARE_ENABLED=1 to enable)"
+        return "DISABLED  (install headroom-ai[code] to enable)"
 
 
 def run_server(
     config: ProxyConfig | None = None,
     workers: int = 1,
     limit_concurrency: int = 1000,
+    print_banner: bool = True,
 ):
     """Run the proxy server.
 
@@ -2613,6 +2614,11 @@ def run_server(
         config: Proxy configuration
         workers: Number of worker processes (use N for multi-core scaling)
         limit_concurrency: Max concurrent connections before 503 response
+        print_banner: When False, skip the legacy ASCII banner. The
+            Click CLI (`headroom proxy`) prints its own startup banner
+            before calling this — printing a second banner here is the
+            "dual banner" UX issue. Direct `python -m headroom.proxy.server`
+            still gets the banner since it has no other startup output.
     """
     if not FASTAPI_AVAILABLE:
         print("ERROR: FastAPI required. Install: pip install fastapi uvicorn httpx")
@@ -2631,7 +2637,8 @@ def run_server(
         bedrock_region=config.bedrock_region,
     )
 
-    print(f"""
+    if print_banner:
+        print(f"""
 ╔══════════════════════════════════════════════════════════════════════╗
 ║                      HEADROOM PROXY SERVER                           ║
 ╠══════════════════════════════════════════════════════════════════════╣

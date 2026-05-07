@@ -76,6 +76,15 @@ def mcp() -> None:
         3. Claude sees compressed summaries with hash markers
         4. When Claude needs full details, it calls headroom_retrieve
         5. The MCP server fetches original content from the proxy
+
+    \b
+    Note on tool naming: MCP clients display tools as
+    `mcp__<server>__<tool>`. Our server is named "headroom" and our
+    tools are named headroom_retrieve / headroom_compress / etc., so
+    Claude Code shows them as `mcp__headroom__headroom_retrieve`. The
+    "headroom" doubling is normal MCP namespacing — not a bug. The
+    proxy's compression markers (and any docs/prompts) reference the
+    bare tool name `headroom_retrieve`.
     """
     pass
 
