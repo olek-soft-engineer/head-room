@@ -75,14 +75,10 @@ proxy = [
 code = [
     "tree-sitter-language-pack>=0.10.0",
 ]
-# ML-based compression with Kompress (ModernBERT)
+# ML-based compression with Kompress (ModernBERT).
+# (The legacy [llmlingua] extra was removed in 0.9.x — no live code path used it.
+# Use [ml] for the supported ML compression dependencies.)
 ml = [
-    "torch>=2.0.0",
-    "transformers>=4.30.0",
-]
-# Legacy ML compression (LLMLingua-2 — use [ml] instead for Kompress)
-llmlingua = [
-    "llmlingua>=0.2.0",
     "torch>=2.0.0",
     "transformers>=4.30.0",
 ]

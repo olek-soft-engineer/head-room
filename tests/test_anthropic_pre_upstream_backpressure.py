@@ -721,7 +721,7 @@ def _run_cli_capture(args: list[str], env: dict | None = None) -> ProxyConfig:
     captured: dict[str, ProxyConfig] = {}
     orig_run = server_mod.run_server
 
-    def _fake_run(config: ProxyConfig):  # noqa: D401 - stub
+    def _fake_run(config: ProxyConfig, **_kwargs):  # noqa: D401 - stub
         captured["config"] = config
         return 0
 

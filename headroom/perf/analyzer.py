@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 from headroom import paths as _paths
 
@@ -213,6 +214,31 @@ class PerfReport:
     toin_records: list[ToinRecord] = field(default_factory=list)
     log_files_read: int = 0
     total_lines_parsed: int = 0
+    # Window covered by the report. `requested_hours` is what the caller
+    # asked for; `oldest_kept_ts` / `newest_kept_ts` are the actual
+    # timestamps of the oldest and newest records that survived the
+    # filter (may be narrower if the log doesn't go back that far).
+    # All optional so existing callers keep working.
+    requested_hours: float | None = None
+    oldest_kept_ts: str | None = None
+    newest_kept_ts: str | None = None
+    records_filtered_out: int = 0
+
+
+# Log timestamps are emitted by Python's `logging` formatter as
+# `YYYY-MM-DD HH:MM:SS,fff`. We keep the parser permissive so the perf
+# CLI never throws on a stray malformed line — unparsable records are
+# just kept (better to over-report than to silently drop data).
+_LOG_TS_FMT = "%Y-%m-%d %H:%M:%S,%f"
+
+
+def _parse_log_ts(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, _LOG_TS_FMT)
+    except ValueError:
+        return None
 
 
 def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
@@ -220,14 +246,39 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
 
     Args:
         last_n_hours: Only include records from the last N hours (default 7 days).
+            Records with un-parseable timestamps are kept (fail-open) — the
+            window in the report header reflects the actual timestamps that
+            survived the filter, so the user can see whether the log went
+            back far enough.
 
     Returns:
         PerfReport with all parsed records.
     """
     report = PerfReport()
+    report.requested_hours = last_n_hours
 
     if not LOG_DIR.exists():
         return report
+
+    cutoff = datetime.now() - timedelta(hours=last_n_hours) if last_n_hours > 0 else None
+
+    def _within_window(ts_str: str | None) -> bool:
+        # Fail-open: records without a parseable timestamp are kept. The
+        # alternative (silent drop) makes `headroom perf` lie about coverage.
+        if cutoff is None:
+            return True
+        ts = _parse_log_ts(ts_str)
+        if ts is None:
+            return True
+        return ts >= cutoff
+
+    def _track_window(ts_str: str | None) -> None:
+        if not ts_str:
+            return
+        if report.oldest_kept_ts is None or ts_str < report.oldest_kept_ts:
+            report.oldest_kept_ts = ts_str
+        if report.newest_kept_ts is None or ts_str > report.newest_kept_ts:
+            report.newest_kept_ts = ts_str
 
     # Collect log files: proxy.log, proxy.log.1, proxy.log.2, ...
     log_files = sorted(LOG_DIR.glob("proxy.log*"), key=lambda p: p.stat().st_mtime)
@@ -260,9 +311,14 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                         else:
                             # Old comma-separated format
                             transforms = transforms_str.split(",")
+                        ts = m.group("ts")
+                        if not _within_window(ts):
+                            report.records_filtered_out += 1
+                            continue
+                        _track_window(ts)
                         report.perf_records.append(
                             PerfRecord(
-                                timestamp=m.group("ts"),
+                                timestamp=ts,
                                 request_id=m.group("rid"),
                                 model=kv.get("model", ""),
                                 num_messages=int(kv.get("msgs", 0)),
@@ -283,6 +339,10 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                         m2 = _ROUTER_RE.search(line)
                         if m2:
                             ts = line[:23]
+                            if not _within_window(ts):
+                                report.records_filtered_out += 1
+                                continue
+                            _track_window(ts)
                             detail = m2.group("detail")
                             rec = RouterRecord(
                                 timestamp=ts,
@@ -312,6 +372,10 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                     m3 = _TRANSFORM_RE.search(line)
                     if m3:
                         ts = line[:23]
+                        if not _within_window(ts):
+                            report.records_filtered_out += 1
+                            continue
+                        _track_window(ts)
                         report.transform_records.append(
                             TransformRecord(
                                 timestamp=ts,
@@ -327,6 +391,10 @@ def parse_log_files(last_n_hours: float = 168.0) -> PerfReport:
                     m4 = _TOIN_RE.search(line)
                     if m4:
                         ts = line[:23]
+                        if not _within_window(ts):
+                            report.records_filtered_out += 1
+                            continue
+                        _track_window(ts)
                         report.toin_records.append(
                             ToinRecord(
                                 timestamp=ts,
@@ -357,6 +425,21 @@ def format_report(report: PerfReport) -> str:
     # Header
     lines.append("Headroom Performance Report")
     lines.append("=" * 60)
+    if report.requested_hours is not None:
+        if report.oldest_kept_ts and report.newest_kept_ts:
+            window_str = (
+                f"Window: last {report.requested_hours:g}h "
+                f"(actual data: {report.oldest_kept_ts[:19]} → "
+                f"{report.newest_kept_ts[:19]})"
+            )
+        else:
+            window_str = f"Window: last {report.requested_hours:g}h (no records found in window)"
+        lines.append(window_str)
+        if report.records_filtered_out > 0:
+            lines.append(
+                f"Records outside window:  {report.records_filtered_out:,} "
+                "(filtered out — increase --hours to include them)"
+            )
     lines.append("")
 
     records = report.perf_records
@@ -501,7 +584,7 @@ def format_report(report: PerfReport) -> str:
             lines.append("  ! Excluded tools dominate — consider compressing stale Read outputs")
         lines.append("")
 
-    # TOIN status
+    # TOIN status — log-derived counters first, then live-store highlights.
     if report.toin_records:
         latest = report.toin_records[-1]
         lines.append("TOIN Learning")
@@ -511,6 +594,17 @@ def format_report(report: PerfReport) -> str:
         lines.append(f"  Retrievals:   {latest.retrievals} ({latest.retrieval_rate}%)")
         if latest.retrieval_rate == 0 and latest.compressions > 100:
             lines.append("  ! 0% retrieval rate — TOIN learning but never used")
+        lines.append("")
+
+    # TOIN highlights — read the live on-disk pattern store and surface
+    # strategy distribution + top high-impact patterns in human-readable
+    # form. Pattern keys are opaque hashes, so the actionable signal is
+    # *which strategies are winning* and *how many patterns have crossed
+    # the recommendation threshold*. Best-effort: if TOIN isn't installed
+    # or the store is empty, we skip the section silently.
+    toin_lines = _format_toin_highlights()
+    if toin_lines:
+        lines.extend(toin_lines)
         lines.append("")
 
     # Recommendations
@@ -529,6 +623,88 @@ def format_report(report: PerfReport) -> str:
     lines.append(f"Log dir: {LOG_DIR}")
 
     return "\n".join(lines)
+
+
+def _format_toin_highlights() -> list[str]:
+    """Render a human-readable TOIN highlights block from the live store.
+
+    Returns an empty list when TOIN is unavailable or has no patterns.
+    Pattern keys (auth_mode, model_family, structure_hash) are opaque
+    hashes so we don't print them as rows — instead we group by the
+    learned ``optimal_strategy`` (a human-readable string like
+    ``"lossless:table(240->len=7026)"``) and surface the highest-impact
+    slices via ``avg_token_reduction``.
+    """
+    try:
+        from headroom.telemetry.toin import get_toin
+    except ImportError:
+        return []
+
+    try:
+        pairs = get_toin().iter_patterns()
+    except Exception:  # noqa: BLE001 — perf must never fail on TOIN errors
+        return []
+
+    if not pairs:
+        return []
+
+    # Strategy distribution: how many patterns settled on each strategy.
+    strategy_counts: dict[str, int] = {}
+    for _key, pattern in pairs:
+        strategy = pattern.optimal_strategy or "default"
+        strategy_counts[strategy] = strategy_counts.get(strategy, 0) + 1
+
+    # Top patterns by avg token reduction (the high-impact learnings).
+    by_impact = sorted(
+        pairs,
+        key=lambda kp: kp[1].avg_token_reduction,
+        reverse=True,
+    )[:5]
+
+    # How many patterns have enough samples to drive a recommendation.
+    # Falls back to 0 if the threshold attr isn't reachable.
+    try:
+        from headroom.telemetry.toin import get_toin as _get
+
+        threshold = _get()._config.min_samples_for_recommendation
+    except Exception:  # noqa: BLE001
+        threshold = 1
+    qualified = sum(1 for _k, p in pairs if p.sample_size >= threshold)
+
+    lines: list[str] = []
+    lines.append("TOIN Highlights (live store)")
+    lines.append("-" * 40)
+    lines.append(
+        f"  {qualified}/{len(pairs)} patterns have ≥{threshold} samples "
+        f"(eligible for `python -m headroom.cli.toin_publish`)"
+    )
+    lines.append("")
+    lines.append("  Strategy distribution:")
+    for strategy, count in sorted(strategy_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]:
+        lines.append(f"    {count:>4} pattern(s)  {strategy}")
+
+    # Only surface patterns with non-trivial impact AND a non-default
+    # strategy — single-digit-token "wins" against the default strategy
+    # are noise, not insight.
+    impact_rows = [
+        (kp[1].avg_token_reduction, kp[1].total_compressions, kp[1].optimal_strategy or "default")
+        for kp in by_impact
+        if kp[1].avg_token_reduction >= 50 and (kp[1].optimal_strategy or "default") != "default"
+    ]
+    if impact_rows:
+        lines.append("")
+        lines.append("  Top patterns by avg token reduction:")
+        for avg_red, n, strategy in impact_rows:
+            lines.append(f"    {avg_red:>7.0f} tok avg ({n:>3} compression(s))  {strategy}")
+
+    if qualified == 0 and len(pairs) > 0:
+        lines.append("")
+        lines.append(
+            f"  ! No pattern has reached {threshold} samples — TOIN is still warming up. "
+            "Recommendations TOML will be empty until traffic grows."
+        )
+
+    return lines
 
 
 def _generate_recommendations(report: PerfReport) -> list[str]:
