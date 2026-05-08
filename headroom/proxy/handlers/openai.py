@@ -51,6 +51,39 @@ RESPONSES_CONTEXT_SEARCH_TIMEOUT_SECONDS = 2.0
 WS_FIRST_FRAME_TIMEOUT_SECONDS = 60.0
 
 
+def _extract_responses_usage(event: dict[str, Any]) -> tuple[int, int, int, int]:
+    """Return input/output/cache usage from a Responses event.
+
+    Codex WebSocket streams include usage on ``response.completed`` events.
+    The shape mirrors HTTP Responses usage:
+    ``response.usage.input_tokens`` plus
+    ``response.usage.input_tokens_details.cached_tokens``.
+    """
+
+    if event.get("type") != "response.completed":
+        return 0, 0, 0, 0
+
+    response = event.get("response")
+    if not isinstance(response, dict):
+        response = {}
+    usage = response.get("usage") or event.get("usage")
+    if not isinstance(usage, dict):
+        return 0, 0, 0, 0
+
+    def _int(value: Any) -> int:
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    input_tokens = _int(usage.get("input_tokens"))
+    output_tokens = _int(usage.get("output_tokens"))
+    details = usage.get("input_tokens_details")
+    cached_tokens = _int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+    uncached_tokens = max(input_tokens - cached_tokens, 0)
+    return input_tokens, output_tokens, cached_tokens, uncached_tokens
+
+
 def _decode_openai_bearer_payload(headers: dict[str, str]) -> dict[str, Any] | None:
     """Best-effort decode of an OpenAI OAuth bearer token payload.
 
@@ -1260,6 +1293,20 @@ class OpenAIHandlerMixin:
         model = body.get("model", "unknown")
         stream = body.get("stream", False)
 
+        from headroom.proxy.helpers import capture_codex_wire_debug
+
+        capture_codex_wire_debug(
+            "http_inbound_request",
+            request_id=request_id,
+            transport="http",
+            direction="client_to_headroom",
+            method=request.method,
+            url=str(request.url),
+            headers=dict(request.headers.items()),
+            body=body,
+            metadata={"path": request.url.path, "stream": stream},
+        )
+
         # PR-C5: Python no longer compresses /v1/responses — Rust handles
         # item-aware compression natively (see crates/headroom-proxy/src/
         # handlers/responses.rs). We synthesise a minimal `messages` list
@@ -1573,6 +1620,25 @@ class OpenAIHandlerMixin:
                     f"forwarding original body: {type(_e).__name__}: {_e}"
                 )
 
+        capture_codex_wire_debug(
+            "http_upstream_request",
+            request_id=request_id,
+            transport="http",
+            direction="headroom_to_upstream",
+            method="POST",
+            url=url,
+            headers=headers,
+            body=body,
+            metadata={
+                "path": request.url.path,
+                "stream": stream,
+                "auth_mode": auth_mode.value,
+                "is_chatgpt_auth": is_chatgpt_auth,
+                "tokens_saved": tokens_saved,
+                "transforms_applied": transforms_applied,
+            },
+        )
+
         try:
             if stream:
                 # Streaming for Responses API uses semantic events
@@ -1594,6 +1660,28 @@ class OpenAIHandlerMixin:
             else:
                 headers = await apply_copilot_api_auth(headers, url=url)
                 response = await self._retry_request("POST", url, headers, body)
+                _response_body_for_debug: Any = None
+                _response_raw_for_debug: str | None = None
+                try:
+                    _response_body_for_debug = response.json()
+                except Exception:
+                    try:
+                        _response_raw_for_debug = response.text[:200_000]
+                    except Exception:
+                        _response_raw_for_debug = None
+                capture_codex_wire_debug(
+                    "http_upstream_response",
+                    request_id=request_id,
+                    transport="http",
+                    direction="upstream_to_headroom",
+                    method="POST",
+                    url=url,
+                    headers=dict(response.headers),
+                    body=_response_body_for_debug,
+                    raw_text=_response_raw_for_debug,
+                    status_code=response.status_code,
+                    metadata={"stream": stream, "auth_mode": auth_mode.value},
+                )
                 total_latency = (time.time() - start_time) * 1000
 
                 total_input_tokens = original_tokens  # fallback
@@ -1807,6 +1895,21 @@ class OpenAIHandlerMixin:
 
         # Forward client headers to upstream, adding required OpenAI-Beta header
         ws_headers = dict(websocket.headers)
+        _ws_url_obj = getattr(websocket, "url", None)
+        _ws_url = str(_ws_url_obj) if _ws_url_obj is not None else ""
+        _ws_path = getattr(_ws_url_obj, "path", "") if _ws_url_obj is not None else ""
+        from headroom.proxy.helpers import capture_codex_wire_debug
+
+        capture_codex_wire_debug(
+            "ws_inbound_handshake",
+            request_id=request_id,
+            session_id=session_id,
+            transport="websocket",
+            direction="client_to_headroom",
+            url=_ws_url,
+            headers=ws_headers,
+            metadata={"path": _ws_path},
+        )
         # Extract per-request tags from headers up front so the
         # session-end RequestLog can attach them. `_extract_tags` is
         # the same helper the HTTP handlers use; on a WebSocket the
@@ -1914,6 +2017,20 @@ class OpenAIHandlerMixin:
             ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
             upstream_url = build_copilot_upstream_url(ws_base, "/v1/responses")
 
+        capture_codex_wire_debug(
+            "ws_upstream_handshake",
+            request_id=request_id,
+            session_id=session_id,
+            transport="websocket",
+            direction="headroom_to_upstream",
+            url=upstream_url,
+            headers=upstream_headers,
+            metadata={
+                "is_chatgpt_auth": is_chatgpt_auth,
+                "subprotocols": client_subprotocols,
+            },
+        )
+
         # Unit 3: attach the resolved upstream URL to the session handle.
         if session_handle is not None:
             session_handle.upstream_url = upstream_url
@@ -1988,6 +2105,20 @@ class OpenAIHandlerMixin:
             request_id=request_id,
         )
 
+        capture_codex_wire_debug(
+            "ws_upstream_handshake_final",
+            request_id=request_id,
+            session_id=session_id,
+            transport="websocket",
+            direction="headroom_to_upstream",
+            url=upstream_url,
+            headers=upstream_headers,
+            metadata={
+                "is_chatgpt_auth": is_chatgpt_auth,
+                "subprotocols": client_subprotocols,
+            },
+        )
+
         logger.debug(
             f"[{request_id}] WS upstream headers: "
             f"{[k for k in upstream_headers if k.lower() != 'authorization']}, "
@@ -2041,6 +2172,23 @@ class OpenAIHandlerMixin:
             except json.JSONDecodeError:
                 # Not JSON — pass through as-is
                 pass
+            ws_input_tokens_total = 0
+            ws_output_tokens_total = 0
+            ws_cache_read_tokens_total = 0
+            ws_uncached_input_tokens_total = 0
+            ws_response_create_frames = 1
+
+            capture_codex_wire_debug(
+                "ws_inbound_first_frame",
+                request_id=request_id,
+                session_id=session_id,
+                transport="websocket",
+                direction="client_to_headroom",
+                url=_ws_url,
+                body=body if body else None,
+                raw_text=None if body else first_msg_raw,
+                metadata={"frame": 1},
+            )
 
             # --- Memory: inject context, tools, and instructions ---
             memory_user_id: str | None = None
@@ -2267,6 +2415,27 @@ class OpenAIHandlerMixin:
                         f"forwarding original frame: {type(_ce).__name__}: {_ce}"
                     )
 
+            _first_upstream_body: Any = None
+            try:
+                _first_upstream_body = json.loads(first_msg_raw)
+            except json.JSONDecodeError:
+                _first_upstream_body = None
+            capture_codex_wire_debug(
+                "ws_upstream_first_frame",
+                request_id=request_id,
+                session_id=session_id,
+                transport="websocket",
+                direction="headroom_to_upstream",
+                url=upstream_url,
+                body=_first_upstream_body,
+                raw_text=None if _first_upstream_body is not None else first_msg_raw,
+                metadata={
+                    "frame": 1,
+                    "tokens_saved": tokens_saved,
+                    "transforms_applied": transforms_applied,
+                },
+            )
+
             # --- Connect to upstream OpenAI WebSocket ---
             logger.info(f"[{request_id}] WS /v1/responses connecting to {upstream_url}")
 
@@ -2417,11 +2586,54 @@ class OpenAIHandlerMixin:
                             return rewritten
 
                         async def _client_to_upstream() -> None:
-                            nonlocal client_relay_error
+                            nonlocal client_relay_error, ws_response_create_frames
+                            client_frame_index = 1
                             try:
                                 while True:
                                     msg = await websocket.receive_text()
+                                    client_frame_index += 1
+                                    _inbound_frame_body: Any = None
+                                    try:
+                                        _inbound_frame_body = json.loads(msg)
+                                    except json.JSONDecodeError:
+                                        _inbound_frame_body = None
+                                    capture_codex_wire_debug(
+                                        "ws_inbound_client_frame",
+                                        request_id=request_id,
+                                        session_id=session_id,
+                                        transport="websocket",
+                                        direction="client_to_headroom",
+                                        url=_ws_url,
+                                        body=_inbound_frame_body,
+                                        raw_text=None if _inbound_frame_body is not None else msg,
+                                        metadata={"frame": client_frame_index},
+                                    )
+                                    if (
+                                        isinstance(_inbound_frame_body, dict)
+                                        and _inbound_frame_body.get("type") == "response.create"
+                                    ):
+                                        ws_response_create_frames += 1
                                     msg = await _maybe_compress_response_create_frame(msg)
+                                    _outbound_frame_body: Any = None
+                                    try:
+                                        _outbound_frame_body = json.loads(msg)
+                                    except json.JSONDecodeError:
+                                        _outbound_frame_body = None
+                                    capture_codex_wire_debug(
+                                        "ws_upstream_client_frame",
+                                        request_id=request_id,
+                                        session_id=session_id,
+                                        transport="websocket",
+                                        direction="headroom_to_upstream",
+                                        url=upstream_url,
+                                        body=_outbound_frame_body,
+                                        raw_text=None if _outbound_frame_body is not None else msg,
+                                        metadata={
+                                            "frame": client_frame_index,
+                                            "tokens_saved_total": tokens_saved,
+                                            "transforms_applied": transforms_applied,
+                                        },
+                                    )
                                     await upstream.send(msg)
                             except asyncio.CancelledError:
                                 # Explicit cancel from the outer
@@ -2463,6 +2675,8 @@ class OpenAIHandlerMixin:
                             # over ``upstream_disconnect``.
                             nonlocal response_completed_seen
                             nonlocal upstream_relay_error
+                            nonlocal ws_input_tokens_total, ws_output_tokens_total
+                            nonlocal ws_cache_read_tokens_total, ws_uncached_input_tokens_total
 
                             memory_enabled = bool(self.memory_handler and memory_user_id)
 
@@ -2487,7 +2701,9 @@ class OpenAIHandlerMixin:
                             _first_event_started_at = _upstream_first_event_started  # noqa: B023
 
                             try:
+                                upstream_frame_index = 0
                                 async for msg in upstream:
+                                    upstream_frame_index += 1
                                     if (
                                         _first_event_started_at is not None
                                         and "upstream_first_event" not in stage_timer
@@ -2498,13 +2714,39 @@ class OpenAIHandlerMixin:
                                             * 1000.0,
                                         )
                                     if isinstance(msg, bytes):
+                                        capture_codex_wire_debug(
+                                            "ws_upstream_binary_frame",
+                                            request_id=request_id,
+                                            session_id=session_id,
+                                            transport="websocket",
+                                            direction="upstream_to_headroom",
+                                            url=upstream_url,
+                                            metadata={
+                                                "frame": upstream_frame_index,
+                                                "byte_count": len(msg),
+                                            },
+                                        )
                                         await websocket.send_bytes(msg)
                                         continue
                                     msg_str = msg if isinstance(msg, str) else str(msg)
-
-                                    if not memory_enabled:
-                                        await websocket.send_text(msg_str)
-                                        continue
+                                    _upstream_frame_body: Any = None
+                                    try:
+                                        _upstream_frame_body = json.loads(msg_str)
+                                    except json.JSONDecodeError:
+                                        _upstream_frame_body = None
+                                    capture_codex_wire_debug(
+                                        "ws_upstream_text_frame",
+                                        request_id=request_id,
+                                        session_id=session_id,
+                                        transport="websocket",
+                                        direction="upstream_to_headroom",
+                                        url=upstream_url,
+                                        body=_upstream_frame_body,
+                                        raw_text=None
+                                        if _upstream_frame_body is not None
+                                        else msg_str,
+                                        metadata={"frame": upstream_frame_index},
+                                    )
 
                                     # Parse event
                                     try:
@@ -2514,6 +2756,21 @@ class OpenAIHandlerMixin:
                                         continue
 
                                     event_type = event.get("type", "")
+                                    (
+                                        usage_input_tokens,
+                                        usage_output_tokens,
+                                        usage_cache_read_tokens,
+                                        usage_uncached_tokens,
+                                    ) = _extract_responses_usage(event)
+                                    if usage_input_tokens or usage_output_tokens:
+                                        ws_input_tokens_total += usage_input_tokens
+                                        ws_output_tokens_total += usage_output_tokens
+                                        ws_cache_read_tokens_total += usage_cache_read_tokens
+                                        ws_uncached_input_tokens_total += usage_uncached_tokens
+
+                                    if not memory_enabled:
+                                        await websocket.send_text(msg_str)
+                                        continue
 
                                     # --- Phase 1: Buffer until first output item ---
                                     if not decided:
@@ -2828,15 +3085,24 @@ class OpenAIHandlerMixin:
                 **(ws_tags or {}),
                 "auth_mode": _final_auth_mode.value,
                 "endpoint": "responses_ws",
+                "compression_scope": "live_zone",
+                "cache_policy": "prefix_safe",
+                "transport": "websocket",
+                "route": "chatgpt_subscription" if is_chatgpt_auth else "openai_api",
+                "ws_response_create_frames": str(ws_response_create_frames),
                 "ws_frames_compressed": str(ws_frames_compressed),
+                "cache_read_tokens": str(ws_cache_read_tokens_total),
+                "uncached_input_tokens": str(ws_uncached_input_tokens_total),
             }
             await self.metrics.record_request(
                 provider="openai",
                 model=model_name,
-                input_tokens=0,
-                output_tokens=0,
+                input_tokens=ws_input_tokens_total,
+                output_tokens=ws_output_tokens_total,
                 tokens_saved=tokens_saved,
                 latency_ms=ws_session_duration_ms,
+                cache_read_tokens=ws_cache_read_tokens_total,
+                uncached_input_tokens=ws_uncached_input_tokens_total,
             )
             if getattr(self, "logger", None) is not None:
                 from headroom.proxy.helpers import compute_turn_id
@@ -2857,11 +3123,15 @@ class OpenAIHandlerMixin:
                         timestamp=datetime.now().isoformat(),
                         provider="openai",
                         model=model_name,
-                        input_tokens_original=0,
-                        input_tokens_optimized=0,
-                        output_tokens=0,
+                        input_tokens_original=ws_input_tokens_total + tokens_saved,
+                        input_tokens_optimized=ws_input_tokens_total,
+                        output_tokens=ws_output_tokens_total,
                         tokens_saved=tokens_saved,
-                        savings_percent=0.0,
+                        savings_percent=(
+                            tokens_saved / (ws_input_tokens_total + tokens_saved) * 100
+                        )
+                        if ws_input_tokens_total + tokens_saved > 0
+                        else 0.0,
                         optimization_latency_ms=0.0,
                         total_latency_ms=ws_session_duration_ms,
                         tags=ws_session_tags,

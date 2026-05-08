@@ -26,6 +26,145 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("headroom.proxy")
 
+_CODEX_WIRE_DEBUG_ENV = "HEADROOM_CODEX_WIRE_DEBUG"
+_CODEX_WIRE_DEBUG_DIR_ENV = "HEADROOM_CODEX_WIRE_DEBUG_DIR"
+_CODEX_WIRE_REDACTED = "[REDACTED]"
+_CODEX_WIRE_SECRET_KEYS = (
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "api-key",
+    "x-api-key",
+    "openai-api-key",
+    "anthropic-api-key",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "bearer",
+    "password",
+    "secret",
+    "token",
+    "credential",
+)
+
+
+def codex_wire_debug_enabled() -> bool:
+    """Return whether opt-in Codex wire capture is enabled."""
+
+    return os.environ.get(_CODEX_WIRE_DEBUG_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _codex_wire_debug_dir() -> Path:
+    explicit = os.environ.get(_CODEX_WIRE_DEBUG_DIR_ENV, "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    return _paths.codex_wire_debug_dir()
+
+
+def _should_redact_key(key: str) -> bool:
+    normalized = key.lower().replace("-", "_")
+    if normalized in {marker.replace("-", "_") for marker in _CODEX_WIRE_SECRET_KEYS}:
+        return True
+    return (
+        normalized.endswith("_api_key")
+        or normalized.endswith("_secret")
+        or normalized.endswith("_password")
+        or normalized.endswith("_access_token")
+        or normalized.endswith("_refresh_token")
+    )
+
+
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            k: (_CODEX_WIRE_REDACTED if _should_redact_key(str(k)) else _redact_value(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_value(item) for item in value]
+    return value
+
+
+def redact_for_wire_debug(value: Any) -> Any:
+    """Redact obvious secrets while preserving request/response shape."""
+
+    return _redact_value(value)
+
+
+def _safe_event_name(event: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in event)[:80]
+
+
+def capture_codex_wire_debug(
+    event: str,
+    *,
+    request_id: str | None = None,
+    session_id: str | None = None,
+    transport: str,
+    direction: str,
+    method: str | None = None,
+    url: str | None = None,
+    headers: dict[str, Any] | None = None,
+    body: Any = None,
+    raw_text: str | None = None,
+    status_code: int | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> Path | None:
+    """Write an opt-in redacted Codex wire snapshot to disk.
+
+    This is intentionally file-based rather than log-based: real Codex
+    requests can be large, and operators need the exact envelope shape without
+    mixing it into normal proxy logs. Header/body secret-looking keys are
+    redacted, but request content is otherwise preserved because this mode is
+    explicitly for local debugging.
+    """
+
+    if not codex_wire_debug_enabled():
+        return None
+
+    try:
+        out_dir = _codex_wire_debug_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts_ns = time.time_ns()
+        req = request_id or "no_request"
+        safe_req = _safe_event_name(req)
+        safe_event = _safe_event_name(event)
+        path = out_dir / f"{ts_ns}_{safe_req}_{safe_event}.json"
+        payload = {
+            "event": event,
+            "timestamp_ns": ts_ns,
+            "request_id": request_id,
+            "session_id": session_id,
+            "transport": transport,
+            "direction": direction,
+            "method": method,
+            "url": url,
+            "status_code": status_code,
+            "headers": redact_for_wire_debug(headers or {}),
+            "body": redact_for_wire_debug(body),
+            "raw_text": raw_text,
+            "metadata": redact_for_wire_debug(metadata or {}),
+        }
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8"
+        )
+        logger.info(
+            "event=codex_wire_debug_capture path=%s request_id=%s wire_event=%s",
+            path,
+            request_id or "",
+            event,
+        )
+        return path
+    except Exception as exc:  # pragma: no cover - debug path must never break traffic
+        logger.warning("event=codex_wire_debug_capture_failed error=%s", exc)
+        return None
+
+
 # Memory injection mode (P0-1 fix in PR-A2).
 #
 # Values:

@@ -71,6 +71,7 @@ _BRIDGE_STATE_FILE = "bridge_state.json"
 _LOGS_DIR = "logs"
 _PROXY_LOG_FILE = "proxy.log"
 _DEBUG_400_DIR = "debug_400"
+_CODEX_WIRE_DEBUG_DIR = "codex_wire"
 _BIN_DIR = "bin"
 _RTK_UNIX = "rtk"
 _RTK_WIN = "rtk.exe"
@@ -254,6 +255,12 @@ def debug_400_dir() -> Path:
     return log_dir() / _DEBUG_400_DIR
 
 
+def codex_wire_debug_dir() -> Path:
+    """Return the directory used for opt-in Codex wire debug captures."""
+
+    return log_dir() / _CODEX_WIRE_DEBUG_DIR
+
+
 def bin_dir() -> Path:
     """Return the directory where Headroom ships vendored binaries."""
 
@@ -339,6 +346,7 @@ __all__ = [
     "log_dir",
     "proxy_log_path",
     "debug_400_dir",
+    "codex_wire_debug_dir",
     "bin_dir",
     "rtk_path",
     "deploy_root",

@@ -31,8 +31,10 @@ class _DummyMetrics:
         self.ws_session_durations: list[float] = []
         self.stage_timings: list[tuple[str, dict[str, float]]] = []
         self.termination_causes: list[str] = []
+        self.recorded_requests: list[dict] = []
 
     async def record_request(self, **kwargs):  # pragma: no cover
+        self.recorded_requests.append(dict(kwargs))
         return None
 
     async def record_stage_timings(self, path: str, timings: dict[str, float]) -> None:
@@ -250,6 +252,43 @@ async def test_happy_path_registry_empty_after_response_completed():
         "client_disconnect",
         "upstream_disconnect",
     }
+
+
+@pytest.mark.asyncio
+async def test_ws_session_metrics_include_response_completed_usage():
+    """Codex WS sessions should report real upstream usage, not zero-token sessions."""
+
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "usage": {
+                        "input_tokens": 100,
+                        "input_tokens_details": {"cached_tokens": 75},
+                        "output_tokens": 12,
+                    },
+                },
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert handler.metrics.recorded_requests
+    recorded = handler.metrics.recorded_requests[-1]
+    assert recorded["input_tokens"] == 100
+    assert recorded["output_tokens"] == 12
+    assert recorded["cache_read_tokens"] == 75
+    assert recorded["uncached_input_tokens"] == 25
 
 
 @pytest.mark.asyncio
