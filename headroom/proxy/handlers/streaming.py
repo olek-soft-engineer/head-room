@@ -696,6 +696,8 @@ class StreamingMixin:
         # transform mutated the body we re-serialize canonically; otherwise
         # we forward the original client bytes verbatim.
         from headroom.proxy.helpers import (
+            capture_codex_wire_debug,
+            codex_wire_debug_enabled,
             log_outbound_request,
             prepare_outbound_body_bytes,
         )
@@ -716,6 +718,27 @@ class StreamingMixin:
             request_id=request_id,
             source=outbound_source,
         )
+        _codex_wire_debug = (
+            codex_wire_debug_enabled() and provider == "openai" and "/responses" in url
+        )
+        if _codex_wire_debug:
+            capture_codex_wire_debug(
+                "http_stream_upstream_request",
+                request_id=request_id,
+                transport="http_sse",
+                direction="headroom_to_upstream",
+                method="POST",
+                url=url,
+                headers=outbound_headers,
+                body=body,
+                metadata={
+                    "body_bytes": len(outbound_bytes),
+                    "body_mutated": body_mutated,
+                    "mutation_reasons": list(mutation_reasons or []),
+                    "tokens_saved": tokens_saved,
+                    "transforms_applied": transforms_applied,
+                },
+            )
 
         # Mutable state for the generator to update
         stream_state: dict[str, Any] = {
@@ -756,6 +779,17 @@ class StreamingMixin:
                         "POST", url, content=outbound_bytes, headers=outbound_headers
                     )
                     upstream_response = await self.http_client.send(_upstream_req, stream=True)
+                    if _codex_wire_debug:
+                        capture_codex_wire_debug(
+                            "http_stream_upstream_response_headers",
+                            request_id=request_id,
+                            transport="http_sse",
+                            direction="upstream_to_headroom",
+                            method="POST",
+                            url=url,
+                            headers=dict(upstream_response.headers),
+                            status_code=upstream_response.status_code,
+                        )
                     break
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                     last_connect_error = e
@@ -827,6 +861,29 @@ class StreamingMixin:
             finally:
                 await upstream_response.aclose()
 
+            if _codex_wire_debug:
+                _error_text: str | None = None
+                _error_body: Any = None
+                try:
+                    _error_text = error_content.decode("utf-8")
+                    _error_body = json.loads(_error_text)
+                    _error_text = None
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        _error_text = error_content.decode("utf-8", errors="replace")
+                capture_codex_wire_debug(
+                    "http_stream_upstream_error_response",
+                    request_id=request_id,
+                    transport="http_sse",
+                    direction="upstream_to_headroom",
+                    method="POST",
+                    url=url,
+                    headers=response_headers,
+                    body=_error_body,
+                    raw_text=_error_text,
+                    status_code=upstream_response.status_code,
+                )
+
             stream_state["total_bytes"] = len(error_content)
             await self._finalize_stream_response(
                 body=body,
@@ -871,7 +928,9 @@ class StreamingMixin:
 
             try:
                 async with contextlib.aclosing(upstream_response) as response:
+                    sse_chunk_index = 0
                     async for chunk in response.aiter_bytes():
+                        sse_chunk_index += 1
                         # Record TTFB on first chunk
                         if stream_state["ttfb_ms"] is None:
                             stream_state["ttfb_ms"] = (time.time() - start_time) * 1000
@@ -900,9 +959,26 @@ class StreamingMixin:
                         # real-time clients (LangGraph, LangChain, etc.)
                         yield chunk
 
+                        if _codex_wire_debug:
+                            capture_codex_wire_debug(
+                                "http_stream_upstream_chunk",
+                                request_id=request_id,
+                                transport="http_sse",
+                                direction="upstream_to_headroom",
+                                method="POST",
+                                url=url,
+                                raw_text=chunk.decode("utf-8", errors="replace"),
+                                metadata={
+                                    "chunk": sse_chunk_index,
+                                    "byte_count": len(chunk),
+                                },
+                            )
+
                         # Buffer SSE data for memory processing and/or prefix tracker
-                        _track_sse = memory_enabled or (
-                            prefix_tracker is not None and provider == "anthropic"
+                        _track_sse = (
+                            _codex_wire_debug
+                            or memory_enabled
+                            or (prefix_tracker is not None and provider == "anthropic")
                         )
                         if _track_sse:
                             if memory_enabled:
@@ -995,6 +1071,27 @@ class StreamingMixin:
                     )
                     if ccr_parsed:
                         self._record_ccr_feedback_from_response(ccr_parsed, provider, request_id)
+                if _codex_wire_debug:
+                    _debug_parsed_response = (
+                        parsed_response
+                        if parsed_response
+                        else self._parse_sse_to_response(full_sse_data, provider)
+                        if full_sse_data
+                        else None
+                    )
+                    capture_codex_wire_debug(
+                        "http_stream_upstream_complete",
+                        request_id=request_id,
+                        transport="http_sse",
+                        direction="upstream_to_headroom",
+                        method="POST",
+                        url=url,
+                        headers=dict(upstream_response.headers),
+                        body=_debug_parsed_response,
+                        raw_text=full_sse_data,
+                        status_code=upstream_response.status_code,
+                        metadata={"total_bytes": stream_state["total_bytes"]},
+                    )
 
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
                 logger.error(f"[{request_id}] Connection error to upstream API: {e}")
