@@ -386,6 +386,26 @@ class ContentRouterConfig:
     protect_recent_code: int = 4  # Don't compress CODE in last N messages (0 = disabled)
     protect_analysis_context: bool = True  # Detect "analyze/review" intent, protect code
 
+    # Cache safety: assistant text-block compression.
+    # Default OFF. Assistant content is echoed back by the client in
+    # subsequent turns and becomes part of the upstream provider's
+    # prefix cache (Anthropic cache_control, DeepSeek/OpenAI auto).
+    # Compressing it changes the bytes that must match for a cache
+    # hit on the next turn. The hash-keyed result cache makes the
+    # compressed output deterministic *within* a process, but cache
+    # eviction or proxy restart can re-compress with a different
+    # output for stochastic compressors — and that miss costs the
+    # whole prefix discount. Enable only for deployments routed to
+    # backends that don't honor cache_control AND whose compressors
+    # are byte-deterministic.
+    compress_assistant_text_blocks: bool = False
+
+    # Minimum content length (in chars) at which a text or tool_result
+    # block is considered for compression. Below this, the overhead of
+    # routing/detecting/caching exceeds any savings, so the block is
+    # passed through verbatim.
+    min_chars_for_block_compression: int = 500
+
     # Adaptive Read protection: fraction of total messages to protect from
     # compression.  At 10 msgs, protects ~5 Reads.  At 100 msgs, protects ~10.
     # Old Reads beyond this window become compressible even though they are
@@ -1506,6 +1526,15 @@ class ContentRouter(Transform):
             "protect_analysis_context", self.config.protect_analysis_context
         )
         min_tokens = kwargs.get("min_tokens_to_compress", 50)
+        # Cache-safety knobs for content-block (Anthropic-format) handling:
+        compress_assistant_text_blocks = kwargs.get(
+            "compress_assistant_text_blocks",
+            self.config.compress_assistant_text_blocks,
+        )
+        min_chars_for_block_compression = kwargs.get(
+            "min_chars_for_block_compression",
+            self.config.min_chars_for_block_compression,
+        )
         # Store runtime options on self for access by _route_and_compress_block
         self._runtime_target_ratio: float | None = kwargs.get("target_ratio")
         self._runtime_kompress_model: str | None = kwargs.get("kompress_model")
@@ -1645,9 +1674,10 @@ class ContentRouter(Transform):
                     read_protection_window=read_protection_window,
                     messages_from_end=messages_from_end,
                     compressor_timing=compressor_timing,
-                    min_tokens=min_tokens,
+                    min_chars=min_chars_for_block_compression,
                     skip_user=skip_user,
                     skip_system=skip_system,
+                    compress_assistant_text_blocks=compress_assistant_text_blocks,
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -1920,16 +1950,31 @@ class ContentRouter(Transform):
         read_protection_window: int = 8,
         messages_from_end: int = 0,
         compressor_timing: dict[str, float] | None = None,
-        min_tokens: int = 50,
+        min_chars: int = 500,
         skip_user: bool = True,
         skip_system: bool = True,
+        compress_assistant_text_blocks: bool = False,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
-        Handles tool_result blocks by compressing their string content. Also
-        handles `text` blocks (e.g. from non-Anthropic clients whose SDK
-        normalizes content into block-list form) but respects role-based
-        protection so the user's actual prompt is never compressed.
+        Cache-safety contract:
+          1. Any block carrying `cache_control` is the client's explicit
+             cache breakpoint. Modifying any byte of such a block changes
+             the cache key the upstream provider matches against, turning
+             a 90% read discount into a 25% write penalty (Anthropic).
+             We never modify cache_control'd blocks, regardless of role
+             or block type.
+          2. Assistant text blocks are echoed back by the client in
+             subsequent turns and become part of the upstream provider's
+             auto-prefix cache (DeepSeek, OpenAI). Default-skip; opt in
+             via `compress_assistant_text_blocks` when the deployment
+             knows the backend doesn't honor cache_control AND
+             compression is byte-deterministic.
+          3. User and system blocks carry the prompt the model is acting
+             on; compressing them silently mutates the request. Always
+             skipped per `skip_user` / `skip_system`.
+          4. Tool / function blocks are tool outputs — semantically safe
+             to compress (the model references them once, then moves on).
 
         Args:
             message: The original message.
@@ -1943,9 +1988,11 @@ class ContentRouter(Transform):
             min_ratio: Adaptive compression ratio threshold.
             read_protection_window: Messages from end within which excluded tools are protected.
             messages_from_end: How far this message is from the end of the conversation.
-            min_tokens: Minimum token threshold for text-block compression.
+            min_chars: Minimum block content length (chars) to consider for compression.
             skip_user: If True, never compress text blocks in user-role messages.
             skip_system: If True, never compress text blocks in system-role messages.
+            compress_assistant_text_blocks: If True, allow compressing text blocks in
+                assistant-role messages. Default False (cache-safe).
 
         Returns:
             Transformed message with compressed content blocks.
@@ -1953,16 +2000,33 @@ class ContentRouter(Transform):
         new_blocks = []
         any_compressed = False
         role = message.get("role", "")
-        # Text blocks in user/system messages carry the user's prompt or
-        # the system instructions — compressing them silently corrupts the
-        # request. tool_result blocks are unaffected by these guards (they
-        # ride on user-role messages by Anthropic convention but represent
-        # tool output, not user content).
-        protect_text_blocks = (skip_user and role == "user") or (skip_system and role == "system")
+
+        # Role-based gate for `text` blocks. Tool/function roles are tool
+        # outputs and compress freely; assistant defaults to skip (cache
+        # safety) with explicit opt-in; unknown roles default to skip.
+        if (skip_user and role == "user") or (skip_system and role == "system"):
+            protect_text_blocks = True
+        elif role == "assistant" and not compress_assistant_text_blocks:
+            protect_text_blocks = True
+        elif role not in ("assistant", "tool", "function"):
+            protect_text_blocks = True
+        else:
+            protect_text_blocks = False
 
         for block in content_blocks:
             if not isinstance(block, dict):
                 new_blocks.append(block)
+                continue
+
+            # Defense in depth: cache_control marker is the client's
+            # cache breakpoint. Frozen-message-count is a coarse
+            # message-level approximation; this is the per-block
+            # guarantee that we never bust an explicit cache key.
+            if "cache_control" in block:
+                new_blocks.append(block)
+                if route_counts is not None:
+                    route_counts.setdefault("cache_control_protected", 0)
+                    route_counts["cache_control_protected"] += 1
                 continue
 
             block_type = block.get("type")
@@ -1988,7 +2052,7 @@ class ContentRouter(Transform):
                 tool_content = block.get("content", "")
 
                 # Only process string content
-                if isinstance(tool_content, str) and len(tool_content) > 500:
+                if isinstance(tool_content, str) and len(tool_content) > min_chars:
                     # Compression pinning: skip already-compressed content
                     if (
                         "Retrieve more: hash=" in tool_content
@@ -2074,10 +2138,12 @@ class ContentRouter(Transform):
 
             # Handle text blocks — compress for non-Anthropic clients (e.g.
             # OpenAI/DeepSeek via Cline) whose SDK normalizes content to
-            # block-list form. User and system roles are protected above.
+            # block-list form. Roles are gated above (user/system always
+            # skipped; assistant default-skipped, opt-in via
+            # `compress_assistant_text_blocks`).
             elif block_type == "text" and not protect_text_blocks:
                 text_content = block.get("text", "")
-                if isinstance(text_content, str) and len(text_content) > 500:
+                if isinstance(text_content, str) and len(text_content) > min_chars:
                     # Pinning: skip already-compressed content
                     if (
                         "Retrieve more: hash=" in text_content
