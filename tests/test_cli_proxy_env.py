@@ -84,7 +84,7 @@ class TestCLIProxyEnvVars:
         """HEADROOM_CODE_AWARE_ENABLED env var should be passed to ProxyConfig."""
         captured_config = {}
 
-        def mock_run_server(config):
+        def mock_run_server(config, **kwargs):
             captured_config["config"] = config
 
         with patch("headroom.proxy.server.run_server", mock_run_server):
@@ -102,7 +102,7 @@ class TestCLIProxyEnvVars:
         """Without HEADROOM_CODE_AWARE_ENABLED, code-aware stays disabled in the wrapper."""
         captured_config = {}
 
-        def mock_run_server(config):
+        def mock_run_server(config, **kwargs):
             captured_config["config"] = config
 
         env = {k: v for k, v in os.environ.items() if k != "HEADROOM_CODE_AWARE_ENABLED"}
@@ -124,7 +124,7 @@ class TestCLIProxyEnvVars:
         """--code-aware should enable code-aware compression in the wrapper."""
         captured_config = {}
 
-        def mock_run_server(config):
+        def mock_run_server(config, **kwargs):
             captured_config["config"] = config
 
         with patch("headroom.proxy.server.run_server", mock_run_server):
@@ -137,7 +137,7 @@ class TestCLIProxyEnvVars:
         """--code-aware should win over HEADROOM_CODE_AWARE_ENABLED=false."""
         captured_config = {}
 
-        def mock_run_server(config):
+        def mock_run_server(config, **kwargs):
             captured_config["config"] = config
 
         with patch("headroom.proxy.server.run_server", mock_run_server):
