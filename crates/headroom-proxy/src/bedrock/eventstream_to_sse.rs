@@ -238,7 +238,15 @@ pub fn header_value_preview(v: &HeaderValue) -> String {
             if s.len() <= 64 {
                 s.clone()
             } else {
-                let end = s.floor_char_boundary(64);
+                // Walk back from byte 64 to the last char boundary so we don't
+                // split a multi-byte codepoint. UTF-8 chars are at most 4 bytes,
+                // so this loop runs at most 3 times.
+                // (`str::floor_char_boundary` would do this in one call but it
+                // was only stabilised in Rust 1.91; headroom's MSRV is 1.80.)
+                let mut end = 64;
+                while !s.is_char_boundary(end) {
+                    end -= 1;
+                }
                 format!("{}…", &s[..end])
             }
         }
