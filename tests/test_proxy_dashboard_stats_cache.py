@@ -132,6 +132,11 @@ def test_stats_cached_query_reuses_short_ttl_snapshot(monkeypatch: pytest.Monkey
 
     assert calls == {"store": 3, "telemetry": 3, "feedback": 3, "rtk": 3}
     assert first.json()["cli_filtering"]["tokens_saved"] == 5
+    assert first.json()["tokens"]["saved"] == 5
+    assert first.json()["tokens"]["proxy_compression_saved"] == 0
+    assert first.json()["tokens"]["rtk_saved"] == 5
+    assert first.json()["savings"]["by_layer"]["compression"]["tokens"] == 5
+    assert first.json()["savings"]["by_layer"]["compression"]["rtk_tokens"] == 5
 
 
 def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
@@ -142,3 +147,4 @@ def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:
     assert '@click="toggleFeed()"' in html
     assert "this.viewMode === 'history'" in html
     assert "this.feedOpen" in html
+    assert "CLI Filtering (rtk)" not in html

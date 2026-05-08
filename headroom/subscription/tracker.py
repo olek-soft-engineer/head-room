@@ -478,7 +478,12 @@ class SubscriptionTracker(QuotaTracker):
             c = self._state.contribution
             c.tokens_submitted = int(contrib.get("tokens_submitted", 0))
             saved = contrib.get("tokens_saved", {})
-            c.tokens_saved_compression = int(saved.get("compression", 0))
+            # Newer state writes dashboard-facing ``compression`` as
+            # proxy-compression + rtk. Prefer the raw proxy field when present
+            # so loading does not double-count rtk into the internal counter.
+            c.tokens_saved_compression = int(
+                saved.get("proxy_compression", saved.get("compression", 0))
+            )
             c.tokens_saved_rtk = int(saved.get("rtk", 0))
             c.tokens_saved_cache_reads = int(saved.get("cache_reads", 0))
             savings_usd = contrib.get("savings_usd", {})

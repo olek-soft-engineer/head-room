@@ -302,9 +302,13 @@ def merge_cost_stats(
     - cache_savings_usd: prefix cache discount from provider (separate)
     - cli_tokens_avoided: tokens filtered by rtk (token count only, no $ estimate)
 
-    The hero metric (savings_usd) is ONLY compression savings priced at
-    the model's published input rate. Cache and CLI are shown separately.
-    This avoids the non-monotonic moving-average repricing bug (#83).
+    The dollar metric (savings_usd) remains ONLY proxy compression savings
+    priced at the model's published input rate. RTK is folded into the
+    dashboard's compression token total, but it has no reliable model-specific
+    dollar estimate because those tokens never reached the proxy request.
+    Prefix cache savings stay separate because they are a provider discount,
+    not token removal. This avoids the non-monotonic moving-average repricing
+    bug (#83).
     """
     if cost_stats is None:
         return None
@@ -318,6 +322,7 @@ def merge_cost_stats(
         "compression_savings_usd": round(compression_savings, 4),
         "cache_savings_usd": round(cache_net, 4),
         "cli_tokens_avoided": cli_tokens_avoided,
+        "cli_tokens_included_in_compression": True,
     }
 
 
