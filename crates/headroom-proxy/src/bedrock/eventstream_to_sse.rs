@@ -404,8 +404,14 @@ mod tests {
         let s = "x".repeat(63) + "éfoo";
         assert!(s.len() > 64);
         let preview = header_value_preview(&HeaderValue::String(s));
-        assert!(preview.ends_with('…'), "expected ellipsis suffix: {preview:?}");
-        assert!(!preview.contains('é'), "must not include the split codepoint");
+        assert!(
+            preview.ends_with('…'),
+            "expected ellipsis suffix: {preview:?}"
+        );
+        assert!(
+            !preview.contains('é'),
+            "must not include the split codepoint"
+        );
     }
 
     #[test]
