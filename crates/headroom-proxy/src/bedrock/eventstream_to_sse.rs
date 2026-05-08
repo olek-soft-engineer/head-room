@@ -238,7 +238,8 @@ pub fn header_value_preview(v: &HeaderValue) -> String {
             if s.len() <= 64 {
                 s.clone()
             } else {
-                format!("{}…", &s[..64])
+                let end = s.floor_char_boundary(64);
+                format!("{}…", &s[..end])
             }
         }
         HeaderValue::Bytes(b) => format!("[{} bytes]", b.len()),
@@ -393,5 +394,24 @@ mod tests {
             header_value_preview(&HeaderValue::Bytes(Bytes::from_static(&[1, 2, 3])))
                 .starts_with("[3 bytes")
         );
+    }
+
+    #[test]
+    fn header_value_preview_truncates_at_char_boundary() {
+        // 63 ASCII bytes + a 2-byte UTF-8 char (é = U+00E9) puts a char
+        // boundary at byte 63 but NOT at byte 64 — the old `&s[..64]`
+        // would panic here. floor_char_boundary(64) must return 63.
+        let s = "x".repeat(63) + "éfoo";
+        assert!(s.len() > 64);
+        let preview = header_value_preview(&HeaderValue::String(s));
+        assert!(preview.ends_with('…'), "expected ellipsis suffix: {preview:?}");
+        assert!(!preview.contains('é'), "must not include the split codepoint");
+    }
+
+    #[test]
+    fn header_value_preview_exact_boundary_not_truncated() {
+        // A string whose UTF-8 length is exactly 64 must not be truncated.
+        let s = "x".repeat(64);
+        assert_eq!(header_value_preview(&HeaderValue::String(s.clone())), s);
     }
 }
