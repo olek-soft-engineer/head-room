@@ -26,6 +26,36 @@ from headroom.copilot_auth import apply_copilot_api_auth
 logger = logging.getLogger("headroom.proxy")
 
 
+def _parse_completion_tokens_from_sse_chunk(chunk_bytes: bytes) -> int | None:
+    """Extract `usage.completion_tokens` from a single SSE chunk if present.
+
+    Returns the integer count when the chunk carries a usage frame (LiteLLM
+    emits this only when the request included
+    ``stream_options.include_usage=true``), or None when no usage data is
+    present (the typical content-only chunk path) or when the chunk fails
+    to parse. Used by the OpenAI-via-backend stream path to track
+    completion tokens online instead of buffering the entire response.
+    """
+    try:
+        decoded = chunk_bytes.decode("utf-8", errors="replace")
+    except (UnicodeDecodeError, AttributeError):
+        return None
+    for line in decoded.split("\n"):
+        line = line.strip()
+        if not line.startswith("data: ") or line == "data: [DONE]":
+            continue
+        try:
+            data = json.loads(line[6:])
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        chunk_usage = data.get("usage")
+        if isinstance(chunk_usage, dict):
+            return int(chunk_usage.get("completion_tokens", 0) or 0)
+    return None
+
+
 class StreamingMixin:
     """Mixin providing streaming response methods for HeadroomProxy."""
 
@@ -1325,20 +1355,24 @@ class StreamingMixin:
         """Stream OpenAI chat completion response from backend.
 
         Routes stream:true requests through the backend's stream_openai_message(),
-        yielding SSE events to the client. Buffers chunks so the final
-        `usage.completion_tokens` (set when stream_options.include_usage is
-        on) can be parsed for metrics + RequestLog.
+        yielding SSE events to the client. Tracks the final
+        `usage.completion_tokens` online (LiteLLM emits this only when the
+        request included ``stream_options.include_usage=true``) using
+        :func:`_parse_completion_tokens_from_sse_chunk`, so memory stays
+        O(1) regardless of stream length.
         """
         from fastapi.responses import StreamingResponse
 
         assert self.anthropic_backend is not None
 
         async def generate():
-            buffer: list[bytes] = []
+            output_tokens = 0
             try:
                 async for sse_chunk in self.anthropic_backend.stream_openai_message(body, headers):
                     chunk_bytes = sse_chunk.encode() if isinstance(sse_chunk, str) else sse_chunk
-                    buffer.append(chunk_bytes)
+                    parsed = _parse_completion_tokens_from_sse_chunk(chunk_bytes)
+                    if parsed is not None:
+                        output_tokens = parsed
                     yield chunk_bytes
             except Exception as e:
                 logger.error(f"[{request_id}] Backend streaming error: {e}")
@@ -1352,29 +1386,6 @@ class StreamingMixin:
                 yield f"data: {json.dumps(error_data)}\n\n".encode()
                 yield b"data: [DONE]\n\n"
             finally:
-                # Reverse-scan the buffered chunks for the final SSE frame
-                # carrying `usage` (LiteLLM emits this only when the request
-                # included stream_options.include_usage=true).
-                output_tokens = 0
-                for chunk_bytes in reversed(buffer):
-                    decoded = chunk_bytes.decode("utf-8", errors="replace")
-                    found = False
-                    for line in decoded.split("\n"):
-                        line = line.strip()
-                        if not line.startswith("data: ") or line == "data: [DONE]":
-                            continue
-                        try:
-                            data = json.loads(line[6:])
-                        except (json.JSONDecodeError, ValueError):
-                            continue
-                        chunk_usage = data.get("usage")
-                        if chunk_usage:
-                            output_tokens = int(chunk_usage.get("completion_tokens", 0) or 0)
-                            found = True
-                            break
-                    if found:
-                        break
-
                 total_latency = (time.time() - start_time) * 1000
                 await self.metrics.record_request(
                     provider=self.anthropic_backend.name,
