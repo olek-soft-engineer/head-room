@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::{to_bytes, Body};
-use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderName, Request, Response, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{any, get, post};
@@ -220,7 +220,11 @@ pub fn build_app(state: AppState) -> Router {
             )
             .route_layer(axum::middleware::from_fn(
                 crate::bedrock::classify_and_attach_auth_mode,
-            ));
+            ))
+            // Match the explicit body-size cap used by the other proxy handlers.
+            // The `Bytes` extractor axum uses for Bedrock would otherwise cap
+            // at axum's built-in 2 MiB default, rejecting valid large payloads.
+            .layer(DefaultBodyLimit::max(state.config.max_body_bytes as usize));
         router = router.merge(bedrock_router);
         if !state.config.bedrock_validate_eventstream_crc {
             tracing::warn!(
