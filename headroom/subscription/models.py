@@ -395,6 +395,11 @@ class HeadroomContribution:
     def total_saved(self) -> int:
         return self.tokens_saved_compression + self.tokens_saved_rtk + self.tokens_saved_cache_reads
 
+    def compression_saved(self) -> int:
+        """Tokens removed before model context by compression plus rtk."""
+
+        return self.tokens_saved_compression + self.tokens_saved_rtk
+
     def total_savings_usd(self) -> float:
         return self.compression_savings_usd + self.cache_savings_usd
 
@@ -411,7 +416,8 @@ class HeadroomContribution:
         return {
             "tokens_submitted": self.tokens_submitted,
             "tokens_saved": {
-                "compression": self.tokens_saved_compression,
+                "compression": self.compression_saved(),
+                "proxy_compression": self.tokens_saved_compression,
                 "rtk": self.tokens_saved_rtk,
                 "cache_reads": self.tokens_saved_cache_reads,
                 "total": self.total_saved(),

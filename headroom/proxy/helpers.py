@@ -749,8 +749,9 @@ def _get_rtk_stats() -> dict[str, Any] | None:
     Results are memoized briefly so dashboard polling does not spawn a new
     subprocess on every refresh.
     """
-    import shutil
     import subprocess as _sp
+
+    from headroom.rtk import get_rtk_path
 
     now = time.monotonic()
     with _rtk_stats_cache_lock:
@@ -758,29 +759,22 @@ def _get_rtk_stats() -> dict[str, Any] | None:
             return cast(dict[str, Any] | None, _rtk_stats_cache["value"])
 
     payload: dict[str, Any] | None
-    rtk_bin = shutil.which("rtk")
-    if not rtk_bin:
-        # Check headroom-managed install. Preserve the historical Unix-name
-        # behavior here (bin_dir()/"rtk") rather than switching to
-        # paths.rtk_path() which would become rtk.exe on Windows.
-        rtk_managed = _paths.bin_dir() / "rtk"
-        if rtk_managed.exists():
-            rtk_bin = str(rtk_managed)
-        else:
-            payload = None
-            with _rtk_stats_cache_lock:
-                _rtk_stats_cache.update(
-                    {
-                        "expires_at": time.monotonic() + RTK_STATS_CACHE_TTL_SECONDS,
-                        "has_value": True,
-                        "value": payload,
-                    }
-                )
-            return payload
+    rtk_path = get_rtk_path()
+    if not rtk_path:
+        payload = None
+        with _rtk_stats_cache_lock:
+            _rtk_stats_cache.update(
+                {
+                    "expires_at": time.monotonic() + RTK_STATS_CACHE_TTL_SECONDS,
+                    "has_value": True,
+                    "value": payload,
+                }
+            )
+        return payload
 
     try:
         result = _sp.run(
-            [rtk_bin, "gain", "--format", "json"],
+            [str(rtk_path), "gain", "--format", "json"],
             capture_output=True,
             text=True,
             timeout=5,

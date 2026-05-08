@@ -1730,8 +1730,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             cli_filtering_stats.get("tokens_saved", 0) if cli_filtering_stats else 0
         )
 
-        # Calculate total tokens before compression
-        total_tokens_before = m.tokens_input_total + m.tokens_saved_total
+        # Calculate total tokens before Headroom-side reduction. Proxy
+        # compression and rtk both remove tokens before they reach model
+        # context, so dashboard-facing compression savings combines them.
+        proxy_compression_tokens = m.tokens_saved_total
+        compression_tokens = proxy_compression_tokens + cli_tokens_avoided
+        total_tokens_before = m.tokens_input_total + compression_tokens
 
         # Build human-readable summary
         summary = _build_session_summary(
@@ -1775,9 +1779,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             compression_cache_stats = {"mode": proxy.config.mode}
 
         # Build unified savings summary (all layers)
-        compression_tokens = m.tokens_saved_total
         cache_net_usd = prefix_cache_stats.get("totals", {}).get("net_savings_usd", 0.0)
-        total_tokens_all_layers = compression_tokens + cli_tokens_avoided
+        total_tokens_all_layers = compression_tokens
         persistent_savings = m.savings_tracker.stats_preview()
         display_session = persistent_savings.get("display_session", {})
 
@@ -1788,11 +1791,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "by_layer": {
                     "cli_filtering": {
                         "tokens": cli_tokens_avoided,
-                        "description": "Tokens avoided by CLI output filtering (rtk) before reaching context",
+                        "included_in": "compression",
+                        "description": (
+                            "Tokens avoided by CLI output filtering (rtk) before reaching context. "
+                            "Included in dashboard compression savings."
+                        ),
                     },
                     "compression": {
                         "tokens": compression_tokens,
-                        "description": "Tokens removed by proxy compression (SmartCrusher, ContentRouter, etc.)",
+                        "proxy_tokens": proxy_compression_tokens,
+                        "rtk_tokens": cli_tokens_avoided,
+                        "description": (
+                            "Tokens removed before model context by proxy compression plus rtk CLI filtering."
+                        ),
                     },
                     "prefix_cache": {
                         "discount_usd": round(cache_net_usd, 4),
@@ -1816,11 +1827,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "tokens": {
                 "input": m.tokens_input_total,
                 "output": m.tokens_output_total,
-                "saved": m.tokens_saved_total,
+                "saved": compression_tokens,
+                "proxy_compression_saved": proxy_compression_tokens,
+                "rtk_saved": cli_tokens_avoided,
                 "cli_tokens_avoided": cli_tokens_avoided,
                 "total_before_compression": total_tokens_before,
                 "savings_percent": round(
-                    (m.tokens_saved_total / total_tokens_before * 100)
+                    (compression_tokens / total_tokens_before * 100)
                     if total_tokens_before > 0
                     else 0,
                     2,

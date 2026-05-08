@@ -66,6 +66,8 @@ def test_tracker_notify_active_update_and_basic_state(monkeypatch: pytest.Monkey
     assert contribution.tokens_saved_compression == 5
     assert contribution.tokens_saved_rtk == 0
     assert contribution.tokens_saved_cache_reads == 3
+    assert contribution.to_dict()["tokens_saved"]["compression"] == 5
+    assert contribution.to_dict()["tokens_saved"]["proxy_compression"] == 5
     assert contribution.compression_savings_usd == 1.25
     assert contribution.cache_savings_usd == 0.0
 
@@ -189,6 +191,8 @@ def test_persist_and_load_state_round_trip(tmp_path: Path) -> None:
     assert loader._state.contribution.tokens_saved_compression == 2
     assert loader._state.contribution.tokens_saved_rtk == 3
     assert loader._state.contribution.tokens_saved_cache_reads == 4
+    assert loader._state.contribution.to_dict()["tokens_saved"]["compression"] == 5
+    assert loader._state.contribution.to_dict()["tokens_saved"]["proxy_compression"] == 2
     assert loader._state.contribution.compression_savings_usd == 1.5
     assert loader._state.contribution.cache_savings_usd == 2.5
     assert loader._state.poll_count == 7

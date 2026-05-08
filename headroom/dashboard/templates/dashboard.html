@@ -175,13 +175,6 @@
                             <div class="text-xs text-gray-500">Provider-native caching</div>
                         </div>
                     </template>
-                    <template x-if="(stats.cost?.cli_tokens_avoided || 0) > 0">
-                        <div>
-                            <div class="text-xs text-gray-500 mb-1">CLI Filtering (rtk)</div>
-                            <div class="text-2xl font-light tabular-nums text-violet-400" x-text="formatNumber(stats.cost?.cli_tokens_avoided || 0)"></div>
-                            <div class="text-xs text-gray-500">tokens avoided</div>
-                        </div>
-                    </template>
                 </div>
             </div>
         </template>
