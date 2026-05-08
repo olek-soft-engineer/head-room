@@ -766,6 +766,7 @@ class OpenAIHandlerMixin:
                         tags,
                         optimization_latency,
                         pipeline_timing=pipeline_timing,
+                        waste_signals=waste_signals_dict,
                     )
                 else:
                     # Non-streaming: use send_openai_message() → JSON
@@ -823,7 +824,39 @@ class OpenAIHandlerMixin:
                         cached=False,
                         overhead_ms=optimization_latency,
                         pipeline_timing=pipeline_timing,
+                        waste_signals=waste_signals_dict,
                     )
+
+                    # Mirror the streaming path: log to RequestLogger so
+                    # /stats.recent_requests sees the OpenAI-via-backend
+                    # non-streaming path. Previously this path was silent.
+                    if getattr(self, "logger", None) is not None:
+                        from headroom.proxy.models import RequestLog
+
+                        self.logger.log(
+                            RequestLog(
+                                request_id=request_id,
+                                timestamp=datetime.now().isoformat(),
+                                provider=self.anthropic_backend.name,
+                                model=model,
+                                input_tokens_original=original_tokens,
+                                input_tokens_optimized=optimized_tokens,
+                                output_tokens=output_tokens,
+                                tokens_saved=tokens_saved,
+                                savings_percent=(tokens_saved / original_tokens * 100)
+                                if original_tokens > 0
+                                else 0,
+                                optimization_latency_ms=optimization_latency,
+                                total_latency_ms=total_latency,
+                                tags=tags or {},
+                                cache_hit=False,
+                                transforms_applied=transforms_applied,
+                                waste_signals=waste_signals_dict,
+                                request_messages=body.get("messages")
+                                if getattr(self.config, "log_full_messages", False)
+                                else None,
+                            )
+                        )
 
                     if tokens_saved > 0:
                         logger.info(

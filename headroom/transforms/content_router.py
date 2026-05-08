@@ -1645,6 +1645,9 @@ class ContentRouter(Transform):
                     read_protection_window=read_protection_window,
                     messages_from_end=messages_from_end,
                     compressor_timing=compressor_timing,
+                    min_tokens=min_tokens,
+                    skip_user=skip_user,
+                    skip_system=skip_system,
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -1917,11 +1920,16 @@ class ContentRouter(Transform):
         read_protection_window: int = 8,
         messages_from_end: int = 0,
         compressor_timing: dict[str, float] | None = None,
+        min_tokens: int = 50,
+        skip_user: bool = True,
+        skip_system: bool = True,
     ) -> dict[str, Any]:
-        """Process content blocks (Anthropic format) for tool_result compression.
+        """Process content blocks (Anthropic format) for compression.
 
-        Handles tool_result blocks by compressing their string content using
-        the appropriate strategy (typically SmartCrusher for JSON arrays).
+        Handles tool_result blocks by compressing their string content. Also
+        handles `text` blocks (e.g. from non-Anthropic clients whose SDK
+        normalizes content into block-list form) but respects role-based
+        protection so the user's actual prompt is never compressed.
 
         Args:
             message: The original message.
@@ -1935,12 +1943,22 @@ class ContentRouter(Transform):
             min_ratio: Adaptive compression ratio threshold.
             read_protection_window: Messages from end within which excluded tools are protected.
             messages_from_end: How far this message is from the end of the conversation.
+            min_tokens: Minimum token threshold for text-block compression.
+            skip_user: If True, never compress text blocks in user-role messages.
+            skip_system: If True, never compress text blocks in system-role messages.
 
         Returns:
             Transformed message with compressed content blocks.
         """
         new_blocks = []
         any_compressed = False
+        role = message.get("role", "")
+        # Text blocks in user/system messages carry the user's prompt or
+        # the system instructions — compressing them silently corrupts the
+        # request. tool_result blocks are unaffected by these guards (they
+        # ride on user-role messages by Anthropic convention but represent
+        # tool output, not user content).
+        protect_text_blocks = (skip_user and role == "user") or (skip_system and role == "system")
 
         for block in content_blocks:
             if not isinstance(block, dict):
@@ -2047,6 +2065,89 @@ class ContentRouter(Transform):
                         continue
                     else:
                         # Didn't compress — add to skip set
+                        self._cache.mark_skip(content_key)
+                        if route_counts is not None:
+                            route_counts["ratio_too_high"] += 1
+                else:
+                    if route_counts is not None:
+                        route_counts["small"] += 1
+
+            # Handle text blocks — compress for non-Anthropic clients (e.g.
+            # OpenAI/DeepSeek via Cline) whose SDK normalizes content to
+            # block-list form. User and system roles are protected above.
+            elif block_type == "text" and not protect_text_blocks:
+                text_content = block.get("text", "")
+                if isinstance(text_content, str) and len(text_content) > 500:
+                    # Pinning: skip already-compressed content
+                    if (
+                        "Retrieve more: hash=" in text_content
+                        or "Retrieve original: hash=" in text_content
+                    ):
+                        new_blocks.append(block)
+                        if route_counts is not None:
+                            route_counts.setdefault("already_compressed", 0)
+                            route_counts["already_compressed"] += 1
+                        continue
+
+                    content_key = hash(text_content)
+
+                    # Tier 1: skip set
+                    if self._cache.is_skipped(content_key):
+                        new_blocks.append(block)
+                        if route_counts is not None:
+                            route_counts["ratio_too_high"] += 1
+                            route_counts.setdefault("cache_hit", 0)
+                            route_counts["cache_hit"] += 1
+                        continue
+
+                    # Tier 2: result cache
+                    cached = self._cache.get(content_key)
+                    if cached is not None:
+                        cached_compressed, cached_ratio, cached_strategy = cached
+                        if cached_ratio < min_ratio:
+                            new_blocks.append({**block, "text": cached_compressed})
+                            transforms_applied.append(f"router:text_block:{cached_strategy}")
+                            if compressed_details is not None:
+                                compressed_details.append(
+                                    f"text:{cached_strategy}:{cached_ratio:.2f}"
+                                )
+                            any_compressed = True
+                        else:
+                            self._cache.move_to_skip(content_key)
+                            new_blocks.append(block)
+                            if route_counts is not None:
+                                route_counts["ratio_too_high"] += 1
+                        if route_counts is not None:
+                            route_counts.setdefault("cache_hit", 0)
+                            route_counts["cache_hit"] += 1
+                        continue
+
+                    # Cache miss — full compression
+                    if route_counts is not None:
+                        route_counts.setdefault("cache_miss", 0)
+                        route_counts["cache_miss"] += 1
+                    t0 = time.perf_counter()
+                    result = self.compress(text_content, context=context, bias=1.0)
+                    compress_ms = (time.perf_counter() - t0) * 1000
+                    if compressor_timing is not None:
+                        key = f"compressor:{result.strategy_used.value}"
+                        compressor_timing[key] = compressor_timing.get(key, 0.0) + compress_ms
+                    if result.compression_ratio < min_ratio:
+                        self._cache.put(
+                            content_key,
+                            result.compressed,
+                            result.compression_ratio,
+                            result.strategy_used.value,
+                        )
+                        new_blocks.append({**block, "text": result.compressed})
+                        transforms_applied.append(f"router:text_block:{result.strategy_used.value}")
+                        if compressed_details is not None:
+                            compressed_details.append(
+                                f"text:{result.strategy_used.value}:{result.compression_ratio:.2f}"
+                            )
+                        any_compressed = True
+                        continue
+                    else:
                         self._cache.mark_skip(content_key)
                         if route_counts is not None:
                             route_counts["ratio_too_high"] += 1

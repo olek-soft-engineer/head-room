@@ -1223,20 +1223,26 @@ class StreamingMixin:
         tags: dict[str, str],
         optimization_latency: float,
         pipeline_timing: dict[str, float] | None = None,
+        waste_signals: dict[str, int] | None = None,
     ) -> StreamingResponse:
         """Stream OpenAI chat completion response from backend.
 
         Routes stream:true requests through the backend's stream_openai_message(),
-        yielding SSE events to the client.
+        yielding SSE events to the client. Buffers chunks so the final
+        `usage.completion_tokens` (set when stream_options.include_usage is
+        on) can be parsed for metrics + RequestLog.
         """
         from fastapi.responses import StreamingResponse
 
         assert self.anthropic_backend is not None
 
         async def generate():
+            buffer: list[bytes] = []
             try:
                 async for sse_chunk in self.anthropic_backend.stream_openai_message(body, headers):
-                    yield sse_chunk.encode() if isinstance(sse_chunk, str) else sse_chunk
+                    chunk_bytes = sse_chunk.encode() if isinstance(sse_chunk, str) else sse_chunk
+                    buffer.append(chunk_bytes)
+                    yield chunk_bytes
             except Exception as e:
                 logger.error(f"[{request_id}] Backend streaming error: {e}")
                 error_data = {
@@ -1249,18 +1255,74 @@ class StreamingMixin:
                 yield f"data: {json.dumps(error_data)}\n\n".encode()
                 yield b"data: [DONE]\n\n"
             finally:
+                # Reverse-scan the buffered chunks for the final SSE frame
+                # carrying `usage` (LiteLLM emits this only when the request
+                # included stream_options.include_usage=true).
+                output_tokens = 0
+                for chunk_bytes in reversed(buffer):
+                    decoded = chunk_bytes.decode("utf-8", errors="replace")
+                    found = False
+                    for line in decoded.split("\n"):
+                        line = line.strip()
+                        if not line.startswith("data: ") or line == "data: [DONE]":
+                            continue
+                        try:
+                            data = json.loads(line[6:])
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        chunk_usage = data.get("usage")
+                        if chunk_usage:
+                            output_tokens = int(chunk_usage.get("completion_tokens", 0) or 0)
+                            found = True
+                            break
+                    if found:
+                        break
+
                 total_latency = (time.time() - start_time) * 1000
                 await self.metrics.record_request(
                     provider=self.anthropic_backend.name,
                     model=model,
                     input_tokens=optimized_tokens,
-                    output_tokens=0,  # Unknown in streaming
+                    output_tokens=output_tokens,
                     tokens_saved=tokens_saved,
                     latency_ms=total_latency,
                     cached=False,
                     overhead_ms=optimization_latency,
                     pipeline_timing=pipeline_timing,
+                    waste_signals=waste_signals,
                 )
+
+                # Mirror the Anthropic-stream path: log to RequestLogger so
+                # /stats.recent_requests and /transformations/feed see this
+                # request. Without it the OpenAI-via-backend path is invisible.
+                if getattr(self, "logger", None) is not None:
+                    from headroom.proxy.models import RequestLog
+
+                    self.logger.log(
+                        RequestLog(
+                            request_id=request_id,
+                            timestamp=datetime.now().isoformat(),
+                            provider=self.anthropic_backend.name,
+                            model=model,
+                            input_tokens_original=original_tokens,
+                            input_tokens_optimized=optimized_tokens,
+                            output_tokens=output_tokens,
+                            tokens_saved=tokens_saved,
+                            savings_percent=(tokens_saved / original_tokens * 100)
+                            if original_tokens > 0
+                            else 0,
+                            optimization_latency_ms=optimization_latency,
+                            total_latency_ms=total_latency,
+                            tags=tags or {},
+                            cache_hit=False,
+                            transforms_applied=transforms_applied,
+                            waste_signals=waste_signals,
+                            request_messages=body.get("messages")
+                            if getattr(self.config, "log_full_messages", False)
+                            else None,
+                        )
+                    )
+
                 if tokens_saved > 0:
                     logger.info(
                         f"[{request_id}] {model}: {original_tokens:,} → {optimized_tokens:,} "
