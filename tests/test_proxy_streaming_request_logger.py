@@ -154,6 +154,57 @@ async def test_finalize_stream_response_handles_zero_original_tokens():
 
 
 @pytest.mark.asyncio
+async def test_finalize_stream_response_recovers_usage_from_truncated_buffer() -> None:
+    """When upstream truncates mid-event (no trailing \\n\\n), the per-chunk
+    parser leaves the message_start usage event sitting in sse_buffer and
+    PERF logs cache_read=cache_write=0 — which then poisons the freeze
+    heuristic on the next request. The finalizer must flush the residual
+    buffer so the real cache_read / cache_creation tokens still land in
+    the log even on aborted streams.
+    """
+    proxy = _build_proxy_with_real_logger(log_full_messages=False)
+
+    partial_message_start = (
+        b"event: message_start\n"
+        b'data: {"type":"message_start","message":{"id":"msg_x",'
+        b'"type":"message","role":"assistant","model":"claude-sonnet-4-6",'
+        b'"content":[],"stop_reason":null,"usage":{'
+        b'"input_tokens":1234,"cache_read_input_tokens":50000,'
+        b'"cache_creation_input_tokens":2500,"output_tokens":1}}}'
+    )
+
+    state = {
+        "output_tokens": None,
+        "total_bytes": len(partial_message_start),
+        "ttfb_ms": 35.0,
+        "input_tokens": None,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_creation_ephemeral_5m_input_tokens": 0,
+        "cache_creation_ephemeral_1h_input_tokens": 0,
+        "sse_buffer": bytearray(partial_message_start),
+    }
+
+    await proxy._finalize_stream_response(
+        body={"messages": [{"role": "user", "content": "hi"}]},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        request_id="req-stream-truncated",
+        original_tokens=2000,
+        optimized_tokens=1800,
+        tokens_saved=200,
+        transforms_applied=[],
+        optimization_latency=5.0,
+        stream_state=state,
+        start_time=0.0,
+    )
+
+    assert state["input_tokens"] == 1234
+    assert state["cache_read_input_tokens"] == 50000
+    assert state["cache_creation_input_tokens"] == 2500
+
+
+@pytest.mark.asyncio
 async def test_finalize_stream_response_no_op_when_logger_disabled():
     proxy = _build_proxy_with_real_logger(log_full_messages=False)
     proxy.logger = None  # `--no-log-requests` would put us here
