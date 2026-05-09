@@ -697,6 +697,32 @@ def _run_init_targets(
         elif target == "openclaw":
             _init_openclaw(global_scope=global_scope, port=port)
 
+    # Register the headroom MCP server with every targeted agent that has
+    # a registrar implemented. Wave 1 covers Claude Code; subsequent waves
+    # add Cursor / Codex / Continue / Cline / Windsurf / Goose without
+    # touching the call sites.
+    _install_headroom_mcp_for_targets(targets=targets, port=port)
+
+
+def _install_headroom_mcp_for_targets(*, targets: list[str], port: int) -> None:
+    """Install the headroom MCP server into each detected target agent."""
+    from headroom.mcp_registry import format_results, install_everywhere
+
+    proxy_url = f"http://127.0.0.1:{port}"
+    results = install_everywhere(proxy_url=proxy_url, agents=targets)
+    if not results:
+        return
+
+    lines = format_results(
+        results,
+        verbose=True,
+        overwrite_hint=f"headroom mcp install --proxy-url {proxy_url} --force",
+    )
+    if lines:
+        click.echo("\nMCP retrieve tool:")
+        for line in lines:
+            click.echo(line)
+
 
 @main.group(invoke_without_command=True)
 @click.option("-g", "--global", "global_scope", is_flag=True, help="Install for the current user.")

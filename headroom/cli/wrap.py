@@ -242,6 +242,39 @@ def _setup_rtk(verbose: bool = False) -> Path | None:
     return rtk_path
 
 
+def _setup_headroom_mcp(registrar: Any, port: int, *, verbose: bool = False) -> None:
+    """Register the headroom MCP server with the given agent (idempotent).
+
+    The proxy compresses tool_result payloads and emits ``[Retrieve more:
+    hash=…]`` markers. Without this registration those markers point at
+    nothing — the agent has no ``headroom_retrieve`` tool to call.
+
+    Generic across registrars: ``ClaudeRegistrar``, ``CodexRegistrar``, and
+    any future agent registrar all flow through the same setup path.
+    """
+    from headroom.mcp_registry import build_headroom_spec, format_result
+
+    if not registrar.detect():
+        if verbose:
+            click.echo(f"  MCP retrieve tool: {registrar.display_name} not detected — skipping")
+        return
+
+    proxy_url = f"http://127.0.0.1:{port}"
+    spec = build_headroom_spec(proxy_url)
+    result = registrar.register_server(spec)
+
+    line = format_result(
+        registrar.name,
+        result,
+        label="MCP retrieve tool",
+        verbose=verbose,
+        overwrite_hint=f"headroom mcp install --proxy-url {proxy_url} --force",
+        restart_hint=f"restart {registrar.display_name} if it was already running",
+    )
+    if line is not None:
+        click.echo(line)
+
+
 _CBM_MCP_SERVER_NAME = "codebase-memory-mcp"
 
 
@@ -1337,6 +1370,11 @@ def unwrap() -> None:
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
 @click.option("--no-rtk", is_flag=True, help="Skip rtk installation and hook registration")
 @click.option(
+    "--no-mcp",
+    is_flag=True,
+    help="Skip headroom MCP server registration (compression markers will be unactionable)",
+)
+@click.option(
     "--code-graph",
     is_flag=True,
     help="Enable code graph indexing via codebase-memory-mcp (optional)",
@@ -1352,6 +1390,7 @@ def unwrap() -> None:
 def claude(
     port: int,
     no_rtk: bool,
+    no_mcp: bool,
     code_graph: bool,
     no_proxy: bool,
     learn: bool,
@@ -1374,6 +1413,7 @@ def claude(
         headroom wrap claude -- -p              # Claude in print mode
         headroom wrap claude --code-graph        # With code graph intelligence
         headroom wrap claude --no-rtk           # Skip rtk (proxy only)
+        headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
     """
     if prepare_only:
         if not no_rtk:
@@ -1450,6 +1490,13 @@ def claude(
             _setup_rtk(verbose=verbose)
         elif verbose:
             click.echo("  Skipping rtk (--no-rtk)")
+
+        if not no_mcp:
+            from headroom.mcp_registry import ClaudeRegistrar
+
+            _setup_headroom_mcp(ClaudeRegistrar(), port, verbose=verbose)
+        elif verbose:
+            click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
         if code_graph:
             _setup_code_graph(verbose=verbose)
@@ -1660,6 +1707,11 @@ def copilot(
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
 @click.option("--no-rtk", is_flag=True, help="Skip rtk installation and AGENTS.md injection")
 @click.option(
+    "--no-mcp",
+    is_flag=True,
+    help="Skip headroom MCP server registration (compression markers will be unactionable)",
+)
+@click.option(
     "--code-graph",
     is_flag=True,
     help="Enable code graph indexing via codebase-memory-mcp (optional)",
@@ -1688,6 +1740,7 @@ def copilot(
 def codex(
     port: int,
     no_rtk: bool,
+    no_mcp: bool,
     code_graph: bool,
     no_proxy: bool,
     learn: bool,
@@ -1704,16 +1757,28 @@ def codex(
     \b
     Sets OPENAI_BASE_URL to route all OpenAI API calls through Headroom.
     Installs rtk and injects instructions into AGENTS.md so Codex uses
-    token-optimized commands (60-90% savings on shell output).
+    token-optimized commands (60-90% savings on shell output). Also
+    registers the headroom MCP server in ~/.codex/config.toml so Codex
+    can call ``headroom_retrieve`` on compression markers.
 
     \b
     Examples:
-        headroom wrap codex                         # Start proxy + rtk + codex
+        headroom wrap codex                         # Start proxy + rtk + mcp + codex
         headroom wrap codex -- "fix the bug"        # Pass prompt to codex
         headroom wrap codex --no-rtk                # Skip rtk setup
+        headroom wrap codex --no-mcp                # Skip MCP retrieve tool registration
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
+    # Snapshot ~/.codex/config.toml BEFORE any wrap-time mutation so
+    # `headroom unwrap codex` can restore the user's pre-wrap state
+    # byte-for-byte. The snapshot is a no-op if the backup already exists
+    # or if the file already has Headroom markers, so this is safe to
+    # call repeatedly. Crucially this must run before MCP install, which
+    # writes its marker block to the same file.
+    _codex_config_file, _codex_backup_file = _codex_config_paths()
+    _snapshot_codex_config_if_unwrapped(_codex_config_file, _codex_backup_file)
+
     # Setup rtk for Codex (binary + AGENTS.md instructions, no hooks)
     if not no_rtk:
         click.echo("  Setting up rtk for Codex...")
@@ -1726,6 +1791,15 @@ def codex(
             # Also inject into global ~/.codex/AGENTS.md
             global_agents = Path.home() / ".codex" / "AGENTS.md"
             _inject_rtk_instructions(global_agents, verbose=verbose)
+
+    # Register headroom MCP server in ~/.codex/config.toml so Codex can
+    # call headroom_retrieve on compression markers from the proxy.
+    if not no_mcp:
+        from headroom.mcp_registry import CodexRegistrar
+
+        _setup_headroom_mcp(CodexRegistrar(), port, verbose=verbose)
+    elif verbose:
+        click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 
     # Setup memory MCP server for Codex (native tool integration)
     if memory:

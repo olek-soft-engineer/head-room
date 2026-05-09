@@ -96,23 +96,31 @@ def mcp() -> None:
     help=f"Headroom proxy URL (default: {DEFAULT_PROXY_URL})",
 )
 @click.option(
+    "--agent",
+    "agents",
+    multiple=True,
+    help="Restrict installation to specific agents (default: every detected agent).",
+)
+@click.option(
     "--force",
     is_flag=True,
-    help="Overwrite existing headroom config",
+    help="Overwrite existing headroom config in case of mismatch.",
 )
-def mcp_install(proxy_url: str, force: bool) -> None:
-    """Install Headroom MCP server into Claude Code config.
+def mcp_install(proxy_url: str, agents: tuple[str, ...], force: bool) -> None:
+    """Install the Headroom MCP server into every detected coding agent.
 
     \b
-    This registers headroom with Claude Code so it can use the
-    headroom_retrieve tool for CCR (Compress-Cache-Retrieve).
+    By default this installs into every agent that has a registrar and is
+    detected on this system (Claude Code today; Cursor / Codex / Continue /
+    others added in subsequent releases). Pass ``--agent NAME`` one or more
+    times to restrict the installation.
 
     \b
-    Example:
-        headroom mcp install
+    Examples:
+        headroom mcp install                            # every detected agent
+        headroom mcp install --agent claude             # Claude Code only
         headroom mcp install --proxy-url http://localhost:9000
     """
-    # Check for MCP SDK
     try:
         import mcp  # noqa: F401
     except ImportError:
@@ -120,98 +128,35 @@ def mcp_install(proxy_url: str, force: bool) -> None:
         click.echo("Install with: pip install 'headroom-ai[mcp]'", err=True)
         raise SystemExit(1) from None
 
-    command = get_headroom_command()
-    env: dict[str, str] = {}
-    if proxy_url != DEFAULT_PROXY_URL:
-        env["HEADROOM_PROXY_URL"] = proxy_url
+    from headroom.mcp_registry import any_succeeded, format_results, install_everywhere
 
-    # Prefer `claude mcp add` (Claude Code CLI ≥2.x stores servers in
-    # ~/.claude/.claude.json, which is what `claude mcp list` reads).
-    claude_cli = shutil.which("claude")
-    used_claude_cli = False
-    if claude_cli:
-        # Check if already registered
-        result = subprocess.run(
-            [claude_cli, "mcp", "get", "headroom"],
-            capture_output=True,
-            text=True,
-        )
-        already_registered = result.returncode == 0
-
-        if already_registered and not force:
-            click.echo("Headroom MCP is already configured in Claude Code.")
-            click.echo("Use --force to overwrite, or 'headroom mcp uninstall' first.")
-            raise SystemExit(0)
-
-        if already_registered and force:
-            subprocess.run(
-                [claude_cli, "mcp", "remove", "headroom", "-s", "user"],
-                capture_output=True,
-            )
-
-        add_cmd = [claude_cli, "mcp", "add", "headroom", "-s", "user"]
-        for k, v in env.items():
-            add_cmd += ["-e", f"{k}={v}"]
-        add_cmd += ["--", *command]
-
-        result = subprocess.run(add_cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            used_claude_cli = True
-        else:
-            click.echo(
-                f"Warning: 'claude mcp add' failed ({result.stderr.strip()}), "
-                "falling back to mcp.json.",
-                err=True,
-            )
-
-    if not used_claude_cli:
-        # Fallback: write ~/.claude/mcp.json (used by older Claude Code versions
-        # and the Claude.ai desktop app).
-        config = load_mcp_config()
-
-        if "headroom" in config.get("mcpServers", {}) and not force:
-            click.echo("Headroom MCP is already configured in Claude Code.")
-            click.echo("Use --force to overwrite, or 'headroom mcp uninstall' first.")
-            raise SystemExit(0)
-
-        server_config: dict = {"command": command[0], "args": command[1:]}
-        if env:
-            server_config["env"] = env
-
-        if "mcpServers" not in config:
-            config["mcpServers"] = {}
-        config["mcpServers"]["headroom"] = server_config
-        save_mcp_config(config)
-
-    config_note = (
-        "Registered via: claude mcp add (scope: user)"
-        if used_claude_cli
-        else f"Configuration written to: {MCP_CONFIG_PATH}"
+    results = install_everywhere(
+        proxy_url=proxy_url,
+        agents=list(agents) if agents else None,
+        force=force,
     )
 
-    click.echo(f"""
-✓ Headroom MCP server installed!
+    if not results:
+        click.echo("No agents matched the requested filter.")
+        raise SystemExit(1)
 
-{config_note}
+    click.echo("Installing Headroom MCP server...")
+    for line in format_results(
+        results,
+        verbose=True,
+        overwrite_hint=f"headroom mcp install --proxy-url {proxy_url} --force",
+    ):
+        click.echo(line)
 
-Next steps:
-  1. Start the Headroom proxy (if not running):
-     headroom proxy
+    if not any_succeeded(results):
+        raise SystemExit(1)
 
-  2. Start Claude Code WITH the proxy base URL:
-     ANTHROPIC_BASE_URL={proxy_url} claude
-
-  3. Claude Code now has:
-     - All requests compressed through the proxy (saves tokens & cost)
-     - Access to headroom_retrieve tool for CCR retrieval
-     - Stats visible at {proxy_url}/stats
-
-NOTE: The MCP server provides on-demand compression tools
-(headroom_compress, headroom_retrieve, headroom_stats). For automatic
-compression of ALL traffic, also set ANTHROPIC_BASE_URL as shown above.
-
-Proxy URL: {proxy_url}
-""")
+    click.echo(
+        f"\nNext steps:\n"
+        f"  1. Start the Headroom proxy (if not running): headroom proxy\n"
+        f"  2. Start your agent (e.g.) ANTHROPIC_BASE_URL={proxy_url} claude\n"
+        f"  3. Restart any agent that was already running so it picks up the new MCP server.\n"
+    )
 
 
 @mcp.command("uninstall")
