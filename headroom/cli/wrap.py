@@ -34,6 +34,7 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
 
 import click
 
+from headroom._version import __version__ as _HEADROOM_VERSION
 from headroom.copilot_auth import DEFAULT_API_URL as COPILOT_API_URL
 from headroom.copilot_auth import has_oauth_auth, resolve_client_bearer_token
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
@@ -882,6 +883,65 @@ def _query_proxy_config(port: int) -> dict[str, Any] | None:
     return _copilot_query_proxy_config(port)
 
 
+def _query_proxy_health(port: int) -> dict[str, Any] | None:
+    """Query the running proxy's full /health payload."""
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{port}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _proxy_health_config(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Extract the config block from a Headroom /health payload."""
+    if payload is None:
+        return None
+    config = payload.get("config")
+    return config if isinstance(config, dict) else None
+
+
+def _proxy_active_session_count(payload: dict[str, Any] | None) -> int:
+    """Return active session count from /health runtime metadata."""
+    if payload is None:
+        return 0
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, dict):
+        return 0
+    websocket_sessions = runtime.get("websocket_sessions")
+    if not isinstance(websocket_sessions, dict):
+        return 0
+    counts = []
+    for key in ("active_sessions", "active_relay_tasks"):
+        value = websocket_sessions.get(key, 0)
+        if isinstance(value, int):
+            counts.append(value)
+    return max(counts, default=0)
+
+
+def _proxy_version(payload: dict[str, Any] | None) -> str | None:
+    """Return the running proxy version when it exposes one."""
+    if payload is None:
+        return None
+    version = payload.get("version")
+    return version if isinstance(version, str) and version else None
+
+
+def _proxy_needs_version_restart(payload: dict[str, Any] | None) -> bool:
+    """Return True when a running Headroom proxy uses a different package version."""
+    running_version = _proxy_version(payload)
+    return (
+        running_version is not None
+        and running_version != "unknown"
+        and _HEADROOM_VERSION != "unknown"
+        and running_version != _HEADROOM_VERSION
+    )
+
+
 def _detect_running_proxy_backend(port: int) -> str | None:
     """Read the backend of an already-running proxy from its health endpoint."""
     return _copilot_detect_running_proxy_backend(port)
@@ -1024,6 +1084,46 @@ def _recover_persistent_proxy(port: int) -> bool:
     return False
 
 
+def _restart_persistent_proxy(manifest: Any, port: int) -> bool:
+    """Restart a persistent deployment after an idle stale-version detection."""
+    from headroom.install.models import InstallPreset, SupervisorKind
+    from headroom.install.runtime import (
+        start_detached_agent,
+        start_persistent_docker,
+        stop_runtime,
+        wait_ready,
+    )
+    from headroom.install.supervisors import start_supervisor
+
+    click.echo(
+        f"  Restarting persistent deployment '{manifest.profile}' "
+        f"with Headroom {_HEADROOM_VERSION}..."
+    )
+    try:
+        if manifest.preset == InstallPreset.PERSISTENT_DOCKER.value:
+            stop_runtime(manifest)
+            start_persistent_docker(manifest)
+        elif manifest.supervisor_kind == SupervisorKind.SERVICE.value:
+            # start_supervisor performs the platform-native restart operation:
+            # systemd restart, launchctl kickstart -k, or sc.exe start.
+            start_supervisor(manifest)
+        else:
+            stop_runtime(manifest)
+            start_detached_agent(manifest.profile)
+    except Exception as exc:
+        click.echo(
+            f"  Warning: could not restart persistent deployment '{manifest.profile}': {exc}"
+        )
+        return False
+
+    if wait_ready(manifest, timeout_seconds=45):
+        click.echo(f"  Restarted persistent deployment '{manifest.profile}' on port {port}")
+        return True
+
+    click.echo(f"  Warning: persistent deployment '{manifest.profile}' did not become ready")
+    return False
+
+
 def _copilot_model_configured(copilot_args: tuple[str, ...], env: dict[str, str]) -> bool:
     """Return True when Copilot BYOK model selection is configured."""
     return _copilot_model_configured_impl(copilot_args, env)
@@ -1069,6 +1169,26 @@ def _ensure_proxy(
             from headroom.install.health import probe_ready
 
             if probe_ready(manifest.health_url):
+                health_payload = helpers._query_proxy_health(port)
+                if helpers._proxy_needs_version_restart(health_payload):
+                    running_version = helpers._proxy_version(health_payload) or "unknown"
+                    active_sessions = helpers._proxy_active_session_count(health_payload)
+                    if active_sessions > 0:
+                        click.echo(
+                            f"  Proxy on port {port} is running Headroom {running_version}; "
+                            f"current CLI is {_HEADROOM_VERSION}."
+                        )
+                        click.echo(
+                            f"  Leaving it running because {active_sessions} active session(s) "
+                            "are still attached; it will be restarted when idle."
+                        )
+                        return None
+                    if helpers._restart_persistent_proxy(manifest, port):
+                        return None
+                    raise click.ClickException(
+                        f"Persistent deployment '{manifest.profile}' on port {port} "
+                        f"is running stale Headroom {running_version} and could not be restarted."
+                    )
                 click.echo(f"  Proxy already running on port {port}")
                 return None
             if helpers._recover_persistent_proxy(port):
@@ -1085,7 +1205,41 @@ def _ensure_proxy(
         if helpers._check_proxy(port):
             # Proxy is running — check if it has the features we need
             needs_restart = False
-            running_config = helpers._query_proxy_config(port)
+            health_payload = helpers._query_proxy_health(port)
+            running_config = helpers._proxy_health_config(health_payload)
+            if running_config is None:
+                running_config = helpers._query_proxy_config(port)
+
+            if helpers._proxy_needs_version_restart(health_payload):
+                running_version = helpers._proxy_version(health_payload) or "unknown"
+                active_sessions = helpers._proxy_active_session_count(health_payload)
+                if active_sessions > 0:
+                    click.echo(
+                        f"  Proxy on port {port} is running Headroom {running_version}; "
+                        f"current CLI is {_HEADROOM_VERSION}."
+                    )
+                    click.echo(
+                        f"  Leaving it running because {active_sessions} active session(s) "
+                        "are still attached; it will be restarted when idle."
+                    )
+                    return None
+
+                click.echo(
+                    f"  Proxy on port {port} is running Headroom {running_version}; "
+                    f"restarting with {_HEADROOM_VERSION}..."
+                )
+                proxy_pid = running_config.get("pid") if running_config is not None else None
+                if proxy_pid is None:
+                    raise click.ClickException(
+                        f"Proxy on port {port} is stale but did not expose a PID. "
+                        "Stop it manually and retry."
+                    )
+                if not helpers._kill_proxy_by_pid(int(proxy_pid), port):
+                    raise click.ClickException(
+                        f"Failed to stop stale proxy (PID {proxy_pid}) on port {port}. "
+                        "Stop it manually and retry."
+                    )
+                needs_restart = True
 
             if running_config is not None:
                 missing = []
