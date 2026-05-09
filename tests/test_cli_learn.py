@@ -153,6 +153,7 @@ def test_learn_project_lookup_and_apply_flow(
     monkeypatch.setattr("headroom.learn.analyzer._detect_default_model", lambda: "gpt-4o")
     monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
     monkeypatch.setattr("headroom.learn.analyzer.SessionAnalyzer", lambda model=None: analyzer)
+    monkeypatch.setattr("os.cpu_count", lambda: 12)
 
     result = runner.invoke(
         main,
