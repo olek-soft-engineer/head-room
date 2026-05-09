@@ -188,6 +188,7 @@ def _start_proxy(
         stdout=log_file,
         stderr=log_file,
         env=proxy_env,
+        start_new_session=os.name == "posix",
     )
 
     # Wait for proxy to be ready (up to 45 seconds).
@@ -240,6 +241,74 @@ def _setup_rtk(verbose: bool = False) -> Path | None:
         click.echo("  rtk hook registration failed — continuing without it")
 
     return rtk_path
+
+
+def _remove_claude_rtk_hooks(settings_path: Path | None = None) -> bool:
+    """Remove Headroom/rtk-managed Claude hook entries from settings.json.
+
+    `rtk init --global --auto-patch` installs a Claude PreToolUse hook that
+    points at an ``rtk-rewrite`` script. Unwrap should remove that hook without
+    touching unrelated Claude settings or user-authored hooks.
+    """
+
+    path = settings_path or (Path.home() / ".claude" / "settings.json")
+    if not path.exists():
+        return False
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+
+    hooks = payload.get("hooks")
+    if not isinstance(hooks, dict):
+        return False
+
+    changed = False
+    for event, entries in list(hooks.items()):
+        if not isinstance(entries, list):
+            continue
+        retained_entries: list[Any] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                retained_entries.append(entry)
+                continue
+            hook_items = entry.get("hooks")
+            if not isinstance(hook_items, list):
+                retained_entries.append(entry)
+                continue
+            retained_hooks = [
+                item
+                for item in hook_items
+                if not (
+                    isinstance(item, dict) and "rtk-rewrite" in str(item.get("command", "")).lower()
+                )
+            ]
+            if len(retained_hooks) != len(hook_items):
+                changed = True
+            if retained_hooks:
+                retained_entries.append({**entry, "hooks": retained_hooks})
+            elif len(retained_hooks) == len(hook_items):
+                retained_entries.append(entry)
+            else:
+                changed = True
+        if retained_entries:
+            hooks[event] = retained_entries
+        else:
+            del hooks[event]
+            changed = True
+
+    if not changed:
+        return False
+
+    if hooks:
+        payload["hooks"] = hooks
+    else:
+        payload.pop("hooks", None)
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return True
 
 
 def _setup_headroom_mcp(
@@ -454,6 +523,8 @@ _MEMORY_AGENTS_MARKER = "<!-- headroom:memory-instructions -->"
 # Codex config injection markers
 _CODEX_TOP_LEVEL_MARKER = "# --- Headroom proxy (auto-injected by headroom wrap codex) ---"
 _CODEX_END_MARKER = "# --- end Headroom ---"
+_CODEX_MCP_MARKER = "# --- Headroom MCP server ---"
+_CODEX_MCP_END = "# --- end Headroom MCP server ---"
 # File name used for the pre-wrap snapshot of ~/.codex/config.toml.  The
 # snapshot lets `headroom unwrap codex` restore the exact prior state, even
 # if the user had their own `model_provider` / `[model_providers.*]` config
@@ -469,7 +540,7 @@ def _codex_config_paths() -> tuple[Path, Path]:
     return config_file, backup_file
 
 
-def _strip_codex_headroom_blocks(content: str) -> str:
+def _strip_codex_headroom_blocks(content: str, *, remove_mcp: bool = False) -> str:
     """Remove all Headroom-managed blocks from a Codex ``config.toml`` string.
 
     Returns the cleaned content.  Safe to call on content that never contained
@@ -478,19 +549,25 @@ def _strip_codex_headroom_blocks(content: str) -> str:
     """
     import re
 
-    # Remove any top-level-marker → end-marker span, possibly repeated.
-    while _CODEX_TOP_LEVEL_MARKER in content and _CODEX_END_MARKER in content:
-        start = content.index(_CODEX_TOP_LEVEL_MARKER)
-        end_idx = content.index(_CODEX_END_MARKER, start)
-        if end_idx < start:
-            break
-        end = end_idx + len(_CODEX_END_MARKER)
-        content = content[:start].rstrip("\n") + "\n" + content[end:].lstrip("\n")
+    def _remove_marker_span(text: str, start_marker: str, end_marker: str) -> str:
+        while start_marker in text and end_marker in text:
+            start = text.index(start_marker)
+            end_idx = text.index(end_marker, start)
+            if end_idx < start:
+                break
+            end = end_idx + len(end_marker)
+            text = text[:start].rstrip("\n") + "\n" + text[end:].lstrip("\n")
+        text = text.replace(start_marker + "\n", "")
+        text = text.replace(end_marker + "\n", "")
+        return text
 
-    # Remove any stale top-level marker or end marker that lost its partner
-    # (e.g. a crashed prior wrap).
-    content = content.replace(_CODEX_TOP_LEVEL_MARKER + "\n", "")
-    content = content.replace(_CODEX_END_MARKER + "\n", "")
+    # Remove any top-level-marker → end-marker span, possibly repeated.
+    content = _remove_marker_span(content, _CODEX_TOP_LEVEL_MARKER, _CODEX_END_MARKER)
+
+    if remove_mcp:
+        # Remove Headroom-managed MCP blocks written by `wrap codex`.
+        content = _remove_marker_span(content, _CODEX_MCP_MARKER, _CODEX_MCP_END)
+        content = _remove_marker_span(content, _MEMORY_MCP_MARKER, _MEMORY_MCP_END)
 
     # Strip any leftover top-level keys that older (or crashed) versions of
     # `wrap codex` may have written outside the marker block.
@@ -673,7 +750,7 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
     if config_file.exists():
         original = config_file.read_text()
         if _CODEX_TOP_LEVEL_MARKER in original or _CODEX_END_MARKER in original:
-            cleaned = _strip_codex_headroom_blocks(original)
+            cleaned = _strip_codex_headroom_blocks(original, remove_mcp=True)
             if not cleaned.strip():
                 # Nothing left but Headroom content — remove the file entirely
                 # so Codex falls back to its default config.
@@ -843,6 +920,56 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
             return True
 
     return False
+
+
+def _stop_local_proxy_for_unwrap(port: int) -> str:
+    """Stop a local Headroom proxy for durable unwrap commands.
+
+    Returns a status string:
+      * ``"stopped"``: a Headroom proxy was identified and stopped.
+      * ``"not_running"``: nothing is listening on the requested port.
+      * ``"unidentified"``: something is listening, but it did not expose
+        Headroom's health/config payload, so we did not kill it.
+      * ``"no_pid"``: the service looked like Headroom but did not expose a PID.
+      * ``"failed"``: a PID was found but the port stayed bound after stop.
+    """
+
+    if not _check_proxy(port):
+        return "not_running"
+
+    running_config = _query_proxy_config(port)
+    if running_config is None:
+        return "unidentified"
+
+    proxy_pid = running_config.get("pid")
+    if proxy_pid is None:
+        return "no_pid"
+
+    try:
+        pid = int(proxy_pid)
+    except (TypeError, ValueError):
+        return "no_pid"
+
+    return "stopped" if _kill_proxy_by_pid(pid, port) else "failed"
+
+
+def _echo_unwrap_proxy_stop_status(status: str, port: int) -> None:
+    """Print a human-readable proxy stop result for unwrap commands."""
+
+    if status == "stopped":
+        click.echo(f"  Stopped local Headroom proxy on port {port}.")
+    elif status == "not_running":
+        click.echo(f"  No local Headroom proxy detected on port {port}.")
+    elif status == "unidentified":
+        click.echo(
+            f"  Warning: port {port} is in use, but it did not look like Headroom; left it running."
+        )
+    elif status == "no_pid":
+        click.echo(
+            f"  Warning: Headroom proxy on port {port} did not expose a PID; left it running."
+        )
+    else:
+        click.echo(f"  Warning: failed to stop Headroom proxy on port {port}; stop it manually.")
 
 
 def _find_persistent_manifest(port: int) -> Any:
@@ -1069,6 +1196,12 @@ def _make_cleanup(proxy_proc_holder: list, port: int = 8787) -> Any:
     return cleanup
 
 
+def _ignore_child_sigint(signum: int | None = None, frame: Any = None) -> None:
+    """Keep the wrapper alive when Ctrl-C is intended for the child CLI."""
+
+    return None
+
+
 def _launch_tool(
     binary: str,
     args: tuple,
@@ -1090,7 +1223,7 @@ def _launch_tool(
     """Common logic: start proxy, launch tool, clean up."""
     proxy_holder: list[subprocess.Popen | None] = [None]
     cleanup = _make_cleanup(proxy_holder, port)
-    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, cleanup)
 
     try:
@@ -1431,7 +1564,7 @@ def claude(
     # Setup rtk before launching (Claude-specific)
     proxy_holder: list[subprocess.Popen | None] = [None]
     cleanup = _make_cleanup(proxy_holder, port)
-    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGINT, _ignore_child_sigint)
     signal.signal(signal.SIGTERM, cleanup)
 
     # Memory sync BEFORE proxy startup — sync headroom DB ↔ Claude's files
@@ -1524,6 +1657,62 @@ def claude(
         raise SystemExit(1) from e
     finally:
         cleanup()
+
+
+# =============================================================================
+# Claude Code (unwrap)
+# =============================================================================
+
+
+@unwrap.command("claude")
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+@click.option("--keep-mcp", is_flag=True, help="Keep Headroom MCP registrations")
+@click.option("--keep-rtk", is_flag=True, help="Keep rtk Claude hooks")
+def unwrap_claude(
+    port: int,
+    no_stop_proxy: bool,
+    keep_mcp: bool,
+    keep_rtk: bool,
+) -> None:
+    """Undo durable setup from ``headroom wrap claude``."""
+    click.echo()
+    click.echo("  ╔═══════════════════════════════════════════════╗")
+    click.echo("  ║          HEADROOM UNWRAP: CLAUDE              ║")
+    click.echo("  ╚═══════════════════════════════════════════════╝")
+    click.echo()
+
+    if not keep_mcp:
+        from headroom.mcp_registry import ClaudeRegistrar
+
+        registrar = ClaudeRegistrar()
+        if registrar.detect():
+            removed_headroom = registrar.unregister_server("headroom")
+            removed_code_graph = registrar.unregister_server(_CBM_MCP_SERVER_NAME)
+            if removed_headroom:
+                click.echo("  Removed Headroom MCP retrieve tool from Claude.")
+            else:
+                click.echo("  Headroom MCP retrieve tool was not registered in Claude.")
+            if removed_code_graph:
+                click.echo("  Removed code graph MCP server from Claude.")
+        else:
+            click.echo("  Claude Code not detected; skipped MCP cleanup.")
+    else:
+        click.echo("  Kept Claude MCP registrations (--keep-mcp).")
+
+    if not keep_rtk:
+        if _remove_claude_rtk_hooks():
+            click.echo("  Removed rtk Claude hook from settings.json.")
+        else:
+            click.echo("  No rtk Claude hook found in settings.json.")
+    else:
+        click.echo("  Kept rtk Claude hooks (--keep-rtk).")
+
+    click.echo()
+    click.echo("✓ Claude is no longer durably wrapped by Headroom.")
+    if not no_stop_proxy:
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    click.echo()
 
 
 # =============================================================================
@@ -2320,11 +2509,15 @@ def openclaw(
 
 
 @unwrap.command("openclaw")
+@click.option("--proxy-port", default=8787, type=int, help="Headroom proxy port")
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 @click.option("--no-restart", is_flag=True, help="Do not restart OpenClaw gateway at the end")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.option("--existing-entry-json", default=None, hidden=True)
 def unwrap_openclaw(
+    proxy_port: int,
+    no_stop_proxy: bool,
     no_restart: bool,
     verbose: bool,
     prepare_only: bool,
@@ -2384,6 +2577,8 @@ def unwrap_openclaw(
     click.echo("✓ OpenClaw Headroom wrap removed.")
     click.echo("  Plugin: headroom (installed, disabled)")
     click.echo("  Slot:   plugins.slots.contextEngine = legacy")
+    if not no_stop_proxy:
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(proxy_port), proxy_port)
     click.echo()
 
 
@@ -2393,7 +2588,9 @@ def unwrap_openclaw(
 
 
 @unwrap.command("codex")
-def unwrap_codex() -> None:
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+def unwrap_codex(port: int, no_stop_proxy: bool) -> None:
     """Undo ``headroom wrap codex`` edits to ``~/.codex/config.toml``.
 
     Behaviour:
@@ -2430,4 +2627,6 @@ def unwrap_codex() -> None:
 
     click.echo()
     click.echo("✓ Codex is no longer routed through the Headroom proxy.")
+    if not no_stop_proxy:
+        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
     click.echo()

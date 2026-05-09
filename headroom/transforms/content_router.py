@@ -1520,7 +1520,7 @@ class ContentRouter(Transform):
         skip_user = (
             kwargs.get("compress_user_messages") is not True and self.config.skip_user_messages
         )
-        skip_system = kwargs.get("compress_system_messages") is False
+        skip_system = kwargs.get("compress_system_messages") is not True
         protect_recent = kwargs.get("protect_recent", self.config.protect_recent_code)
         protect_analysis = kwargs.get(
             "protect_analysis_context", self.config.protect_analysis_context
@@ -1715,10 +1715,11 @@ class ContentRouter(Transform):
                 route_counts["user_msg"] += 1
                 continue
 
-            # Protection 1b: Never compress system messages (when disabled)
-            if skip_system and role == "system":
+            # Protection 1b: Never compress system/developer messages unless
+            # explicitly opted in. These are cache-hot instruction bytes.
+            if skip_system and role in {"system", "developer"}:
                 result_slots[i] = message
-                transforms_applied.append("router:protected:system_message")
+                transforms_applied.append(f"router:protected:{role}_message")
                 route_counts.setdefault("system_msg", 0)
                 route_counts["system_msg"] += 1
                 continue
@@ -2004,7 +2005,7 @@ class ContentRouter(Transform):
         # Role-based gate for `text` blocks. Tool/function roles are tool
         # outputs and compress freely; assistant defaults to skip (cache
         # safety) with explicit opt-in; unknown roles default to skip.
-        if (skip_user and role == "user") or (skip_system and role == "system"):
+        if (skip_user and role == "user") or (skip_system and role in {"system", "developer"}):
             protect_text_blocks = True
         elif role == "assistant" and not compress_assistant_text_blocks:
             protect_text_blocks = True

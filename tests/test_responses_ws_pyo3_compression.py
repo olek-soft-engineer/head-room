@@ -36,6 +36,7 @@ def _ensure_binding():
 def _ws_compress_first_frame(
     first_msg_raw: str,
     auth_mode_value: str = "payg",
+    bypass: bool = False,
 ) -> tuple[str, bool]:
     """Replicates the WS-handler compression block as a pure function.
 
@@ -45,6 +46,9 @@ def _ws_compress_first_frame(
     up a full WebSocket fixture. If you change the handler's
     compression block, mirror it here so the tests catch the drift.
     """
+    if bypass:
+        return first_msg_raw, False
+
     compress = _ensure_binding()
 
     try:
@@ -60,7 +64,9 @@ def _ws_compress_first_frame(
     model = (inner.get("model") if isinstance(inner, dict) else None) or ""
 
     inner_bytes = json.dumps(inner).encode("utf-8")
-    new_bytes, modified, _saved, _transforms = compress(inner_bytes, auth_mode_value, model)
+    new_bytes, modified, _saved, _transforms, _reason = compress(
+        inner_bytes, auth_mode_value, model
+    )
     if not modified:
         return first_msg_raw, False
 
@@ -110,6 +116,37 @@ class TestWrappedEnvelopeShape:
         # Single small user message → no compression applies.
         assert modified is False
         assert json.loads(out) == json.loads(first_msg)
+
+    def test_bypass_header_short_circuits_first_frame(self):
+        first_msg = json.dumps(
+            {
+                "type": "response.create",
+                "response": {
+                    "model": "gpt-5",
+                    "input": [
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_1",
+                            "output": json.dumps(
+                                [
+                                    {
+                                        "id": i,
+                                        "name": f"Item {i}",
+                                        "desc": "large repeated payload " * 20,
+                                    }
+                                    for i in range(100)
+                                ]
+                            ),
+                        }
+                    ],
+                },
+            }
+        )
+
+        out, modified = _ws_compress_first_frame(first_msg, bypass=True)
+
+        assert modified is False
+        assert out == first_msg
 
 
 class TestUnwrappedShape:

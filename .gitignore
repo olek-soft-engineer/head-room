@@ -187,6 +187,7 @@ benchmark_results/
 .deepeval/
 
 # Headroom specific
+.headroom/
 headroom.db
 headroom_*.db
 *.jsonl

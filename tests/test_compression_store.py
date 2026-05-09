@@ -803,8 +803,40 @@ class TestCompressionStoreSearch:
         results = store.search(hash_key, "query")
         assert results == []
 
+    def test_search_plain_text_returns_matching_chunks(self, store: CompressionStore):
+        """search() can find content in Kompress-style plain-text originals."""
+        original = (
+            "The OpenAI handler contains def _compress_openai_responses_payload "
+            "for Responses API live-zone compression. Other text is irrelevant."
+        )
+        hash_key = store.store(original=original, compressed="compressed")
+
+        results = store.search(hash_key, "def _compress_openai_responses_payload")
+
+        assert len(results) == 1
+        assert results[0]["type"] == "text"
+        assert "_compress_openai_responses_payload" in results[0]["text"]
+
+    def test_search_json_object_returns_matching_leaf(self, store: CompressionStore):
+        """search() can find values inside JSON objects, not only arrays."""
+        original = json.dumps(
+            {
+                "module": {
+                    "name": "openai",
+                    "function": "_compress_openai_responses_payload",
+                }
+            }
+        )
+        hash_key = store.store(original=original, compressed="{}")
+
+        results = store.search(hash_key, "_compress_openai_responses_payload")
+
+        assert len(results) == 1
+        assert results[0]["path"] == "module.function"
+        assert results[0]["value"] == "_compress_openai_responses_payload"
+
     def test_search_non_array_returns_empty(self, store: CompressionStore):
-        """search() returns empty for non-array content."""
+        """search() returns empty for JSON objects without matching leaves."""
         hash_key = store.store(original=json.dumps({"key": "value"}), compressed="{}")
         results = store.search(hash_key, "query")
         assert results == []

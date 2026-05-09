@@ -409,12 +409,7 @@ class CompressionStore:
         if entry is None:
             return []
 
-        try:
-            items = json.loads(entry.original_content)
-            if not isinstance(items, list):
-                return []
-        except json.JSONDecodeError:
-            return []
+        items = self._search_items_from_original(entry.original_content)
 
         if not items:
             return []
@@ -449,6 +444,149 @@ class CompressionStore:
             self.process_pending_feedback()
 
         return results
+
+    def _search_items_from_original(self, original_content: str) -> list[Any]:
+        """Normalize cached originals into searchable items.
+
+        CCR producers store different shapes:
+        - SmartCrusher/search-style paths usually store JSON arrays.
+        - Kompress stores the original plain text.
+        - Some callers store JSON objects or scalar JSON values.
+
+        Search should work for all of them. Preserve the legacy JSON-array
+        result shape, but fall back to structured text chunks for everything
+        else so `headroom_retrieve(hash, query=...)` can find plain-text
+        originals.
+        """
+
+        try:
+            parsed = json.loads(original_content)
+        except json.JSONDecodeError:
+            return self._plain_text_search_items(original_content)
+
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            return self._json_object_search_items(parsed)
+        if isinstance(parsed, str):
+            return self._plain_text_search_items(parsed)
+        if parsed is None:
+            return []
+        return [{"type": "json_scalar", "value": parsed}]
+
+    def _json_object_search_items(self, value: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return searchable leaf records for a JSON object."""
+
+        items: list[dict[str, Any]] = []
+
+        def walk(node: Any, path: str) -> None:
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    child_path = f"{path}.{key}" if path else str(key)
+                    walk(child, child_path)
+                return
+            if isinstance(node, list):
+                for idx, child in enumerate(node):
+                    walk(child, f"{path}[{idx}]")
+                return
+            if node is None:
+                return
+            items.append({"type": "json_leaf", "path": path, "value": node})
+
+        walk(value, "")
+        if items:
+            return items
+        return [{"type": "json_object", "value": value}]
+
+    def _plain_text_search_items(self, text: str) -> list[dict[str, Any]]:
+        """Chunk arbitrary text into searchable records.
+
+        Line-aware chunks work well for logs/source. Word-window chunks handle
+        Kompress originals, which are often long single-line text blobs.
+        """
+
+        if not text or not text.strip():
+            return []
+
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        lines = normalized.split("\n")
+        if len(lines) > 1:
+            return self._line_text_search_items(lines)
+
+        words = normalized.split()
+        if not words:
+            return []
+        max_words = 350
+        overlap_words = 50
+        if len(words) <= max_words:
+            return [
+                {
+                    "type": "text",
+                    "text": normalized,
+                    "chunk_index": 0,
+                    "word_start": 1,
+                    "word_end": len(words),
+                }
+            ]
+
+        items: list[dict[str, Any]] = []
+        start = 0
+        chunk_index = 0
+        step = max_words - overlap_words
+        while start < len(words):
+            end = min(len(words), start + max_words)
+            items.append(
+                {
+                    "type": "text",
+                    "text": " ".join(words[start:end]),
+                    "chunk_index": chunk_index,
+                    "word_start": start + 1,
+                    "word_end": end,
+                }
+            )
+            if end == len(words):
+                break
+            start += step
+            chunk_index += 1
+        return items
+
+    @staticmethod
+    def _line_text_search_items(lines: list[str]) -> list[dict[str, Any]]:
+        max_chars = 2000
+        items: list[dict[str, Any]] = []
+        current: list[str] = []
+        line_start = 1
+        char_count = 0
+
+        for idx, line in enumerate(lines, start=1):
+            line_len = len(line) + 1
+            if current and char_count + line_len > max_chars:
+                items.append(
+                    {
+                        "type": "text",
+                        "text": "\n".join(current),
+                        "chunk_index": len(items),
+                        "line_start": line_start,
+                        "line_end": idx - 1,
+                    }
+                )
+                current = []
+                line_start = idx
+                char_count = 0
+            current.append(line)
+            char_count += line_len
+
+        if current:
+            items.append(
+                {
+                    "type": "text",
+                    "text": "\n".join(current),
+                    "chunk_index": len(items),
+                    "line_start": line_start,
+                    "line_end": len(lines),
+                }
+            )
+        return items
 
     def _get_entry_for_search(
         self,

@@ -74,9 +74,7 @@ from headroom.ccr import (
 )
 from headroom.config import (
     CacheAlignerConfig,
-    CCRConfig,
     ReadLifecycleConfig,
-    SmartCrusherConfig,
 )
 from headroom.dashboard import get_dashboard_html
 from headroom.observability import (
@@ -122,6 +120,7 @@ from headroom.proxy.helpers import (
     _get_rtk_stats,  # noqa: F401
     _read_request_json,  # noqa: F401
     _setup_file_logging,  # noqa: F401
+    initialize_rtk_session_baseline,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
 )
@@ -157,7 +156,6 @@ from headroom.transforms import (
     CodeCompressorConfig,
     ContentRouter,
     ContentRouterConfig,
-    SmartCrusher,
     TransformPipeline,
     is_tree_sitter_available,
 )
@@ -346,41 +344,22 @@ class HeadroomProxy(
         # Reported via metrics as `_context_manager_status = "passthrough"`.
         self._context_manager_status = "passthrough"
 
-        if config.smart_routing:
-            # Smart routing: ContentRouter handles all content types intelligently
-            # It lazy-loads compressors only when needed
-            router_config = ContentRouterConfig(
-                enable_code_aware=config.code_aware_enabled,
-                tool_profiles=config.tool_profiles,
-                read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
-            )
-            # Token mode: allow compression of older excluded-tool results
-            if is_token_mode(config.mode):
-                router_config.protect_recent_reads_fraction = 0.3
-            transforms = [
-                CacheAligner(CacheAlignerConfig(enabled=False)),
-                ContentRouter(router_config, observer=self.metrics),
-            ]
-            self._code_aware_status = "lazy" if config.code_aware_enabled else "disabled"
-        else:
-            # Legacy mode: sequential pipeline
-            transforms = [
-                CacheAligner(CacheAlignerConfig(enabled=False)),
-                SmartCrusher(
-                    SmartCrusherConfig(  # type: ignore[arg-type]
-                        enabled=True,
-                        min_tokens_to_crush=config.min_tokens_to_crush,
-                        max_items_after_crush=config.max_items_after_crush,
-                    ),
-                    ccr_config=CCRConfig(
-                        enabled=config.ccr_inject_tool,
-                        inject_retrieval_marker=config.ccr_inject_tool,  # Add CCR markers
-                    ),
-                    observer=self.metrics,
-                ),
-            ]
-            # Add CodeAware if enabled and available
-            self._code_aware_status = self._setup_code_aware(config, transforms)
+        # ContentRouter is the single proxy routing surface. Provider handlers
+        # normalize their request shapes into messages or CompressionUnits, and
+        # the router chooses SmartCrusher, log/search/diff/code, or Kompress.
+        router_config = ContentRouterConfig(
+            enable_code_aware=config.code_aware_enabled,
+            tool_profiles=config.tool_profiles,
+            read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
+        )
+        # Token mode: allow compression of older excluded-tool results.
+        if is_token_mode(config.mode):
+            router_config.protect_recent_reads_fraction = 0.3
+        transforms = [
+            CacheAligner(CacheAlignerConfig(enabled=False)),
+            ContentRouter(router_config, observer=self.metrics),
+        ]
+        self._code_aware_status = "lazy" if config.code_aware_enabled else "disabled"
 
         self.anthropic_pipeline = TransformPipeline(
             transforms=transforms,
@@ -862,11 +841,7 @@ class HeadroomProxy(
             self.anthropic_pre_upstream_memory_context_timeout_seconds,
         )
 
-        # Smart routing status
-        if self.config.smart_routing:
-            logger.info("Smart Routing: ENABLED (intelligent content detection)")
-        else:
-            logger.info("Smart Routing: DISABLED (legacy sequential mode)")
+        logger.info("Smart Routing: ENABLED (ContentRouter is always active)")
 
         # Eagerly load ALL compressors, parsers, and detectors at startup
         # This eliminates cold-start latency spikes on first requests.
@@ -1364,6 +1339,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.started_at = time.time()
         app.state.ready = False
         app.state.startup_error = None
+        initialize_rtk_session_baseline()
 
         try:
             try:
@@ -1734,8 +1710,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # compression and rtk both remove tokens before they reach model
         # context, so dashboard-facing compression savings combines them.
         proxy_compression_tokens = m.tokens_saved_total
-        compression_tokens = proxy_compression_tokens + cli_tokens_avoided
-        total_tokens_before = m.tokens_input_total + compression_tokens
+        all_layers_tokens_saved = proxy_compression_tokens + cli_tokens_avoided
+        total_tokens_before = m.tokens_input_total + all_layers_tokens_saved
+        proxy_total_before_compression = m.tokens_input_total + proxy_compression_tokens
 
         # Build human-readable summary
         summary = _build_session_summary(
@@ -1780,7 +1757,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         # Build unified savings summary (all layers)
         cache_net_usd = prefix_cache_stats.get("totals", {}).get("net_savings_usd", 0.0)
-        total_tokens_all_layers = compression_tokens
+        total_tokens_all_layers = all_layers_tokens_saved
         persistent_savings = m.savings_tracker.stats_preview()
         display_session = persistent_savings.get("display_session", {})
 
@@ -1791,18 +1768,20 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "by_layer": {
                     "cli_filtering": {
                         "tokens": cli_tokens_avoided,
-                        "included_in": "compression",
+                        "included_in": "tokens.saved",
                         "description": (
                             "Tokens avoided by CLI output filtering (rtk) before reaching context. "
-                            "Included in dashboard compression savings."
+                            "Included in dashboard token savings, but not in dollar savings."
                         ),
                     },
                     "compression": {
-                        "tokens": compression_tokens,
+                        "tokens": proxy_compression_tokens,
                         "proxy_tokens": proxy_compression_tokens,
                         "rtk_tokens": cli_tokens_avoided,
+                        "all_layers_tokens": all_layers_tokens_saved,
                         "description": (
-                            "Tokens removed before model context by proxy compression plus rtk CLI filtering."
+                            "Tokens removed by Headroom proxy compression. "
+                            "Dashboard token savings also includes rtk CLI filtering."
                         ),
                     },
                     "prefix_cache": {
@@ -1827,13 +1806,27 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "tokens": {
                 "input": m.tokens_input_total,
                 "output": m.tokens_output_total,
-                "saved": compression_tokens,
+                "saved": all_layers_tokens_saved,
                 "proxy_compression_saved": proxy_compression_tokens,
                 "rtk_saved": cli_tokens_avoided,
                 "cli_tokens_avoided": cli_tokens_avoided,
+                "proxy_total_before_compression": proxy_total_before_compression,
                 "total_before_compression": total_tokens_before,
+                "all_layers_saved": all_layers_tokens_saved,
+                "proxy_savings_percent": round(
+                    (proxy_compression_tokens / proxy_total_before_compression * 100)
+                    if proxy_total_before_compression > 0
+                    else 0,
+                    2,
+                ),
                 "savings_percent": round(
-                    (compression_tokens / total_tokens_before * 100)
+                    (all_layers_tokens_saved / total_tokens_before * 100)
+                    if total_tokens_before > 0
+                    else 0,
+                    2,
+                ),
+                "all_layers_savings_percent": round(
+                    (all_layers_tokens_saved / total_tokens_before * 100)
                     if total_tokens_before > 0
                     else 0,
                     2,
@@ -1956,6 +1949,18 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         if cached:
             return await _get_cached_stats_payload()
         return await _build_stats_payload()
+
+    @app.post("/stats/reset", dependencies=[Depends(_require_loopback)])
+    async def stats_reset():
+        """Reset in-memory proxy stats for local test/debug isolation."""
+        await proxy.metrics.reset_runtime()
+        if proxy.cost_tracker:
+            proxy.cost_tracker.reset_runtime()
+        initialize_rtk_session_baseline()
+        async with _stats_snapshot_lock:
+            _stats_snapshot["value"] = None
+            _stats_snapshot["expires_at"] = 0.0
+        return JSONResponse(status_code=200, content={"status": "reset"})
 
     @app.get("/stats-history")
     async def stats_history(
@@ -2105,6 +2110,10 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         store = get_compression_store()
 
         if query:
+            if not store.exists(hash_key, clean_expired=True):
+                raise HTTPException(
+                    status_code=404, detail="Entry not found or expired (TTL: 5 minutes)"
+                )
             # Search within cached content
             results = store.search(hash_key, query)
             return {
@@ -2415,6 +2424,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         store = get_compression_store()
 
         if query:
+            if not store.exists(hash_key, clean_expired=True):
+                raise HTTPException(status_code=404, detail="Entry not found or expired")
             results = store.search(hash_key, query)
             return {
                 "hash": hash_key,
@@ -2911,13 +2922,6 @@ if __name__ == "__main__":
     parser.add_argument("--log-file", help="Log file path")
     parser.add_argument("--log-messages", action="store_true", help="Log full messages")
 
-    # Smart routing (content-aware compression)
-    parser.add_argument(
-        "--no-smart-routing",
-        action="store_true",
-        help="Disable smart routing (use legacy sequential pipeline)",
-    )
-
     # Code-aware compression
     parser.add_argument(
         "--code-aware",
@@ -2934,7 +2938,6 @@ if __name__ == "__main__":
 
     # Environment variable defaults (HEADROOM_* prefix)
     # CLI args override env vars, env vars override ProxyConfig defaults
-    env_smart_routing = _get_env_bool("HEADROOM_SMART_ROUTING", True)
     env_code_aware = _get_env_bool("HEADROOM_CODE_AWARE_ENABLED", True)
     env_optimize = _get_env_bool("HEADROOM_OPTIMIZE", True)
     env_cache = _get_env_bool("HEADROOM_CACHE_ENABLED", True)
@@ -2942,7 +2945,6 @@ if __name__ == "__main__":
 
     # Determine settings: CLI flags override env vars
     # --no-X explicitly disables, --X explicitly enables, neither uses env var
-    smart_routing = env_smart_routing if not args.no_smart_routing else False
     code_aware_enabled = (
         env_code_aware
         if not (args.code_aware or args.no_code_aware)
@@ -2983,7 +2985,7 @@ if __name__ == "__main__":
         if args.log_file
         else os.environ.get("HEADROOM_LOG_FILE"),
         log_full_messages=args.log_messages or _get_env_bool("HEADROOM_LOG_MESSAGES", False),
-        smart_routing=smart_routing,
+        smart_routing=True,
         code_aware_enabled=code_aware_enabled,
         # Connection pool settings
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", args.max_connections),

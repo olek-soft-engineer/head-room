@@ -246,6 +246,26 @@ def test_handle_openai_responses_routes_chatgpt_auth_to_backend_api(monkeypatch)
     assert response.status_code == 200
 
 
+def test_handle_openai_responses_routes_api_key_auth_direct_to_openai(monkeypatch):
+    request = _build_request(
+        {"model": "gpt-4o-mini", "input": "hello"},
+        {"Authorization": "Bearer sk-test"},
+    )
+    handler = _DummyOpenAIHandler()
+
+    monkeypatch.setattr("headroom.tokenizers.get_tokenizer", lambda model: _DummyTokenizer())
+
+    response = anyio.run(handler.handle_openai_responses, request)
+
+    assert handler.captured_request is not None
+    method, url, headers, body = handler.captured_request
+    assert method == "POST"
+    assert url == "https://api.openai.com/v1/responses"
+    assert headers.get("ChatGPT-Account-ID") is None
+    assert body["input"] == "hello"
+    assert response.status_code == 200
+
+
 def test_handle_openai_responses_stream_skips_python_compression(monkeypatch):
     """PR-C5: Python no longer compresses /v1/responses (Rust handles it
     natively). The streaming forward path must still fire — only the

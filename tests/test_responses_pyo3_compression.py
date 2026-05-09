@@ -48,21 +48,21 @@ class TestPassthroughCases:
     def test_not_json_passthrough(self):
         compress = _ensure_binding()
         body = b"this is not JSON at all"
-        out, modified, _saved, _transforms = compress(body, "payg", "gpt-4o-mini")
+        out, modified, _saved, _transforms, _reason = compress(body, "payg", "gpt-4o-mini")
         assert out == body
         assert modified is False
 
     def test_no_input_array_passthrough(self):
         compress = _ensure_binding()
         body = json.dumps({"model": "gpt-4o-mini"}).encode()
-        out, modified, _saved, _transforms = compress(body, "payg", "gpt-4o-mini")
+        out, modified, _saved, _transforms, _reason = compress(body, "payg", "gpt-4o-mini")
         assert out == body
         assert modified is False
 
     def test_empty_input_array_passthrough(self):
         compress = _ensure_binding()
         body = json.dumps({"model": "gpt-4o-mini", "input": []}).encode()
-        out, modified, _saved, _transforms = compress(body, "payg", "gpt-4o-mini")
+        out, modified, _saved, _transforms, _reason = compress(body, "payg", "gpt-4o-mini")
         assert out == body
         assert modified is False
 
@@ -76,7 +76,7 @@ class TestPassthroughCases:
                 "input": [{"type": "message", "role": "user", "content": "hi"}],
             }
         ).encode()
-        out, modified, _saved, _transforms = compress(body, "payg", "gpt-4o-mini")
+        out, modified, _saved, _transforms, _reason = compress(body, "payg", "gpt-4o-mini")
         assert modified is False
         # Body should be byte-equal (passthrough, not re-serialized).
         assert out == body
@@ -94,7 +94,7 @@ class TestAuthModeAccepted:
         compress = _ensure_binding()
         body = json.dumps({"model": "gpt-4o-mini", "input": []}).encode()
         # Should not raise on any string input.
-        out, modified, _saved, _transforms = compress(body, auth_mode, "gpt-4o-mini")
+        out, modified, _saved, _transforms, _reason = compress(body, auth_mode, "gpt-4o-mini")
         assert isinstance(out, bytes)
         assert modified is False
 
@@ -105,7 +105,7 @@ class TestModelDefault:
     def test_empty_model_uses_default(self):
         compress = _ensure_binding()
         body = json.dumps({"input": []}).encode()
-        out, modified, _saved, _transforms = compress(body, "payg", "")
+        out, modified, _saved, _transforms, _reason = compress(body, "payg", "")
         assert isinstance(out, bytes)
         assert modified is False
 
@@ -118,13 +118,15 @@ class TestNoExceptionsLeak:
 
     def test_garbage_bytes_no_raise(self):
         compress = _ensure_binding()
-        out, modified, _saved, _transforms = compress(b"\xff\xfe\x00\xff", "payg", "gpt-4o-mini")
+        out, modified, _saved, _transforms, _reason = compress(
+            b"\xff\xfe\x00\xff", "payg", "gpt-4o-mini"
+        )
         assert modified is False
         assert out == b"\xff\xfe\x00\xff"
 
     def test_empty_body_no_raise(self):
         compress = _ensure_binding()
-        out, modified, _saved, _transforms = compress(b"", "payg", "gpt-4o-mini")
+        out, modified, _saved, _transforms, _reason = compress(b"", "payg", "gpt-4o-mini")
         assert modified is False
         assert out == b""
 
@@ -142,11 +144,12 @@ class TestTelemetryFields:
     def test_no_change_returns_zero_savings_and_empty_transforms(self):
         compress = _ensure_binding()
         body = json.dumps({"model": "gpt-4o-mini", "input": []}).encode()
-        out, modified, saved, transforms = compress(body, "payg", "gpt-4o-mini")
+        out, modified, saved, transforms, reason = compress(body, "payg", "gpt-4o-mini")
         assert modified is False
         assert out == body
         assert saved == 0
         assert transforms == []
+        assert reason == "no_eligible_items"
 
     def test_field_types(self):
         """Pin the wire shape so downstream callers don't break."""
@@ -154,13 +157,14 @@ class TestTelemetryFields:
         body = json.dumps({"model": "gpt-4o-mini", "input": []}).encode()
         result = compress(body, "payg", "gpt-4o-mini")
         assert isinstance(result, tuple)
-        assert len(result) == 4
-        out, modified, saved, transforms = result
+        assert len(result) == 5
+        out, modified, saved, transforms, reason = result
         assert isinstance(out, bytes)
         assert isinstance(modified, bool)
         assert isinstance(saved, int)
         assert isinstance(transforms, list)
         assert all(isinstance(t, str) for t in transforms)
+        assert reason is None or isinstance(reason, str)
 
     def test_large_local_shell_output_compresses_with_telemetry(self):
         """End-to-end check: a payload large enough to clear the
@@ -186,10 +190,11 @@ class TestTelemetryFields:
                 ],
             }
         ).encode()
-        out, modified, saved, transforms = compress(body, "payg", "gpt-4o")
+        out, modified, saved, transforms, reason = compress(body, "payg", "gpt-4o")
         assert modified is True
         assert saved > 0
         assert transforms, "expected at least one strategy in transforms"
+        assert reason is None
         new_doc = json.loads(out)
         assert new_doc["input"][0]["type"] == "local_shell_call_output"
         assert len(new_doc["input"][0]["output"]) < len(log_body)

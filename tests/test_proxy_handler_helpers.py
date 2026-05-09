@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin, _decode_openai_bearer_payload
+from headroom.proxy.helpers import _headroom_bypass_enabled
 
 
 def _jwt(payload: object) -> str:
@@ -77,6 +78,17 @@ def test_openai_handler_prefix_helpers_cover_edge_cases() -> None:
     )
     assert restored == original
     assert changed == 1
+
+
+def test_headroom_bypass_helper_is_transport_neutral() -> None:
+    assert _headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
+    assert _headroom_bypass_enabled({"x-headroom-bypass": " TRUE "}) is True
+    assert _headroom_bypass_enabled({"x-headroom-mode": "passthrough"}) is True
+    assert _headroom_bypass_enabled({"x-headroom-mode": " PASSTHROUGH "}) is True
+    assert _headroom_bypass_enabled({"x-headroom-bypass": "false"}) is False
+    assert _headroom_bypass_enabled({}) is False
+    assert _headroom_bypass_enabled(None) is False
+    assert OpenAIHandlerMixin._headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
 
 
 def test_anthropic_tool_sort_and_context_append_helpers() -> None:

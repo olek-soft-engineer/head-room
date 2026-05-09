@@ -30,17 +30,25 @@ class _ToinStub:
 @pytest.fixture(autouse=True)
 def _reset_rtk_stats_cache() -> None:
     proxy_helpers._rtk_stats_cache.update({"expires_at": 0.0, "has_value": False, "value": None})
+    proxy_helpers._rtk_session_baseline.update(
+        {"initialized": False, "total_commands": 0, "tokens_saved": 0}
+    )
 
 
 def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     now = {"value": 100.0}
     calls = {"run": 0}
+    totals = [
+        {"total_commands": 7, "total_saved": 1234},
+        {"total_commands": 9, "total_saved": 1500},
+    ]
 
     def _fake_run(*args, **kwargs):
         calls["run"] += 1
+        summary = totals[min(calls["run"] - 1, len(totals) - 1)]
         return SimpleNamespace(
             returncode=0,
-            stdout=json.dumps({"summary": {"total_commands": 7, "total_saved": 1234}}),
+            stdout=json.dumps({"summary": summary}),
         )
 
     monkeypatch.setattr(proxy_helpers.time, "monotonic", lambda: now["value"])
@@ -53,8 +61,8 @@ def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch
     assert first == second
     assert first == {
         "installed": True,
-        "total_commands": 7,
-        "tokens_saved": 1234,
+        "total_commands": 0,
+        "tokens_saved": 0,
         "avg_savings_pct": 0.0,
     }
     assert calls["run"] == 1
@@ -62,7 +70,12 @@ def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch
     now["value"] += proxy_helpers.RTK_STATS_CACHE_TTL_SECONDS + 0.1
     third = proxy_helpers._get_rtk_stats()
 
-    assert third == first
+    assert third == {
+        "installed": True,
+        "total_commands": 2,
+        "tokens_saved": 266,
+        "avg_savings_pct": 0.0,
+    }
     assert calls["run"] == 2
 
 
@@ -135,8 +148,71 @@ def test_stats_cached_query_reuses_short_ttl_snapshot(monkeypatch: pytest.Monkey
     assert first.json()["tokens"]["saved"] == 5
     assert first.json()["tokens"]["proxy_compression_saved"] == 0
     assert first.json()["tokens"]["rtk_saved"] == 5
-    assert first.json()["savings"]["by_layer"]["compression"]["tokens"] == 5
+    assert first.json()["tokens"]["all_layers_saved"] == 5
+    assert (
+        first.json()["tokens"]["savings_percent"]
+        == first.json()["tokens"]["all_layers_savings_percent"]
+    )
+    assert first.json()["savings"]["by_layer"]["compression"]["tokens"] == 0
     assert first.json()["savings"]["by_layer"]["compression"]["rtk_tokens"] == 5
+    assert first.json()["savings"]["by_layer"]["compression"]["all_layers_tokens"] == 5
+
+
+def test_stats_reset_clears_runtime_proxy_counters(monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    import headroom.proxy.server as server
+    from headroom.proxy.loopback_guard import require_loopback
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    monkeypatch.setattr(
+        server,
+        "get_compression_store",
+        lambda: _StatsStub({"store": 0}, "store", {}),
+    )
+    monkeypatch.setattr(
+        server,
+        "get_telemetry_collector",
+        lambda: _StatsStub({"telemetry": 0}, "telemetry", {}),
+    )
+    monkeypatch.setattr(
+        server,
+        "get_compression_feedback",
+        lambda: _StatsStub({"feedback": 0}, "feedback", {}),
+    )
+    monkeypatch.setattr(server, "_get_rtk_stats", lambda: None)
+    monkeypatch.setattr(server, "get_toin", lambda: _ToinStub())
+
+    app = create_app(
+        ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+        )
+    )
+    app.dependency_overrides[require_loopback] = lambda: None
+
+    with TestClient(app) as client:
+        proxy = client.app.state.proxy
+        proxy.metrics.tokens_saved_total = 123
+        proxy.metrics.tokens_input_total = 456
+        proxy.metrics.requests_total = 2
+
+        before = client.get("/stats").json()
+        reset = client.post("/stats/reset")
+        after = client.get("/stats").json()
+
+    assert before["tokens"]["proxy_compression_saved"] == 123
+    assert reset.status_code == 200
+    assert after["tokens"]["proxy_compression_saved"] == 0
+    assert after["tokens"]["input"] == 0
+    assert after["requests"]["total"] == 0
 
 
 def test_dashboard_uses_cached_stats_and_lazy_history_feed_polling() -> None:

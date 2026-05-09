@@ -193,6 +193,62 @@ class PrometheusMetrics:
         self._stage_timing_lock = threading.Lock()
         self._otel_metrics = otel_metrics
 
+    async def reset_runtime(self) -> None:
+        """Reset in-memory request/compression counters for local test/debug use."""
+        async with self._lock:
+            self.requests_total = 0
+            self.requests_by_provider.clear()
+            self.requests_by_model.clear()
+            self.requests_by_stack.clear()
+            self.requests_cached = 0
+            self.requests_rate_limited = 0
+            self.requests_failed = 0
+
+            self.tokens_input_total = 0
+            self.tokens_output_total = 0
+            self.tokens_saved_total = 0
+
+            self.compressions_by_strategy.clear()
+            self.tokens_saved_by_strategy.clear()
+
+            self.latency_sum_ms = 0.0
+            self.latency_min_ms = float("inf")
+            self.latency_max_ms = 0.0
+            self.latency_count = 0
+
+            self.overhead_sum_ms = 0.0
+            self.overhead_min_ms = float("inf")
+            self.overhead_max_ms = 0.0
+            self.overhead_count = 0
+
+            self.ttfb_sum_ms = 0.0
+            self.ttfb_min_ms = float("inf")
+            self.ttfb_max_ms = 0.0
+            self.ttfb_count = 0
+
+            self.transform_timing_sum.clear()
+            self.transform_timing_count.clear()
+            self.transform_timing_max.clear()
+
+            self.waste_signals_total.clear()
+            self.cache_by_provider.clear()
+            self._cache_requests_by_model.clear()
+
+            self.prefix_freeze_busts_avoided = 0
+            self.prefix_freeze_tokens_preserved = 0
+            self.prefix_freeze_compression_foregone = 0
+            self.cache_bust_tokens_lost = 0
+            self.cache_bust_count = 0
+            self.savings_history = []
+
+        with self._stage_timing_lock:
+            self.stage_timing_sum.clear()
+            self.stage_timing_count.clear()
+            self.stage_timing_max.clear()
+            self.ws_session_duration_sum_ms.clear()
+            self.ws_session_duration_count.clear()
+            self.ws_session_duration_max_ms.clear()
+
     def _get_otel_metrics(self) -> HeadroomOtelMetrics:
         return self._otel_metrics or get_otel_metrics()
 
