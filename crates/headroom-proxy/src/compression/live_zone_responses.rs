@@ -35,7 +35,8 @@ use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_openai_responses_live_zone, BlockAction, LiveZoneError, LiveZoneOutcome,
+    compress_openai_responses_live_zone, summarize_openai_responses_no_change_reason, BlockAction,
+    LiveZoneError, LiveZoneOutcome,
 };
 use serde_json::Value;
 
@@ -146,6 +147,7 @@ pub fn compress_openai_responses_request(
     // the rationale — same wiring on the OpenAI Responses path.
     match compress_openai_responses_live_zone(&dispatch_body, auth_mode.into(), model) {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
+            let reason = summarize_openai_responses_no_change_reason(&manifest);
             tracing::info!(
                 event = "compression_decision",
                 request_id = %request_id,
@@ -153,7 +155,7 @@ pub fn compress_openai_responses_request(
                 method = "POST",
                 compression_mode = mode.as_str(),
                 decision = "no_change",
-                reason = "no_block_compressed",
+                reason = reason,
                 body_bytes = body.len(),
                 items_total = manifest.messages_total,
                 latest_user_message_index = ?manifest.latest_user_message_index,

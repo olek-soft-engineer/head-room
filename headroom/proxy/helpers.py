@@ -100,6 +100,32 @@ def _safe_event_name(event: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in event)[:80]
 
 
+def _wire_debug_preview(value: Any, *, max_chars: int = 900) -> str:
+    """Return a compact, human-readable preview for proxy.log.
+
+    This is intentionally lossy: the full redacted payload is already written
+    to the wire-debug JSON file. The log line should be short enough to scan
+    live without flooding the proxy log.
+    """
+
+    try:
+        if isinstance(value, bytes):
+            text = safe_decode_for_logging(value, max_bytes=max_chars)
+        elif isinstance(value, str):
+            text = value
+        elif value is None:
+            return ""
+        else:
+            text = json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+    except Exception:
+        text = repr(value)
+
+    text = " ".join(text.split())
+    if len(text) > max_chars:
+        return text[: max_chars - 1] + "…"
+    return text
+
+
 def capture_codex_wire_debug(
     event: str,
     *,
@@ -158,6 +184,21 @@ def capture_codex_wire_debug(
             path,
             request_id or "",
             event,
+        )
+        preview_source = redact_for_wire_debug(body) if body is not None else raw_text
+        preview = _wire_debug_preview(preview_source)
+        meta_keys = ",".join(sorted((metadata or {}).keys()))
+        logger.info(
+            "event=codex_wire_debug_frame request_id=%s session_id=%s wire_event=%s "
+            "transport=%s direction=%s status_code=%s meta_keys=%s preview=%s",
+            request_id or "",
+            session_id or "",
+            event,
+            transport,
+            direction,
+            status_code if status_code is not None else "",
+            meta_keys,
+            preview,
         )
         return path
     except Exception as exc:  # pragma: no cover - debug path must never break traffic
@@ -248,6 +289,21 @@ def get_python_forwarder_mode() -> PythonForwarderMode:
         f"Invalid {_PYTHON_FORWARDER_MODE_ENV}={raw!r}; "
         "expected 'byte_faithful' or 'legacy_json_kwarg'"
     )
+
+
+def _headroom_bypass_enabled(headers: Any) -> bool:
+    """Return True when inbound headers request full Headroom passthrough.
+
+    This is transport-neutral policy: HTTP and WebSocket handlers both call
+    it on original inbound headers before request-body mutation.
+    """
+
+    try:
+        bypass = str(headers.get("x-headroom-bypass", "")).strip().lower() == "true"
+        passthrough = str(headers.get("x-headroom-mode", "")).strip().lower() == "passthrough"
+    except AttributeError:
+        return False
+    return bypass or passthrough
 
 
 def serialize_body_canonical(body: dict[str, Any]) -> bytes:
@@ -517,6 +573,11 @@ _rtk_stats_cache: dict[str, Any] = {
     "has_value": False,
     "value": None,
 }
+_rtk_session_baseline: dict[str, Any] = {
+    "initialized": False,
+    "total_commands": 0,
+    "tokens_saved": 0,
+}
 
 # Maximum request body size (100MB - increased to support image-heavy requests)
 MAX_REQUEST_BODY_SIZE = 100 * 1024 * 1024
@@ -742,39 +803,20 @@ def _setup_file_logging() -> None:
         pass
 
 
-def _get_rtk_stats() -> dict[str, Any] | None:
-    """Get rtk (Rust Token Killer) savings stats if rtk is installed.
+def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
+    """Read rtk's current project-level lifetime stats."""
 
-    Reads from rtk's tracking database via `rtk gain --format json`.
-    Results are memoized briefly so dashboard polling does not spawn a new
-    subprocess on every refresh.
-    """
     import subprocess as _sp
 
     from headroom.rtk import get_rtk_path
 
-    now = time.monotonic()
-    with _rtk_stats_cache_lock:
-        if _rtk_stats_cache["has_value"] and now < float(_rtk_stats_cache["expires_at"]):
-            return cast(dict[str, Any] | None, _rtk_stats_cache["value"])
-
-    payload: dict[str, Any] | None
     rtk_path = get_rtk_path()
     if not rtk_path:
-        payload = None
-        with _rtk_stats_cache_lock:
-            _rtk_stats_cache.update(
-                {
-                    "expires_at": time.monotonic() + RTK_STATS_CACHE_TTL_SECONDS,
-                    "has_value": True,
-                    "value": payload,
-                }
-            )
-        return payload
+        return None
 
     try:
         result = _sp.run(
-            [str(rtk_path), "gain", "--format", "json"],
+            [str(rtk_path), "gain", "--project", "--format", "json"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -789,21 +831,83 @@ def _get_rtk_stats() -> dict[str, Any] | None:
                 "avg_savings_pct": summary.get("avg_savings_pct", 0.0),
             }
         else:
-            payload = {
+            return {
                 "installed": True,
                 "total_commands": 0,
                 "tokens_saved": 0,
                 "avg_savings_pct": 0.0,
             }
     except Exception:
-        payload = {
+        return {
             "installed": True,
             "total_commands": 0,
             "tokens_saved": 0,
             "avg_savings_pct": 0.0,
         }
 
+    return payload
+
+
+def initialize_rtk_session_baseline() -> None:
+    """Pin the current rtk counters as the proxy-session baseline."""
+
+    payload = _read_rtk_lifetime_stats()
     with _rtk_stats_cache_lock:
+        _rtk_session_baseline.update(
+            {
+                "initialized": True,
+                "total_commands": int((payload or {}).get("total_commands", 0) or 0),
+                "tokens_saved": int((payload or {}).get("tokens_saved", 0) or 0),
+            }
+        )
+        _rtk_stats_cache.update(
+            {
+                "expires_at": 0.0,
+                "has_value": False,
+                "value": None,
+            }
+        )
+
+
+def _get_rtk_stats() -> dict[str, Any] | None:
+    """Get rtk savings for the current Headroom proxy session.
+
+    rtk persists project-level lifetime counters. Dashboard stats should be
+    session-local, so we subtract the counter snapshot captured at proxy
+    startup instead of resetting rtk's own history.
+    """
+
+    now = time.monotonic()
+    with _rtk_stats_cache_lock:
+        if _rtk_stats_cache["has_value"] and now < float(_rtk_stats_cache["expires_at"]):
+            return cast(dict[str, Any] | None, _rtk_stats_cache["value"])
+
+    payload = _read_rtk_lifetime_stats()
+    with _rtk_stats_cache_lock:
+        if not _rtk_session_baseline["initialized"]:
+            _rtk_session_baseline.update(
+                {
+                    "initialized": True,
+                    "total_commands": int((payload or {}).get("total_commands", 0) or 0),
+                    "tokens_saved": int((payload or {}).get("tokens_saved", 0) or 0),
+                }
+            )
+
+        if payload is not None:
+            payload = {
+                **payload,
+                "total_commands": max(
+                    int(payload.get("total_commands", 0) or 0)
+                    - int(_rtk_session_baseline["total_commands"]),
+                    0,
+                ),
+                "tokens_saved": max(
+                    int(payload.get("tokens_saved", 0) or 0)
+                    - int(_rtk_session_baseline["tokens_saved"]),
+                    0,
+                ),
+            }
+
         _rtk_stats_cache.update(
             {
                 "expires_at": time.monotonic() + RTK_STATS_CACHE_TTL_SECONDS,

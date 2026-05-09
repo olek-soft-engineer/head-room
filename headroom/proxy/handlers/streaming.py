@@ -230,11 +230,38 @@ class StreamingMixin:
 
             elif provider == "openai":
                 chunk_usage = data.get("usage")
-                if chunk_usage:
-                    usage_found["input_tokens"] = chunk_usage.get("prompt_tokens", 0)
-                    usage_found["output_tokens"] = chunk_usage.get("completion_tokens", 0)
-                    details = chunk_usage.get("prompt_tokens_details") or {}
-                    usage_found["cache_read_input_tokens"] = details.get("cached_tokens", 0)
+                if not isinstance(chunk_usage, dict):
+                    response = data.get("response")
+                    if isinstance(response, dict):
+                        chunk_usage = response.get("usage")
+                if isinstance(chunk_usage, dict):
+
+                    def _usage_int(value: Any) -> int:
+                        try:
+                            return max(int(value), 0)
+                        except (TypeError, ValueError):
+                            return 0
+
+                    # Chat Completions streams report prompt/completion tokens.
+                    # Responses streams report input/output tokens under
+                    # response.usage on response.completed.
+                    input_tokens = chunk_usage.get("prompt_tokens")
+                    if input_tokens is None:
+                        input_tokens = chunk_usage.get("input_tokens", 0)
+                    output_tokens = chunk_usage.get("completion_tokens")
+                    if output_tokens is None:
+                        output_tokens = chunk_usage.get("output_tokens", 0)
+                    usage_found["input_tokens"] = _usage_int(input_tokens)
+                    usage_found["output_tokens"] = _usage_int(output_tokens)
+                    details = (
+                        chunk_usage.get("prompt_tokens_details")
+                        or chunk_usage.get("input_tokens_details")
+                        or {}
+                    )
+                    if isinstance(details, dict):
+                        usage_found["cache_read_input_tokens"] = _usage_int(
+                            details.get("cached_tokens")
+                        )
 
             elif provider == "gemini":
                 usage_meta = data.get("usageMetadata")
@@ -601,11 +628,24 @@ class StreamingMixin:
                 f"estimating {output_tokens} from {stream_state['total_bytes']} bytes"
             )
 
+        provider_input_tokens = stream_state.get("input_tokens")
+        effective_optimized_tokens = optimized_tokens
+        effective_original_tokens = original_tokens
+        if (
+            provider == "openai"
+            and isinstance(provider_input_tokens, int)
+            and provider_input_tokens > 0
+        ):
+            effective_optimized_tokens = provider_input_tokens
+            effective_original_tokens = max(original_tokens, provider_input_tokens + tokens_saved)
+
         cache_read_tokens = stream_state["cache_read_input_tokens"] or 0
         cache_write_tokens = stream_state["cache_creation_input_tokens"] or 0
         cache_write_5m_tokens = stream_state["cache_creation_ephemeral_5m_input_tokens"] or 0
         cache_write_1h_tokens = stream_state["cache_creation_ephemeral_1h_input_tokens"] or 0
-        uncached_input_tokens = max(optimized_tokens - cache_read_tokens - cache_write_tokens, 0)
+        uncached_input_tokens = max(
+            effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
+        )
 
         num_msgs = len(body.get("messages", []))
         cache_hit_pct = (
@@ -616,7 +656,7 @@ class StreamingMixin:
         logger.info(
             f"[{request_id}] PERF "
             f"model={model} msgs={num_msgs} "
-            f"tok_before={original_tokens} tok_after={optimized_tokens} "
+            f"tok_before={effective_original_tokens} tok_after={effective_optimized_tokens} "
             f"tok_saved={tokens_saved} "
             f"cache_read={cache_read_tokens} cache_write={cache_write_tokens} "
             f"cache_hit_pct={cache_hit_pct} "
@@ -654,7 +694,7 @@ class StreamingMixin:
             self.cost_tracker.record_tokens(
                 model,
                 tokens_saved,
-                optimized_tokens,
+                effective_optimized_tokens,
                 cache_read_tokens=cache_read_tokens,
                 cache_write_tokens=cache_write_tokens,
                 cache_write_5m_tokens=cache_write_5m_tokens,
@@ -666,7 +706,7 @@ class StreamingMixin:
             await self.metrics.record_request(
                 provider=provider,
                 model=model,
-                input_tokens=optimized_tokens,
+                input_tokens=effective_optimized_tokens,
                 output_tokens=output_tokens,
                 tokens_saved=tokens_saved,
                 latency_ms=total_latency,
@@ -694,12 +734,12 @@ class StreamingMixin:
                     timestamp=datetime.now().isoformat(),
                     provider=provider,
                     model=model,
-                    input_tokens_original=original_tokens,
-                    input_tokens_optimized=optimized_tokens,
+                    input_tokens_original=effective_original_tokens,
+                    input_tokens_optimized=effective_optimized_tokens,
                     output_tokens=output_tokens,
                     tokens_saved=tokens_saved,
-                    savings_percent=(tokens_saved / original_tokens * 100)
-                    if original_tokens > 0
+                    savings_percent=(tokens_saved / effective_original_tokens * 100)
+                    if effective_original_tokens > 0
                     else 0,
                     optimization_latency_ms=optimization_latency,
                     total_latency_ms=total_latency,

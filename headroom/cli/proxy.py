@@ -6,6 +6,7 @@ from typing import Any
 
 import click
 
+from headroom import paths as _paths
 from headroom.providers.registry import resolve_api_overrides, resolve_api_targets
 from headroom.proxy.modes import PROXY_MODE_TOKEN, normalize_proxy_mode
 
@@ -190,6 +191,19 @@ def _get_env_bool(name: str, default: bool) -> bool:
     "--log-messages",
     is_flag=True,
     help="Enable full message logging (request/response content stored for live feed)",
+)
+@click.option(
+    "--codex-wire-debug",
+    is_flag=True,
+    help="Enable local Codex wire snapshots and matching proxy.log frame traces.",
+)
+@click.option(
+    "--codex-wire-debug-dir",
+    default=None,
+    help=(
+        "Directory for Codex wire snapshots (default: "
+        "~/.headroom/logs/codex_wire or workspace .headroom/logs/codex_wire)."
+    ),
 )
 @click.option(
     "--budget",
@@ -393,6 +407,8 @@ def proxy(
     anthropic_pre_upstream_memory_context_timeout_seconds: float | None,
     log_file: str | None,
     log_messages: bool,
+    codex_wire_debug: bool,
+    codex_wire_debug_dir: str | None,
     budget: float | None,
     code_aware_flag: bool | None,
     code_graph: bool,
@@ -497,6 +513,12 @@ def proxy(
     # Telemetry opt-out: --no-telemetry flag sets the env var
     if no_telemetry:
         os.environ["HEADROOM_TELEMETRY"] = "off"
+
+    if codex_wire_debug or codex_wire_debug_dir:
+        os.environ["HEADROOM_CODEX_WIRE_DEBUG"] = "1"
+        os.environ["HEADROOM_CODEX_WIRE_DEBUG_DIR"] = codex_wire_debug_dir or str(
+            _paths.codex_wire_debug_dir()
+        )
 
     # Stateless mode: suppress TOIN filesystem persistence
     if is_stateless:

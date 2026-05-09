@@ -288,6 +288,7 @@ async def test_ws_session_metrics_include_response_completed_usage():
     assert recorded["input_tokens"] == 100
     assert recorded["output_tokens"] == 12
     assert recorded["cache_read_tokens"] == 75
+    assert recorded["cache_write_tokens"] == 25
     assert recorded["uncached_input_tokens"] == 25
 
 

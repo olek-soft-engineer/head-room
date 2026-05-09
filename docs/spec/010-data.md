@@ -101,9 +101,9 @@ CREATE TABLE compression_store (
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HEADROOM_CACHE_ENABLED` | `true` | Enable compression cache |
-| `HEADROOM_CACHE_TTL` | `3600` | Cache TTL in seconds |
-| `HEADROOM_CACHE_MAX_SIZE` | `10000` | Max cache entries |
+| CLI `--no-cache` | unset | Disable semantic cache for the proxy process |
+| `HEADROOM_WORKSPACE_DIR` | `~/.headroom` | Workspace root for proxy state, logs, memory, and savings |
+| `HEADROOM_STATELESS` | `false` | Disable filesystem writes and keep runtime state in memory |
 
 ---
 

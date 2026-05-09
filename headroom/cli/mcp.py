@@ -299,7 +299,7 @@ def mcp_status() -> None:
 @click.option(
     "--direct",
     is_flag=True,
-    help="Use direct CompressionStore access (same process as proxy)",
+    help="(Deprecated, ignored) Direct CompressionStore access is no longer supported",
 )
 @click.option(
     "--debug",
@@ -343,10 +343,13 @@ def mcp_serve(proxy_url: str | None, direct: bool, debug: bool) -> None:
     # Use default if not specified
     effective_proxy_url = proxy_url or DEFAULT_PROXY_URL
 
-    server = create_ccr_mcp_server(
-        proxy_url=effective_proxy_url,
-        direct_mode=direct,
-    )
+    if direct:
+        click.echo(
+            "Warning: --direct is deprecated and ignored; MCP retrieval uses the proxy URL.",
+            err=True,
+        )
+
+    server = create_ccr_mcp_server(proxy_url=effective_proxy_url)
 
     async def run() -> None:
         try:

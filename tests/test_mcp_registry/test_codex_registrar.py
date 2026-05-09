@@ -178,6 +178,21 @@ def test_register_force_overwrites_block(tmp_path: Path) -> None:
     assert "9999" not in text
 
 
+def test_register_force_preserves_user_managed_entry(tmp_path: Path) -> None:
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir()
+    cfg.write_text(
+        '[mcp_servers.headroom]\ncommand = "/usr/local/bin/custom-headroom"\nargs = ["serve"]\n'
+    )
+
+    result = _make_registrar(tmp_path).register_server(_spec(), force=True)
+
+    assert result.status == RegisterStatus.MISMATCH
+    assert "user-managed" in (result.detail or "").lower()
+    assert "/usr/local/bin/custom-headroom" in cfg.read_text()
+    assert cfg.read_text().count("[mcp_servers.headroom]") == 1
+
+
 def test_register_mismatch_when_user_managed_outside_markers(tmp_path: Path) -> None:
     cfg = _config_path(tmp_path)
     cfg.parent.mkdir()

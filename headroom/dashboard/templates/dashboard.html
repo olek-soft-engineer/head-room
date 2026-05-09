@@ -99,28 +99,33 @@
     <main class="p-6 max-w-7xl mx-auto">
         <template x-if="viewMode === 'session'">
             <div>
-        <!-- Hero Metrics (reordered: Savings $ -> Tokens Saved % -> Quality Confidence -> Overhead) -->
+        <!-- Hero Metrics (reordered: Savings $ -> Compression % -> Quality Confidence -> Overhead) -->
         <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
-            <!-- Savings ($) - Compression only, priced at model list rate -->
+            <!-- Savings ($) - proxy compression only, priced at model list rate -->
             <div class="bg-surface rounded-lg p-4 border border-border">
-                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Compression Savings</div>
+                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Proxy $ Saved</div>
                 <div class="flex items-baseline gap-2">
                     <span class="text-3xl font-light tabular-nums text-emerald-400" x-text="'$' + formatCurrency(stats.cost?.savings_usd || 0)"></span>
                 </div>
                 <div class="mt-2 text-xs text-gray-500">
                     <span x-show="stats.cost?.savings_usd > 0"
-                          x-text="formatNumber(stats.tokens?.saved || 0) + ' tokens at model list price'"></span>
+                          x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens only; RTK excluded from $'"></span>
                     <span x-show="!(stats.cost?.savings_usd > 0)"
                           x-text="formatNumber(stats.requests?.total || 0) + ' requests processed'"></span>
                 </div>
             </div>
 
-            <!-- Tokens Saved (%) -->
+            <!-- Token Savings (%) -->
             <div class="bg-surface rounded-lg p-4 border border-border">
-                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Tokens Saved</div>
+                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Token Savings</div>
                 <div class="flex items-baseline gap-2">
                     <span class="text-3xl font-light tabular-nums text-accent" x-text="formatNumber(stats.tokens?.saved || 0)"></span>
                     <span class="text-sm text-accent" x-text="(stats.tokens?.savings_percent || 0).toFixed(1) + '%'"></span>
+                </div>
+                <div class="mt-1 text-xs text-gray-500 leading-relaxed">
+                    <span x-text="'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' (' + proxyShareOfTotal.toFixed(1) + '%)'"></span>
+                    <span class="mx-1 text-gray-600">/</span>
+                    <span x-text="'RTK ' + formatNumber(stats.tokens?.rtk_saved || 0) + ' (' + rtkShareOfTotal.toFixed(1) + '%)'"></span>
                 </div>
                 <div class="mt-2 h-8">
                     <svg class="w-full h-full" viewBox="0 0 100 32" preserveAspectRatio="none">
@@ -166,7 +171,7 @@
                     <div>
                         <div class="text-xs text-gray-500 mb-1">Compression</div>
                         <div class="text-2xl font-light tabular-nums text-emerald-400" x-text="'$' + formatCurrency(stats.cost?.compression_savings_usd || 0)"></div>
-                        <div class="text-xs text-gray-500" x-text="formatNumber(stats.tokens?.saved || 0) + ' tokens removed'"></div>
+                        <div class="text-xs text-gray-500" x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens removed'"></div>
                     </div>
                     <template x-if="(stats.cost?.cache_savings_usd || 0) > 0">
                         <div>
@@ -691,6 +696,14 @@
                     <div class="flex justify-between items-center">
                         <span class="text-sm text-gray-400">Before Compression</span>
                         <span class="font-mono text-sm" x-text="formatNumber(stats.tokens?.total_before_compression || 0)"></span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-gray-400">RTK Filtered</span>
+                        <span class="font-mono text-sm text-emerald-400" x-text="formatNumber(stats.tokens?.rtk_saved || 0)"></span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-gray-400">Proxy Removed</span>
+                        <span class="font-mono text-sm text-accent" x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0)"></span>
                     </div>
                     <div class="flex justify-between items-center">
                         <span class="text-sm text-gray-400">After Compression (sent)</span>
@@ -1755,10 +1768,26 @@
                     return Math.min((tokens / max) * 100, 100);
                 },
 
+                get compressionTotalBefore() {
+                    return this.stats.tokens?.total_before_compression || 0;
+                },
+
+                get proxyShareOfTotal() {
+                    const total = this.compressionTotalBefore;
+                    if (total <= 0) return 0;
+                    return (this.stats.tokens?.proxy_compression_saved || 0) / total * 100;
+                },
+
+                get rtkShareOfTotal() {
+                    const total = this.compressionTotalBefore;
+                    if (total <= 0) return 0;
+                    return (this.stats.tokens?.rtk_saved || 0) / total * 100;
+                },
+
                 // --- Compression Confidence ---
 
                 get confidenceLevel() {
-                    const saved = this.stats.tokens?.saved || 0;
+                    const saved = this.stats.tokens?.proxy_compression_saved || 0;
                     if (saved === 0) return 'none';
                     const signals = this.stats.waste_signals || {};
                     const totalWaste = Object.values(signals).reduce((a, b) => a + b, 0);
@@ -1785,7 +1814,7 @@
                 },
 
                 get confidenceDetail() {
-                    const saved = this.stats.tokens?.saved || 0;
+                    const saved = this.stats.tokens?.proxy_compression_saved || 0;
                     if (saved === 0) return 'No compression yet';
                     const signals = this.stats.waste_signals || {};
                     const totalWaste = Object.values(signals).reduce((a, b) => a + b, 0);
