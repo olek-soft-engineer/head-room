@@ -588,6 +588,38 @@ class StreamingMixin:
         from headroom.proxy.cost import _summarize_transforms
 
         total_latency = (time.time() - start_time) * 1000
+
+        # Per-chunk SSE parsing only flushes events terminated by ``\n\n``.
+        # When upstream truncates mid-event (client disconnect, network
+        # drop, connection reset), the message_start (cache_read /
+        # cache_creation) or message_delta (output_tokens) usage events
+        # can sit in the residual buffer and never be parsed — surfacing
+        # as cache_read=cache_write=0 in PERF logs and poisoning the
+        # downstream freeze heuristic for the next request. Append the
+        # terminator so the buffer parser drains whatever's there. The
+        # per-event try/except in the parser swallows incomplete JSON,
+        # so this is safe even when the truncation cut mid-payload.
+        sse_buffer = stream_state.get("sse_buffer")
+        if isinstance(sse_buffer, bytearray) and len(sse_buffer) > 0:
+            sse_buffer.extend(b"\n\n")
+            late_usage = self._parse_sse_usage_from_buffer(stream_state, provider) or {}
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "cache_creation_ephemeral_5m_input_tokens",
+                "cache_creation_ephemeral_1h_input_tokens",
+            ):
+                if key not in late_usage:
+                    continue
+                current = stream_state.get(key)
+                # Only fill in unset (None) or default-zero slots so a
+                # real cache_read=0 from earlier in the stream isn't
+                # clobbered by a later partial event.
+                if current is None or current == 0:
+                    stream_state[key] = late_usage[key]
+
         output_tokens = stream_state["output_tokens"]
         if output_tokens is None:
             output_tokens = stream_state["total_bytes"] // 40
