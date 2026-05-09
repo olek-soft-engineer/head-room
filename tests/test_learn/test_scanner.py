@@ -8,12 +8,13 @@ making it impossible to reconstruct names formed from three or more tokens.
 
 from __future__ import annotations
 
+from collections.abc import Generator
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
-from headroom.learn.scanner import _decode_project_path, _greedy_path_decode
+from headroom.learn.scanner import ClaudeCodeScanner, _decode_project_path, _greedy_path_decode
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -191,7 +192,7 @@ class TestDecodeProjectPath:
     # ------------------------------------------------------------------
 
     @pytest.fixture()
-    def users_tmp(self, tmp_path: Path) -> Path:
+    def users_tmp(self, tmp_path: Path) -> Generator[Path, None, None]:
         """Return a temporary directory whose path starts with /Users/…
 
         On macOS the system temp dir is under /private/var, so we create a
@@ -315,10 +316,31 @@ class TestDecodeProjectPath:
 
     def test_windows_users_path(self) -> None:
         """Encoded name -C-Users-foo-project detects drive letter."""
-        import sys
-
         result = _decode_project_path("-C-Users-foo-project")
-        if sys.platform == "win32":
-            assert result is None or "Users" in str(result)
-        else:
-            assert result is None
+        assert result is not None
+        assert str(result).startswith("C:")
+        assert "Users" in str(result)
+
+    def test_windows_username_with_dot_stays_single_component(self) -> None:
+        """Windows profile names like john.doe must not decode as john/doe."""
+        result = _decode_project_path("-C-Users-john.doe-work")
+
+        assert result is not None
+        rendered = str(result)
+        assert rendered.startswith("C:")
+        assert "john.doe" in rendered
+        assert "john\\doe" not in rendered
+        assert "john/doe" not in rendered
+
+    def test_discover_windows_project_uses_leaf_name(self, tmp_path: Path) -> None:
+        """A syntactic Windows path decoded on Unix should still display the project leaf."""
+        claude_dir = tmp_path / ".claude"
+        project_dir = claude_dir / "projects" / "-C-Users-john.doe-work"
+        project_dir.mkdir(parents=True)
+        (project_dir / "session.jsonl").write_text("{}\n")
+
+        projects = ClaudeCodeScanner(claude_dir=claude_dir).discover_projects()
+
+        assert len(projects) == 1
+        assert projects[0].name == "work"
+        assert str(projects[0].project_path).startswith("C:")
