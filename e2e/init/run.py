@@ -92,9 +92,27 @@ def _verify_claude_local(ctx: CaseContext) -> None:
     claude_calls = [
         record["argv"] for record in _read_jsonl(ctx.shim_log) if record["tool"] == "claude"
     ]
+    # `init` auto-registers the headroom MCP server after the marketplace
+    # install (see d9d8972 — keeps `[Retrieve more: hash=…]` markers from
+    # being dead pointers for users who never ran `headroom mcp install`).
+    # The `-e HEADROOM_PROXY_URL=…` arg is only emitted when the proxy
+    # port differs from the 8787 default; this case uses --port 9011.
     expected = [
         ["plugin", "marketplace", "add", str(REPO_ROOT_IN_CONTAINER)],
         ["plugin", "install", "headroom@headroom-marketplace", "--scope", "local"],
+        [
+            "mcp",
+            "add",
+            "headroom",
+            "-s",
+            "user",
+            "-e",
+            "HEADROOM_PROXY_URL=http://127.0.0.1:9011",
+            "--",
+            "headroom",
+            "mcp",
+            "serve",
+        ],
     ]
     if claude_calls != expected:
         raise AssertionError(f"Unexpected Claude install commands: {claude_calls}")
