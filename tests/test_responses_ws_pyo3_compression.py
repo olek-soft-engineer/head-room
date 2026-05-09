@@ -1,11 +1,9 @@
-"""WebSocket /v1/responses compression integration tests.
+"""WebSocket-shaped `/v1/responses` Rust binding tests.
 
-PR-C5 retired Python compression on the WS path expecting the standalone
-Rust proxy binary to take over (it isn't deployed by the CLI). PR #406
-re-enabled compression on the HTTP path via the inline PyO3 binding.
-This module pins the WS-side equivalent: the first frame from the client
-must be compressed via the same PyO3 dispatcher before forwarding to
-the upstream WebSocket.
+The default Python CLI runtime now compresses WS `response.create` frames
+through its CompressionUnit + ContentRouter path. These tests keep the
+lower-level PyO3 live-zone binding covered on WebSocket-shaped envelopes
+so Rust migration work cannot silently break the exposed bridge.
 
 The tests exercise the compression *transformation logic* in isolation —
 they replicate the body-shape handling the WS handler does (envelope

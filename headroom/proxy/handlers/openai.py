@@ -1599,12 +1599,13 @@ class OpenAIHandlerMixin:
             metadata={"path": request.url.path, "stream": stream},
         )
 
-        # PR-C5: Python no longer compresses /v1/responses — Rust handles
-        # item-aware compression natively (see crates/headroom-proxy/src/
-        # handlers/responses.rs). We synthesise a minimal `messages` list
-        # purely for downstream memory injection + telemetry; list-typed
-        # `input` is consulted via `body["input"]` directly via the
-        # live-zone-tail helpers below.
+        # /v1/responses uses provider-specific CompressionUnit extraction
+        # below, then routes mutable text through ContentRouter. The
+        # standalone Rust proxy has native item-aware handling, but the
+        # Python CLI runtime does not run that proxy today. We synthesise a
+        # minimal `messages` list purely for downstream memory injection and
+        # telemetry; list-typed `input` is consulted directly by the unit
+        # extraction helpers.
         input_data = body.get("input", "")
         instructions = body.get("instructions")
 
@@ -1698,10 +1699,9 @@ class OpenAIHandlerMixin:
         tokenizer = get_tokenizer(model)
         original_tokens = tokenizer.count_messages(messages)
 
-        # PR-C5: Python compression on /v1/responses is retired — the Rust
-        # handler at crates/headroom-proxy/src/handlers/responses.rs is the
-        # canonical compression path. Defaults below feed downstream
-        # telemetry and memory injection without invoking the pipeline.
+        # Defaults below feed downstream telemetry and memory injection.
+        # If optimization remains enabled, the Responses payload is compressed
+        # later through `_compress_openai_responses_payload`.
         optimized_messages = messages
         optimized_tokens = original_tokens
         tokens_saved = 0
@@ -1864,16 +1864,11 @@ class OpenAIHandlerMixin:
         else:
             url = build_copilot_upstream_url(self.OPENAI_API_URL, "/v1/responses")
 
-        # Hot-fix (post-PR-C5): re-enable /v1/responses compression via the
-        # PyO3 inline call to the Rust live-zone dispatcher. PR-C5 retired
-        # the Python pipeline expecting that the standalone
-        # `crates/headroom-proxy` Rust binary would sit in front of the
-        # Python proxy and compress here. That binary is not deployed by
-        # the CLI today (`headroom proxy`, `headroom wrap codex` both run
-        # only the Python proxy), so /v1/responses traffic has been
-        # uncompressed since v0.20.16. This call closes that gap by
-        # invoking the same dispatcher in-process via `headroom._core`.
-        # All policy gating already happened upstream (auth_mode classify,
+        # The standalone Rust proxy has native /v1/responses item handling,
+        # but the default CLI runtime is this Python proxy. Compress the
+        # Python runtime path here by extracting mutable Responses text into
+        # CompressionUnits and routing them through ContentRouter. Policy
+        # gating already happened upstream (auth_mode classify,
         # CompressionPolicy resolve at request entry).
         if self.config.optimize and not _bypass:
             try:
@@ -2207,8 +2202,8 @@ class OpenAIHandlerMixin:
         1. Accepts the client WebSocket
         2. Receives the first message (``response.create`` request)
         3. Opens an upstream WebSocket to OpenAI
-        4. Sends the request upstream as-is (PR-C5: Python compression on
-           /v1/responses retired — Rust handles item-aware compression)
+        4. Compresses eligible `response.create` text through the Python
+           ContentRouter path, then sends the request upstream
         5. Relays all subsequent messages bidirectionally
         """
         try:
@@ -2504,12 +2499,10 @@ class OpenAIHandlerMixin:
                 # deregister / metrics / stage-timings emission as usual.
                 return
 
-            # PR-C5 retired Python compression on this path expecting the
-            # standalone Rust proxy binary to take over. That binary is not
-            # deployed by the CLI today (`headroom proxy` runs only Python
-            # via uvicorn). Hot-fix follow-up to PR #406: the first frame
-            # is now compressed via the inline PyO3 binding right before
-            # upstream send (see the compression block further below).
+            # The standalone Rust proxy has a native Responses path, but the
+            # CLI runtime runs this Python proxy. Compress eligible
+            # `response.create` frames through the shared Python
+            # CompressionUnit + ContentRouter path before upstream send.
             # Subsequent client→upstream frames are now ALSO compressed
             # via `_maybe_compress_response_create_frame` in
             # `_client_to_upstream` so long-lived subscription Codex

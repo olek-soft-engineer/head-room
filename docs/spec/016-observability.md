@@ -102,7 +102,7 @@ logging:
 - Top compressed endpoints
 - Session overview
 
-**Requires:** `HEADROOM_DASHBOARD_ENABLED=true`
+**Requires:** the proxy process to be running. The dashboard is served by default at `/dashboard`.
 
 ---
 

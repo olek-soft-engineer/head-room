@@ -6,7 +6,7 @@ Extracted from server.py to keep the codebase maintainable.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
@@ -139,8 +139,10 @@ class ProxyConfig:
     # Read lifecycle management
     read_lifecycle: bool = True
 
-    # Smart content routing
-    smart_routing: bool = True
+    # Deprecated compatibility argument. ContentRouter is always active in
+    # the Python proxy; accepting this avoids breaking old config constructors
+    # while keeping it out of runtime state.
+    smart_routing: InitVar[bool | None] = None
 
     # Caching
     cache_enabled: bool = True

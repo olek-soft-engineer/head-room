@@ -149,7 +149,7 @@ def test_pipeline_extension_manager_uses_canonical_stage_contract():
 
 
 def test_default_transform_pipeline_always_uses_content_router() -> None:
-    config = HeadroomConfig(content_router_enabled=False)
+    config = HeadroomConfig()
 
     pipeline = TransformPipeline(config)
 

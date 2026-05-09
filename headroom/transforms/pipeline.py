@@ -98,11 +98,6 @@ class TransformPipeline:
         # - Logs -> LogCompressor
         # - Search results -> SearchCompressor
         # - HTML -> HTMLExtractor
-        if not self.config.content_router_enabled:
-            logger.warning(
-                "HeadroomConfig.content_router_enabled=False is deprecated and ignored; "
-                "ContentRouter is always present in the default pipeline"
-            )
         transforms.append(ContentRouter())
         logger.info("Pipeline using ContentRouter for intelligent content-aware compression")
 

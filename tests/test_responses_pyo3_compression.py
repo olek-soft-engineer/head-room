@@ -1,10 +1,9 @@
-"""Hot-fix tests: PyO3 inline `/v1/responses` compression.
+"""Rust binding tests for `/v1/responses` live-zone compression.
 
-Re-enables compression after PR-C5 retired the Python pipeline. The
-standalone Rust proxy binary (`crates/headroom-proxy`) was supposed to
-handle this, but it's not deployed by the CLI today. This module
-exposes a PyO3 binding so the Python proxy can call the live-zone
-dispatcher in-process.
+The default Python CLI runtime currently compresses Responses payloads
+through CompressionUnit extraction plus ContentRouter. This module keeps
+the lower-level PyO3 live-zone binding covered so Rust migration work
+cannot silently break the exposed bridge.
 
 These tests pin:
 

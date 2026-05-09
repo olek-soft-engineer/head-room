@@ -420,7 +420,6 @@ class TestEndToEndTOINIntegration:
         reset_compression_store()
         config = ProxyConfig(
             optimize=True,  # Enable optimization
-            smart_routing=False,  # Use legacy mode for simpler testing
             cache_enabled=False,
             rate_limit_enabled=False,
             cost_tracking_enabled=False,

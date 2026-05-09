@@ -22,15 +22,14 @@
 
 ## Compression Capabilities
 
-### Semantic Cache
+### Proxy Cache
 
-**Description:** Caches semantically similar requests using CCR pattern.
+**Description:** The proxy has semantic cache support and CCR-backed retrieval, controlled by CLI configuration.
 
 **Configuration:**
 ```bash
-HEADROOM_CACHE_ENABLED=true
-HEADROOM_CACHE_TTL=3600
-HEADROOM_CACHE_MAX_SIZE=10000
+headroom proxy          # cache enabled by default
+headroom proxy --no-cache
 ```
 
 **Behavior:**

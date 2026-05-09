@@ -2985,7 +2985,6 @@ if __name__ == "__main__":
         if args.log_file
         else os.environ.get("HEADROOM_LOG_FILE"),
         log_full_messages=args.log_messages or _get_env_bool("HEADROOM_LOG_MESSAGES", False),
-        smart_routing=True,
         code_aware_enabled=code_aware_enabled,
         # Connection pool settings
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", args.max_connections),
