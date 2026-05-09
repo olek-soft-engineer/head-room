@@ -358,6 +358,34 @@ def test_wrap_codex_prepare_only_creates_backup_and_config(
     assert backup.read_text() == original
 
 
+def test_wrap_codex_prepare_only_updates_stale_mcp_proxy_url(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text(
+        "# --- Headroom MCP server ---\n"
+        "[mcp_servers.headroom]\n"
+        'command = "headroom"\n'
+        'args = ["mcp", "serve"]\n'
+        "\n"
+        "[mcp_servers.headroom.env]\n"
+        'HEADROOM_PROXY_URL = "http://127.0.0.1:9000"\n'
+        "# --- end Headroom MCP server ---\n"
+    )
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        result = runner.invoke(main, ["wrap", "codex", "--prepare-only", "--port", "8787"])
+
+    assert result.exit_code == 0, result.output
+    content = config_file.read_text()
+    assert "[mcp_servers.headroom]" in content
+    assert 'command = "headroom"' in content
+    assert 'args = ["mcp", "serve"]' in content
+    assert "http://127.0.0.1:9000" not in content
+
+
 def test_unwrap_codex_restores_prior_config_end_to_end(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

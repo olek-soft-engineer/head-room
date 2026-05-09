@@ -75,7 +75,19 @@ class CodexRegistrar(MCPRegistrar):
             return RegisterResult(RegisterStatus.MISMATCH, _diff_specs(existing, spec))
 
         if existing is not None and force:
-            # Drop any prior block (ours or user's) before re-writing.
+            content = self._read_text()
+            if _MARKER_START not in content:
+                # Even force=True is only allowed to replace blocks that
+                # Headroom owns. Otherwise appending our table would create a
+                # duplicate [mcp_servers.<name>] TOML section and may clobber a
+                # user-managed integration.
+                return RegisterResult(
+                    RegisterStatus.MISMATCH,
+                    "user-managed [mcp_servers."
+                    f"{spec.name}] entry outside Headroom markers; "
+                    f"{_diff_specs(existing, spec)}",
+                )
+            # Drop any prior Headroom block before re-writing.
             self.unregister_server(spec.name)
 
         return self._write_block(spec)

@@ -242,7 +242,9 @@ def _setup_rtk(verbose: bool = False) -> Path | None:
     return rtk_path
 
 
-def _setup_headroom_mcp(registrar: Any, port: int, *, verbose: bool = False) -> None:
+def _setup_headroom_mcp(
+    registrar: Any, port: int, *, verbose: bool = False, force: bool = False
+) -> None:
     """Register the headroom MCP server with the given agent (idempotent).
 
     The proxy compresses tool_result payloads and emits ``[Retrieve more:
@@ -261,7 +263,7 @@ def _setup_headroom_mcp(registrar: Any, port: int, *, verbose: bool = False) -> 
 
     proxy_url = f"http://127.0.0.1:{port}"
     spec = build_headroom_spec(proxy_url)
-    result = registrar.register_server(spec)
+    result = registrar.register_server(spec, force=force)
 
     line = format_result(
         registrar.name,
@@ -1797,7 +1799,10 @@ def codex(
     if not no_mcp:
         from headroom.mcp_registry import CodexRegistrar
 
-        _setup_headroom_mcp(CodexRegistrar(), port, verbose=verbose)
+        # Codex starts a long-lived local MCP subprocess from config.toml.
+        # If a previous wrap used another port, retrieval can silently point
+        # at the wrong proxy while model traffic uses the right one.
+        _setup_headroom_mcp(CodexRegistrar(), port, verbose=verbose, force=True)
     elif verbose:
         click.echo("  Skipping MCP retrieve tool (--no-mcp)")
 

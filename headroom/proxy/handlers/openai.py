@@ -2068,6 +2068,14 @@ class OpenAIHandlerMixin:
         if session_handle is not None:
             session_handle.upstream_url = upstream_url
 
+        logger.info(
+            "[%s] WS /v1/responses accepted (route=%s, auth_mode=%s, subprotocols=%s)",
+            request_id,
+            "chatgpt_subscription" if is_chatgpt_auth else "openai_api",
+            classify_auth_mode(ws_headers).value,
+            client_subprotocols,
+        )
+
         # Ensure Authorization header is present — fall back to OPENAI_API_KEY env var.
         # Safety net for clients that don't forward auth headers via WebSocket upgrade.
         if "authorization" not in _lower_headers:
@@ -2442,6 +2450,15 @@ class OpenAIHandlerMixin:
                                     _ws_auth_mode.value,
                                     transforms_applied,
                                 )
+                        else:
+                            logger.info(
+                                "[%s] WS /v1/responses first frame passthrough "
+                                "(%d bytes, auth_mode=%s, model=%s)",
+                                request_id,
+                                len(_inner_bytes),
+                                _ws_auth_mode.value,
+                                _model or "unknown",
+                            )
                 except Exception as _ce:
                     logger.warning(
                         f"[{request_id}] WS /v1/responses compression failed; "
