@@ -9,7 +9,7 @@ replacements back into their native request shape.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 from .content_router import CompressionStrategy, ContentRouter, RouterCompressionResult
@@ -63,11 +63,9 @@ def find_content_router(transforms: object) -> ContentRouter | None:
     """Return the first ContentRouter in a pipeline or iterable."""
 
     candidates = getattr(transforms, "transforms", transforms)
-    try:
-        iterator = iter(candidates)  # type: ignore[arg-type]
-    except TypeError:
+    if not isinstance(candidates, Iterable):
         return None
-    for transform in iterator:
+    for transform in candidates:
         if isinstance(transform, ContentRouter):
             return transform
     return None
@@ -86,32 +84,32 @@ def compress_unit_with_router(
     """
 
     tokens_before = tokenizer.count_text(unit.text)
-    base = {
-        "original": unit.text,
-        "compressed": unit.text,
-        "modified": False,
-        "tokens_before": tokens_before,
-        "tokens_after": tokens_before,
-        "tokens_saved": 0,
-        "transforms_applied": [],
-        "strategy": CompressionStrategy.PASSTHROUGH.value,
-        "router_result": None,
-    }
+    base = UnitCompressionResult(
+        original=unit.text,
+        compressed=unit.text,
+        modified=False,
+        tokens_before=tokens_before,
+        tokens_after=tokens_before,
+        tokens_saved=0,
+        transforms_applied=[],
+        strategy=CompressionStrategy.PASSTHROUGH.value,
+        router_result=None,
+    )
 
     if not unit.mutable:
-        return UnitCompressionResult(**base, reason="immutable")
+        return replace(base, reason="immutable")
     if unit.role == "user":
-        return UnitCompressionResult(**base, reason="protected_user_message")
+        return replace(base, reason="protected_user_message")
     if unit.role in {"system", "developer"}:
-        return UnitCompressionResult(**base, reason="protected_system_message")
+        return replace(base, reason="protected_system_message")
     if unit.role == "assistant" and unit.metadata.get("compress_assistant") != "true":
-        return UnitCompressionResult(**base, reason="protected_assistant_message")
+        return replace(base, reason="protected_assistant_message")
     if unit.cache_zone != "live":
-        return UnitCompressionResult(**base, reason=f"cache_zone_{unit.cache_zone}")
+        return replace(base, reason=f"cache_zone_{unit.cache_zone}")
     if len(unit.text) < unit.min_bytes:
-        return UnitCompressionResult(**base, reason="below_unit_floor")
+        return replace(base, reason="below_unit_floor")
     if "Retrieve more: hash=" in unit.text or "Retrieve original: hash=" in unit.text:
-        return UnitCompressionResult(**base, reason="already_compressed")
+        return replace(base, reason="already_compressed")
 
     router_result = router.compress(
         unit.text,
@@ -122,21 +120,21 @@ def compress_unit_with_router(
     replacement = router_result.compressed
     strategy = router_result.strategy_used.value
     if replacement == unit.text:
-        return UnitCompressionResult(
-            **{**base, "strategy": strategy, "router_result": router_result},
+        return replace(
+            base,
+            strategy=strategy,
+            router_result=router_result,
             reason="router_no_change",
         )
 
     tokens_after = tokenizer.count_text(replacement)
     if tokens_after >= tokens_before:
-        return UnitCompressionResult(
-            **{
-                **base,
-                "compressed": replacement,
-                "tokens_after": tokens_after,
-                "strategy": strategy,
-                "router_result": router_result,
-            },
+        return replace(
+            base,
+            compressed=replacement,
+            tokens_after=tokens_after,
+            strategy=strategy,
+            router_result=router_result,
             reason="rejected_not_smaller",
         )
 
