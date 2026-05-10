@@ -46,8 +46,23 @@ class AnthropicHandlerMixin:
             canonical = str(tool)
         return (name, canonical)
 
-    # _extract_anthropic_cache_ttl_metrics is defined in StreamingMixin
-    # (which takes precedence via MRO). Do not duplicate here.
+    @staticmethod
+    def _extract_anthropic_cache_ttl_metrics(usage: dict[str, Any] | None) -> tuple[int, int]:
+        """Extract observed Anthropic cache-write TTL bucket usage.
+
+        HeadroomProxy also inherits StreamingMixin, which exposes the same
+        helper for SSE usage parsing. Keep this local copy so the Anthropic
+        handler remains safe when tested or embedded without StreamingMixin.
+        """
+        if not isinstance(usage, dict):
+            return (0, 0)
+        cache_creation = usage.get("cache_creation")
+        if not isinstance(cache_creation, dict):
+            return (0, 0)
+        return (
+            int(cache_creation.get("ephemeral_5m_input_tokens", 0) or 0),
+            int(cache_creation.get("ephemeral_1h_input_tokens", 0) or 0),
+        )
 
     @classmethod
     def _sort_tools_deterministically(

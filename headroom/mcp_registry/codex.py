@@ -28,6 +28,18 @@ _MARKER_START = "# --- Headroom MCP server ---"
 _MARKER_END = "# --- end Headroom MCP server ---"
 
 
+def _marker_start(server_name: str) -> str:
+    if server_name == "headroom":
+        return _MARKER_START
+    return f"# --- Headroom MCP server: {server_name} ---"
+
+
+def _marker_end(server_name: str) -> str:
+    if server_name == "headroom":
+        return _MARKER_END
+    return f"# --- end Headroom MCP server: {server_name} ---"
+
+
 class CodexRegistrar(MCPRegistrar):
     """Register MCP servers with the OpenAI Codex CLI."""
 
@@ -64,7 +76,7 @@ class CodexRegistrar(MCPRegistrar):
 
         if existing is not None and not force:
             content = self._read_text()
-            if _MARKER_START not in content:
+            if _marker_start(spec.name) not in content:
                 # Entry exists but wasn't written by us — refuse to clobber.
                 return RegisterResult(
                     RegisterStatus.MISMATCH,
@@ -76,7 +88,7 @@ class CodexRegistrar(MCPRegistrar):
 
         if existing is not None and force:
             content = self._read_text()
-            if _MARKER_START not in content:
+            if _marker_start(spec.name) not in content:
                 # Even force=True is only allowed to replace blocks that
                 # Headroom owns. Otherwise appending our table would create a
                 # duplicate [mcp_servers.<name>] TOML section and may clobber a
@@ -98,11 +110,13 @@ class CodexRegistrar(MCPRegistrar):
         if not self._config_file.exists():
             return False
         content = self._read_text()
-        if _MARKER_START not in content or _MARKER_END not in content:
+        marker_start = _marker_start(server_name)
+        marker_end = _marker_end(server_name)
+        if marker_start not in content or marker_end not in content:
             return False
         try:
-            start = content.index(_MARKER_START)
-            end = content.index(_MARKER_END) + len(_MARKER_END)
+            start = content.index(marker_start)
+            end = content.index(marker_end) + len(marker_end)
         except ValueError:
             return False
         before = content[:start].rstrip("\n")
@@ -142,9 +156,11 @@ class CodexRegistrar(MCPRegistrar):
         try:
             self._codex_dir.mkdir(parents=True, exist_ok=True)
             content = self._read_text()
-            if _MARKER_START in content and _MARKER_END in content:
-                start = content.index(_MARKER_START)
-                end = content.index(_MARKER_END) + len(_MARKER_END)
+            marker_start = _marker_start(spec.name)
+            marker_end = _marker_end(spec.name)
+            if marker_start in content and marker_end in content:
+                start = content.index(marker_start)
+                end = content.index(marker_end) + len(marker_end)
                 content = (
                     content[:start].rstrip("\n")
                     + ("\n\n" if content[:start].rstrip("\n") else "")
@@ -172,7 +188,7 @@ class CodexRegistrar(MCPRegistrar):
 def _render_block(spec: ServerSpec) -> str:
     """Render a Headroom-marked TOML block for ``spec``."""
     lines: list[str] = [
-        _MARKER_START,
+        _marker_start(spec.name),
         f"[mcp_servers.{spec.name}]",
         f"command = {_toml_str(spec.command)}",
     ]
@@ -184,7 +200,7 @@ def _render_block(spec: ServerSpec) -> str:
         lines.append(f"[mcp_servers.{spec.name}.env]")
         for k, v in spec.env.items():
             lines.append(f"{k} = {_toml_str(v)}")
-    lines.append(_MARKER_END)
+    lines.append(_marker_end(spec.name))
     return "\n".join(lines)
 
 
