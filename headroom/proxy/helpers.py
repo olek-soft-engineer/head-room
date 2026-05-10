@@ -100,17 +100,17 @@ def _safe_event_name(event: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in event)[:80]
 
 
-def _wire_debug_preview(value: Any, *, max_chars: int = 900) -> str:
-    """Return a compact, human-readable preview for proxy.log.
+def _wire_debug_preview(value: Any, *, max_chars: int | None = None) -> str:
+    """Return the redacted wire payload for proxy.log.
 
-    This is intentionally lossy: the full redacted payload is already written
-    to the wire-debug JSON file. The log line should be short enough to scan
-    live without flooding the proxy log.
+    This is intentionally not truncated. During Codex WS debugging we need the
+    proxy log itself to show the complete frame so we can decide later where a
+    deliberate trim boundary belongs.
     """
 
     try:
         if isinstance(value, bytes):
-            text = safe_decode_for_logging(value, max_bytes=max_chars)
+            text = value.decode("utf-8", errors="replace")
         elif isinstance(value, str):
             text = value
         elif value is None:
@@ -121,7 +121,7 @@ def _wire_debug_preview(value: Any, *, max_chars: int = 900) -> str:
         text = repr(value)
 
     text = " ".join(text.split())
-    if len(text) > max_chars:
+    if max_chars is not None and len(text) > max_chars:
         return text[: max_chars - 1] + "…"
     return text
 

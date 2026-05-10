@@ -14,7 +14,9 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import gc
+import hashlib
 import logging
 import threading
 from dataclasses import dataclass
@@ -34,6 +36,62 @@ HF_MODEL_ID = "chopratejas/kompress-base"
 # Supports multiple models loaded simultaneously.
 _kompress_cache: dict[str, tuple[Any, Any, str]] = {}
 _kompress_lock = threading.Lock()
+
+
+def _bucket_count(value: int) -> str:
+    """Return a coarse, privacy-preserving size bucket."""
+    if value <= 0:
+        return "0"
+    lower = 1 << (value.bit_length() - 1)
+    upper = lower << 1
+    return f"{lower}-{upper}"
+
+
+def _kompress_content_signature(content: str) -> Any:
+    """Create a first-class TOIN signature for Kompress/plain-text content.
+
+    This intentionally keys on shape, not values. Retrieval pressure should
+    teach TOIN about this class of compressed content without storing the
+    content or treating it as an anonymous fallback.
+    """
+    from ..telemetry.models import ToolSignature
+
+    words = content.split()
+    line_count = content.count("\n") + 1 if content else 0
+    nonempty_lines = [line for line in content.splitlines() if line.strip()]
+    avg_line_chars = (
+        sum(len(line) for line in nonempty_lines) // len(nonempty_lines) if nonempty_lines else 0
+    )
+    has_paths = "/" in content or "\\" in content
+    has_assignment_like_tokens = any("=" in word for word in words[:200])
+    has_brackets = any(ch in content for ch in "{}[]()")
+    has_error_terms = any(
+        term in content.lower() for term in ("error", "exception", "traceback", "failed", "fatal")
+    )
+    shape = "|".join(
+        (
+            "kompress-text",
+            f"chars:{_bucket_count(len(content))}",
+            f"words:{_bucket_count(len(words))}",
+            f"lines:{_bucket_count(line_count)}",
+            f"avg_line:{_bucket_count(avg_line_chars)}",
+            f"paths:{int(has_paths)}",
+            f"assign:{int(has_assignment_like_tokens)}",
+            f"brackets:{int(has_brackets)}",
+            f"errors:{int(has_error_terms)}",
+        )
+    )
+    structure_hash = hashlib.sha256(shape.encode()).hexdigest()[:24]
+    return ToolSignature(
+        structure_hash=structure_hash,
+        field_count=0,
+        has_nested_objects=False,
+        has_arrays=False,
+        max_depth=0,
+        string_field_count=1,
+        has_error_like_field=has_error_terms,
+        has_message_like_field=True,
+    )
 
 
 def _is_onnx_available() -> bool:
@@ -800,13 +858,30 @@ class KompressCompressor(Transform):
         try:
             from ..cache.compression_store import get_compression_store
 
+            signature = _kompress_content_signature(original)
+            compressed_tokens = len(compressed.split())
             store = get_compression_store()
-            return store.store(
+            cache_key = store.store(
                 original,
                 compressed,
                 original_tokens=original_tokens,
-                compressed_tokens=len(compressed.split()),
+                compressed_tokens=compressed_tokens,
+                original_item_count=original_tokens,
+                compressed_item_count=compressed_tokens,
+                tool_signature_hash=signature.structure_hash,
                 compression_strategy="kompress",
             )
+            with contextlib.suppress(Exception):
+                from ..telemetry import get_toin
+
+                get_toin().record_compression(
+                    tool_signature=signature,
+                    original_count=original_tokens,
+                    compressed_count=compressed_tokens,
+                    original_tokens=original_tokens,
+                    compressed_tokens=compressed_tokens,
+                    strategy="kompress",
+                )
+            return cache_key
         except Exception:
             return None

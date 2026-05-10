@@ -157,3 +157,56 @@ def test_codex_responses_subpath_passthrough_derives_chatgpt_routing_from_jwt(pa
     assert url == expected_url
     assert headers["authorization"] == f"Bearer {token}"
     assert headers["ChatGPT-Account-ID"] == "acct-from-jwt"
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_url"),
+    [
+        (
+            "/v1/models?client_version=0.130.0",
+            "https://chatgpt.com/backend-api/models?client_version=0.130.0",
+        ),
+        (
+            "/v1/models/gpt-5.3-codex?client_version=0.130.0",
+            "https://chatgpt.com/backend-api/models/gpt-5.3-codex?client_version=0.130.0",
+        ),
+    ],
+)
+def test_codex_model_metadata_routes_to_chatgpt_backend_for_subscription_auth(
+    path,
+    expected_url,
+):
+    class FakeAsyncClient:
+        def __init__(self):
+            self.calls: list[tuple[str, str, dict[str, str]]] = []
+
+        async def request(self, method, url, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls.append((method, url, dict(kwargs.get("headers", {}))))
+            return httpx.Response(200, json={"method": method, "url": url})
+
+        async def aclose(self):
+            return None
+
+    token = _jwt(
+        {
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-from-jwt",
+            }
+        }
+    )
+
+    with TestClient(create_app(ProxyConfig())) as client:
+        fake_http_client = FakeAsyncClient()
+        client.app.state.proxy.http_client = fake_http_client
+        client.app.state.proxy.OPENAI_API_URL = "https://api.openai.test"
+
+        response = client.get(path, headers={"Authorization": f"Bearer {token}"})
+
+    assert response.status_code == 200
+    assert len(fake_http_client.calls) == 1
+
+    method, url, headers = fake_http_client.calls[0]
+    assert method == "GET"
+    assert url == expected_url
+    assert headers["authorization"] == f"Bearer {token}"
+    assert headers["ChatGPT-Account-ID"] == "acct-from-jwt"

@@ -2236,6 +2236,23 @@ class OpenAIHandlerMixin:
         _ws_url_obj = getattr(websocket, "url", None)
         _ws_url = str(_ws_url_obj) if _ws_url_obj is not None else ""
         _ws_path = getattr(_ws_url_obj, "path", "") if _ws_url_obj is not None else ""
+        if not _ws_path:
+            _ws_path = "/v1/responses"
+        metrics_for_inbound_ws = getattr(self, "metrics", None)
+        if metrics_for_inbound_ws is not None and hasattr(
+            metrics_for_inbound_ws, "record_inbound_request"
+        ):
+            with contextlib.suppress(Exception):
+                metrics_for_inbound_ws.record_inbound_request(method="WS", path=_ws_path)
+        logger.info(
+            "event=proxy_inbound_websocket request_id=%s session_id=%s path=%s "
+            "client=%s header_count=%d",
+            request_id,
+            session_id,
+            _ws_path,
+            getattr(websocket, "client", ""),
+            len(ws_headers),
+        )
         from headroom.proxy.helpers import capture_codex_wire_debug
 
         capture_codex_wire_debug(
@@ -2549,6 +2566,12 @@ class OpenAIHandlerMixin:
             ws_recorded_uncached_input_tokens_total = 0
             ws_recorded_tokens_saved_total = 0
             ws_response_create_frames = 1
+            ws_client_frames_total = 1
+            ws_upstream_frames_total = 0
+            ws_cancel_frames = 0
+            ws_last_client_frame_type = str(body.get("type") or "unknown") if body else "unknown"
+            ws_last_upstream_frame_type = "unknown"
+            ws_client_disconnect_seen = False
             _ws_bypass = self._headroom_bypass_enabled(ws_headers)
             if _ws_bypass:
                 logger.info(
@@ -3043,16 +3066,44 @@ class OpenAIHandlerMixin:
 
                         async def _client_to_upstream() -> None:
                             nonlocal client_relay_error, ws_response_create_frames
+                            nonlocal ws_client_frames_total, ws_cancel_frames
+                            nonlocal ws_last_client_frame_type, ws_client_disconnect_seen
                             client_frame_index = 1
                             try:
                                 while True:
                                     msg = await websocket.receive_text()
                                     client_frame_index += 1
+                                    ws_client_frames_total += 1
+                                    if session_handle is not None:
+                                        session_handle.mark_activity()
                                     _inbound_frame_body: Any = None
                                     try:
                                         _inbound_frame_body = json.loads(msg)
                                     except json.JSONDecodeError:
                                         _inbound_frame_body = None
+                                    ws_last_client_frame_type = (
+                                        str(_inbound_frame_body.get("type") or "unknown")
+                                        if isinstance(_inbound_frame_body, dict)
+                                        else "non_json"
+                                    )
+                                    if ws_last_client_frame_type == "response.cancel":
+                                        ws_cancel_frames += 1
+                                        logger.info(
+                                            "[%s] WS client sent response.cancel "
+                                            "session_id=%s frame=%d cancels=%d",
+                                            request_id,
+                                            session_id,
+                                            client_frame_index,
+                                            ws_cancel_frames,
+                                        )
+                                    else:
+                                        logger.debug(
+                                            "[%s] WS client frame session_id=%s frame=%d type=%s",
+                                            request_id,
+                                            session_id,
+                                            client_frame_index,
+                                            ws_last_client_frame_type,
+                                        )
                                     capture_codex_wire_debug(
                                         "ws_inbound_client_frame",
                                         request_id=request_id,
@@ -3115,6 +3166,17 @@ class OpenAIHandlerMixin:
                                     logger.debug(
                                         f"[{request_id}] WS client→upstream relay ended: {relay_err}"
                                     )
+                                else:
+                                    ws_client_disconnect_seen = True
+                                    logger.info(
+                                        "[%s] WS client disconnected session_id=%s "
+                                        "frames=%d cancels=%d last_type=%s",
+                                        request_id,
+                                        session_id,
+                                        ws_client_frames_total,
+                                        ws_cancel_frames,
+                                        ws_last_client_frame_type,
+                                    )
                                 with contextlib.suppress(Exception):
                                     await upstream.close()
 
@@ -3147,6 +3209,7 @@ class OpenAIHandlerMixin:
                             nonlocal ws_recorded_cache_write_tokens_total
                             nonlocal ws_recorded_uncached_input_tokens_total
                             nonlocal ws_recorded_tokens_saved_total
+                            nonlocal ws_upstream_frames_total, ws_last_upstream_frame_type
 
                             memory_enabled = bool(self.memory_handler and memory_user_id)
 
@@ -3247,6 +3310,9 @@ class OpenAIHandlerMixin:
                                 upstream_frame_index = 0
                                 async for msg in upstream:
                                     upstream_frame_index += 1
+                                    ws_upstream_frames_total += 1
+                                    if session_handle is not None:
+                                        session_handle.mark_activity()
                                     if (
                                         _first_event_started_at is not None
                                         and "upstream_first_event" not in stage_timer
@@ -3257,6 +3323,7 @@ class OpenAIHandlerMixin:
                                             * 1000.0,
                                         )
                                     if isinstance(msg, bytes):
+                                        ws_last_upstream_frame_type = "binary"
                                         capture_codex_wire_debug(
                                             "ws_upstream_binary_frame",
                                             request_id=request_id,
@@ -3295,10 +3362,19 @@ class OpenAIHandlerMixin:
                                     try:
                                         event = json.loads(msg_str)
                                     except (json.JSONDecodeError, TypeError):
+                                        ws_last_upstream_frame_type = "non_json"
                                         await websocket.send_text(msg_str)
                                         continue
 
                                     event_type = event.get("type", "")
+                                    ws_last_upstream_frame_type = str(event_type or "unknown")
+                                    logger.debug(
+                                        "[%s] WS upstream frame session_id=%s frame=%d type=%s",
+                                        request_id,
+                                        session_id,
+                                        upstream_frame_index,
+                                        ws_last_upstream_frame_type,
+                                    )
                                     if event_type == "response.created":
                                         response_started_ms = time.perf_counter() * 1000.0
                                     (
@@ -3556,6 +3632,13 @@ class OpenAIHandlerMixin:
                                         logger.debug(
                                             f"[{request_id}] WS relay {task_name} raised: {exc!r}"
                                         )
+                            if (
+                                ws_cancel_frames > 0
+                                and not response_completed_seen
+                                and termination_cause
+                                in {"upstream_disconnect", "client_disconnect", "unknown"}
+                            ):
+                                termination_cause = "client_cancel"
                         finally:
                             # In case anything above raised before the
                             # cancel-and-await loop ran.
@@ -3566,8 +3649,19 @@ class OpenAIHandlerMixin:
                                 await asyncio.gather(*relay_tasks, return_exceptions=True)
 
                         logger.info(
-                            f"[{request_id}] WS /v1/responses completed "
-                            f"(tokens_saved={tokens_saved}, cause={termination_cause})"
+                            "[%s] WS /v1/responses completed "
+                            "(tokens_saved=%d, cause=%s, client_frames=%d, upstream_frames=%d, "
+                            "cancel_frames=%d, client_disconnect=%s, last_client_type=%s, "
+                            "last_upstream_type=%s)",
+                            request_id,
+                            tokens_saved,
+                            termination_cause,
+                            ws_client_frames_total,
+                            ws_upstream_frames_total,
+                            ws_cancel_frames,
+                            ws_client_disconnect_seen,
+                            ws_last_client_frame_type,
+                            ws_last_upstream_frame_type,
                         )
                     break
                 except Exception as ws_err:
@@ -3658,6 +3752,13 @@ class OpenAIHandlerMixin:
                 "route": "chatgpt_subscription" if is_chatgpt_auth else "openai_api",
                 "ws_response_create_frames": str(ws_response_create_frames),
                 "ws_frames_compressed": str(ws_frames_compressed),
+                "ws_client_frames_total": str(ws_client_frames_total),
+                "ws_upstream_frames_total": str(ws_upstream_frames_total),
+                "ws_cancel_frames": str(ws_cancel_frames),
+                "ws_last_client_frame_type": ws_last_client_frame_type,
+                "ws_last_upstream_frame_type": ws_last_upstream_frame_type,
+                "ws_client_disconnect_seen": str(ws_client_disconnect_seen),
+                "ws_termination_cause": termination_cause,
                 "cache_read_tokens": str(ws_cache_read_tokens_total),
                 "cache_write_tokens": str(ws_cache_write_tokens_total),
                 "uncached_input_tokens": str(ws_uncached_input_tokens_total),
@@ -3793,6 +3894,23 @@ class OpenAIHandlerMixin:
                             metrics_for_close.record_ws_session_duration(
                                 session_duration_ms, termination_cause
                             )
+            metrics_for_ws_inbound_close = getattr(self, "metrics", None)
+            if metrics_for_ws_inbound_close is not None and hasattr(
+                metrics_for_ws_inbound_close, "record_inbound_response"
+            ):
+                with contextlib.suppress(Exception):
+                    metrics_for_ws_inbound_close.record_inbound_response(
+                        status_code=f"ws:{termination_cause}"
+                    )
+            logger.info(
+                "event=proxy_inbound_websocket_closed request_id=%s session_id=%s "
+                "path=%s cause=%s duration_ms=%.2f",
+                request_id,
+                session_id,
+                _ws_path,
+                termination_cause,
+                (time.perf_counter() - session_started_at) * 1000.0,
+            )
             await emit_stage_timings_log(
                 path="openai_responses_ws",
                 request_id=request_id,
