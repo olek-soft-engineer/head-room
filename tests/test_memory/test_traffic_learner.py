@@ -521,6 +521,16 @@ class TestProjectForPattern:
         )
         assert _project_for_pattern(pattern, [proj]) is proj
 
+    def test_windows_root_with_trailing_backslash_matches_child_path(self):
+        proj = self._project(r"C:\Users\john.doe\repo\\")
+        pattern = ExtractedPattern(
+            category=PatternCategory.ERROR_RECOVERY,
+            content=r"File `C:\Users\john.doe\repo\src\main.py` does not exist.",
+            importance=0.5,
+        )
+
+        assert _project_for_pattern(pattern, [proj]) is proj
+
     def test_no_false_match_on_prefix_boundary(self):
         # /x/ab should not match a project rooted at /x/a
         proj_a = self._project("/x/a")

@@ -1256,7 +1256,7 @@ def _project_for_pattern(pattern: ExtractedPattern, roots: list[ProjectInfo]) ->
 
     for cand in candidates:
         for root in roots_sorted:
-            root_str = str(root.project_path).rstrip("/")
+            root_str = str(root.project_path).rstrip("/\\")
             if not root_str:
                 continue
             if (

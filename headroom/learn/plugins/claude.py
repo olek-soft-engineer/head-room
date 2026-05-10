@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from .._shared import classify_error, is_error_content
 from ..base import ConversationScanner, LearnPlugin
@@ -77,7 +77,7 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
                 else:
                     project_path = Path("/" + entry.name[1:].replace("-", "/"))
 
-            name = project_path.name if project_path != Path("/") else entry.name
+            name = _project_display_name(project_path, entry.name)
 
             context_file = None
             if project_path.exists():
@@ -323,6 +323,8 @@ def _decode_project_path(escaped_name: str) -> Path | None:
             result = _greedy_path_decode(win_base, parts[2:])
             if result:
                 return result
+        if len(parts) > 1 and parts[1].lower() == "users":
+            return win_path
 
     simple = Path("/" + escaped_name[1:].replace("-", "/"))
     if simple.exists():
@@ -342,6 +344,16 @@ def _decode_project_path(escaped_name: str) -> Path | None:
         return _greedy_path_decode(base, remaining)
 
     return None
+
+
+def _project_display_name(project_path: Path, fallback: str) -> str:
+    """Return a human project name for POSIX and Windows-style decoded paths."""
+    rendered = str(project_path)
+    if re.match(r"^[A-Za-z]:[\\/]", rendered):
+        return PureWindowsPath(rendered).name or fallback
+    if project_path == Path("/"):
+        return fallback
+    return project_path.name or fallback
 
 
 def _greedy_path_decode(base: Path, parts: list[str]) -> Path | None:
