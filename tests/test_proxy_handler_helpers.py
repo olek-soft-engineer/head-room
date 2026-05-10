@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import builtins
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
+
+import httpx
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin, _decode_openai_bearer_payload
 from headroom.proxy.helpers import _headroom_bypass_enabled
+from headroom.proxy.server import HeadroomProxy
 
 
 def _jwt(payload: object) -> str:
@@ -34,6 +39,32 @@ class _FreshCompressor:
 
     def __init__(self):
         type(self).instances += 1
+
+
+class _TimeoutHttpClient:
+    async def request(self, **kwargs):  # noqa: ANN001, ANN201
+        raise httpx.ConnectTimeout("connect timed out")
+
+
+class _PassthroughRequest:
+    method = "GET"
+    headers = {}
+    url = SimpleNamespace(path="/favicon.ico", query="")
+
+    async def body(self) -> bytes:
+        return b""
+
+
+class _RetryThenSuccessClient:
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    async def post(self, url, content, headers):  # noqa: ANN001, ANN201
+        self.attempts += 1
+        if self.attempts == 1:
+            raise httpx.ConnectTimeout("connect timed out")
+        request = httpx.Request("POST", url, headers=headers, content=content)
+        return httpx.Response(200, request=request, content=b"{}")
 
 
 def test_decode_openai_bearer_payload_handles_missing_and_non_mapping_payloads() -> None:
@@ -89,6 +120,47 @@ def test_headroom_bypass_helper_is_transport_neutral() -> None:
     assert _headroom_bypass_enabled({}) is False
     assert _headroom_bypass_enabled(None) is False
     assert OpenAIHandlerMixin._headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
+
+
+def test_openai_passthrough_connect_timeout_returns_502() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _TimeoutHttpClient()
+
+    async def run():
+        return await handler.handle_passthrough(
+            _PassthroughRequest(),
+            "https://api.openai.com",
+        )
+
+    response = asyncio.run(run())
+
+    assert response.status_code == 502
+    payload = json.loads(response.body)
+    assert payload["error"]["type"] == "connection_error"
+    assert "Failed to connect to upstream API" in payload["error"]["message"]
+
+
+def test_retry_request_retries_connect_timeout() -> None:
+    proxy = object.__new__(HeadroomProxy)
+    proxy.http_client = _RetryThenSuccessClient()
+    proxy.config = SimpleNamespace(
+        retry_enabled=True,
+        retry_max_attempts=2,
+        retry_base_delay_ms=0,
+        retry_max_delay_ms=0,
+    )
+
+    response = asyncio.run(
+        proxy._retry_request(
+            "POST",
+            "https://api.openai.com/v1/responses",
+            {},
+            {"model": "gpt-5"},
+        )
+    )
+
+    assert response.status_code == 200
+    assert proxy.http_client.attempts == 2
 
 
 def test_anthropic_tool_sort_and_context_append_helpers() -> None:
