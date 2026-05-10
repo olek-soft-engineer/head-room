@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -246,7 +247,8 @@ def test_learn_analyze_all_continues_when_one_project_write_fails(
     assert str(blocked.project_path) in result.output
     assert "[WROTE]" in result.output
     assert str(ok.project_path / "AGENTS.md") in result.output
-    assert plugin.scan_calls == [(blocked, 8), (ok, 8)]
+    expected_workers = min(os.cpu_count() or 4, 8)
+    assert plugin.scan_calls == [(blocked, expected_workers), (ok, expected_workers)]
 
 
 def test_learn_handles_empty_sessions_and_no_pattern_outputs(
