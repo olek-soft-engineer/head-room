@@ -29,6 +29,22 @@ def _spec(env: dict[str, str] | None = None) -> ServerSpec:
     )
 
 
+def _serena_spec() -> ServerSpec:
+    return ServerSpec(
+        name="serena",
+        command="uvx",
+        args=(
+            "--from",
+            "git+https://github.com/oraios/serena",
+            "serena",
+            "start-mcp-server",
+            "--project-from-cwd",
+            "--context",
+            "codex",
+        ),
+    )
+
+
 def _config_path(tmp_path: Path) -> Path:
     return tmp_path / ".codex" / "config.toml"
 
@@ -137,6 +153,23 @@ def test_register_includes_env_subtable(tmp_path: Path) -> None:
     }
 
 
+def test_register_headroom_and_serena_coexist(tmp_path: Path) -> None:
+    reg = _make_registrar(tmp_path)
+
+    assert reg.register_server(_spec()).status == RegisterStatus.REGISTERED
+    assert reg.register_server(_serena_spec()).status == RegisterStatus.REGISTERED
+
+    text = _config_path(tmp_path).read_text()
+    assert "[mcp_servers.headroom]" in text
+    assert "[mcp_servers.serena]" in text
+    assert "# --- Headroom MCP server ---" in text
+    assert "# --- Headroom MCP server: serena ---" in text
+
+    parsed = tomllib.loads(text)
+    assert parsed["mcp_servers"]["headroom"]["command"] == "headroom"
+    assert parsed["mcp_servers"]["serena"]["command"] == "uvx"
+
+
 def test_register_omits_env_subtable_when_env_empty(tmp_path: Path) -> None:
     _make_registrar(tmp_path).register_server(_spec())
     text = _config_path(tmp_path).read_text()
@@ -226,6 +259,19 @@ def test_unregister_removes_marker_block(tmp_path: Path) -> None:
     assert "# --- Headroom MCP server ---" not in text
     # Surrounding content survives.
     assert "[other_section]" in text
+
+
+def test_unregister_serena_preserves_headroom_block(tmp_path: Path) -> None:
+    reg = _make_registrar(tmp_path)
+    reg.register_server(_spec())
+    reg.register_server(_serena_spec())
+
+    assert reg.unregister_server("serena") is True
+    text = _config_path(tmp_path).read_text()
+    assert "[mcp_servers.headroom]" in text
+    assert "[mcp_servers.serena]" not in text
+    assert "# --- Headroom MCP server ---" in text
+    assert "# --- Headroom MCP server: serena ---" not in text
 
 
 def test_unregister_returns_false_when_no_block(tmp_path: Path) -> None:

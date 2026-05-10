@@ -37,6 +37,23 @@ def build_headroom_spec(proxy_url: str = DEFAULT_PROXY_URL) -> ServerSpec:
     )
 
 
+def build_serena_spec(context: str) -> ServerSpec:
+    """Construct the canonical Serena MCP server spec for an agent context."""
+    return ServerSpec(
+        name="serena",
+        command="uvx",
+        args=(
+            "--from",
+            "git+https://github.com/oraios/serena",
+            "serena",
+            "start-mcp-server",
+            "--project-from-cwd",
+            "--context",
+            context,
+        ),
+    )
+
+
 def install_everywhere(
     proxy_url: str = DEFAULT_PROXY_URL,
     *,

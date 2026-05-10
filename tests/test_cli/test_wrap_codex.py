@@ -92,6 +92,10 @@ class TestStripCodexHeadroomBlocks:
             "[mcp_servers.headroom]\n"
             'command = "headroom"\n'
             f"{wrap_mod._CODEX_MCP_END}\n\n"
+            "# --- Headroom MCP server: serena ---\n"
+            "[mcp_servers.serena]\n"
+            'command = "uvx"\n'
+            "# --- end Headroom MCP server: serena ---\n\n"
             f"{wrap_mod._MEMORY_MCP_MARKER}\n"
             "[mcp_servers.headroom_memory]\n"
             'command = "python"\n'
@@ -101,6 +105,7 @@ class TestStripCodexHeadroomBlocks:
         cleaned = wrap_mod._strip_codex_headroom_blocks(content, remove_mcp=True)
 
         assert "[mcp_servers.headroom]" not in cleaned
+        assert "[mcp_servers.serena]" not in cleaned
         assert "[mcp_servers.headroom_memory]" not in cleaned
         assert 'model = "gpt-4o"' in cleaned
 
@@ -488,6 +493,43 @@ def test_wrap_codex_prepare_only_updates_stale_mcp_proxy_url(
     assert 'command = "headroom"' in content
     assert 'args = ["mcp", "serve"]' in content
     assert "http://127.0.0.1:9000" not in content
+
+
+def test_wrap_codex_prepare_only_registers_serena_when_uvx_exists(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+
+    def fake_which(cmd: str) -> str | None:
+        if cmd == "uvx":
+            return "/usr/local/bin/uvx"
+        return None
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        with patch("headroom.cli.wrap.shutil.which", side_effect=fake_which):
+            result = runner.invoke(main, ["wrap", "codex", "--prepare-only"])
+
+    assert result.exit_code == 0, result.output
+    content = config_file.read_text()
+    assert "[mcp_servers.serena]" in content
+    assert 'command = "uvx"' in content
+    assert '"--context", "codex"' in content
+
+
+def test_wrap_codex_prepare_only_no_serena_skips_serena(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+
+    with patch("headroom.cli.wrap._ensure_rtk_binary", return_value=None):
+        result = runner.invoke(main, ["wrap", "codex", "--prepare-only", "--no-serena"])
+
+    assert result.exit_code == 0, result.output
+    assert "[mcp_servers.serena]" not in config_file.read_text()
 
 
 def test_unwrap_codex_restores_prior_config_end_to_end(
