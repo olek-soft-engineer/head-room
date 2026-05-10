@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 from fastapi.responses import JSONResponse
@@ -252,10 +253,12 @@ def test_openai_response_subpath_passthrough_returns_502_on_http_failure() -> No
 
     with TestClient(_app()) as client:
         client.app.state.proxy.http_client = FailingAsyncClient()
-        response = client.post("/v1/responses/compact?trace=1", json={"model": "gpt-4o"})
+        with patch("headroom.providers.proxy_routes.logger") as logger:
+            response = client.post("/v1/responses/compact?trace=1", json={"model": "gpt-4o"})
 
     assert response.status_code == 502
     assert "boom: POST https://api.openai.test/v1/responses/compact?trace=1" in response.text
+    logger.error.assert_called_once()
 
 
 def test_openai_response_subpath_passthrough_uses_openai_target() -> None:

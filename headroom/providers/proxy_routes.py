@@ -46,6 +46,41 @@ def _select_passthrough_base_url(proxy: Any, headers: dict[str, str]) -> str:
     return _api_target(proxy, provider_name)
 
 
+async def _handle_chatgpt_model_metadata(
+    proxy: Any,
+    request: Request,
+    upstream_path: str,
+) -> Response | None:
+    headers = dict(request.headers.items())
+    headers.pop("host", None)
+    headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
+    if not is_chatgpt_auth:
+        return None
+
+    url = f"https://chatgpt.com{upstream_path}"
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+
+    body = await request.body()
+    try:
+        assert proxy.http_client is not None
+        resp = await proxy.http_client.request(
+            request.method,
+            url,
+            headers=headers,
+            content=body,
+            timeout=120.0,
+        )
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers),
+        )
+    except Exception as exc:
+        logger.error("Passthrough %s failed: %s", upstream_path, exc)
+        return Response(content=str(exc), status_code=502)
+
+
 def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     """Register provider-specific proxy endpoints."""
 
@@ -207,6 +242,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.get("/v1/models")
     async def list_models(request: Request):
+        chatgpt_response = await _handle_chatgpt_model_metadata(
+            proxy,
+            request,
+            "/backend-api/models",
+        )
+        if chatgpt_response is not None:
+            return chatgpt_response
+
         provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
         return await proxy.handle_passthrough(
             request,
@@ -217,6 +260,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
 
     @app.get("/v1/models/{model_id}")
     async def get_model(request: Request, model_id: str):
+        chatgpt_response = await _handle_chatgpt_model_metadata(
+            proxy,
+            request,
+            f"/backend-api/models/{model_id}",
+        )
+        if chatgpt_response is not None:
+            return chatgpt_response
+
         provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
         return await proxy.handle_passthrough(
             request,

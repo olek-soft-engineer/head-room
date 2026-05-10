@@ -76,6 +76,12 @@ class PrometheusMetrics:
         self.requests_cached = 0
         self.requests_rate_limited = 0
         self.requests_failed = 0
+        self.inbound_requests_total = 0
+        self.inbound_requests_completed = 0
+        self.inbound_requests_active = 0
+        self.inbound_requests_by_method: dict[str, int] = defaultdict(int)
+        self.inbound_requests_by_path: dict[str, int] = defaultdict(int)
+        self.inbound_responses_by_status: dict[str, int] = defaultdict(int)
 
         self.tokens_input_total = 0
         self.tokens_output_total = 0
@@ -203,6 +209,12 @@ class PrometheusMetrics:
             self.requests_cached = 0
             self.requests_rate_limited = 0
             self.requests_failed = 0
+            self.inbound_requests_total = 0
+            self.inbound_requests_completed = 0
+            self.inbound_requests_active = 0
+            self.inbound_requests_by_method.clear()
+            self.inbound_requests_by_path.clear()
+            self.inbound_responses_by_status.clear()
 
             self.tokens_input_total = 0
             self.tokens_output_total = 0
@@ -338,6 +350,32 @@ class PrometheusMetrics:
         saved = original_tokens - compressed_tokens
         if saved > 0:
             self.tokens_saved_by_strategy[strategy] += saved
+
+    def record_inbound_request(self, *, method: str, path: str) -> None:
+        self.inbound_requests_total += 1
+        self.inbound_requests_active += 1
+        self.inbound_requests_by_method[method.upper()] += 1
+        self.inbound_requests_by_path[path] += 1
+
+    def record_inbound_response(self, *, status_code: int | str) -> None:
+        self.inbound_requests_completed += 1
+        self.inbound_requests_active = max(0, self.inbound_requests_active - 1)
+        self.inbound_responses_by_status[str(status_code)] += 1
+
+    def record_inbound_aborted(self, *, reason: str) -> None:
+        self.inbound_requests_completed += 1
+        self.inbound_requests_active = max(0, self.inbound_requests_active - 1)
+        self.inbound_responses_by_status[f"aborted:{reason}"] += 1
+
+    def inbound_snapshot(self) -> dict[str, object]:
+        return {
+            "total": self.inbound_requests_total,
+            "completed": self.inbound_requests_completed,
+            "active": self.inbound_requests_active,
+            "by_method": dict(self.inbound_requests_by_method),
+            "by_path": dict(self.inbound_requests_by_path),
+            "by_status": dict(self.inbound_responses_by_status),
+        }
 
     async def record_request(
         self,
@@ -598,6 +636,27 @@ class PrometheusMetrics:
                 metric_type="counter",
                 help_text="Failed requests",
                 value=self.requests_failed,
+            )
+            _append_metric(
+                lines,
+                name="headroom_inbound_requests_total",
+                metric_type="counter",
+                help_text="All inbound HTTP requests accepted by the proxy",
+                value=self.inbound_requests_total,
+            )
+            _append_metric(
+                lines,
+                name="headroom_inbound_requests_completed_total",
+                metric_type="counter",
+                help_text="Inbound HTTP requests completed or aborted by the proxy",
+                value=self.inbound_requests_completed,
+            )
+            _append_metric(
+                lines,
+                name="headroom_inbound_requests_active",
+                metric_type="gauge",
+                help_text="Inbound HTTP requests currently active in the proxy",
+                value=self.inbound_requests_active,
             )
             _append_metric(
                 lines,

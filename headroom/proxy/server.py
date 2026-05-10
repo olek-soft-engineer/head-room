@@ -1556,6 +1556,39 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     # outermost and we don't count requests they reject.
     @app.middleware("http")
     async def _record_headroom_stack(request, call_next):
+        started = time.perf_counter()
+        inbound_id = f"inbound-{time.time_ns()}"
+        path = request.url.path
+        method = request.method
+        query = request.url.query
+        headers = dict(request.headers.items())
+        client = getattr(request, "client", None)
+        client_addr = ""
+        if client is not None:
+            client_host = getattr(client, "host", None)
+            client_port = getattr(client, "port", None)
+            client_addr = f"{client_host}:{client_port}" if client_port else str(client_host)
+        try:
+            proxy.metrics.record_inbound_request(method=method, path=path)
+        except Exception:
+            logger.debug("record_inbound_request failed", exc_info=True)
+        try:
+            from headroom.proxy.helpers import redact_for_wire_debug
+
+            safe_headers = redact_for_wire_debug(headers)
+        except Exception:
+            safe_headers = {"redaction_error": True}
+        logger.info(
+            "event=proxy_inbound_request id=%s method=%s path=%s query=%s client=%s "
+            "content_length=%s headers=%s",
+            inbound_id,
+            method,
+            path,
+            query,
+            client_addr,
+            request.headers.get("content-length", ""),
+            json.dumps(safe_headers, ensure_ascii=False, default=str),
+        )
         if request.url.path.startswith("/v1/"):
             stack = request.headers.get("x-headroom-stack")
             if stack:
@@ -1563,7 +1596,50 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     proxy.metrics.record_stack(stack)
                 except Exception:
                     logger.debug("record_stack failed", exc_info=True)
-        return await call_next(request)
+        try:
+            response = await call_next(request)
+        except asyncio.CancelledError:
+            try:
+                proxy.metrics.record_inbound_aborted(reason="cancelled")
+            except Exception:
+                logger.debug("record_inbound_aborted failed", exc_info=True)
+            logger.info(
+                "event=proxy_inbound_request_aborted id=%s method=%s path=%s reason=cancelled "
+                "duration_ms=%.2f",
+                inbound_id,
+                method,
+                path,
+                (time.perf_counter() - started) * 1000.0,
+            )
+            raise
+        except Exception as exc:
+            try:
+                proxy.metrics.record_inbound_aborted(reason=type(exc).__name__)
+            except Exception:
+                logger.debug("record_inbound_aborted failed", exc_info=True)
+            logger.info(
+                "event=proxy_inbound_request_aborted id=%s method=%s path=%s reason=%s "
+                "duration_ms=%.2f",
+                inbound_id,
+                method,
+                path,
+                type(exc).__name__,
+                (time.perf_counter() - started) * 1000.0,
+            )
+            raise
+        try:
+            proxy.metrics.record_inbound_response(status_code=response.status_code)
+        except Exception:
+            logger.debug("record_inbound_response failed", exc_info=True)
+        logger.info(
+            "event=proxy_inbound_response id=%s method=%s path=%s status=%s duration_ms=%.2f",
+            inbound_id,
+            method,
+            path,
+            response.status_code,
+            (time.perf_counter() - started) * 1000.0,
+        )
+        return response
 
     # Third-party proxy extensions (Enterprise, custom plugins). Discovered via
     # the `headroom.proxy_extension` entry-point group, but **opt-in only**:
@@ -1905,6 +1981,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
             "toin": get_toin().get_stats(),
             "cli_filtering": cli_filtering_stats,
+            "proxy_inbound": proxy.metrics.inbound_snapshot(),
             "cache": await proxy.cache.stats() if proxy.cache else None,
             "rate_limiter": await proxy.rate_limiter.stats() if proxy.rate_limiter else None,
             "recent_requests": proxy.logger.get_recent(10) if proxy.logger else [],

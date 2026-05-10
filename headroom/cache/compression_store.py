@@ -53,6 +53,32 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_RETRIEVAL_LOG_PREVIEW_CHARS = 4096
+_SECRET_KEY_VALUE_RE = re.compile(
+    r"(?i)\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_-]*)"
+    r"(\s*[:=]\s*)([\"']?)([^\"'\s,}]+)"
+)
+_AUTH_VALUE_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}")
+_API_KEY_VALUE_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+
+
+def _redact_retrieval_log_payload(payload: str) -> str:
+    redacted = _SECRET_KEY_VALUE_RE.sub(r"\1\2\3[REDACTED]", payload)
+    redacted = _AUTH_VALUE_RE.sub(r"\1 [REDACTED]", redacted)
+    return _API_KEY_VALUE_RE.sub("sk-[REDACTED]", redacted)
+
+
+def _payload_for_retrieval_log(payload: str) -> dict[str, Any]:
+    redacted = _redact_retrieval_log_payload(payload)
+    preview = redacted[:_RETRIEVAL_LOG_PREVIEW_CHARS]
+    truncated = len(redacted) > len(preview)
+    return {
+        "payload_chars": len(payload),
+        "payload_preview_chars": len(preview),
+        "payload_truncated": truncated,
+        "payload_preview": preview,
+    }
+
 
 @dataclass
 class CompressionEntry:
@@ -337,6 +363,15 @@ class CompressionStore:
                     retrieval_type="full",
                     tool_signature_hash=entry.tool_signature_hash,
                 )
+            self._log_retrieval_payload(
+                hash_key=hash_key,
+                query=query,
+                retrieval_type="full",
+                payload=entry.original_content,
+                items_retrieved=entry.original_item_count,
+                total_items=entry.original_item_count,
+                entry=entry,
+            )
 
             # CRITICAL: Make a deep copy to return
             # (entry could be modified/evicted after lock release)
@@ -442,8 +477,50 @@ class CompressionStore:
                 )
             # Process feedback immediately to ensure TOIN learns in real-time
             self.process_pending_feedback()
+        self._log_retrieval_payload(
+            hash_key=hash_key,
+            query=query,
+            retrieval_type="search",
+            payload=json.dumps(results, ensure_ascii=False),
+            items_retrieved=len(results),
+            total_items=len(items),
+            entry=entry,
+        )
 
         return results
+
+    def _log_retrieval_payload(
+        self,
+        *,
+        hash_key: str,
+        query: str | None,
+        retrieval_type: str,
+        payload: str,
+        items_retrieved: int,
+        total_items: int,
+        entry: CompressionEntry,
+    ) -> None:
+        event = {
+            "event": "headroom_retrieve",
+            "hash": hash_key,
+            "retrieval_type": retrieval_type,
+            "query": query,
+            "items_retrieved": items_retrieved,
+            "total_items": total_items,
+            "tool_name": entry.tool_name,
+            "tool_call_id": entry.tool_call_id,
+            "compression_strategy": entry.compression_strategy,
+            "tool_signature_hash": entry.tool_signature_hash,
+            "original_tokens": entry.original_tokens,
+            "compressed_tokens": entry.compressed_tokens,
+            "original_item_count": entry.original_item_count,
+            "compressed_item_count": entry.compressed_item_count,
+            **_payload_for_retrieval_log(payload),
+        }
+        logger.info(
+            "event=headroom_retrieve %s",
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+        )
 
     def _search_items_from_original(self, original_content: str) -> list[Any]:
         """Normalize cached originals into searchable items.

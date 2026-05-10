@@ -425,6 +425,46 @@ async def test_upstream_error_mid_stream_classifies_as_upstream_error():
 
 
 @pytest.mark.asyncio
+async def test_response_cancel_frame_is_logged_as_client_cancel_lifecycle():
+    """A Codex Ctrl-C maps to response.cancel on the WS stream.
+
+    The proxy should relay it upstream and classify the lifecycle as a
+    client-side cancel when no response.completed event follows.
+    """
+    cancel_frame = json.dumps({"type": "response.cancel", "response_id": "r_1"})
+    upstream = _FakeUpstream([], hold_after_events=True)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(
+        frames=[_first_frame(), cancel_frame],
+        hold_after_initial=True,
+    )
+    handler = _DummyOpenAIHandler()
+
+    async def _trigger() -> None:
+        await asyncio.sleep(0.05)
+        client_ws.trigger_disconnect()
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        trigger_task = asyncio.create_task(_trigger())
+        try:
+            await asyncio.wait_for(
+                handler.handle_openai_responses_ws(client_ws),
+                timeout=2.0,
+            )
+        finally:
+            trigger_task.cancel()
+            try:
+                await trigger_task
+            except asyncio.CancelledError:
+                pass
+
+    assert cancel_frame in upstream.sent
+    assert handler.metrics.termination_causes[-1] == "client_cancel"
+    assert handler.ws_sessions.active_count() == 0
+
+
+@pytest.mark.asyncio
 async def test_upstream_connect_failure_still_deregisters_cleanly():
     """Handshake-phase leak must be impossible: if upstream connect
     raises before relay tasks are created, the session is still
