@@ -12,12 +12,30 @@ from headroom.proxy.modes import PROXY_MODE_TOKEN, normalize_proxy_mode
 
 from .main import main
 
+_CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
+_CONTEXT_TOOL_RTK = "rtk"
+_CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
+_VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
+
 
 def _get_env_bool(name: str, default: bool) -> bool:
     val = os.environ.get(name)
     if val is None:
         return default
     return val.lower() in ("true", "1", "yes", "on")
+
+
+def _selected_context_tool() -> str:
+    raw = os.environ.get(_CONTEXT_TOOL_ENV, "").strip().lower().replace("_", "-")
+    if not raw:
+        return _CONTEXT_TOOL_RTK
+    if raw == "leanctx":
+        raw = _CONTEXT_TOOL_LEAN_CTX
+    if raw not in _VALID_CONTEXT_TOOLS:
+        raise click.ClickException(
+            f"{_CONTEXT_TOOL_ENV} must be one of: {', '.join(sorted(_VALID_CONTEXT_TOOLS))}"
+        )
+    return raw
 
 
 @main.command()
@@ -735,6 +753,7 @@ Memory (Multi-Provider):
     from headroom.proxy.server import _get_code_aware_banner_status
 
     code_aware_line = f"  Code-Aware:   {_get_code_aware_banner_status(config)}"
+    context_tool_line = f"  Context Tool: {_selected_context_tool()}"
 
     click.echo(f"""
 ╔═══════════════════════════════════════════════════════════════════════╗
@@ -752,6 +771,7 @@ Starting proxy server...
   Memory:       {memory_status}
   License:      {license_status}
 {code_aware_line}
+{context_tool_line}
 {extensions_line}
 {stateless_line}{telemetry_line}
 {backend_section}

@@ -193,6 +193,7 @@ class SubscriptionTracker(QuotaTracker):
         *,
         tokens_submitted: int = 0,
         tokens_saved_compression: int = 0,
+        tokens_saved_cli_filtering: int | None = None,
         tokens_saved_rtk: int = 0,
         tokens_saved_cache_reads: int = 0,
         compression_savings_usd: float = 0.0,
@@ -204,9 +205,15 @@ class SubscriptionTracker(QuotaTracker):
         """
         with self._lock:
             c = self._state.contribution
+            cli_filtering = (
+                tokens_saved_rtk
+                if tokens_saved_cli_filtering is None
+                else tokens_saved_cli_filtering
+            )
             c.tokens_submitted += max(tokens_submitted, 0)
             c.tokens_saved_compression += max(tokens_saved_compression, 0)
-            c.tokens_saved_rtk += max(tokens_saved_rtk, 0)
+            c.tokens_saved_cli_filtering += max(cli_filtering, 0)
+            c.tokens_saved_rtk += max(cli_filtering, 0)
             c.tokens_saved_cache_reads += max(tokens_saved_cache_reads, 0)
             c.compression_savings_usd += max(compression_savings_usd, 0.0)
             c.cache_savings_usd += max(cache_savings_usd, 0.0)
@@ -479,12 +486,14 @@ class SubscriptionTracker(QuotaTracker):
             c.tokens_submitted = int(contrib.get("tokens_submitted", 0))
             saved = contrib.get("tokens_saved", {})
             # Newer state writes dashboard-facing ``compression`` as
-            # proxy-compression + rtk. Prefer the raw proxy field when present
-            # so loading does not double-count rtk into the internal counter.
+            # proxy-compression + CLI filtering. Prefer the raw proxy field when
+            # present so loading does not double-count CLI filtering.
             c.tokens_saved_compression = int(
                 saved.get("proxy_compression", saved.get("compression", 0))
             )
-            c.tokens_saved_rtk = int(saved.get("rtk", 0))
+            cli_filtering = int(saved.get("cli_filtering", saved.get("rtk", 0)))
+            c.tokens_saved_cli_filtering = cli_filtering
+            c.tokens_saved_rtk = cli_filtering
             c.tokens_saved_cache_reads = int(saved.get("cache_reads", 0))
             savings_usd = contrib.get("savings_usd", {})
             c.compression_savings_usd = float(savings_usd.get("compression", 0.0))

@@ -75,6 +75,8 @@ _CODEX_WIRE_DEBUG_DIR = "codex_wire"
 _BIN_DIR = "bin"
 _RTK_UNIX = "rtk"
 _RTK_WIN = "rtk.exe"
+_LEAN_CTX_UNIX = "lean-ctx"
+_LEAN_CTX_WIN = "lean-ctx.exe"
 _DEPLOY_DIR = "deploy"
 _PLUGINS_DIR = "plugins"
 
@@ -274,6 +276,13 @@ def rtk_path() -> Path:
     return bin_dir() / name
 
 
+def lean_ctx_path() -> Path:
+    """Return the path to the vendored ``lean-ctx`` binary."""
+
+    name = _LEAN_CTX_WIN if os.name == "nt" else _LEAN_CTX_UNIX
+    return bin_dir() / name
+
+
 def deploy_root() -> Path:
     """Return the root directory for persistent deployment profiles."""
 
@@ -349,6 +358,7 @@ __all__ = [
     "codex_wire_debug_dir",
     "bin_dir",
     "rtk_path",
+    "lean_ctx_path",
     "deploy_root",
     "beacon_lock_path",
     "models_config_path",

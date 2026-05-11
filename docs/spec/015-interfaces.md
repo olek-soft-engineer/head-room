@@ -100,7 +100,7 @@ headroom wrap [OPTIONS] -- <command> [args...]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port` | `8787` | Proxy port |
-| `--no-rtk` | `false` | Skip RTK hooks |
+| `--no-context-tool` / `--no-rtk` | `false` | Skip CLI context-tool setup |
 
 **Supported Commands:**
 - `claude` — Wrap Claude Code

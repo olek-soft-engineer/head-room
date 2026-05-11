@@ -116,11 +116,12 @@ from headroom.proxy.helpers import (
     MAX_MESSAGE_ARRAY_LENGTH,  # noqa: F401
     MAX_REQUEST_BODY_SIZE,  # noqa: F401
     MAX_SSE_BUFFER_SIZE,  # noqa: F401
+    _get_context_tool_stats,
     _get_image_compressor,  # noqa: F401
     _get_rtk_stats,  # noqa: F401
     _read_request_json,  # noqa: F401
     _setup_file_logging,  # noqa: F401
-    initialize_rtk_session_baseline,
+    initialize_context_tool_session_baseline,
     is_anthropic_auth,  # noqa: F401
     jitter_delay_ms,
 )
@@ -1353,7 +1354,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.started_at = time.time()
         app.state.ready = False
         app.state.startup_error = None
-        initialize_rtk_session_baseline()
+        initialize_context_tool_session_baseline()
 
         try:
             try:
@@ -1790,15 +1791,24 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # Build prefix cache stats once (used in both prefix_cache and cost)
         prefix_cache_stats = _build_prefix_cache_stats(m, proxy.cost_tracker)
 
-        # Fetch CLI filtering savings (rtk — tokens avoided before reaching context)
-        cli_filtering_stats = _get_rtk_stats()
+        # Fetch CLI filtering savings from the selected context tool. These
+        # tokens are avoided before they reach model context.
+        cli_filtering_stats = _get_context_tool_stats()
+        cli_filtering_tool = (
+            str(cli_filtering_stats.get("tool", "rtk")) if cli_filtering_stats else "rtk"
+        )
+        cli_filtering_label = (
+            str(cli_filtering_stats.get("label", "RTK")) if cli_filtering_stats else "RTK"
+        )
         cli_tokens_avoided = (
             cli_filtering_stats.get("tokens_saved", 0) if cli_filtering_stats else 0
         )
+        rtk_tokens_avoided = cli_tokens_avoided if cli_filtering_tool == "rtk" else 0
+        lean_ctx_tokens_avoided = cli_tokens_avoided if cli_filtering_tool == "lean-ctx" else 0
 
         # Calculate total tokens before Headroom-side reduction. Proxy
-        # compression and rtk both remove tokens before they reach model
-        # context, so dashboard-facing compression savings combines them.
+        # compression and the configured context tool both remove tokens before
+        # they reach model context, so dashboard-facing savings combines them.
         proxy_compression_tokens = m.tokens_saved_total
         all_layers_tokens_saved = proxy_compression_tokens + cli_tokens_avoided
         total_tokens_before = m.tokens_input_total + all_layers_tokens_saved
@@ -1870,21 +1880,27 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "total_tokens": total_tokens_all_layers,
                 "by_layer": {
                     "cli_filtering": {
+                        "tool": cli_filtering_tool,
+                        "label": cli_filtering_label,
                         "tokens": cli_tokens_avoided,
+                        "tokens_saved": cli_tokens_avoided,
                         "included_in": "tokens.saved",
                         "description": (
-                            "Tokens avoided by CLI output filtering (rtk) before reaching context. "
+                            f"Tokens avoided by CLI output filtering ({cli_filtering_label}) "
+                            "before reaching context. "
                             "Included in dashboard token savings, but not in dollar savings."
                         ),
                     },
                     "compression": {
                         "tokens": proxy_compression_tokens,
                         "proxy_tokens": proxy_compression_tokens,
-                        "rtk_tokens": cli_tokens_avoided,
+                        "cli_filtering_tokens": cli_tokens_avoided,
+                        "rtk_tokens": rtk_tokens_avoided,
+                        "lean_ctx_tokens": lean_ctx_tokens_avoided,
                         "all_layers_tokens": all_layers_tokens_saved,
                         "description": (
                             "Tokens removed by Headroom proxy compression. "
-                            "Dashboard token savings also includes rtk CLI filtering."
+                            "Dashboard token savings also includes CLI context-tool filtering."
                         ),
                     },
                     "prefix_cache": {
@@ -1911,7 +1927,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "output": m.tokens_output_total,
                 "saved": all_layers_tokens_saved,
                 "proxy_compression_saved": proxy_compression_tokens,
-                "rtk_saved": cli_tokens_avoided,
+                "cli_filtering_saved": cli_tokens_avoided,
+                "rtk_saved": rtk_tokens_avoided,
+                "lean_ctx_saved": lean_ctx_tokens_avoided,
                 "cli_tokens_avoided": cli_tokens_avoided,
                 "proxy_total_before_compression": proxy_total_before_compression,
                 "total_before_compression": total_tokens_before,
@@ -2027,6 +2045,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 ),
             },
             "toin": get_toin().get_stats(),
+            "context_tool": {
+                "configured": cli_filtering_tool,
+                "label": cli_filtering_label,
+                "available": bool(
+                    cli_filtering_stats and cli_filtering_stats.get("installed", False)
+                ),
+                "stats": cli_filtering_stats,
+            },
             "cli_filtering": cli_filtering_stats,
             "proxy_inbound": proxy.metrics.inbound_snapshot(),
             "cache": await proxy.cache.stats() if proxy.cache else None,
@@ -2080,7 +2106,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         await proxy.metrics.reset_runtime()
         if proxy.cost_tracker:
             proxy.cost_tracker.reset_runtime()
-        initialize_rtk_session_baseline()
+        initialize_context_tool_session_baseline()
         async with _stats_snapshot_lock:
             _stats_snapshot["value"] = None
             _stats_snapshot["expires_at"] = 0.0

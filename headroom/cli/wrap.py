@@ -1,13 +1,13 @@
 """Wrap CLI commands to run through Headroom proxy.
 
 Usage:
-    headroom wrap claude                    # Start proxy + rtk + claude
+    headroom wrap claude                    # Start proxy + context tool + claude
     headroom wrap copilot -- --model ...    # Start proxy + launch GitHub Copilot CLI
     headroom wrap codex                     # Start proxy + OpenAI Codex CLI
     headroom wrap aider                     # Start proxy + aider
     headroom wrap cursor                    # Start proxy + print Cursor config instructions
     headroom wrap openclaw                  # Install + configure OpenClaw plugin
-    headroom wrap claude --no-rtk           # Without rtk hooks
+    headroom wrap claude --no-context-tool  # Without CLI context-tool setup
     headroom wrap claude --port 9999        # Custom proxy port
     headroom wrap claude -- --model opus    # Pass args to claude
 """
@@ -22,6 +22,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, cast
@@ -77,10 +78,35 @@ from headroom.providers.openclaw import (
 
 from .main import main
 
+_CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
+_CONTEXT_TOOL_RTK = "rtk"
+_CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
+_VALID_CONTEXT_TOOLS = {_CONTEXT_TOOL_RTK, _CONTEXT_TOOL_LEAN_CTX}
+
 
 def _live_wrap_module() -> Any:
     """Return the current live wrap module instance."""
     return cast(Any, sys.modules[__name__])
+
+
+def _selected_context_tool() -> str:
+    """Return the configured CLI context tool.
+
+    RTK remains the default for backward compatibility. Set
+    ``HEADROOM_CONTEXT_TOOL=lean-ctx`` to let lean-ctx configure the supported
+    coding agent instead.
+    """
+
+    raw = os.environ.get(_CONTEXT_TOOL_ENV, "").strip().lower().replace("_", "-")
+    if not raw:
+        return _CONTEXT_TOOL_RTK
+    if raw == "leanctx":
+        raw = _CONTEXT_TOOL_LEAN_CTX
+    if raw not in _VALID_CONTEXT_TOOLS:
+        raise click.ClickException(
+            f"{_CONTEXT_TOOL_ENV} must be one of: {', '.join(sorted(_VALID_CONTEXT_TOOLS))}"
+        )
+    return raw
 
 
 def _print_telemetry_notice() -> None:
@@ -242,6 +268,53 @@ def _setup_rtk(verbose: bool = False) -> Path | None:
         click.echo("  rtk hook registration failed — continuing without it")
 
     return rtk_path
+
+
+def _setup_lean_ctx_agent(agent: str, verbose: bool = False) -> Path | None:
+    """Run lean-ctx agent setup for the requested coding tool."""
+
+    from headroom.lean_ctx import get_lean_ctx_path
+    from headroom.lean_ctx.installer import ensure_lean_ctx
+
+    lean_ctx = get_lean_ctx_path()
+    if not lean_ctx:
+        click.echo("  Downloading lean-ctx...")
+        lean_ctx = ensure_lean_ctx()
+    if not lean_ctx:
+        click.echo("  lean-ctx download failed — continuing without it")
+        return None
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="headroom-lean-ctx-") as setup_cwd:
+            # lean-ctx writes project-local files when initialized from a git
+            # checkout. Run from a non-project directory so setup is limited to
+            # home-scoped agent config such as ~/.codex or ~/.claude.
+            result = subprocess.run(
+                [str(lean_ctx), "init", "--agent", agent],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                cwd=setup_cwd,
+            )
+    except Exception as e:
+        click.echo(f"  lean-ctx setup failed — continuing without it: {e}")
+        return None
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        suffix = f": {detail}" if detail else ""
+        click.echo(f"  lean-ctx setup failed — continuing without it{suffix}")
+        return None
+
+    if verbose:
+        detail = result.stdout.strip()
+        if detail:
+            click.echo(f"  lean-ctx configured for {agent}: {detail}")
+        else:
+            click.echo(f"  lean-ctx configured for {agent}")
+    return lean_ctx
 
 
 def _remove_claude_rtk_hooks(settings_path: Path | None = None) -> bool:
@@ -1710,7 +1783,13 @@ def unwrap() -> None:
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
-@click.option("--no-rtk", is_flag=True, help="Skip rtk installation and hook registration")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
 @click.option(
     "--no-mcp",
     is_flag=True,
@@ -1756,13 +1835,16 @@ def claude(
         headroom wrap claude --resume <id>      # Resume a session
         headroom wrap claude -- -p              # Claude in print mode
         headroom wrap claude --code-graph        # With code graph intelligence
-        headroom wrap claude --no-rtk           # Skip rtk (proxy only)
+        headroom wrap claude --no-context-tool  # Skip CLI context-tool setup
         headroom wrap claude --no-mcp           # Skip MCP retrieve tool registration
         headroom wrap claude --no-serena        # Skip Serena MCP registration
     """
     if prepare_only:
         if not no_rtk:
-            _prepare_wrap_rtk(verbose=verbose, label="Claude")
+            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+                _setup_lean_ctx_agent("claude", verbose=verbose)
+            else:
+                _prepare_wrap_rtk(verbose=verbose, label="Claude")
         return
 
     claude_bin = shutil.which("claude")
@@ -1831,10 +1913,14 @@ def claude(
         )
 
         if not no_rtk:
-            click.echo("  Setting up rtk...")
-            _setup_rtk(verbose=verbose)
+            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+                click.echo("  Setting up lean-ctx...")
+                _setup_lean_ctx_agent("claude", verbose=verbose)
+            else:
+                click.echo("  Setting up rtk...")
+                _setup_rtk(verbose=verbose)
         elif verbose:
-            click.echo("  Skipping rtk (--no-rtk)")
+            click.echo("  Skipping CLI context tool (--no-context-tool)")
 
         if not no_mcp:
             from headroom.mcp_registry import ClaudeRegistrar
@@ -1945,9 +2031,11 @@ def unwrap_claude(
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
 @click.option(
+    "--no-context-tool",
     "--no-rtk",
+    "no_rtk",
     is_flag=True,
-    help="Skip rtk installation and Copilot instructions injection",
+    help="Skip CLI context-tool setup",
 )
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
@@ -2005,7 +2093,7 @@ def copilot(
         headroom wrap copilot -- --model claude-sonnet-4-20250514
         headroom wrap copilot --backend anyllm --anyllm-provider groq -- --model gpt-4o
         headroom wrap copilot --provider-type openai --wire-api responses -- --model gpt-5.4
-        headroom wrap copilot --no-rtk -- --prompt "explain this file"
+        headroom wrap copilot --no-context-tool -- --prompt "explain this file"
     """
     copilot_bin = shutil.which("copilot")
     if not copilot_bin:
@@ -2034,11 +2122,15 @@ def copilot(
     )
 
     if not no_rtk:
-        click.echo("  Setting up rtk for Copilot...")
-        rtk_path = _ensure_rtk_binary(verbose=verbose)
-        if rtk_path:
-            copilot_instructions = Path.cwd() / ".github" / "copilot-instructions.md"
-            _inject_rtk_instructions(copilot_instructions, verbose=verbose)
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            click.echo("  Setting up lean-ctx for Copilot...")
+            _setup_lean_ctx_agent("copilot", verbose=verbose)
+        else:
+            click.echo("  Setting up rtk for Copilot...")
+            rtk_path = _ensure_rtk_binary(verbose=verbose)
+            if rtk_path:
+                copilot_instructions = Path.cwd() / ".github" / "copilot-instructions.md"
+                _inject_rtk_instructions(copilot_instructions, verbose=verbose)
 
     env = os.environ.copy()
     openai_api_url: str | None = None
@@ -2118,7 +2210,13 @@ def copilot(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
-@click.option("--no-rtk", is_flag=True, help="Skip rtk installation and AGENTS.md injection")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
 @click.option(
     "--no-mcp",
     is_flag=True,
@@ -2171,16 +2269,16 @@ def codex(
 
     \b
     Sets OPENAI_BASE_URL to route all OpenAI API calls through Headroom.
-    Installs rtk and injects instructions into AGENTS.md so Codex uses
-    token-optimized commands (60-90% savings on shell output). Also
+    Sets up the selected CLI context tool so Codex uses token-optimized
+    commands (60-90% savings on shell output). Also
     registers the headroom MCP server in ~/.codex/config.toml so Codex
     can call ``headroom_retrieve`` on compression markers.
 
     \b
     Examples:
-        headroom wrap codex                         # Start proxy + rtk + mcp + codex
+        headroom wrap codex                         # Start proxy + context tool + mcp + codex
         headroom wrap codex -- "fix the bug"        # Pass prompt to codex
-        headroom wrap codex --no-rtk                # Skip rtk setup
+        headroom wrap codex --no-context-tool       # Skip CLI context-tool setup
         headroom wrap codex --no-mcp                # Skip MCP retrieve tool registration
         headroom wrap codex --no-serena             # Skip Serena MCP registration
         headroom wrap codex --port 9999             # Custom proxy port
@@ -2195,18 +2293,22 @@ def codex(
     _codex_config_file, _codex_backup_file = _codex_config_paths()
     _snapshot_codex_config_if_unwrapped(_codex_config_file, _codex_backup_file)
 
-    # Setup rtk for Codex (binary + AGENTS.md instructions, no hooks)
+    # Setup CLI context tool for Codex.
     if not no_rtk:
-        click.echo("  Setting up rtk for Codex...")
-        rtk_path = _ensure_rtk_binary(verbose=verbose)
-        if rtk_path:
-            # Inject into project AGENTS.md (Codex reads this automatically)
-            agents_md = Path.cwd() / "AGENTS.md"
-            _inject_rtk_instructions(agents_md, verbose=verbose)
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            click.echo("  Setting up lean-ctx for Codex...")
+            _setup_lean_ctx_agent("codex", verbose=verbose)
+        else:
+            click.echo("  Setting up rtk for Codex...")
+            rtk_path = _ensure_rtk_binary(verbose=verbose)
+            if rtk_path:
+                # Inject into project AGENTS.md (Codex reads this automatically)
+                agents_md = Path.cwd() / "AGENTS.md"
+                _inject_rtk_instructions(agents_md, verbose=verbose)
 
-            # Also inject into global ~/.codex/AGENTS.md
-            global_agents = Path.home() / ".codex" / "AGENTS.md"
-            _inject_rtk_instructions(global_agents, verbose=verbose)
+                # Also inject into global ~/.codex/AGENTS.md
+                global_agents = Path.home() / ".codex" / "AGENTS.md"
+                _inject_rtk_instructions(global_agents, verbose=verbose)
 
     # Register headroom MCP server in ~/.codex/config.toml so Codex can
     # call headroom_retrieve on compression markers from the proxy.
@@ -2320,7 +2422,13 @@ def codex(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
-@click.option("--no-rtk", is_flag=True, help="Skip rtk installation and conventions injection")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
 @click.option(
     "--code-graph",
     is_flag=True,
@@ -2355,25 +2463,28 @@ def aider(
 
     \b
     Sets OPENAI_API_BASE to route all API calls through Headroom.
-    Installs rtk and injects instructions into .aider.conf.yml conventions
-    so aider uses token-optimized commands.
+    Sets up the selected CLI context tool so aider uses token-optimized commands.
 
     \b
     Examples:
-        headroom wrap aider                              # Start proxy + rtk + aider
+        headroom wrap aider                              # Start proxy + context tool + aider
         headroom wrap aider -- --model gpt-4o            # Use GPT-4o
         headroom wrap aider -- --model claude-sonnet-4   # Use Claude
-        headroom wrap aider --no-rtk                     # Skip rtk setup
+        headroom wrap aider --no-context-tool            # Skip CLI context-tool setup
         headroom wrap aider --backend litellm-vertex --region us-central1
     """
-    # Setup rtk for aider (binary + CONVENTIONS.md instructions)
+    # Setup CLI context tool for aider.
     if not no_rtk:
-        click.echo("  Setting up rtk for aider...")
-        rtk_path = _ensure_rtk_binary(verbose=verbose)
-        if rtk_path:
-            # aider reads CONVENTIONS.md from project root
-            conventions = Path.cwd() / "CONVENTIONS.md"
-            _inject_rtk_instructions(conventions, verbose=verbose)
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            click.echo("  Setting up lean-ctx for aider...")
+            _setup_lean_ctx_agent("aider", verbose=verbose)
+        else:
+            click.echo("  Setting up rtk for aider...")
+            rtk_path = _ensure_rtk_binary(verbose=verbose)
+            if rtk_path:
+                # aider reads CONVENTIONS.md from project root
+                conventions = Path.cwd() / "CONVENTIONS.md"
+                _inject_rtk_instructions(conventions, verbose=verbose)
 
     if prepare_only:
         return
@@ -2411,7 +2522,13 @@ def aider(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
-@click.option("--no-rtk", is_flag=True, help="Skip rtk installation and .cursorrules injection")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
 @click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
 @click.option(
     "--learn", is_flag=True, help="Enable live traffic learning (patterns saved to .cursor/rules/)"
@@ -2432,8 +2549,8 @@ def cursor(
 
     \b
     Cursor reads its API configuration from its settings UI, not from
-    environment variables. This command starts the proxy, installs rtk
-    with .cursorrules instructions, and prints the Cursor settings.
+    environment variables. This command starts the proxy, sets up the selected
+    CLI context tool, and prints the Cursor settings.
 
     \b
     After running this command, open Cursor and configure:
@@ -2441,16 +2558,20 @@ def cursor(
 
     \b
     Example:
-        headroom wrap cursor                # Start proxy + rtk + instructions
-        headroom wrap cursor --no-rtk       # Proxy only, no rtk
+        headroom wrap cursor                # Start proxy + context-tool instructions
+        headroom wrap cursor --no-context-tool  # Proxy only, no CLI context tool
         headroom wrap cursor --port 9999    # Custom proxy port
     """
     if not no_rtk:
-        click.echo("  Setting up rtk for Cursor...")
-        rtk_path = _ensure_rtk_binary(verbose=verbose)
-        if rtk_path:
-            cursorrules = Path.cwd() / ".cursorrules"
-            _inject_rtk_instructions(cursorrules, verbose=verbose)
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            click.echo("  Setting up lean-ctx for Cursor...")
+            _setup_lean_ctx_agent("cursor", verbose=verbose)
+        else:
+            click.echo("  Setting up rtk for Cursor...")
+            rtk_path = _ensure_rtk_binary(verbose=verbose)
+            if rtk_path:
+                cursorrules = Path.cwd() / ".cursorrules"
+                _inject_rtk_instructions(cursorrules, verbose=verbose)
 
     if prepare_only:
         return
@@ -2476,7 +2597,10 @@ def cursor(
             click.echo(line)
         if not no_rtk:
             click.echo()
-            click.echo("  rtk instructions injected into .cursorrules")
+            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+                click.echo("  lean-ctx configured for Cursor")
+            else:
+                click.echo("  rtk instructions injected into .cursorrules")
             click.echo("  Cursor will use token-optimized commands automatically.")
         click.echo()
         click.echo("  Press Ctrl+C to stop the proxy.")

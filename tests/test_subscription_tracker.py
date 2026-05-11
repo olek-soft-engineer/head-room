@@ -56,7 +56,7 @@ def test_tracker_notify_active_update_and_basic_state(monkeypatch: pytest.Monkey
     tracker.update_contribution(
         tokens_submitted=10,
         tokens_saved_compression=5,
-        tokens_saved_rtk=-1,
+        tokens_saved_cli_filtering=-1,
         tokens_saved_cache_reads=3,
         compression_savings_usd=1.25,
         cache_savings_usd=-2.0,
@@ -64,10 +64,13 @@ def test_tracker_notify_active_update_and_basic_state(monkeypatch: pytest.Monkey
     contribution = tracker._state.contribution
     assert contribution.tokens_submitted == 10
     assert contribution.tokens_saved_compression == 5
+    assert contribution.tokens_saved_cli_filtering == 0
     assert contribution.tokens_saved_rtk == 0
     assert contribution.tokens_saved_cache_reads == 3
     assert contribution.to_dict()["tokens_saved"]["compression"] == 5
     assert contribution.to_dict()["tokens_saved"]["proxy_compression"] == 5
+    assert contribution.to_dict()["tokens_saved"]["cli_filtering"] == 0
+    assert contribution.to_dict()["tokens_saved"]["rtk"] == 0
     assert contribution.compression_savings_usd == 1.25
     assert contribution.cache_savings_usd == 0.0
 
@@ -178,7 +181,7 @@ def test_persist_and_load_state_round_trip(tmp_path: Path) -> None:
     tracker.update_contribution(
         tokens_submitted=11,
         tokens_saved_compression=2,
-        tokens_saved_rtk=3,
+        tokens_saved_cli_filtering=3,
         tokens_saved_cache_reads=4,
         compression_savings_usd=1.5,
         cache_savings_usd=2.5,
@@ -189,10 +192,13 @@ def test_persist_and_load_state_round_trip(tmp_path: Path) -> None:
     loader = SubscriptionTracker(persist_path=persist_path)
     assert loader._state.contribution.tokens_submitted == 11
     assert loader._state.contribution.tokens_saved_compression == 2
+    assert loader._state.contribution.tokens_saved_cli_filtering == 3
     assert loader._state.contribution.tokens_saved_rtk == 3
     assert loader._state.contribution.tokens_saved_cache_reads == 4
     assert loader._state.contribution.to_dict()["tokens_saved"]["compression"] == 5
     assert loader._state.contribution.to_dict()["tokens_saved"]["proxy_compression"] == 2
+    assert loader._state.contribution.to_dict()["tokens_saved"]["cli_filtering"] == 3
+    assert loader._state.contribution.to_dict()["tokens_saved"]["rtk"] == 3
     assert loader._state.contribution.compression_savings_usd == 1.5
     assert loader._state.contribution.cache_savings_usd == 2.5
     assert loader._state.poll_count == 7

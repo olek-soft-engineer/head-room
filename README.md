@@ -83,7 +83,7 @@ OPENAI_BASE_URL=http://localhost:8787/v1 your-app
 - **Cross-agent memory and learning.** Claude Code saves a fact, Codex reads it back. `headroom learn` mines failed sessions and writes corrections straight to `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` — reliability compounds over time.
 - **Reversible (CCR).** Compression is not deletion. The model can always call `headroom_retrieve` to pull the original bytes. Nothing is thrown away.
 
-Bundles the [RTK](https://github.com/rtk-ai/rtk) binary for shell-output rewriting — full [attribution below](#compared-to).
+Bundles managed [RTK](https://github.com/rtk-ai/rtk) and [lean-ctx](https://github.com/yvgude/lean-ctx) binaries for local CLI context filtering — full [attribution below](#compared-to).
 
 ---
 
@@ -264,10 +264,11 @@ Headroom runs **locally**, covers **every** content type (not just CLI or text),
 |----------------------------------|-------------------------------------------------|-------------------------------------|:-----:|:----------:|
 | **Headroom**                     | All context — tools, RAG, logs, files, history  | Proxy · library · middleware · MCP  |  Yes  |    Yes     |
 | [RTK](https://github.com/rtk-ai/rtk) | CLI command outputs                         | CLI wrapper                         |  Yes  |    No      |
+| [lean-ctx](https://github.com/yvgude/lean-ctx) | CLI commands, MCP tools, editor rules | CLI wrapper · MCP                  |  Yes  |    No      |
 | [Compresr](https://compresr.ai), [Token Co.](https://thetokencompany.ai) | Text sent to their API | Hosted API call         |  No   |    No      |
 | OpenAI Compaction                | Conversation history                            | Provider-native                     |  No   |    No      |
 
-> **Attribution.** Headroom ships with the excellent [RTK](https://github.com/rtk-ai/rtk) binary for shell-output rewriting — `git show` → `git show --short`, noisy `ls` → scoped, chatty installers → summarized. Huge thanks to the RTK team; their tool is a first-class part of our stack, and Headroom compresses everything downstream of it.
+> **Attribution.** Headroom ships with the excellent [RTK](https://github.com/rtk-ai/rtk) binary for shell-output rewriting — `git show` → `git show --short`, noisy `ls` → scoped, chatty installers → summarized. Huge thanks to the RTK team; their tool is a first-class part of our stack, and Headroom compresses everything downstream of it. Headroom can also use [lean-ctx](https://github.com/yvgude/lean-ctx) as the selected CLI context tool; set `HEADROOM_CONTEXT_TOOL=lean-ctx` before running `headroom wrap ...`.
 
 ---
 
