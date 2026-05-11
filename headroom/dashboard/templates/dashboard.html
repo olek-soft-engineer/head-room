@@ -120,12 +120,20 @@
                 <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Token Savings</div>
                 <div class="flex items-baseline gap-2">
                     <span class="text-3xl font-light tabular-nums text-accent" x-text="formatNumber(stats.tokens?.saved || 0)"></span>
-                    <span class="text-sm text-accent" x-text="(stats.tokens?.savings_percent || 0).toFixed(1) + '%'"></span>
+                    <!-- Active compression ratio: savings as fraction of what we *attempted*
+                         to compress (extracted units + tool schema). Excludes frozen-prefix
+                         bytes (user messages, system prompt, prior turns) we never touch for
+                         prefix-cache safety. The whole-request ratio is stored as
+                         `savings_percent` and shown as a small footnote for transparency. -->
+                    <span class="text-sm text-accent" x-text="(stats.tokens?.active_savings_percent || 0).toFixed(1) + '%'" title="Of compressible tokens attempted"></span>
                 </div>
                 <div class="mt-1 text-xs text-gray-500 leading-relaxed">
                     <span x-text="'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' (' + proxyShareOfTotal.toFixed(1) + '%)'"></span>
                     <span class="mx-1 text-gray-600">/</span>
                     <span x-text="'RTK ' + formatNumber(stats.tokens?.rtk_saved || 0) + ' (' + rtkShareOfTotal.toFixed(1) + '%)'"></span>
+                </div>
+                <div class="mt-1 text-xs text-gray-600 leading-relaxed">
+                    <span x-text="'Of total wire: ' + (stats.tokens?.savings_percent || 0).toFixed(2) + '%'" title="Savings as fraction of all input tokens including frozen prefix"></span>
                 </div>
                 <div class="mt-2 h-8">
                     <svg class="w-full h-full" viewBox="0 0 100 32" preserveAspectRatio="none">

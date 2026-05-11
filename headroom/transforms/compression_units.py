@@ -8,6 +8,7 @@ replacements back into their native request shape.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Protocol
@@ -37,6 +38,42 @@ class CompressionUnit:
     metadata: dict[str, str] = field(default_factory=dict)
 
 
+# Categorical buckets for unit-level outcomes. Lets log readers filter
+# by "what kind of decision" without parsing per-event reason strings.
+# - applied:           the compressor ran and produced shorter bytes
+# - protected_role:    role guard (user/system/assistant) refused compression
+# - cache_zone:        unit lived in a non-live cache zone (e.g. prefix)
+# - size_floor:        text_bytes < min_bytes — too small to be worth it
+# - immutable:         caller marked the unit unmutable
+# - compressor_noop:   router returned identical bytes (no compression possible)
+# - already_compressed: input already carried a CCR retrieval marker
+# - rejected_not_smaller: compressor produced output >= input tokens
+# - cache_hit:         result returned from result_cache (placeholder; not
+#                      currently wired into the unit path — see follow-up)
+UNIT_REASON_CATEGORIES = {
+    None: "applied",
+    "protected_user_message": "protected_role",
+    "protected_system_message": "protected_role",
+    "protected_assistant_message": "protected_role",
+    "immutable": "immutable",
+    "below_unit_floor": "size_floor",
+    "router_no_change": "compressor_noop",
+    "already_compressed": "already_compressed",
+    "rejected_not_smaller": "rejected_not_smaller",
+}
+
+
+def _categorize_reason(reason: str | None) -> str:
+    if reason is None:
+        return "applied"
+    if reason in UNIT_REASON_CATEGORIES:
+        return UNIT_REASON_CATEGORIES[reason] or "applied"
+    # cache_zone_* uses a dynamic suffix (cache_zone_frozen, cache_zone_prefix, …)
+    if reason.startswith("cache_zone_"):
+        return "cache_zone"
+    return "other"
+
+
 @dataclass(frozen=True)
 class UnitCompressionResult:
     original: str
@@ -49,6 +86,12 @@ class UnitCompressionResult:
     strategy: str
     reason: str | None = None
     router_result: RouterCompressionResult | None = None
+    # Context for log readers: why the outcome looked the way it did.
+    # `text_bytes` + `min_bytes` together explain size_floor decisions;
+    # `reason_category` is the high-level bucket for dashboard grouping.
+    text_bytes: int = 0
+    min_bytes: int = 0
+    reason_category: str = "applied"
 
 
 @dataclass(frozen=True)
@@ -57,6 +100,11 @@ class RoutedCompressionUnit:
 
     unit: CompressionUnit
     slot: object
+
+
+_CCR_MARKER_RE = re.compile(
+    r"(?m)^.*(?:Retrieve more: hash=|Retrieve original: hash=|<<ccr:[^>]+>>).*$"
+)
 
 
 def find_content_router(transforms: object) -> ContentRouter | None:
@@ -69,6 +117,84 @@ def find_content_router(transforms: object) -> ContentRouter | None:
         if isinstance(transform, ContentRouter):
             return transform
     return None
+
+
+def _compress_live_text_with_markers(
+    unit: CompressionUnit,
+    *,
+    router: ContentRouter,
+) -> tuple[str, list[str], RouterCompressionResult | None]:
+    """Compress text around CCR markers while preserving marker bytes."""
+
+    parts: list[str] = []
+    transforms: list[str] = []
+    last_end = 0
+    last_router_result: RouterCompressionResult | None = None
+
+    for match in _CCR_MARKER_RE.finditer(unit.text):
+        prefix = unit.text[last_end : match.start()]
+        if prefix:
+            compressed_prefix, prefix_transforms, last_router_result = _compress_marker_free_text(
+                prefix,
+                unit=unit,
+                router=router,
+                last_router_result=last_router_result,
+            )
+            parts.append(compressed_prefix)
+            transforms.extend(prefix_transforms)
+        parts.append(match.group(0))
+        last_end = match.end()
+
+    suffix = unit.text[last_end:]
+    if suffix:
+        compressed_suffix, suffix_transforms, last_router_result = _compress_marker_free_text(
+            suffix,
+            unit=unit,
+            router=router,
+            last_router_result=last_router_result,
+        )
+        parts.append(compressed_suffix)
+        transforms.extend(suffix_transforms)
+
+    if transforms:
+        transforms.insert(0, "ccr_marker_preserving")
+
+    return "".join(parts), transforms, last_router_result
+
+
+def _compress_marker_free_text(
+    text: str,
+    *,
+    unit: CompressionUnit,
+    router: ContentRouter,
+    last_router_result: RouterCompressionResult | None,
+) -> tuple[str, list[str], RouterCompressionResult | None]:
+    boundary = re.match(r"^(\s*)(.*?)(\s*)$", text, flags=re.DOTALL)
+    if boundary is None:
+        return text, [], last_router_result
+
+    leading, core, trailing = boundary.groups()
+    if len(core) < unit.min_bytes:
+        return text, [], last_router_result
+
+    router_result = router.compress(
+        core,
+        context=unit.context,
+        question=unit.question,
+        bias=unit.bias,
+    )
+    if router_result.compressed == core:
+        return text, [], router_result
+
+    strategy = router_result.strategy_used.value
+    return (
+        f"{leading}{router_result.compressed}{trailing}",
+        [
+            f"router:{unit.provider}:{unit.endpoint}:{unit.item_type}:{strategy}",
+            strategy,
+        ],
+        router_result,
+    )
 
 
 def compress_unit_with_router(
@@ -84,6 +210,7 @@ def compress_unit_with_router(
     """
 
     tokens_before = tokenizer.count_text(unit.text)
+    text_bytes = len(unit.text.encode("utf-8", errors="replace"))
     base = UnitCompressionResult(
         original=unit.text,
         compressed=unit.text,
@@ -94,22 +221,67 @@ def compress_unit_with_router(
         transforms_applied=[],
         strategy=CompressionStrategy.PASSTHROUGH.value,
         router_result=None,
+        text_bytes=text_bytes,
+        min_bytes=unit.min_bytes,
+        reason_category="applied",
     )
 
+    def _with_reason(**kw: object) -> UnitCompressionResult:
+        # Every early-return path goes through here so reason_category
+        # stays in sync with reason. Log readers grep by category for
+        # quick "how many units were size-floored this hour" answers.
+        reason_val = kw.get("reason")
+        if isinstance(reason_val, str) or reason_val is None:
+            kw["reason_category"] = _categorize_reason(reason_val)
+        return replace(base, **kw)  # type: ignore[arg-type]
+
     if not unit.mutable:
-        return replace(base, reason="immutable")
+        return _with_reason(reason="immutable")
     if unit.role == "user":
-        return replace(base, reason="protected_user_message")
+        return _with_reason(reason="protected_user_message")
     if unit.role in {"system", "developer"}:
-        return replace(base, reason="protected_system_message")
+        return _with_reason(reason="protected_system_message")
     if unit.role == "assistant" and unit.metadata.get("compress_assistant") != "true":
-        return replace(base, reason="protected_assistant_message")
+        return _with_reason(reason="protected_assistant_message")
     if unit.cache_zone != "live":
-        return replace(base, reason=f"cache_zone_{unit.cache_zone}")
+        return _with_reason(reason=f"cache_zone_{unit.cache_zone}")
     if len(unit.text) < unit.min_bytes:
-        return replace(base, reason="below_unit_floor")
-    if "Retrieve more: hash=" in unit.text or "Retrieve original: hash=" in unit.text:
-        return replace(base, reason="already_compressed")
+        return _with_reason(reason="below_unit_floor")
+    if _CCR_MARKER_RE.search(unit.text):
+        replacement, marker_transforms, router_result = _compress_live_text_with_markers(
+            unit,
+            router=router,
+        )
+        if replacement == unit.text:
+            return _with_reason(
+                router_result=router_result,
+                reason="already_compressed",
+            )
+
+        tokens_after = tokenizer.count_text(replacement)
+        if tokens_after >= tokens_before:
+            return _with_reason(
+                compressed=replacement,
+                tokens_after=tokens_after,
+                router_result=router_result,
+                reason="rejected_not_smaller",
+            )
+
+        return UnitCompressionResult(
+            original=unit.text,
+            compressed=replacement,
+            modified=True,
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
+            tokens_saved=tokens_before - tokens_after,
+            transforms_applied=marker_transforms,
+            strategy="ccr_marker_preserving",
+            reason=None,
+            router_result=router_result,
+            text_bytes=text_bytes,
+            min_bytes=unit.min_bytes,
+            reason_category="applied",
+        )
 
     router_result = router.compress(
         unit.text,
@@ -120,8 +292,7 @@ def compress_unit_with_router(
     replacement = router_result.compressed
     strategy = router_result.strategy_used.value
     if replacement == unit.text:
-        return replace(
-            base,
+        return _with_reason(
             strategy=strategy,
             router_result=router_result,
             reason="router_no_change",
@@ -129,8 +300,7 @@ def compress_unit_with_router(
 
     tokens_after = tokenizer.count_text(replacement)
     if tokens_after >= tokens_before:
-        return replace(
-            base,
+        return _with_reason(
             compressed=replacement,
             tokens_after=tokens_after,
             strategy=strategy,
@@ -152,6 +322,9 @@ def compress_unit_with_router(
         strategy=strategy,
         reason=None,
         router_result=router_result,
+        text_bytes=text_bytes,
+        min_bytes=unit.min_bytes,
+        reason_category="applied",
     )
 
 

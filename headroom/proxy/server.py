@@ -1049,11 +1049,25 @@ class HeadroomProxy(
         logger.info(f"Input tokens:          {m.tokens_input_total:,}")
         logger.info(f"Output tokens:         {m.tokens_output_total:,}")
         logger.info(f"Tokens saved:          {m.tokens_saved_total:,}")
+        # Active-compression ratio: savings as a fraction of what we
+        # *attempted* to compress (extracted units + tool schema),
+        # NOT the whole request. The full-request denominator is
+        # dominated by frozen prefix bytes (instructions, user msgs,
+        # prior turns) that we never touch — including them collapses
+        # the headline number even on sessions where every attempted
+        # compression succeeded.
+        attempted = getattr(m, "attempted_input_tokens_total", 0)
+        if attempted > 0:
+            # `attempted` is pre-compression; savings rate is plain
+            # saved / attempted.
+            savings_pct = (m.tokens_saved_total / attempted) * 100
+            logger.info(f"Active compression:    {savings_pct:.1f}%")
+            logger.info(f"  (attempted tokens:   {attempted:,})")
         if m.tokens_input_total > 0:
-            savings_pct = (
+            whole_request_pct = (
                 m.tokens_saved_total / (m.tokens_input_total + m.tokens_saved_total)
             ) * 100
-            logger.info(f"Token savings:         {savings_pct:.1f}%")
+            logger.info(f"Of total wire traffic: {whole_request_pct:.2f}%")
         if m.latency_count > 0:
             avg_latency = m.latency_sum_ms / m.latency_count
             logger.info(f"Avg latency:           {avg_latency:.0f}ms")
@@ -1789,6 +1803,19 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         all_layers_tokens_saved = proxy_compression_tokens + cli_tokens_avoided
         total_tokens_before = m.tokens_input_total + all_layers_tokens_saved
         proxy_total_before_compression = m.tokens_input_total + proxy_compression_tokens
+        # `attempted_input_tokens` is the compressible-only denominator
+        # (extracted units + tool schema). The "active compression"
+        # ratio is what fraction of the tokens we *tried* to compress
+        # actually got compressed. Excludes prefix-frozen content
+        # (user/system messages, prior turns) we never touched —
+        # otherwise the ratio is dominated by content we deliberately
+        # avoided changing for prefix-cache safety.
+        # `attempted_input_tokens_total` is already pre-compression: it
+        # accumulates `unit.tokens_before` for each eligible unit that
+        # reached the router, plus the original (pre-compaction) tool
+        # schema size. So the savings rate is plain `saved / attempted`
+        # — adding `saved` again would double-count.
+        attempted_input_tokens = getattr(m, "attempted_input_tokens_total", 0)
 
         # Build human-readable summary
         summary = _build_session_summary(
@@ -1889,6 +1916,26 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "proxy_total_before_compression": proxy_total_before_compression,
                 "total_before_compression": total_tokens_before,
                 "all_layers_saved": all_layers_tokens_saved,
+                # Compressible-only denominator: tokens we extracted as
+                # candidates + tool-schema tokens we compacted. Excludes
+                # frozen-prefix content (user msgs, system prompt, prior
+                # turns) that we deliberately don't touch. Already
+                # pre-compression — do NOT add `tokens_saved` again.
+                "proxy_attempted_tokens": attempted_input_tokens,
+                # Active compression: savings as a fraction of what we
+                # *tried* to compress. The number the dashboard headline
+                # should show — it answers "are we doing well *when we
+                # have something to compress?*" rather than diluting the
+                # win by frozen-prefix bytes we never touched.
+                "active_savings_percent": round(
+                    (proxy_compression_tokens / attempted_input_tokens * 100)
+                    if attempted_input_tokens > 0
+                    else 0,
+                    2,
+                ),
+                # Whole-request ratio kept for transparency. Heavily
+                # diluted by frozen prefix on Codex-style requests
+                # where most input is non-compressible by design.
                 "proxy_savings_percent": round(
                     (proxy_compression_tokens / proxy_total_before_compression * 100)
                     if proxy_total_before_compression > 0

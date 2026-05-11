@@ -35,6 +35,7 @@ Pipeline Usage:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -50,6 +51,57 @@ from .base import Transform
 from .content_detector import ContentType, DetectionResult
 
 logger = logging.getLogger(__name__)
+
+
+def _router_debug_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+def _log_router_debug(event: str, **payload: Any) -> None:
+    payload = {"event": event, **payload}
+    logger.info("event=%s %s", event, _router_debug_dumps(payload))
+
+
+def _json_shape(content: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(content)
+    except Exception as exc:
+        return {"is_json": False, "error": type(exc).__name__}
+    if isinstance(parsed, dict):
+        return {
+            "is_json": True,
+            "kind": "object",
+            "keys": list(parsed.keys()),
+            "length": len(parsed),
+        }
+    if isinstance(parsed, list):
+        return {"is_json": True, "kind": "array", "length": len(parsed)}
+    return {"is_json": True, "kind": type(parsed).__name__}
+
+
+def _mixed_indicators(content: str) -> dict[str, bool]:
+    return {
+        "has_code_fences": bool(_CODE_FENCE_PATTERN.search(content)),
+        "has_json_blocks": bool(_JSON_BLOCK_START.search(content)),
+        "has_prose": len(_PROSE_PATTERN.findall(content)) > 5,
+        "has_search_results": bool(_SEARCH_RESULT_PATTERN.search(content)),
+    }
+
+
+def _section_debug(section: ContentSection, index: int) -> dict[str, Any]:
+    return {
+        "index": index,
+        "content_type": section.content_type.value,
+        "language": getattr(section, "language", None),
+        "start_line": getattr(section, "start_line", None),
+        "end_line": getattr(section, "end_line", None),
+        "is_code_fence": getattr(section, "is_code_fence", False),
+        "chars": len(section.content),
+        "bytes": len(section.content.encode("utf-8", errors="replace")),
+        "tokens_estimate": len(section.content.split()),
+        "json_shape": _json_shape(section.content),
+        "content": section.content,
+    }
 
 
 def _detect_content(content: str) -> DetectionResult:
@@ -290,6 +342,16 @@ class RouterCompressionResult:
         strategy_used: Primary strategy used for compression.
         routing_log: List of routing decisions made.
         sections_processed: Number of content sections processed.
+        strategy_chain: Every strategy attempted in order. For a direct
+            hit it's a single entry; for the SMART_CRUSHER → KOMPRESS →
+            LOG fallback chain it's three. Lets log readers see *how*
+            we got to the final compressor without parsing the
+            decision_reason string.
+        cache_hit: True when this result came from the router's
+            result_cache (no fresh compression ran). Currently the
+            single-content compress() path doesn't populate the cache,
+            so this is False in practice — placeholder for the
+            cache-wire-up follow-up.
     """
 
     compressed: str
@@ -297,6 +359,8 @@ class RouterCompressionResult:
     strategy_used: CompressionStrategy
     routing_log: list[RoutingDecision] = field(default_factory=list)
     sections_processed: int = 1
+    strategy_chain: list[str] = field(default_factory=list)
+    cache_hit: bool = False
 
     @property
     def total_original_tokens(self) -> int:
@@ -773,7 +837,25 @@ class ContentRouter(Transform):
         Returns:
             RouterCompressionResult with compressed content and routing metadata.
         """
+        request_debug = {
+            "chars": len(content),
+            "bytes": len(content.encode("utf-8", errors="replace")),
+            "tokens_estimate": len(content.split()),
+            "json_shape": _json_shape(content),
+            "mixed_indicators": _mixed_indicators(content),
+            "context_chars": len(context),
+            "question": question,
+            "bias": bias,
+            "content": content,
+            "context": context,
+        }
         if not content or not content.strip():
+            _log_router_debug(
+                "content_router_input",
+                **request_debug,
+                selected_strategy=CompressionStrategy.PASSTHROUGH.value,
+                selection_reason="empty_or_whitespace",
+            )
             result = RouterCompressionResult(
                 compressed=content,
                 original=content,
@@ -782,7 +864,17 @@ class ContentRouter(Transform):
             )
         else:
             # Determine strategy from content analysis
+            mixed = is_mixed_content(content)
+            detection = _detect_content(content)
             strategy = self._determine_strategy(content)
+            _log_router_debug(
+                "content_router_input",
+                **request_debug,
+                detected_content_type=detection.content_type.value,
+                detection_confidence=detection.confidence,
+                selected_strategy=strategy.value,
+                selection_reason="mixed_content" if mixed else "content_detection",
+            )
 
             if strategy == CompressionStrategy.MIXED:
                 result = self._compress_mixed(content, context, question, bias=bias)
@@ -793,6 +885,30 @@ class ContentRouter(Transform):
         # forcing function for catching strategy-level regressions.
         # Empty routing_log (passthrough fast path) → no calls.
         self._observe(result)
+        _log_router_debug(
+            "content_router_output",
+            selected_strategy=result.strategy_used.value,
+            sections_processed=result.sections_processed,
+            total_original_tokens=result.total_original_tokens,
+            total_compressed_tokens=result.total_compressed_tokens,
+            tokens_saved=result.tokens_saved,
+            savings_percentage=result.savings_percentage,
+            compression_ratio=result.compression_ratio,
+            routing_log=[
+                {
+                    "content_type": decision.content_type.value,
+                    "strategy": decision.strategy.value,
+                    "original_tokens": decision.original_tokens,
+                    "compressed_tokens": decision.compressed_tokens,
+                    "confidence": decision.confidence,
+                    "section_index": decision.section_index,
+                    "compression_ratio": decision.compression_ratio,
+                }
+                for decision in result.routing_log
+            ],
+            original=result.original,
+            compressed=result.compressed,
+        )
         return result
 
     def _observe(self, result: RouterCompressionResult) -> None:
@@ -881,6 +997,12 @@ class ContentRouter(Transform):
             RouterCompressionResult with reassembled content.
         """
         sections = split_into_sections(content)
+        _log_router_debug(
+            "content_router_mixed_sections",
+            section_count=len(sections),
+            sections=[_section_debug(section, idx) for idx, section in enumerate(sections)],
+            content=content,
+        )
 
         if not sections:
             return RouterCompressionResult(
@@ -898,7 +1020,7 @@ class ContentRouter(Transform):
 
             # Compress section
             original_tokens = len(section.content.split())
-            compressed_content, compressed_tokens = self._apply_strategy_to_content(
+            compressed_content, compressed_tokens, _section_chain = self._apply_strategy_to_content(
                 section.content,
                 strategy,
                 context,
@@ -952,7 +1074,7 @@ class ContentRouter(Transform):
         """
         original_tokens = len(content.split())
 
-        compressed, compressed_tokens = self._apply_strategy_to_content(
+        compressed, compressed_tokens, strategy_chain = self._apply_strategy_to_content(
             content, strategy, context, question=question, bias=bias
         )
 
@@ -960,6 +1082,7 @@ class ContentRouter(Transform):
             compressed=compressed,
             original=content,
             strategy_used=strategy,
+            strategy_chain=strategy_chain,
             routing_log=[
                 RoutingDecision(
                     content_type=self._content_type_from_strategy(strategy),
@@ -978,7 +1101,7 @@ class ContentRouter(Transform):
         language: str | None = None,
         question: str | None = None,
         bias: float = 1.0,
-    ) -> tuple[str, int]:
+    ) -> tuple[str, int, list[str]]:
         """Apply a compression strategy to content.
 
         Args:
@@ -990,86 +1113,206 @@ class ContentRouter(Transform):
             bias: Compression bias multiplier (>1 = keep more, <1 = keep fewer).
 
         Returns:
-            Tuple of (compressed_content, compressed_token_count).
+            Tuple of (compressed_content, compressed_token_count,
+            strategy_chain). The chain lists every strategy attempted
+            in order — first the requested one, then any fallbacks.
+            Single-entry chain means a direct hit; multi-entry means
+            the fallback chain fired (e.g. ``[smart_crusher, kompress,
+            log]``). Log readers use this to see *how* we got to the
+            final compressor without parsing decision_reason strings.
         """
         # Track original tokens for TOIN recording
         original_tokens = len(content.split())
         compressed: str | None = None
         compressed_tokens: int | None = None
+        requested_strategy = strategy
+        actual_strategy = strategy
+        compressor_name = strategy.value
+        decision_reason = "strategy_not_enabled_or_unavailable"
+        strategy_chain: list[str] = [strategy.value]
+        error: str | None = None
 
         try:
             if strategy == CompressionStrategy.CODE_AWARE:
                 if self.config.enable_code_aware:
                     compressor = self._get_code_compressor()
                     if compressor:
+                        compressor_name = type(compressor).__name__
                         result = compressor.compress(content, language=language, context=context)
                         compressed, compressed_tokens = result.compressed, result.compressed_tokens
+                        decision_reason = "code_aware"
                 if compressed is None:
                     # Fallback to Kompress
                     compressed, compressed_tokens = self._try_ml_compressor(
                         content, context, question
                     )
                     strategy = CompressionStrategy.KOMPRESS  # Update for TOIN
+                    actual_strategy = strategy
+                    compressor_name = "KompressCompressor"
+                    decision_reason = "code_aware_unavailable_fallback_kompress"
+                    strategy_chain.append(CompressionStrategy.KOMPRESS.value)
 
             elif strategy == CompressionStrategy.SMART_CRUSHER:
                 # SmartCrusher handles its own TOIN recording
                 if self.config.enable_smart_crusher:
                     crusher = self._get_smart_crusher()
                     if crusher:
+                        compressor_name = type(crusher).__name__
                         result = crusher.crush(content, query=context, bias=bias)
-                        return result.compressed, len(result.compressed.split())
+                        compressed, compressed_tokens = (
+                            result.compressed,
+                            len(result.compressed.split()),
+                        )
+                        smart_crusher_fallback = False
+                        if result.compressed == content:
+                            strategy_chain.append(CompressionStrategy.KOMPRESS.value)
+                            fallback_compressed, fallback_tokens = self._try_ml_compressor(
+                                content, context, question
+                            )
+                            if fallback_tokens < compressed_tokens:
+                                compressed = fallback_compressed
+                                compressed_tokens = fallback_tokens
+                                actual_strategy = CompressionStrategy.KOMPRESS
+                                compressor_name = "KompressCompressor"
+                                decision_reason = "smart_crusher_fallback_kompress_after_no_savings"
+                                smart_crusher_fallback = True
+                        if not smart_crusher_fallback:
+                            decision_reason = "smart_crusher"
 
             elif strategy == CompressionStrategy.SEARCH:
                 if self.config.enable_search_compressor:
                     compressor = self._get_search_compressor()
                     if compressor:
+                        compressor_name = type(compressor).__name__
                         result = compressor.compress(content, context=context, bias=bias)
                         compressed, compressed_tokens = (
                             result.compressed,
                             len(result.compressed.split()),
                         )
+                        decision_reason = "search_compressor"
 
             elif strategy == CompressionStrategy.LOG:
                 if self.config.enable_log_compressor:
                     compressor = self._get_log_compressor()
                     if compressor:
+                        compressor_name = type(compressor).__name__
                         result = compressor.compress(content, bias=bias)
+                        # Use the same word-count metric the rest of the
+                        # router uses; `compressed_line_count` is in
+                        # lines, not tokens — recording it here made
+                        # ratios meaningless against `original_tokens`.
                         compressed, compressed_tokens = (
                             result.compressed,
-                            result.compressed_line_count,
+                            len(result.compressed.split()),
                         )
+                        decision_reason = "log_compressor"
 
             elif strategy == CompressionStrategy.DIFF:
                 compressor = self._get_diff_compressor()
                 if compressor:
+                    compressor_name = type(compressor).__name__
                     result = compressor.compress(content, context=context)
                     compressed, compressed_tokens = (
                         result.compressed,
-                        result.compressed_line_count,
+                        len(result.compressed.split()),
                     )
+                    decision_reason = "diff_compressor"
 
             elif strategy == CompressionStrategy.HTML:
                 if self.config.enable_html_extractor:
                     extractor = self._get_html_extractor()
                     if extractor:
+                        compressor_name = type(extractor).__name__
                         result = extractor.extract(content)
                         compressed = result.extracted
                         # Estimate tokens from extracted text (simple word count)
                         compressed_tokens = len(compressed.split()) if compressed else 0
+                        decision_reason = "html_extractor"
 
             elif strategy == CompressionStrategy.KOMPRESS:
                 compressed, compressed_tokens = self._try_ml_compressor(content, context, question)
+                compressor_name = "KompressCompressor"
+                decision_reason = "kompress"
 
             elif strategy == CompressionStrategy.TEXT:
                 # Prefer Kompress ML compressor for text
                 # Passes through unchanged if Kompress not available
                 compressed, compressed_tokens = self._try_ml_compressor(content, context, question)
+                compressor_name = "KompressCompressor"
+                decision_reason = "text_uses_kompress"
 
         except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            decision_reason = "compression_exception"
             logger.warning("Compression with %s failed: %s", strategy.value, e)
 
         # If compression succeeded, record to TOIN
         if compressed is not None and compressed_tokens is not None:
+            fallback_eligible_strategy = strategy in {
+                CompressionStrategy.SMART_CRUSHER,
+                CompressionStrategy.CODE_AWARE,
+                CompressionStrategy.DIFF,
+                CompressionStrategy.LOG,
+            }
+            fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
+            if fallback_eligible_strategy and fallback_no_savings:
+                strategy_chain.append(CompressionStrategy.KOMPRESS.value)
+                fallback_compressed, fallback_tokens = self._try_ml_compressor(
+                    content, context, question
+                )
+                if fallback_tokens < compressed_tokens:
+                    compressed = fallback_compressed
+                    compressed_tokens = fallback_tokens
+                    actual_strategy = CompressionStrategy.KOMPRESS
+                    compressor_name = "KompressCompressor"
+                    decision_reason = f"{decision_reason}_fallback_kompress_after_no_savings"
+                else:
+                    # Last-ditch: line-structured compressors (the proxy's
+                    # own log dumps land here — repetitive JSONL that
+                    # Kompress can't shrink but the log compressor can).
+                    # Only attempted when the strategy was SMART_CRUSHER so
+                    # we don't reroute genuine code/diff content.
+                    if (
+                        strategy == CompressionStrategy.SMART_CRUSHER
+                        and self.config.enable_log_compressor
+                    ):
+                        log_compressor = self._get_log_compressor()
+                        if log_compressor is not None:
+                            strategy_chain.append(CompressionStrategy.LOG.value)
+                            try:
+                                log_result = log_compressor.compress(content, bias=bias)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug("Log fallback failed for SMART_CRUSHER: %s", exc)
+                            else:
+                                log_compressed_tokens = len(log_result.compressed.split())
+                                if log_compressed_tokens < compressed_tokens:
+                                    compressed = log_result.compressed
+                                    compressed_tokens = log_compressed_tokens
+                                    actual_strategy = CompressionStrategy.LOG
+                                    compressor_name = type(log_compressor).__name__
+                                    decision_reason = (
+                                        f"{decision_reason}_fallback_log_after_no_savings"
+                                    )
+
+            _log_router_debug(
+                "content_router_strategy_result",
+                requested_strategy=requested_strategy.value,
+                actual_strategy=actual_strategy.value,
+                strategy_chain=strategy_chain,
+                compressor=compressor_name,
+                reason=decision_reason,
+                language=language,
+                question=question,
+                bias=bias,
+                original_tokens=original_tokens,
+                compressed_tokens=compressed_tokens,
+                tokens_saved=max(0, original_tokens - compressed_tokens),
+                compression_ratio=compressed_tokens / original_tokens if original_tokens else 1.0,
+                json_shape=_json_shape(content),
+                input=content,
+                output=compressed,
+                error=error,
+            )
             self._record_to_toin(
                 strategy=strategy,
                 content=content,
@@ -1079,10 +1322,30 @@ class ContentRouter(Transform):
                 language=language,
                 context=context,
             )
-            return compressed, compressed_tokens
+            return compressed, compressed_tokens, strategy_chain
 
         # Fallback: return unchanged
-        return content, original_tokens
+        strategy_chain.append(CompressionStrategy.PASSTHROUGH.value)
+        _log_router_debug(
+            "content_router_strategy_result",
+            requested_strategy=requested_strategy.value,
+            actual_strategy=CompressionStrategy.PASSTHROUGH.value,
+            strategy_chain=strategy_chain,
+            compressor=None,
+            reason=decision_reason,
+            language=language,
+            question=question,
+            bias=bias,
+            original_tokens=original_tokens,
+            compressed_tokens=original_tokens,
+            tokens_saved=0,
+            compression_ratio=1.0,
+            json_shape=_json_shape(content),
+            input=content,
+            output=content,
+            error=error,
+        )
+        return content, original_tokens, strategy_chain
 
     def _try_ml_compressor(
         self, content: str, context: str, question: str | None = None

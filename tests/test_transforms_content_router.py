@@ -239,6 +239,7 @@ def test_content_router_mixed_pure_apply_and_toin(monkeypatch: pytest.MonkeyPatc
         lambda content, strategy, context, language=None, question=None, bias=1.0: (
             f"{strategy.value}:{content}",
             len(content.split()) - 1,
+            [strategy.value],
         ),
     )
     result = router._compress_mixed(mixed_content, "ctx")
@@ -252,6 +253,7 @@ def test_content_router_mixed_pure_apply_and_toin(monkeypatch: pytest.MonkeyPatc
         lambda content, strategy, context, language=None, question=None, bias=1.0: (
             "shrunk",
             1,
+            [strategy.value],
         ),
     )
     pure = router._compress_pure("some plain text", CompressionStrategy.TEXT, "ctx")
