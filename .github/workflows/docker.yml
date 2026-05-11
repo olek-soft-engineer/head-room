@@ -331,7 +331,18 @@ jobs:
         run: |
           target="${IMAGE}@${INDEX_DIGEST}"
           echo "Signing ${target} (signatures -> ${COSIGN_REPOSITORY})"
-          cosign sign --yes "${target}"
+          for attempt in 1 2 3; do
+            if cosign sign --yes "${target}"; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "ERROR: cosign signing failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+            sleep_for=$((attempt * 10))
+            echo "cosign signing failed on attempt ${attempt}; retrying in ${sleep_for}s" >&2
+            sleep "$sleep_for"
+          done
 
   promote-latest:
     # Re-push the :latest tag pointing at the root variant *after* every

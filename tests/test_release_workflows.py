@@ -187,6 +187,27 @@ def test_fastembed_uses_rustls_features() -> None:
     assert '"image-models"' in cargo
 
 
+def test_fastembed_uses_dynamic_ort_on_windows() -> None:
+    """Windows sdist builds must not link Pyke's DirectML ORT binaries.
+
+    `ort-download-binaries-*` emits DXCORE/DXGI/D3D12/DirectML link libs on
+    Windows. Those SDK libs are not present on many Python build hosts, so the
+    Windows target must use ORT dynamic loading instead.
+    """
+
+    cargo = (ROOT / "crates" / "headroom-core" / "Cargo.toml").read_text(encoding="utf-8")
+    assert "[target.'cfg(windows)'.dependencies]" in cargo
+    windows_section = cargo.split("[target.'cfg(windows)'.dependencies]", 1)[1].split(
+        "\n[",
+        1,
+    )[0]
+    windows_dependency_lines = "\n".join(
+        line for line in windows_section.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert '"ort-load-dynamic"' in windows_section
+    assert "ort-download-binaries" not in windows_dependency_lines
+
+
 def test_dockerfiles_no_longer_install_openssl_devel() -> None:
     """Once openssl-sys is out of the build tree, every Dockerfile
     that used to install `openssl-devel` / `libssl-dev` for the Rust
