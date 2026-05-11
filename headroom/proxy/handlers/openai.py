@@ -18,7 +18,11 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from headroom.proxy.helpers import _headroom_bypass_enabled, jitter_delay_ms
+from headroom.proxy.helpers import (
+    COMPRESSION_TIMEOUT_SECONDS,
+    _headroom_bypass_enabled,
+    jitter_delay_ms,
+)
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.ws_session_registry import (
     TerminationCause,
@@ -865,6 +869,22 @@ class OpenAIHandlerMixin:
             len(input_bytes),
             len(output_bytes),
             attempted_input_tokens,
+        )
+
+    async def _compress_openai_responses_payload_in_executor(
+        self,
+        payload: dict[str, Any],
+        *,
+        model: str,
+        request_id: str,
+    ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
+        return await self._run_compression_in_executor(
+            lambda: self._compress_openai_responses_payload(
+                payload,
+                model=model,
+                request_id=request_id,
+            ),
+            timeout=COMPRESSION_TIMEOUT_SECONDS,
         )
 
     async def handle_openai_chat(
@@ -2346,7 +2366,7 @@ class OpenAIHandlerMixin:
                     _bytes_before,
                     _bytes_after,
                     _attempted_tokens,
-                ) = self._compress_openai_responses_payload(
+                ) = await self._compress_openai_responses_payload_in_executor(
                     body,
                     model=model,
                     request_id=request_id,
@@ -3253,7 +3273,7 @@ class OpenAIHandlerMixin:
                             _bytes_before,
                             _bytes_after,
                             _ws_attempted_tokens,
-                        ) = self._compress_openai_responses_payload(
+                        ) = await self._compress_openai_responses_payload_in_executor(
                             _inner,
                             model=_model,
                             request_id=request_id,
@@ -3477,7 +3497,7 @@ class OpenAIHandlerMixin:
                                     bytes_before,
                                     bytes_after,
                                     frame_attempted_tokens,
-                                ) = self._compress_openai_responses_payload(
+                                ) = await self._compress_openai_responses_payload_in_executor(
                                     inner_payload,
                                     model=model_for_frame,
                                     request_id=request_id,
@@ -4785,12 +4805,33 @@ class OpenAIHandlerMixin:
         body = await request.body()
 
         headers = await apply_copilot_api_auth(headers, url=url)
-        response = await self.http_client.request(  # type: ignore[union-attr]
-            method=request.method,
-            url=url,
-            headers=headers,
-            content=body,
-        )
+        try:
+            response = await self.http_client.request(  # type: ignore[union-attr]
+                method=request.method,
+                url=url,
+                headers=headers,
+                content=body,
+            )
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            logger.warning(
+                "Passthrough request failed before upstream response: %s %s -> %s: %s",
+                request.method,
+                path,
+                url,
+                e,
+            )
+            return Response(
+                content=json.dumps(
+                    {
+                        "error": {
+                            "type": "connection_error",
+                            "message": f"Failed to connect to upstream API: {e}",
+                        }
+                    }
+                ),
+                status_code=502,
+                media_type="application/json",
+            )
 
         # Remove compression headers since httpx already decompressed the response
         response_headers = dict(response.headers)
