@@ -51,7 +51,7 @@ def test_openai_responses_adapter_compresses_only_live_text_slots():
         ],
     }
 
-    new_payload, modified, saved, transforms, units_by_category, strategy_chain = (
+    new_payload, modified, saved, transforms, units_by_category, strategy_chain, _attempted = (
         handler._compress_openai_responses_live_text_units_with_router(
             payload,
             model="gpt-5",
@@ -94,7 +94,7 @@ def test_openai_responses_adapter_compresses_custom_tool_call_output():
         ],
     }
 
-    new_payload, modified, saved, transforms, units_by_category, strategy_chain = (
+    new_payload, modified, saved, transforms, units_by_category, strategy_chain, _attempted = (
         handler._compress_openai_responses_live_text_units_with_router(
             payload,
             model="gpt-5",
@@ -117,7 +117,7 @@ def test_openai_responses_adapter_accepts_empty_input_list():
     handler = _handler_with_router(router)
     payload = {"model": "gpt-5", "input": [], "tools": []}
 
-    new_payload, modified, saved, transforms, units_by_category, strategy_chain = (
+    new_payload, modified, saved, transforms, units_by_category, strategy_chain, _attempted = (
         handler._compress_openai_responses_live_text_units_with_router(
             payload,
             model="gpt-5",
@@ -163,7 +163,7 @@ def test_openai_responses_adapter_preserves_headroom_retrieve_outputs():
         ],
     }
 
-    new_payload, modified, saved, transforms, units_by_category, strategy_chain = (
+    new_payload, modified, saved, transforms, units_by_category, strategy_chain, _attempted = (
         handler._compress_openai_responses_live_text_units_with_router(
             payload,
             model="gpt-5",
@@ -199,7 +199,7 @@ def test_openai_responses_adapter_keeps_small_and_opaque_items():
         ],
     }
 
-    new_payload, modified, saved, transforms, units_by_category, strategy_chain = (
+    new_payload, modified, saved, transforms, units_by_category, strategy_chain, _attempted = (
         handler._compress_openai_responses_live_text_units_with_router(
             payload,
             model="gpt-5",
@@ -248,7 +248,7 @@ def test_openai_responses_payload_routes_through_content_router_without_rust(
         ],
     }
 
-    new_payload, modified, saved, transforms, reason, _, _ = (
+    new_payload, modified, saved, transforms, reason, _, _, _ = (
         handler._compress_openai_responses_payload(
             payload,
             model="gpt-5",

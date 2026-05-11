@@ -43,53 +43,8 @@ def _json_debug_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
-def _redacted_debug_value(value: Any) -> Any:
-    from headroom.proxy.helpers import redact_for_wire_debug
-
-    return redact_for_wire_debug(value)
-
-
-# Fields that embed full payload bodies (~tens of KB per event). At INFO
-# level these dominate log volume and obscure the summary signals; at
-# DEBUG level they remain available for deep diagnosis.
-_LOG_BLOAT_FIELDS = frozenset(
-    {
-        "payload",
-        "input_payload",
-        "output_payload",
-        "input",
-        "output",
-        "original",
-        "compressed",
-        "extraction",
-        "units",
-        "router_routing_log",
-    }
-)
-
-
-def _log_codex_compression_debug(event: str, **payload: Any) -> None:
-    """Emit Codex compression diagnostics.
-
-    INFO carries the summary fields (request_id, pass_id, savings,
-    strategy_chain, units_by_category, etc.) — the line a human log
-    reader should be able to scan to understand what happened.
-
-    DEBUG carries everything, including the full request/response
-    payload bodies and per-unit text. Enable the proxy logger at DEBUG
-    when actually diagnosing a regression; leave it at INFO for
-    steady-state ops to keep proxy.log readable.
-
-    Obvious credential keys are still redacted by key name at both levels.
-    """
-
-    payload = {"event": event, **payload}
-    # DEBUG: everything.
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("event=%s %s", event, _json_debug_dumps(_redacted_debug_value(payload)))
-    # INFO: stripped of body-embedding fields so summaries are scannable.
-    stripped = {k: v for k, v in payload.items() if k not in _LOG_BLOAT_FIELDS}
-    logger.info("event=%s %s", event, _json_debug_dumps(_redacted_debug_value(stripped)))
+def _log_codex_compression_debug(_event: str, **_payload: Any) -> None:
+    return
 
 
 def _json_shape(value: str) -> dict[str, Any]:
@@ -109,25 +64,8 @@ def _json_shape(value: str) -> dict[str, Any]:
     return {"is_json": True, "kind": type(parsed).__name__}
 
 
-def _routing_log_debug(router_result: Any) -> list[dict[str, Any]]:
-    routing_log = getattr(router_result, "routing_log", []) or []
-    rows: list[dict[str, Any]] = []
-    for idx, decision in enumerate(routing_log):
-        content_type = getattr(decision, "content_type", None)
-        strategy = getattr(decision, "strategy", None)
-        rows.append(
-            {
-                "index": idx,
-                "content_type": getattr(content_type, "value", str(content_type)),
-                "strategy": getattr(strategy, "value", str(strategy)),
-                "original_tokens": getattr(decision, "original_tokens", None),
-                "compressed_tokens": getattr(decision, "compressed_tokens", None),
-                "confidence": getattr(decision, "confidence", None),
-                "section_index": getattr(decision, "section_index", None),
-                "compression_ratio": getattr(decision, "compression_ratio", None),
-            }
-        )
-    return rows
+def _routing_log_debug(_router_result: Any) -> list[dict[str, Any]]:
+    return []
 
 
 _OPENAI_TOOL_SCHEMA_DROP_KEYS = {
@@ -431,34 +369,13 @@ class OpenAIHandlerMixin:
         are intentionally not exposed as text units.
         """
 
-        def _log(event: str, **fields: Any) -> None:
-            # All events from this single compression pass share `pass_id`,
-            # so downstream analytics can attribute each unit_result to
-            # its originating pass — without this, unit_results from
-            # multiple passes get conflated under one request_id and
-            # per-pass questions become unanswerable. Savings ARE expected
-            # to sum across passes: each pass really did avoid sending
-            # those tokens upstream, regardless of any prefix-cache the
-            # upstream may apply.
-            _log_codex_compression_debug(
-                event,
-                request_id=request_id,
-                pass_id=pass_id,
-                model=model,
-                **fields,
-            )
+        def _log(_event: str, **_fields: Any) -> None:
+            return
 
         input_items = payload.get("input")
         messages_items = payload.get("messages")
         items = input_items if isinstance(input_items, list) else messages_items
         if not isinstance(items, list):
-            _log(
-                "codex_compression_payload_skipped",
-                reason="input_or_messages_not_list",
-                input_type=type(payload.get("input")).__name__,
-                messages_type=type(payload.get("messages")).__name__,
-                payload=payload,
-            )
             return payload, False, 0, [], {}, [], 0
         try:
             from headroom.transforms.compression_units import (
@@ -473,22 +390,11 @@ class OpenAIHandlerMixin:
                 request_id,
                 exc,
             )
-            _log(
-                "codex_compression_payload_skipped",
-                reason="compression_unit_adapter_unavailable",
-                error=repr(exc),
-                payload=payload,
-            )
             return payload, False, 0, [], {}, [], 0
 
         router = find_content_router(self.openai_pipeline)
         if router is None:
             logger.debug("[%s] OpenAI Responses ContentRouter unavailable", request_id)
-            _log(
-                "codex_compression_payload_skipped",
-                reason="content_router_unavailable",
-                payload=payload,
-            )
             return payload, False, 0, [], {}, [], 0
 
         try:
@@ -498,12 +404,6 @@ class OpenAIHandlerMixin:
                 "[%s] OpenAI Responses ContentRouter tokenizer unavailable: %s",
                 request_id,
                 exc,
-            )
-            _log(
-                "codex_compression_payload_skipped",
-                reason="tokenizer_unavailable",
-                error=repr(exc),
-                payload=payload,
             )
             return payload, False, 0, [], {}, [], 0
 

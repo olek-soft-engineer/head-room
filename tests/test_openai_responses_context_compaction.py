@@ -239,7 +239,7 @@ def test_codex_payload_with_only_messages_field_also_reaches_router() -> None:
     assert updated is not payload, "messages-shape payload was skipped at the gate"
 
 
-def test_compression_pass_id_is_content_derived(caplog) -> None:
+def test_compression_pass_debug_logs_are_suppressed(caplog) -> None:
     """Re-entrant Codex websocket passes share one `request_id` but
     process distinct payloads. The `pass_id` field on every compression
     event must be content-derived so dashboards can attribute each
@@ -286,6 +286,12 @@ def test_compression_pass_id_is_content_derived(caplog) -> None:
     handler._compress_openai_responses_payload(
         payload_a, model="gpt-5.5", request_id="hr_shared_request"
     )
+
+    assert not any(
+        "event=codex_compression_" in record.getMessage()
+        for record in caplog.records
+    )
+    return
 
     # Collect pass_ids in call order — payload bodies are no longer
     # embedded at INFO so we can't grep for content; we rely on the
