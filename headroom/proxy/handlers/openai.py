@@ -3065,6 +3065,10 @@ class OpenAIHandlerMixin:
             ws_last_client_frame_type = str(body.get("type") or "unknown") if body else "unknown"
             ws_last_upstream_frame_type = "unknown"
             ws_client_disconnect_seen = False
+            ws_overhead_ms_total = 0.0
+            ws_recorded_overhead_ms_total = 0.0
+            ws_ttfb_ms: float | None = None
+            ws_recorded_ttfb_ms = False
             _ws_bypass = self._headroom_bypass_enabled(ws_headers)
             if _ws_bypass:
                 logger.info(
@@ -3083,6 +3087,58 @@ class OpenAIHandlerMixin:
                 raw_text=None if body else first_msg_raw,
                 metadata={"frame": 1},
             )
+
+            def _record_ws_compression_overhead(duration_ms: float) -> None:
+                nonlocal ws_overhead_ms_total
+                ws_overhead_ms_total += max(0.0, float(duration_ms))
+                if ws_overhead_ms_total > 0:
+                    stage_timer.record("compression", ws_overhead_ms_total)
+
+            def _current_ws_overhead_ms() -> float:
+                summary = stage_timer.summary()
+                return ws_overhead_ms_total + max(0.0, float(summary.get("memory_context") or 0.0))
+
+            def _ws_dashboard_pipeline_timing(
+                *,
+                overhead_ms: float,
+                ttfb_ms: float,
+            ) -> dict[str, float]:
+                timing: dict[str, float] = {}
+                if overhead_ms > 0:
+                    timing["codex_ws.compression"] = overhead_ms
+                if ttfb_ms > 0:
+                    timing["codex_ws.ttfb"] = ttfb_ms
+
+                summary = stage_timer.summary()
+                for stage_name in (
+                    "memory_context",
+                    "upstream_connect",
+                    "upstream_first_event",
+                ):
+                    value = summary.get(stage_name)
+                    if value is not None and value > 0:
+                        timing[f"codex_ws.{stage_name}"] = float(value)
+                return timing
+
+            def _prepare_ws_performance_metrics() -> tuple[float, float, dict[str, float]]:
+                current_overhead_ms = _current_ws_overhead_ms()
+                overhead_delta_ms = max(
+                    0.0,
+                    current_overhead_ms - ws_recorded_overhead_ms_total,
+                )
+                ttfb_for_record_ms = (
+                    max(0.0, float(ws_ttfb_ms))
+                    if ws_ttfb_ms is not None and not ws_recorded_ttfb_ms
+                    else 0.0
+                )
+                return (
+                    overhead_delta_ms,
+                    ttfb_for_record_ms,
+                    _ws_dashboard_pipeline_timing(
+                        overhead_ms=overhead_delta_ms,
+                        ttfb_ms=ttfb_for_record_ms,
+                    ),
+                )
 
             # --- Memory: inject context, tools, and instructions ---
             memory_user_id: str | None = None
@@ -3264,20 +3320,26 @@ class OpenAIHandlerMixin:
                         _inner = _send_body["response"] if _wrapped else _send_body
                         _model = (_inner.get("model") if isinstance(_inner, dict) else None) or ""
 
-                        (
-                            _new_inner,
-                            _modified,
-                            _ws_saved,
-                            _ws_transforms,
-                            _ws_reason,
-                            _bytes_before,
-                            _bytes_after,
-                            _ws_attempted_tokens,
-                        ) = await self._compress_openai_responses_payload_in_executor(
-                            _inner,
-                            model=_model,
-                            request_id=request_id,
-                        )
+                        _compression_started = time.perf_counter()
+                        try:
+                            (
+                                _new_inner,
+                                _modified,
+                                _ws_saved,
+                                _ws_transforms,
+                                _ws_reason,
+                                _bytes_before,
+                                _bytes_after,
+                                _ws_attempted_tokens,
+                            ) = await self._compress_openai_responses_payload_in_executor(
+                                _inner,
+                                model=_model,
+                                request_id=request_id,
+                            )
+                        finally:
+                            _record_ws_compression_overhead(
+                                (time.perf_counter() - _compression_started) * 1000.0
+                            )
                         if _modified:
                             if isinstance(_new_inner, dict):
                                 if _wrapped:
@@ -3488,20 +3550,26 @@ class OpenAIHandlerMixin:
                             try:
                                 model_for_frame = inner_payload.get("model") or ""
                                 _frame_auth_mode = classify_auth_mode(ws_headers)
-                                (
-                                    new_inner,
-                                    modified,
-                                    frame_saved,
-                                    frame_transforms,
-                                    frame_reason,
-                                    bytes_before,
-                                    bytes_after,
-                                    frame_attempted_tokens,
-                                ) = await self._compress_openai_responses_payload_in_executor(
-                                    inner_payload,
-                                    model=model_for_frame,
-                                    request_id=request_id,
-                                )
+                                _compression_started = time.perf_counter()
+                                try:
+                                    (
+                                        new_inner,
+                                        modified,
+                                        frame_saved,
+                                        frame_transforms,
+                                        frame_reason,
+                                        bytes_before,
+                                        bytes_after,
+                                        frame_attempted_tokens,
+                                    ) = await self._compress_openai_responses_payload_in_executor(
+                                        inner_payload,
+                                        model=model_for_frame,
+                                        request_id=request_id,
+                                    )
+                                finally:
+                                    _record_ws_compression_overhead(
+                                        (time.perf_counter() - _compression_started) * 1000.0
+                                    )
                             except Exception as _frame_err:
                                 logger.warning(
                                     "[%s] WS /v1/responses frame compression "
@@ -3706,7 +3774,9 @@ class OpenAIHandlerMixin:
                             nonlocal ws_recorded_cache_write_tokens_total
                             nonlocal ws_recorded_uncached_input_tokens_total
                             nonlocal ws_recorded_tokens_saved_total
+                            nonlocal ws_recorded_overhead_ms_total, ws_recorded_ttfb_ms
                             nonlocal ws_upstream_frames_total, ws_last_upstream_frame_type
+                            nonlocal ws_ttfb_ms
 
                             memory_enabled = bool(self.memory_handler and memory_user_id)
 
@@ -3736,6 +3806,7 @@ class OpenAIHandlerMixin:
                                 nonlocal ws_recorded_uncached_input_tokens_total
                                 nonlocal ws_recorded_tokens_saved_total
                                 nonlocal ws_recorded_attempted_input_tokens_total
+                                nonlocal ws_recorded_overhead_ms_total, ws_recorded_ttfb_ms
 
                                 input_delta = ws_input_tokens_total - ws_recorded_input_tokens_total
                                 output_delta = (
@@ -3757,6 +3828,11 @@ class OpenAIHandlerMixin:
                                     attempted_input_tokens_total
                                     - ws_recorded_attempted_input_tokens_total
                                 )
+                                (
+                                    overhead_delta_ms,
+                                    ttfb_for_record_ms,
+                                    dashboard_pipeline_timing,
+                                ) = _prepare_ws_performance_metrics()
                                 if (
                                     input_delta <= 0
                                     and output_delta <= 0
@@ -3765,6 +3841,8 @@ class OpenAIHandlerMixin:
                                     and uncached_delta <= 0
                                     and saved_delta <= 0
                                     and attempted_delta <= 0
+                                    and overhead_delta_ms <= 0
+                                    and ttfb_for_record_ms <= 0
                                 ):
                                     return
 
@@ -3794,6 +3872,9 @@ class OpenAIHandlerMixin:
                                     cache_write_tokens=max(0, cache_write_delta),
                                     uncached_input_tokens=max(0, uncached_delta),
                                     attempted_input_tokens=max(0, attempted_delta),
+                                    overhead_ms=overhead_delta_ms,
+                                    ttfb_ms=ttfb_for_record_ms,
+                                    pipeline_timing=dashboard_pipeline_timing,
                                 )
 
                                 ws_recorded_input_tokens_total = ws_input_tokens_total
@@ -3807,6 +3888,9 @@ class OpenAIHandlerMixin:
                                 ws_recorded_attempted_input_tokens_total = (
                                     attempted_input_tokens_total
                                 )
+                                ws_recorded_overhead_ms_total = _current_ws_overhead_ms()
+                                if ttfb_for_record_ms > 0:
+                                    ws_recorded_ttfb_ms = True
 
                             # The retry-loop variable is safe to close over here:
                             # ``_upstream_to_client`` is defined and awaited within
@@ -3824,6 +3908,10 @@ class OpenAIHandlerMixin:
                                         _first_event_started_at is not None
                                         and "upstream_first_event" not in stage_timer
                                     ):
+                                        if ws_ttfb_ms is None:
+                                            ws_ttfb_ms = (
+                                                time.perf_counter() - session_started_at
+                                            ) * 1000.0
                                         stage_timer.record(
                                             "upstream_first_event",
                                             (time.perf_counter() - _first_event_started_at)
@@ -4253,6 +4341,11 @@ class OpenAIHandlerMixin:
                 0,
                 attempted_input_tokens_total - ws_recorded_attempted_input_tokens_total,
             )
+            (
+                final_overhead_delta_ms,
+                final_ttfb_ms,
+                final_pipeline_timing,
+            ) = _prepare_ws_performance_metrics()
             ws_session_tags = {
                 **(ws_tags or {}),
                 "auth_mode": _final_auth_mode.value,
@@ -4282,6 +4375,8 @@ class OpenAIHandlerMixin:
                 or residual_cache_write_tokens > 0
                 or residual_uncached_input_tokens > 0
                 or residual_attempted_input_tokens > 0
+                or final_overhead_delta_ms > 0
+                or final_ttfb_ms > 0
             ):
                 if self.cost_tracker:
                     self.cost_tracker.record_tokens(
@@ -4303,7 +4398,13 @@ class OpenAIHandlerMixin:
                     cache_write_tokens=residual_cache_write_tokens,
                     uncached_input_tokens=residual_uncached_input_tokens,
                     attempted_input_tokens=residual_attempted_input_tokens,
+                    overhead_ms=final_overhead_delta_ms,
+                    ttfb_ms=final_ttfb_ms,
+                    pipeline_timing=final_pipeline_timing,
                 )
+                ws_recorded_overhead_ms_total = _current_ws_overhead_ms()
+                if final_ttfb_ms > 0:
+                    ws_recorded_ttfb_ms = True
             if getattr(self, "logger", None) is not None:
                 from headroom.proxy.helpers import compute_turn_id
                 from headroom.proxy.models import RequestLog
@@ -4332,7 +4433,7 @@ class OpenAIHandlerMixin:
                         )
                         if ws_input_tokens_total + tokens_saved > 0
                         else 0.0,
-                        optimization_latency_ms=0.0,
+                        optimization_latency_ms=_current_ws_overhead_ms(),
                         total_latency_ms=ws_session_duration_ms,
                         tags=ws_session_tags,
                         cache_hit=False,

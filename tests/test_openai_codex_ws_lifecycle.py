@@ -15,8 +15,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 
 # ---------------------------------------------------------------------------
@@ -331,6 +331,49 @@ async def test_ws_session_metrics_include_response_completed_usage():
     assert recorded["cache_read_tokens"] == 75
     assert recorded["cache_write_tokens"] == 25
     assert recorded["uncached_input_tokens"] == 25
+
+
+@pytest.mark.asyncio
+async def test_ws_session_metrics_include_dashboard_performance_timings():
+    """Codex WS response metrics should feed the dashboard Performance tab."""
+
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "r_1",
+                    "usage": {
+                        "input_tokens": 100,
+                        "input_tokens_details": {"cached_tokens": 75},
+                        "output_tokens": 12,
+                    },
+                },
+            }
+        ),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+
+    def _noop_compress(payload, *, model, request_id):
+        return payload, False, 0, [], "test_noop", 10, 10, 0
+
+    handler._compress_openai_responses_payload = _noop_compress  # type: ignore[method-assign]
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert handler.metrics.recorded_requests
+    recorded = handler.metrics.recorded_requests[-1]
+    assert recorded["overhead_ms"] > 0
+    assert recorded["ttfb_ms"] > 0
+    assert recorded["pipeline_timing"]["codex_ws.compression"] > 0
+    assert recorded["pipeline_timing"]["codex_ws.upstream_first_event"] > 0
 
 
 @pytest.mark.asyncio
