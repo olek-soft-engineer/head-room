@@ -439,6 +439,13 @@ class GeminiHandlerMixin:
                         uncached_tokens=uncached_input_tokens,
                     )
 
+                # Eligible-tracking is TODO for Gemini; pass the full
+                # pre-compression request size as the fallback denominator.
+                # This makes Gemini's contribution to the aggregate
+                # active_savings_percent equal its whole-request ratio —
+                # not ideal but coherent until per-part live-zone
+                # tracking exists for this provider.
+                attempted_input_tokens = total_input_tokens + tokens_saved
                 await self.metrics.record_request(
                     provider="gemini",
                     model=model,
@@ -450,6 +457,7 @@ class GeminiHandlerMixin:
                     waste_signals=waste_signals_dict,
                     cache_read_tokens=cache_read_tokens,
                     uncached_input_tokens=uncached_input_tokens,
+                    attempted_input_tokens=attempted_input_tokens,
                 )
 
                 if tokens_saved > 0:
@@ -856,6 +864,9 @@ class GeminiHandlerMixin:
                 max(0, original_tokens - compressed_tokens) if compressed_tokens > 0 else 0
             )
 
+            # Fallback denominator (see comment on the main gemini
+            # record_request site) — pre-comp request size.
+            attempted_input_tokens = compressed_tokens + tokens_saved
             await self.metrics.record_request(
                 provider="gemini",
                 model=model,
@@ -863,6 +874,7 @@ class GeminiHandlerMixin:
                 output_tokens=0,
                 tokens_saved=tokens_saved,
                 latency_ms=total_latency,
+                attempted_input_tokens=attempted_input_tokens,
             )
 
             if tokens_saved > 0:

@@ -86,6 +86,14 @@ class PrometheusMetrics:
         self.tokens_input_total = 0
         self.tokens_output_total = 0
         self.tokens_saved_total = 0
+        # Sum of tokens we actually attempted to compress across the
+        # session: extracted units that passed all gates + tool-schema
+        # tokens we ran compaction against. Excludes prefix-frozen
+        # content (instructions, user/system messages, prior turns).
+        # This is the right denominator for an "active compression
+        # ratio" — what fraction of the compressible-eligible tokens
+        # did we actually save?
+        self.attempted_input_tokens_total = 0
 
         # Per-strategy compression counters. Populated lazily as we see
         # each strategy tag — no hardcoded list of strategies; the keys
@@ -219,6 +227,7 @@ class PrometheusMetrics:
             self.tokens_input_total = 0
             self.tokens_output_total = 0
             self.tokens_saved_total = 0
+            self.attempted_input_tokens_total = 0
 
             self.compressions_by_strategy.clear()
             self.tokens_saved_by_strategy.clear()
@@ -395,6 +404,7 @@ class PrometheusMetrics:
         cache_write_5m_tokens: int = 0,
         cache_write_1h_tokens: int = 0,
         uncached_input_tokens: int = 0,
+        attempted_input_tokens: int = 0,
     ):
         """Record metrics for a request."""
         async with self._lock:
@@ -408,6 +418,9 @@ class PrometheusMetrics:
             self.tokens_input_total += input_tokens
             self.tokens_output_total += output_tokens
             self.tokens_saved_total += tokens_saved
+            # See the attribute definition for why this is the right
+            # denominator for the active-compression ratio.
+            self.attempted_input_tokens_total += max(0, int(attempted_input_tokens))
 
             # Track provider-specific prefix cache metrics
             if cache_read_tokens > 0 or cache_write_tokens > 0:

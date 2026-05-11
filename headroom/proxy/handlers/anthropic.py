@@ -1573,6 +1573,21 @@ class AnthropicHandlerMixin:
                         _backend_name = (
                             self.anthropic_backend.name if self.anthropic_backend else "anthropic"
                         )
+                        # Eligible-only denominator for the active
+                        # compression ratio: tokens in the live zone we
+                        # actually attempted to compress. Frozen prefix
+                        # (system + prior cached turns) is byte-identical
+                        # pre/post — counting it would dilute the metric
+                        # with content we deliberately don't touch for
+                        # prefix-cache safety. Fall back to the full
+                        # pre-comp request if the live-zone count fails
+                        # so the aggregate denominator stays coherent.
+                        try:
+                            attempted_input_tokens = tokenizer.count_messages(
+                                original_client_messages[frozen_message_count:]
+                            )
+                        except Exception:
+                            attempted_input_tokens = original_tokens
                         await self.metrics.record_request(
                             provider=_backend_name,
                             model=model,
@@ -1583,6 +1598,7 @@ class AnthropicHandlerMixin:
                             cached=False,
                             overhead_ms=optimization_latency,
                             pipeline_timing=pipeline_timing,
+                            attempted_input_tokens=attempted_input_tokens,
                         )
 
                         if self.cost_tracker:
