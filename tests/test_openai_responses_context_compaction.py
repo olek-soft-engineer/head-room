@@ -287,10 +287,7 @@ def test_compression_pass_debug_logs_are_suppressed(caplog) -> None:
         payload_a, model="gpt-5.5", request_id="hr_shared_request"
     )
 
-    assert not any(
-        "event=codex_compression_" in record.getMessage()
-        for record in caplog.records
-    )
+    assert not any("event=codex_compression_" in record.getMessage() for record in caplog.records)
     return
 
     # Collect pass_ids in call order — payload bodies are no longer

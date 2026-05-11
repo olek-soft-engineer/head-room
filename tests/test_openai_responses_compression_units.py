@@ -105,9 +105,7 @@ def test_openai_responses_adapter_compresses_custom_tool_call_output():
     assert modified is True
     assert saved > 0
     assert new_payload["input"][0]["output"] == "custom output summary"
-    assert (
-        "router:openai:responses:custom_tool_call_output:kompress" in transforms
-    )
+    assert "router:openai:responses:custom_tool_call_output:kompress" in transforms
     assert units_by_category == {"applied": 1}
     assert strategy_chain == []
 
