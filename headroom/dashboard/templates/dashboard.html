@@ -109,7 +109,7 @@
                 </div>
                 <div class="mt-2 text-xs text-gray-500">
                     <span x-show="stats.cost?.savings_usd > 0"
-                          x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens only; RTK excluded from $'"></span>
+                          x-text="formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' proxy tokens only; ' + cliFilteringLabel + ' excluded from $'"></span>
                     <span x-show="!(stats.cost?.savings_usd > 0)"
                           x-text="formatNumber(stats.requests?.total || 0) + ' requests processed'"></span>
                 </div>
@@ -125,7 +125,7 @@
                 <div class="mt-1 text-xs text-gray-500 leading-relaxed">
                     <span x-text="'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' (' + proxyShareOfTotal.toFixed(1) + '%)'"></span>
                     <span class="mx-1 text-gray-600">/</span>
-                    <span x-text="'RTK ' + formatNumber(stats.tokens?.rtk_saved || 0) + ' (' + rtkShareOfTotal.toFixed(1) + '%)'"></span>
+                    <span x-text="cliFilteringLabel + ' ' + formatNumber(cliFilteringSaved) + ' (' + cliFilteringShareOfTotal.toFixed(1) + '%)'"></span>
                 </div>
                 <div class="mt-2 h-8">
                     <svg class="w-full h-full" viewBox="0 0 100 32" preserveAspectRatio="none">
@@ -698,8 +698,8 @@
                         <span class="font-mono text-sm" x-text="formatNumber(stats.tokens?.total_before_compression || 0)"></span>
                     </div>
                     <div class="flex justify-between items-center">
-                        <span class="text-sm text-gray-400">RTK Filtered</span>
-                        <span class="font-mono text-sm text-emerald-400" x-text="formatNumber(stats.tokens?.rtk_saved || 0)"></span>
+                        <span class="text-sm text-gray-400" x-text="cliFilteringLabel + ' Filtered'"></span>
+                        <span class="font-mono text-sm text-emerald-400" x-text="formatNumber(cliFilteringSaved)"></span>
                     </div>
                     <div class="flex justify-between items-center">
                         <span class="text-sm text-gray-400">Proxy Removed</span>
@@ -1778,10 +1778,26 @@
                     return (this.stats.tokens?.proxy_compression_saved || 0) / total * 100;
                 },
 
-                get rtkShareOfTotal() {
+                get cliFilteringLabel() {
+                    const raw = this.stats.savings?.by_layer?.cli_filtering?.label
+                        || this.stats.context_tool?.label
+                        || this.stats.context_tool?.configured
+                        || 'Context Tool';
+                    if (String(raw).toLowerCase() === 'lean-ctx') return 'Lean-ctx';
+                    return String(raw);
+                },
+
+                get cliFilteringSaved() {
+                    return this.stats.tokens?.cli_filtering_saved
+                        ?? this.stats.tokens?.cli_tokens_avoided
+                        ?? this.stats.tokens?.rtk_saved
+                        ?? 0;
+                },
+
+                get cliFilteringShareOfTotal() {
                     const total = this.compressionTotalBefore;
                     if (total <= 0) return 0;
-                    return (this.stats.tokens?.rtk_saved || 0) / total * 100;
+                    return this.cliFilteringSaved / total * 100;
                 },
 
                 // --- Compression Confidence ---
