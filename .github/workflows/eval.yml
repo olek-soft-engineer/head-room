@@ -86,7 +86,17 @@ jobs:
           pip install -e ".[all]"
           python -c "from headroom._core import SmartCrusher; print('headroom._core OK')"
       - name: Run Tier 1 evaluation suite
-        run: python -m headroom.evals suite --tier 1 --ci -o eval_results/
+        run: |
+          if [ -z "${OPENAI_API_KEY}" ]; then
+            echo "::warning title=Weekly eval skipped::OPENAI_API_KEY is not configured for this repo; skipping the live Tier 1 suite."
+            mkdir -p eval_results
+            printf '%s\n\n%s\n' \
+              '# Weekly Evaluation Skipped' \
+              'OPENAI_API_KEY is not configured for this repository, so the live Tier 1 evaluation suite was skipped.' \
+              > eval_results/skipped.md
+            exit 0
+          fi
+          python -m headroom.evals suite --tier 1 --ci -o eval_results/
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
