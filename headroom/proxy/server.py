@@ -1171,7 +1171,7 @@ class HeadroomProxy(
 
                     return response
 
-            except (httpx.ConnectError, httpx.ReadTimeout, httpx.HTTPStatusError) as e:
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError) as e:
                 last_error = e
 
                 if not self.config.retry_enabled or attempt >= self.config.retry_max_attempts - 1:

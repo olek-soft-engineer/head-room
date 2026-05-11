@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 
 # ---------------------------------------------------------------------------
@@ -78,9 +79,16 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.cost_tracker = None
         self.memory_handler = None
         self.ws_sessions = ws_sessions or WebSocketSessionRegistry()
+        self.compression_executor_calls = 0
+        self.compression_executor_timeouts: list[float] = []
 
     async def _next_request_id(self) -> str:
         return "req-lifecycle-test"
+
+    async def _run_compression_in_executor(self, fn, *, timeout: float):
+        self.compression_executor_calls += 1
+        self.compression_executor_timeouts.append(timeout)
+        return fn()
 
 
 class _FakeWebSocketDisconnect(Exception):
@@ -222,6 +230,39 @@ def _first_frame() -> str:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ws_first_frame_compression_uses_bounded_executor():
+    """Codex WS compression must not run synchronously on the event loop."""
+    upstream_events = [
+        json.dumps({"type": "response.created", "response": {"id": "r_1"}}),
+        json.dumps({"type": "response.completed", "response": {"id": "r_1"}}),
+    ]
+    upstream = _FakeUpstream(upstream_events)
+    fake_ws_mod = _make_fake_websockets_module(upstream)
+
+    client_ws = _FakeWebSocket(frames=[_first_frame()])
+    handler = _DummyOpenAIHandler()
+    handler.config.optimize = True
+    handler._compress_openai_responses_payload = MagicMock(
+        return_value=(
+            {"model": "gpt-5.4", "input": "hi"},
+            False,
+            0,
+            [],
+            "router_no_compression",
+            10,
+            10,
+        )
+    )
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        await handler.handle_openai_responses_ws(client_ws)
+
+    assert handler.compression_executor_calls == 1
+    assert handler.compression_executor_timeouts == [COMPRESSION_TIMEOUT_SECONDS]
+    handler._compress_openai_responses_payload.assert_called_once()
 
 
 @pytest.mark.asyncio
