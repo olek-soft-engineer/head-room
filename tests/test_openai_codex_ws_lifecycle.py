@@ -15,8 +15,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
+from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 from headroom.proxy.ws_session_registry import WebSocketSessionRegistry
 
 # ---------------------------------------------------------------------------
