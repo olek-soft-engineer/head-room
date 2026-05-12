@@ -45,9 +45,7 @@ from headroom.proxy.auth_mode import classify_auth_mode
 logger = logging.getLogger("headroom.proxy")
 
 _CODEX_WS_UNIT_ROUTER_MAX_WORKERS = 10
-_CODEX_WS_UNIT_ROUTER_SEMAPHORE = threading.BoundedSemaphore(
-    _CODEX_WS_UNIT_ROUTER_MAX_WORKERS
-)
+_CODEX_WS_UNIT_ROUTER_SEMAPHORE = threading.BoundedSemaphore(_CODEX_WS_UNIT_ROUTER_MAX_WORKERS)
 
 
 def _codex_ws_unit_worker_count(unit_count: int) -> int:
@@ -731,9 +729,7 @@ class OpenAIHandlerMixin:
                 + elapsed_ms
             )
             timing_sink[f"compression_unit_router_category_{result.reason_category}"] = (
-                timing_sink.get(
-                    f"compression_unit_router_category_{result.reason_category}", 0.0
-                )
+                timing_sink.get(f"compression_unit_router_category_{result.reason_category}", 0.0)
                 + elapsed_ms
             )
             record_unit = getattr(getattr(self, "metrics", None), "record_codex_ws_unit", None)
@@ -1001,9 +997,7 @@ class OpenAIHandlerMixin:
         output_serialization_started = time.perf_counter()
         output_bytes = json.dumps(working).encode("utf-8")
         _add_timing("compression_output_json_dump", output_serialization_started)
-        output_context_budget = (
-            _openai_responses_context_budget(working) if debug_enabled else None
-        )
+        output_context_budget = _openai_responses_context_budget(working) if debug_enabled else None
         # One-line summary at INFO — the single event a human reading
         # logs should scan first to understand "what happened on this
         # pass". All the verbose per-event debug data stays available
@@ -3319,10 +3313,9 @@ class OpenAIHandlerMixin:
                     stage_timer.record("compression", ws_overhead_ms_total)
 
             def _record_ws_compression_timing(name: str, duration_ms: float) -> None:
-                ws_compression_timing_totals[name] = (
-                    ws_compression_timing_totals.get(name, 0.0)
-                    + max(0.0, float(duration_ms))
-                )
+                ws_compression_timing_totals[name] = ws_compression_timing_totals.get(
+                    name, 0.0
+                ) + max(0.0, float(duration_ms))
 
             def _codex_ws_final_strategies(timing: dict[str, float]) -> list[str]:
                 prefix = "compression_unit_router_strategy_"
@@ -3608,9 +3601,7 @@ class OpenAIHandlerMixin:
                                 "compression_executor_wait_run",
                                 _first_frame_compression_elapsed_ms,
                             )
-                            _record_ws_compression_overhead(
-                                _first_frame_compression_elapsed_ms
-                            )
+                            _record_ws_compression_overhead(_first_frame_compression_elapsed_ms)
                         record_frame = getattr(
                             getattr(self, "metrics", None), "record_codex_ws_frame", None
                         )
@@ -3623,9 +3614,7 @@ class OpenAIHandlerMixin:
                                 tokens_saved=_ws_saved,
                                 modified=_modified,
                                 strategy_chain=_codex_ws_strategy_chain(_ws_transforms),
-                                final_strategies=_codex_ws_final_strategies(
-                                    _ws_compression_timing
-                                ),
+                                final_strategies=_codex_ws_final_strategies(_ws_compression_timing),
                             )
                         if _modified:
                             if isinstance(_new_inner, dict):
@@ -3681,9 +3670,7 @@ class OpenAIHandlerMixin:
                         if record_frame is not None:
                             record_frame(
                                 elapsed_ms=_first_frame_compression_elapsed_ms,
-                                bytes_before=len(
-                                    first_msg_raw.encode("utf-8", errors="replace")
-                                ),
+                                bytes_before=len(first_msg_raw.encode("utf-8", errors="replace")),
                                 failed=True,
                             )
                     logger.warning(
@@ -3859,9 +3846,7 @@ class OpenAIHandlerMixin:
                             try:
                                 model_for_frame = inner_payload.get("model") or ""
                                 _frame_auth_mode = classify_auth_mode(ws_headers)
-                                _preflight_ms = (
-                                    time.perf_counter() - _preflight_started
-                                ) * 1000.0
+                                _preflight_ms = (time.perf_counter() - _preflight_started) * 1000.0
                                 _record_ws_compression_timing(
                                     "compression_preflight_serialization",
                                     _preflight_ms,
@@ -3884,9 +3869,10 @@ class OpenAIHandlerMixin:
                                         model=model_for_frame,
                                         request_id=request_id,
                                     )
-                                    for _timing_name, _timing_ms in (
-                                        frame_compression_timing.items()
-                                    ):
+                                    for (
+                                        _timing_name,
+                                        _timing_ms,
+                                    ) in frame_compression_timing.items():
                                         _record_ws_compression_timing(_timing_name, _timing_ms)
                                 finally:
                                     frame_compression_elapsed_ms = (
@@ -3896,9 +3882,7 @@ class OpenAIHandlerMixin:
                                         "compression_executor_wait_run",
                                         frame_compression_elapsed_ms,
                                     )
-                                    _record_ws_compression_overhead(
-                                        frame_compression_elapsed_ms
-                                    )
+                                    _record_ws_compression_overhead(frame_compression_elapsed_ms)
                                 record_frame = getattr(
                                     getattr(self, "metrics", None),
                                     "record_codex_ws_frame",
@@ -3912,9 +3896,7 @@ class OpenAIHandlerMixin:
                                         attempted_tokens=frame_attempted_tokens,
                                         tokens_saved=frame_saved,
                                         modified=modified,
-                                        strategy_chain=_codex_ws_strategy_chain(
-                                            frame_transforms
-                                        ),
+                                        strategy_chain=_codex_ws_strategy_chain(frame_transforms),
                                         final_strategies=_codex_ws_final_strategies(
                                             frame_compression_timing
                                         ),

@@ -380,7 +380,9 @@ async def test_ws_session_metrics_include_dashboard_performance_timings():
     assert recorded["pipeline_timing"]["codex_ws.compression_preflight_serialization"] > 0
     assert recorded["pipeline_timing"]["codex_ws.compression_executor_wait_run"] > 0
     assert recorded["pipeline_timing"]["codex_ws.compression_live_unit_extraction"] == 2.0
-    assert recorded["pipeline_timing"]["codex_ws.compression_unit_router_strategy_passthrough"] == 3.0
+    assert (
+        recorded["pipeline_timing"]["codex_ws.compression_unit_router_strategy_passthrough"] == 3.0
+    )
 
 
 @pytest.mark.asyncio

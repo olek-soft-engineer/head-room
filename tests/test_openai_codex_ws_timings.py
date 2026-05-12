@@ -280,6 +280,7 @@ def test_codex_ws_request_id_and_session_id_present_in_log(stage_log_capture):
     assert isinstance(payload["session_id"], str)
     assert len(payload["session_id"]) >= 16
 
+
 def test_codex_compression_debug_noop_skips_expensive_payload_debug(monkeypatch):
     handler = _DummyOpenAIHandler()
 

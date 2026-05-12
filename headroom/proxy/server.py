@@ -2118,9 +2118,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "frames_compressed_total": m.codex_ws_frames_compressed_total,
                 "frames_failed_total": m.codex_ws_frames_failed_total,
                 "frames_to_kompress_total": m.codex_ws_frames_to_kompress_total,
-                "frames_kompress_attempted_total": (
-                    m.codex_ws_frames_kompress_attempted_total
-                ),
+                "frames_kompress_attempted_total": (m.codex_ws_frames_kompress_attempted_total),
                 "frames_to_kompress_percent": _pct(
                     m.codex_ws_frames_to_kompress_total,
                     m.codex_ws_frames_attempted_total,
