@@ -20,6 +20,7 @@ import hashlib
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -36,6 +37,8 @@ KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
 KOMPRESS_ONNX_INTRA_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTRA_THREADS"
 KOMPRESS_ONNX_INTER_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTER_THREADS"
 KOMPRESS_COREML_CACHE_DIR_ENV = "HEADROOM_KOMPRESS_COREML_CACHE_DIR"
+KOMPRESS_MAX_CONCURRENT_ENV = "HEADROOM_KOMPRESS_MAX_CONCURRENT"
+KOMPRESS_BATCH_SIZE_ENV = "HEADROOM_KOMPRESS_BATCH_SIZE"
 
 KompressBackend = Literal["auto", "onnx", "onnx_cpu", "onnx_coreml", "pytorch", "pytorch_mps"]
 
@@ -43,6 +46,8 @@ KompressBackend = Literal["auto", "onnx", "onnx_cpu", "onnx_coreml", "pytorch", 
 # Supports multiple models loaded simultaneously.
 _kompress_cache: dict[str, tuple[Any, Any, str]] = {}
 _kompress_lock = threading.Lock()
+_execution_semaphores: dict[str, threading.BoundedSemaphore] = {}
+_execution_semaphores_lock = threading.Lock()
 
 
 def _selected_backend() -> KompressBackend:
@@ -85,6 +90,48 @@ def _onnx_session_options(ort: Any) -> Any:
         intra_op_num_threads=_env_int(KOMPRESS_ONNX_INTRA_THREADS_ENV),
         inter_op_num_threads=_env_int(KOMPRESS_ONNX_INTER_THREADS_ENV),
     )
+
+
+def _model_device_type(model: Any, backend: str) -> str:
+    if backend.startswith("onnx"):
+        return backend
+    if hasattr(model, "parameters"):
+        try:
+            return str(next(model.parameters()).device.type)
+        except Exception:
+            return "unknown"
+    return "unknown"
+
+
+def _default_max_concurrent(backend: str, device_type: str) -> int:
+    # MPS/CUDA execution is usually serialized under the hood; letting many
+    # Codex unit workers call the same model concurrently mostly adds queueing,
+    # memory pressure, and timeout leaks. CPU defaults to 1 as well because ONNX
+    # already owns its intra/inter-op threads.
+    if backend.startswith("onnx"):
+        return 1
+    if backend == "pytorch" and device_type in {"cuda", "mps", "cpu"}:
+        return 1
+    return 1
+
+
+def _execution_limit(backend: str, device_type: str) -> int:
+    return _env_int(KOMPRESS_MAX_CONCURRENT_ENV) or _default_max_concurrent(backend, device_type)
+
+
+def _execution_semaphore(backend: str, device_type: str) -> threading.BoundedSemaphore:
+    limit = _execution_limit(backend, device_type)
+    key = f"{backend}:{device_type}:{limit}"
+    with _execution_semaphores_lock:
+        semaphore = _execution_semaphores.get(key)
+        if semaphore is None:
+            semaphore = threading.BoundedSemaphore(limit)
+            _execution_semaphores[key] = semaphore
+        return semaphore
+
+
+def _batch_size() -> int:
+    return _env_int(KOMPRESS_BATCH_SIZE_ENV) or 32
 
 
 def _bucket_count(value: int) -> str:
@@ -361,10 +408,30 @@ def _load_kompress_pytorch(model_id: str, device: str = "auto") -> tuple[Any, An
         model.eval()
 
         tokenizer = AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base")
+        _validate_pytorch_device(model, tokenizer, device)
 
         _kompress_cache[model_id] = (model, tokenizer, "pytorch")
         logger.info("Kompress PyTorch loaded on %s (%s)", device, model_id)
         return model, tokenizer, "pytorch"
+
+
+def _validate_pytorch_device(model: Any, tokenizer: Any, device: str) -> None:
+    if device == "cpu":
+        return
+
+    encoding = tokenizer(
+        ["headroom", "kompress", "probe"],
+        is_split_into_words=True,
+        truncation=True,
+        max_length=512,
+        padding=True,
+        return_tensors="pt",
+    )
+    input_ids = encoding["input_ids"].to(device)
+    attention_mask = encoding["attention_mask"].to(device)
+    with _execution_semaphore("pytorch", device):
+        scores = model.get_scores(input_ids, attention_mask)
+        _ = scores[0].detach().cpu()
 
 
 def _load_kompress(model_id: str = HF_MODEL_ID, device: str = "auto") -> tuple[Any, Any, str]:
@@ -394,7 +461,19 @@ def _load_kompress(model_id: str = HF_MODEL_ID, device: str = "auto") -> tuple[A
 
     if backend in ("pytorch", "pytorch_mps"):
         forced_device = "mps" if backend == "pytorch_mps" else device
-        return _load_kompress_pytorch(model_id, forced_device)
+        try:
+            return _load_kompress_pytorch(model_id, forced_device)
+        except Exception as exc:
+            if backend != "pytorch_mps":
+                raise
+            logger.warning(
+                "Kompress PyTorch MPS validation failed for %s; falling back to ONNX CPU: %s",
+                model_id,
+                exc,
+            )
+            if _is_onnx_available():
+                return _load_kompress_onnx(model_id, use_coreml=False)
+            return _load_kompress_pytorch(model_id, "cpu")
 
     # Auto mode: preserve stable default behavior. This avoids changing
     # compression quality/perf characteristics for existing installs while
@@ -542,11 +621,27 @@ class KompressCompressor(Transform):
         try:
             model, tokenizer, backend = _load_kompress(self.config.model_id, self.config.device)
             is_onnx = backend == "onnx"
+            device_type = _model_device_type(model, backend)
+
+            if self._should_batch_single_content(model, backend):
+                batch_result = self.compress_batch(
+                    [content],
+                    context=context,
+                    content_type=content_type,
+                    question=question,
+                    target_ratio=[target_ratio],
+                    batch_size=_batch_size(),
+                )
+                if batch_result:
+                    return batch_result[0]
 
             max_chunk_words = self.config.chunk_words
             kept_ids: set[int] = set()
+            inference_ms = 0.0
+            chunk_count = 0
 
             for chunk_start in range(0, n_words, max_chunk_words):
+                chunk_count += 1
                 chunk_words = words[chunk_start : chunk_start + max_chunk_words]
 
                 # ONNX uses numpy tensors, PyTorch uses torch tensors
@@ -569,12 +664,23 @@ class KompressCompressor(Transform):
                     input_ids = input_ids.to(device)
                     attention_mask = attention_mask.to(device)
 
-                if target_ratio is not None:
-                    scores = model.get_scores(input_ids, attention_mask)
-                    if is_onnx:
-                        score_list = scores[0]  # numpy: [seq_len]
+                with _execution_semaphore(backend, device_type):
+                    inference_started = time.perf_counter()
+                    if target_ratio is not None:
+                        scores = model.get_scores(input_ids, attention_mask)
+                        if is_onnx:
+                            score_list = scores[0]  # numpy: [seq_len]
+                        else:
+                            score_list = scores[0].cpu()
                     else:
-                        score_list = scores[0].cpu()
+                        keep_mask = model.get_keep_mask(input_ids, attention_mask)
+                        if is_onnx:
+                            mask_list = keep_mask[0]  # list of bools
+                        else:
+                            mask_list = keep_mask[0].cpu()
+                    inference_ms += (time.perf_counter() - inference_started) * 1000
+
+                if target_ratio is not None:
                     word_scores: dict[int, float] = {}
                     for idx, wid in enumerate(word_ids):
                         if wid is None:
@@ -590,11 +696,6 @@ class KompressCompressor(Transform):
                         for wid in sorted_wids[:num_keep]:
                             kept_ids.add(wid + chunk_start)
                 else:
-                    keep_mask = model.get_keep_mask(input_ids, attention_mask)
-                    if is_onnx:
-                        mask_list = keep_mask[0]  # list of bools
-                    else:
-                        mask_list = keep_mask[0].cpu()
                     for idx, wid in enumerate(word_ids):
                         if wid is None:
                             continue
@@ -602,6 +703,16 @@ class KompressCompressor(Transform):
                             kept_ids.add(wid + chunk_start)
 
             if not kept_ids:
+                if inference_ms >= 1000.0:
+                    logger.info(
+                        "Kompress slow passthrough backend=%s device=%s words=%d chunks=%d "
+                        "inference_ms=%.0f",
+                        backend,
+                        device_type,
+                        n_words,
+                        chunk_count,
+                        inference_ms,
+                    )
                 return self._passthrough(content, n_words)
 
             compressed_words = [words[w] for w in sorted(kept_ids) if w < n_words]
@@ -627,6 +738,19 @@ class KompressCompressor(Transform):
                         f"\n[{n_words} items compressed to {compressed_count}."
                         f" Retrieve more: hash={cache_key}]"
                     )
+
+            if inference_ms >= 1000.0:
+                logger.info(
+                    "Kompress slow compress backend=%s device=%s words=%d chunks=%d "
+                    "inference_ms=%.0f ratio=%.3f saved=%d",
+                    backend,
+                    device_type,
+                    n_words,
+                    chunk_count,
+                    inference_ms,
+                    ratio,
+                    result.tokens_saved,
+                )
 
             return result
 
@@ -760,7 +884,9 @@ class KompressCompressor(Transform):
             return [r for r in results if r is not None]
 
         is_onnx = backend == "onnx"
+        device_type = _model_device_type(model, backend)
         kept_ids_per_text: dict[int, set[int]] = {i: set() for i in range(n) if results[i] is None}
+        inference_ms = 0.0
 
         for batch_start in range(0, len(chunk_queue), batch_size):
             batch = chunk_queue[batch_start : batch_start + batch_size]
@@ -786,7 +912,10 @@ class KompressCompressor(Transform):
                     attention_mask = attention_mask.to(device)
 
                 # Single forward pass for all chunks in this batch.
-                scores = model.get_scores(input_ids, attention_mask)
+                with _execution_semaphore(backend, device_type):
+                    inference_started = time.perf_counter()
+                    scores = model.get_scores(input_ids, attention_mask)
+                    inference_ms += (time.perf_counter() - inference_started) * 1000
 
                 for batch_idx, (text_idx, chunk_start, _chunk_words, ratio) in enumerate(batch):
                     word_ids = encoding.word_ids(batch_index=batch_idx)
@@ -873,7 +1002,28 @@ class KompressCompressor(Transform):
                 final.append(self._passthrough(contents[i], len(word_lists[i])))
             else:
                 final.append(r)
+        if inference_ms >= 1000.0:
+            total_words = sum(len(words) for words in word_lists)
+            total_saved = sum(r.tokens_saved for r in final)
+            logger.info(
+                "Kompress slow batch backend=%s device=%s items=%d chunks=%d "
+                "batch_size=%d words=%d inference_ms=%.0f saved=%d",
+                backend,
+                device_type,
+                n,
+                len(chunk_queue),
+                batch_size,
+                total_words,
+                inference_ms,
+                total_saved,
+            )
         return final
+
+    def _should_batch_single_content(self, model: Any, backend: str) -> bool:
+        if backend != "pytorch":
+            return False
+        device_type = _model_device_type(model, backend)
+        return device_type in {"cuda", "mps"}
 
     def _should_use_sequential_fallback(self) -> bool:
         """Return True if batched inference wouldn't speed up on this backend.
