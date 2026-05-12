@@ -92,8 +92,9 @@ class TestKompressBackendSelection:
         monkeypatch.setattr(
             kmod,
             "_load_kompress_pytorch",
-            lambda model_id, device: calls.append((model_id, device))
-            or ("model", "tokenizer", "pytorch"),
+            lambda model_id, device: (
+                calls.append((model_id, device)) or ("model", "tokenizer", "pytorch")
+            ),
         )
 
         assert kmod._load_kompress("model-a", device="auto") == ("model", "tokenizer", "pytorch")
@@ -108,8 +109,9 @@ class TestKompressBackendSelection:
         monkeypatch.setattr(
             kmod,
             "_load_kompress_onnx",
-            lambda model_id, *, use_coreml=False: calls.append((model_id, use_coreml))
-            or ("model", "tokenizer", "onnx_coreml"),
+            lambda model_id, *, use_coreml=False: (
+                calls.append((model_id, use_coreml)) or ("model", "tokenizer", "onnx_coreml")
+            ),
         )
 
         assert kmod._load_kompress("model-b") == ("model", "tokenizer", "onnx_coreml")
@@ -126,8 +128,9 @@ class TestKompressBackendSelection:
         monkeypatch.setattr(
             kmod,
             "_load_kompress_onnx",
-            lambda model_id, *, use_coreml=False: calls.append("onnx")
-            or ("model", "tokenizer", "onnx"),
+            lambda model_id, *, use_coreml=False: (
+                calls.append("onnx") or ("model", "tokenizer", "onnx")
+            ),
         )
         monkeypatch.setattr(
             kmod,
