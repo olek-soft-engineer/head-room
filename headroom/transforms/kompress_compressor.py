@@ -18,9 +18,10 @@ import contextlib
 import gc
 import hashlib
 import logging
+import os
 import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from ..config import TransformResult
 from ..onnx_runtime import create_cpu_session_options, trim_process_heap
@@ -31,11 +32,59 @@ logger = logging.getLogger(__name__)
 
 # Default HuggingFace model ID
 HF_MODEL_ID = "chopratejas/kompress-base"
+KOMPRESS_BACKEND_ENV = "HEADROOM_KOMPRESS_BACKEND"
+KOMPRESS_ONNX_INTRA_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTRA_THREADS"
+KOMPRESS_ONNX_INTER_THREADS_ENV = "HEADROOM_KOMPRESS_ONNX_INTER_THREADS"
+KOMPRESS_COREML_CACHE_DIR_ENV = "HEADROOM_KOMPRESS_COREML_CACHE_DIR"
+
+KompressBackend = Literal["auto", "onnx", "onnx_cpu", "onnx_coreml", "pytorch", "pytorch_mps"]
 
 # Model cache: model_id -> (model, tokenizer, backend)
 # Supports multiple models loaded simultaneously.
 _kompress_cache: dict[str, tuple[Any, Any, str]] = {}
 _kompress_lock = threading.Lock()
+
+
+def _selected_backend() -> KompressBackend:
+    raw = os.environ.get(KOMPRESS_BACKEND_ENV, "auto").strip().lower().replace("-", "_")
+    aliases = {
+        "": "auto",
+        "cpu": "onnx_cpu",
+        "coreml": "onnx_coreml",
+        "mps": "pytorch_mps",
+        "torch": "pytorch",
+        "torch_mps": "pytorch_mps",
+        "onnx": "onnx",
+        "onnx_cpu": "onnx_cpu",
+        "onnx_coreml": "onnx_coreml",
+        "pytorch": "pytorch",
+        "pytorch_mps": "pytorch_mps",
+        "auto": "auto",
+    }
+    return aliases.get(raw, "auto")  # type: ignore[return-value]
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s must be an integer, got %r; ignoring", name, raw)
+        return None
+    if value <= 0:
+        logger.warning("%s must be positive, got %r; ignoring", name, raw)
+        return None
+    return value
+
+
+def _onnx_session_options(ort: Any) -> Any:
+    return create_cpu_session_options(
+        ort,
+        intra_op_num_threads=_env_int(KOMPRESS_ONNX_INTRA_THREADS_ENV),
+        inter_op_num_threads=_env_int(KOMPRESS_ONNX_INTER_THREADS_ENV),
+    )
 
 
 def _bucket_count(value: int) -> str:
@@ -220,7 +269,11 @@ class _OnnxModel:
         return (np.array(scores) > 0.5).tolist()
 
 
-def _load_kompress_onnx(model_id: str) -> tuple[Any, Any, str]:
+def _load_kompress_onnx(
+    model_id: str,
+    *,
+    use_coreml: bool = False,
+) -> tuple[Any, Any, str]:
     """Download ONNX INT8 model from HuggingFace and load with onnxruntime."""
     import onnxruntime as ort
     from transformers import AutoTokenizer
@@ -234,17 +287,44 @@ def _load_kompress_onnx(model_id: str) -> tuple[Any, Any, str]:
         logger.info("Downloading Kompress ONNX model from %s ...", model_id)
         onnx_path = hf_hub_download(model_id, "onnx/kompress-int8.onnx")
 
+        backend = "onnx_coreml" if use_coreml else "onnx"
+        providers: list[Any]
+        if use_coreml:
+            from headroom import paths as _paths
+
+            coreml_cache_dir = os.environ.get(KOMPRESS_COREML_CACHE_DIR_ENV, "").strip()
+            cache_dir = (
+                coreml_cache_dir
+                if coreml_cache_dir
+                else str(_paths.workspace_dir() / "cache" / "coreml")
+            )
+            os.makedirs(cache_dir, exist_ok=True)
+            providers = [
+                (
+                    "CoreMLExecutionProvider",
+                    {
+                        "ModelFormat": "NeuralNetwork",
+                        "MLComputeUnits": "ALL",
+                        "RequireStaticInputShapes": "1",
+                        "ModelCacheDirectory": cache_dir,
+                    },
+                ),
+                "CPUExecutionProvider",
+            ]
+        else:
+            providers = ["CPUExecutionProvider"]
+
         session = ort.InferenceSession(
             onnx_path,
-            create_cpu_session_options(ort),
-            providers=["CPUExecutionProvider"],
+            _onnx_session_options(ort),
+            providers=providers,
         )
         model = _OnnxModel(session)
         tokenizer = AutoTokenizer.from_pretrained("answerdotai/ModernBERT-base")
 
-        _kompress_cache[model_id] = (model, tokenizer, "onnx")
-        logger.info("Kompress ONNX INT8 loaded: %s", model_id)
-        return model, tokenizer, "onnx"
+        _kompress_cache[model_id] = (model, tokenizer, backend)
+        logger.info("Kompress ONNX INT8 loaded: %s backend=%s", model_id, backend)
+        return model, tokenizer, backend
 
 
 def _load_kompress_pytorch(model_id: str, device: str = "auto") -> tuple[Any, Any, str]:
@@ -290,16 +370,38 @@ def _load_kompress_pytorch(model_id: str, device: str = "auto") -> tuple[Any, An
 def _load_kompress(model_id: str = HF_MODEL_ID, device: str = "auto") -> tuple[Any, Any, str]:
     """Load Kompress model, returns (model, tokenizer, backend).
 
-    Try ONNX first (lightweight), fall back to PyTorch.
+    The default keeps the historic behavior: try ONNX CPU first
+    (lightweight), then fall back to PyTorch. Operators can override via
+    HEADROOM_KOMPRESS_BACKEND:
+
+    - auto: ONNX CPU first, then PyTorch.
+    - onnx / onnx_cpu: force ONNX CPU.
+    - onnx_coreml: force ONNX Runtime CoreML provider with CPU fallback.
+    - pytorch: force PyTorch with the configured device.
+    - pytorch_mps: force PyTorch on Apple's MPS backend.
+
     Models are cached by model_id — multiple models can coexist.
     """
     if model_id in _kompress_cache:
         return _kompress_cache[model_id]
 
-    # Prefer ONNX (50MB onnxruntime vs 800MB torch)
+    backend = _selected_backend()
+    if backend in ("onnx", "onnx_cpu"):
+        return _load_kompress_onnx(model_id, use_coreml=False)
+
+    if backend == "onnx_coreml":
+        return _load_kompress_onnx(model_id, use_coreml=True)
+
+    if backend in ("pytorch", "pytorch_mps"):
+        forced_device = "mps" if backend == "pytorch_mps" else device
+        return _load_kompress_pytorch(model_id, forced_device)
+
+    # Auto mode: preserve stable default behavior. This avoids changing
+    # compression quality/perf characteristics for existing installs while
+    # allowing opt-in MPS/CoreML experiments via HEADROOM_KOMPRESS_BACKEND.
     if _is_onnx_available():
         try:
-            return _load_kompress_onnx(model_id)
+            return _load_kompress_onnx(model_id, use_coreml=False)
         except Exception as e:
             logger.warning("ONNX load failed for %s, trying PyTorch: %s", model_id, e)
 
