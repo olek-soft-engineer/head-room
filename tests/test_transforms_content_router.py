@@ -302,6 +302,62 @@ def test_content_router_mixed_pure_apply_and_toin(monkeypatch: pytest.MonkeyPatc
     assert len(calls) == 1
 
 
+def test_diff_strategy_does_not_fallback_to_kompress_when_diff_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = ContentRouter()
+    diff = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-a\n+a"
+
+    class NoopDiffCompressor:
+        def compress(self, content: str, context: str = "") -> SimpleNamespace:
+            return SimpleNamespace(compressed=content)
+
+    monkeypatch.setattr(router, "_get_diff_compressor", lambda: NoopDiffCompressor())
+
+    def fail_kompress(*_args: object, **_kwargs: object) -> tuple[str, int]:
+        raise AssertionError("Diff compression must not fallback to Kompress")
+
+    monkeypatch.setattr(router, "_try_ml_compressor", fail_kompress)
+
+    compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
+        diff,
+        CompressionStrategy.DIFF,
+        context="",
+    )
+
+    assert compressed == diff
+    assert compressed_tokens == len(diff.split())
+    assert strategy_chain == ["diff"]
+
+
+def test_log_strategy_does_not_fallback_to_kompress_when_log_is_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    router = ContentRouter()
+    log = "ERROR one\nERROR two\nERROR three"
+
+    class NoopLogCompressor:
+        def compress(self, content: str, bias: float = 1.0) -> SimpleNamespace:
+            return SimpleNamespace(compressed=content)
+
+    monkeypatch.setattr(router, "_get_log_compressor", lambda: NoopLogCompressor())
+
+    def fail_kompress(*_args: object, **_kwargs: object) -> tuple[str, int]:
+        raise AssertionError("Log compression must not fallback to Kompress")
+
+    monkeypatch.setattr(router, "_try_ml_compressor", fail_kompress)
+
+    compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
+        log,
+        CompressionStrategy.LOG,
+        context="",
+    )
+
+    assert compressed == log
+    assert compressed_tokens == len(log.split())
+    assert strategy_chain == ["log"]
+
+
 # ---------------------------------------------------------------------------
 # Cache-safety tests for _process_content_blocks. These pin down the
 # block-level invariants that protect upstream prefix caches:

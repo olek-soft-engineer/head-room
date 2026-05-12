@@ -13,7 +13,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from typing import Protocol
 
-from .content_router import CompressionStrategy, ContentRouter, RouterCompressionResult
+from .content_router import (
+    CompressionStrategy,
+    ContentRouter,
+    RouterCompressionResult,
+)
 
 
 class TokenCounterLike(Protocol):

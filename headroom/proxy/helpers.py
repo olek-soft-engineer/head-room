@@ -571,7 +571,7 @@ _CONTEXT_TOOL_ENV = "HEADROOM_CONTEXT_TOOL"
 _CONTEXT_TOOL_RTK = "rtk"
 _CONTEXT_TOOL_LEAN_CTX = "lean-ctx"
 
-RTK_STATS_CACHE_TTL_SECONDS = 5.0
+RTK_STATS_CACHE_TTL_SECONDS = float(os.environ.get("HEADROOM_CONTEXT_TOOL_STATS_TTL_SECONDS", "60"))
 CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS = RTK_STATS_CACHE_TTL_SECONDS
 _context_tool_stats_cache_lock = threading.Lock()
 _context_tool_stats_cache: dict[str, Any] = {
@@ -584,7 +584,11 @@ _context_tool_session_baseline: dict[str, Any] = {
     "initialized": False,
     "tool": None,
     "total_commands": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
     "tokens_saved": 0,
+    "total_time_ms": 0,
+    "captured_at": 0.0,
 }
 _rtk_stats_cache_lock = _context_tool_stats_cache_lock
 _rtk_stats_cache = _context_tool_stats_cache
@@ -849,6 +853,107 @@ def _first_value(mapping: dict[str, Any], keys: tuple[str, ...], default: Any = 
     return default
 
 
+def _context_tool_summary_payload(
+    *,
+    tool: str,
+    installed: bool,
+    summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Normalize RTK/lean-ctx lifetime gain output into one schema.
+
+    Both tools expose cumulative counters, but field names vary slightly.
+    Headroom computes session values by subtracting a startup baseline, so
+    keeping raw input/output counters is necessary for a truthful session
+    savings percentage.
+    """
+
+    summary = summary or {}
+    input_tokens = _coerce_int(
+        _first_value(
+            summary,
+            (
+                "total_input",
+                "total_input_tokens",
+                "input_tokens",
+                "tokens_input",
+                "totalBefore",
+            ),
+        )
+    )
+    output_tokens = _coerce_int(
+        _first_value(
+            summary,
+            (
+                "total_output",
+                "total_output_tokens",
+                "output_tokens",
+                "tokens_output",
+                "totalAfter",
+            ),
+        )
+    )
+    tokens_saved = _coerce_int(
+        _first_value(
+            summary,
+            (
+                "total_saved",
+                "tokens_saved",
+                "total_tokens_saved",
+                "saved_tokens",
+                "totalSaved",
+            ),
+        )
+    )
+    if tokens_saved <= 0 and input_tokens > 0 and output_tokens >= 0:
+        tokens_saved = max(input_tokens - output_tokens, 0)
+    if input_tokens <= 0 and tokens_saved > 0 and output_tokens >= 0:
+        input_tokens = tokens_saved + output_tokens
+
+    lifetime_savings_pct = _coerce_float(
+        _first_value(
+            summary,
+            (
+                "avg_savings_pct",
+                "average_savings_pct",
+                "savings_pct",
+                "savings_percent",
+                "avgSavingsPct",
+            ),
+            0.0,
+        )
+    )
+    if lifetime_savings_pct <= 0 and input_tokens > 0:
+        lifetime_savings_pct = (tokens_saved / input_tokens) * 100.0
+
+    return {
+        "tool": tool,
+        "label": _context_tool_label(tool),
+        "installed": installed,
+        "scope": "project" if tool == _CONTEXT_TOOL_RTK else "local",
+        "total_commands": _coerce_int(
+            _first_value(
+                summary,
+                (
+                    "total_commands",
+                    "commands",
+                    "command_count",
+                    "totalCommandCount",
+                ),
+            )
+        ),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "tokens_saved": tokens_saved,
+        # Backward-compatible name. See `lifetime_avg_savings_pct` and
+        # `session_savings_pct` below for explicit scopes.
+        "avg_savings_pct": lifetime_savings_pct,
+        "lifetime_avg_savings_pct": lifetime_savings_pct,
+        "total_time_ms": _coerce_int(
+            _first_value(summary, ("total_time_ms", "time_ms", "totalTimeMs"))
+        ),
+    }
+
+
 def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
     """Read rtk's current project-level lifetime stats."""
 
@@ -860,9 +965,14 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
             "tool": _CONTEXT_TOOL_RTK,
             "label": _context_tool_label(_CONTEXT_TOOL_RTK),
             "installed": False,
+            "scope": "project",
             "total_commands": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
             "tokens_saved": 0,
             "avg_savings_pct": 0.0,
+            "lifetime_avg_savings_pct": 0.0,
+            "total_time_ms": 0,
         }
 
     try:
@@ -875,31 +985,38 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
         if result.returncode == 0 and result.stdout.strip():
             data = json.loads(result.stdout)
             summary = data.get("summary", {})
-            payload = {
-                "tool": _CONTEXT_TOOL_RTK,
-                "label": _context_tool_label(_CONTEXT_TOOL_RTK),
-                "installed": True,
-                "total_commands": _coerce_int(summary.get("total_commands", 0)),
-                "tokens_saved": _coerce_int(summary.get("total_saved", 0)),
-                "avg_savings_pct": _coerce_float(summary.get("avg_savings_pct", 0.0)),
-            }
+            payload = _context_tool_summary_payload(
+                tool=_CONTEXT_TOOL_RTK,
+                installed=True,
+                summary=summary if isinstance(summary, dict) else {},
+            )
         else:
             return {
                 "tool": _CONTEXT_TOOL_RTK,
                 "label": _context_tool_label(_CONTEXT_TOOL_RTK),
                 "installed": True,
+                "scope": "project",
                 "total_commands": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
                 "tokens_saved": 0,
                 "avg_savings_pct": 0.0,
+                "lifetime_avg_savings_pct": 0.0,
+                "total_time_ms": 0,
             }
     except Exception:
         return {
             "tool": _CONTEXT_TOOL_RTK,
             "label": _context_tool_label(_CONTEXT_TOOL_RTK),
             "installed": True,
+            "scope": "project",
             "total_commands": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
             "tokens_saved": 0,
             "avg_savings_pct": 0.0,
+            "lifetime_avg_savings_pct": 0.0,
+            "total_time_ms": 0,
         }
 
     return payload
@@ -916,18 +1033,28 @@ def _read_lean_ctx_lifetime_stats() -> dict[str, Any] | None:
             "tool": _CONTEXT_TOOL_LEAN_CTX,
             "label": _context_tool_label(_CONTEXT_TOOL_LEAN_CTX),
             "installed": False,
+            "scope": "local",
             "total_commands": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
             "tokens_saved": 0,
             "avg_savings_pct": 0.0,
+            "lifetime_avg_savings_pct": 0.0,
+            "total_time_ms": 0,
         }
 
     base_payload = {
         "tool": _CONTEXT_TOOL_LEAN_CTX,
         "label": _context_tool_label(_CONTEXT_TOOL_LEAN_CTX),
         "installed": True,
+        "scope": "local",
         "total_commands": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
         "tokens_saved": 0,
         "avg_savings_pct": 0.0,
+        "lifetime_avg_savings_pct": 0.0,
+        "total_time_ms": 0,
     }
 
     try:
@@ -945,44 +1072,11 @@ def _read_lean_ctx_lifetime_stats() -> dict[str, Any] | None:
         if not isinstance(summary, dict):
             return dict(base_payload)
 
-        return {
-            **base_payload,
-            "total_commands": _coerce_int(
-                _first_value(
-                    summary,
-                    (
-                        "total_commands",
-                        "commands",
-                        "command_count",
-                        "totalCommandCount",
-                    ),
-                )
-            ),
-            "tokens_saved": _coerce_int(
-                _first_value(
-                    summary,
-                    (
-                        "total_saved",
-                        "tokens_saved",
-                        "total_tokens_saved",
-                        "saved_tokens",
-                        "totalSaved",
-                    ),
-                )
-            ),
-            "avg_savings_pct": _coerce_float(
-                _first_value(
-                    summary,
-                    (
-                        "avg_savings_pct",
-                        "average_savings_pct",
-                        "avgSavingsPct",
-                        "savings_percent",
-                    ),
-                    0.0,
-                )
-            ),
-        }
+        return _context_tool_summary_payload(
+            tool=_CONTEXT_TOOL_LEAN_CTX,
+            installed=True,
+            summary=summary,
+        )
     except Exception:
         return dict(base_payload)
 
@@ -1004,7 +1098,11 @@ def initialize_context_tool_session_baseline() -> None:
                 "initialized": True,
                 "tool": tool,
                 "total_commands": int((payload or {}).get("total_commands", 0) or 0),
+                "input_tokens": int((payload or {}).get("input_tokens", 0) or 0),
+                "output_tokens": int((payload or {}).get("output_tokens", 0) or 0),
                 "tokens_saved": int((payload or {}).get("tokens_saved", 0) or 0),
+                "total_time_ms": int((payload or {}).get("total_time_ms", 0) or 0),
+                "captured_at": time.time(),
             }
         )
         _context_tool_stats_cache.update(
@@ -1053,25 +1151,124 @@ def _get_context_tool_stats() -> dict[str, Any] | None:
                     "initialized": True,
                     "tool": tool,
                     "total_commands": int((payload or {}).get("total_commands", 0) or 0),
+                    "input_tokens": int((payload or {}).get("input_tokens", 0) or 0),
+                    "output_tokens": int((payload or {}).get("output_tokens", 0) or 0),
                     "tokens_saved": int((payload or {}).get("tokens_saved", 0) or 0),
+                    "total_time_ms": int((payload or {}).get("total_time_ms", 0) or 0),
+                    "captured_at": time.time(),
                 }
             )
 
         if payload is not None:
+            lifetime_total_commands = int(payload.get("total_commands", 0) or 0)
+            lifetime_input_tokens = int(payload.get("input_tokens", 0) or 0)
+            lifetime_output_tokens = int(payload.get("output_tokens", 0) or 0)
+            lifetime_tokens_saved = int(payload.get("tokens_saved", 0) or 0)
+            lifetime_total_time_ms = int(payload.get("total_time_ms", 0) or 0)
+            baseline_total_commands = int(_context_tool_session_baseline["total_commands"])
+            baseline_input_tokens = int(_context_tool_session_baseline["input_tokens"])
+            baseline_output_tokens = int(_context_tool_session_baseline["output_tokens"])
+            baseline_tokens_saved = int(_context_tool_session_baseline["tokens_saved"])
+            baseline_total_time_ms = int(_context_tool_session_baseline["total_time_ms"])
+            counter_reset_detected = (
+                lifetime_total_commands < baseline_total_commands
+                or lifetime_input_tokens < baseline_input_tokens
+                or lifetime_output_tokens < baseline_output_tokens
+                or lifetime_tokens_saved < baseline_tokens_saved
+                or lifetime_total_time_ms < baseline_total_time_ms
+            )
+            if counter_reset_detected:
+                baseline_total_commands = lifetime_total_commands
+                baseline_input_tokens = lifetime_input_tokens
+                baseline_output_tokens = lifetime_output_tokens
+                baseline_tokens_saved = lifetime_tokens_saved
+                baseline_total_time_ms = lifetime_total_time_ms
+                _context_tool_session_baseline.update(
+                    {
+                        "total_commands": baseline_total_commands,
+                        "input_tokens": baseline_input_tokens,
+                        "output_tokens": baseline_output_tokens,
+                        "tokens_saved": baseline_tokens_saved,
+                        "total_time_ms": baseline_total_time_ms,
+                        "captured_at": time.time(),
+                    }
+                )
+
+            session_total_commands = max(lifetime_total_commands - baseline_total_commands, 0)
+            session_input_tokens = max(lifetime_input_tokens - baseline_input_tokens, 0)
+            session_output_tokens = max(lifetime_output_tokens - baseline_output_tokens, 0)
+            session_tokens_saved = max(lifetime_tokens_saved - baseline_tokens_saved, 0)
+            session_total_time_ms = max(lifetime_total_time_ms - baseline_total_time_ms, 0)
+            session_savings_pct = (
+                round(session_tokens_saved / session_input_tokens * 100.0, 4)
+                if session_input_tokens > 0
+                else None
+            )
+            session_avg_time_ms = (
+                round(session_total_time_ms / session_total_commands, 2)
+                if session_total_commands > 0 and session_total_time_ms > 0
+                else None
+            )
+            lifetime_savings_pct = float(payload.get("lifetime_avg_savings_pct", 0.0) or 0.0)
+
             payload = {
                 **payload,
                 "tool": tool,
                 "label": _context_tool_label(tool),
-                "total_commands": max(
-                    int(payload.get("total_commands", 0) or 0)
-                    - int(_context_tool_session_baseline["total_commands"]),
-                    0,
+                # Backward-compatible session-delta fields.
+                "total_commands": session_total_commands,
+                "input_tokens": session_input_tokens,
+                "output_tokens": session_output_tokens,
+                "tokens_saved": session_tokens_saved,
+                "total_time_ms": session_total_time_ms,
+                "session_savings_pct": session_savings_pct,
+                "session_avg_time_ms": session_avg_time_ms,
+                # Keep old field for compatibility, but declare its scope.
+                "avg_savings_pct": lifetime_savings_pct,
+                "avg_savings_pct_scope": "lifetime",
+                "lifetime_avg_savings_pct": lifetime_savings_pct,
+                "lifetime_total_commands": lifetime_total_commands,
+                "lifetime_input_tokens": lifetime_input_tokens,
+                "lifetime_output_tokens": lifetime_output_tokens,
+                "lifetime_tokens_saved": lifetime_tokens_saved,
+                "lifetime_total_time_ms": lifetime_total_time_ms,
+                "session_baseline_total_commands": baseline_total_commands,
+                "session_baseline_input_tokens": baseline_input_tokens,
+                "session_baseline_output_tokens": baseline_output_tokens,
+                "session_baseline_tokens_saved": baseline_tokens_saved,
+                "session_baseline_total_time_ms": baseline_total_time_ms,
+                "session_baseline_captured_at": _context_tool_session_baseline.get(
+                    "captured_at", 0.0
                 ),
-                "tokens_saved": max(
-                    int(payload.get("tokens_saved", 0) or 0)
-                    - int(_context_tool_session_baseline["tokens_saved"]),
-                    0,
-                ),
+                "session": {
+                    "commands": session_total_commands,
+                    "input_tokens": session_input_tokens,
+                    "output_tokens": session_output_tokens,
+                    "tokens_saved": session_tokens_saved,
+                    "savings_pct": session_savings_pct,
+                    "total_time_ms": session_total_time_ms,
+                    "avg_time_ms": session_avg_time_ms,
+                },
+                "lifetime": {
+                    "commands": lifetime_total_commands,
+                    "input_tokens": lifetime_input_tokens,
+                    "output_tokens": lifetime_output_tokens,
+                    "tokens_saved": lifetime_tokens_saved,
+                    "savings_pct": lifetime_savings_pct,
+                    "total_time_ms": lifetime_total_time_ms,
+                },
+                "baseline": {
+                    "commands": baseline_total_commands,
+                    "input_tokens": baseline_input_tokens,
+                    "output_tokens": baseline_output_tokens,
+                    "tokens_saved": baseline_tokens_saved,
+                    "total_time_ms": baseline_total_time_ms,
+                    "captured_at": _context_tool_session_baseline.get("captured_at", 0.0),
+                },
+                "sampled_at": time.time(),
+                "sample_ttl_seconds": CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS,
+                "refresh_interval_seconds": CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS,
+                "counter_reset_detected": counter_reset_detected,
             }
 
         _context_tool_stats_cache.update(

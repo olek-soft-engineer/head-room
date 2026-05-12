@@ -49,6 +49,7 @@ from ..config import DEFAULT_EXCLUDE_TOOLS, ReadLifecycleConfig, TransformResult
 from ..tokenizer import Tokenizer
 from .base import Transform
 from .content_detector import ContentType, DetectionResult
+from .content_detector import detect_content_type as _regex_detect_content_type
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +59,10 @@ def _router_debug_dumps(value: Any) -> str:
 
 
 def _log_router_debug(event: str, **payload: Any) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
     payload = {"event": event, **payload}
-    logger.info("event=%s %s", event, _router_debug_dumps(payload))
+    logger.debug("event=%s %s", event, _router_debug_dumps(payload))
 
 
 def _json_shape(content: str) -> dict[str, Any]:
@@ -125,6 +128,10 @@ def _detect_content(content: str) -> DetectionResult:
     # "json_array"); translate to the Python `ContentType` enum so
     # downstream mapping keys match.
     content_type = ContentType(rust_result.content_type)
+    if content_type is ContentType.PLAIN_TEXT:
+        regex_result = _regex_detect_content_type(content)
+        if regex_result.content_type is not ContentType.PLAIN_TEXT:
+            return regex_result
     return DetectionResult(
         content_type=content_type,
         confidence=rust_result.confidence,
@@ -837,25 +844,31 @@ class ContentRouter(Transform):
         Returns:
             RouterCompressionResult with compressed content and routing metadata.
         """
-        request_debug = {
-            "chars": len(content),
-            "bytes": len(content.encode("utf-8", errors="replace")),
-            "tokens_estimate": len(content.split()),
-            "json_shape": _json_shape(content),
-            "mixed_indicators": _mixed_indicators(content),
-            "context_chars": len(context),
-            "question": question,
-            "bias": bias,
-            "content": content,
-            "context": context,
-        }
+        debug_enabled = logger.isEnabledFor(logging.DEBUG)
+        request_debug = (
+            {
+                "chars": len(content),
+                "bytes": len(content.encode("utf-8", errors="replace")),
+                "tokens_estimate": len(content.split()),
+                "json_shape": _json_shape(content),
+                "mixed_indicators": _mixed_indicators(content),
+                "context_chars": len(context),
+                "question": question,
+                "bias": bias,
+                "content": content,
+                "context": context,
+            }
+            if debug_enabled
+            else {}
+        )
         if not content or not content.strip():
-            _log_router_debug(
-                "content_router_input",
-                **request_debug,
-                selected_strategy=CompressionStrategy.PASSTHROUGH.value,
-                selection_reason="empty_or_whitespace",
-            )
+            if debug_enabled:
+                _log_router_debug(
+                    "content_router_input",
+                    **request_debug,
+                    selected_strategy=CompressionStrategy.PASSTHROUGH.value,
+                    selection_reason="empty_or_whitespace",
+                )
             result = RouterCompressionResult(
                 compressed=content,
                 original=content,
@@ -867,14 +880,15 @@ class ContentRouter(Transform):
             mixed = is_mixed_content(content)
             detection = _detect_content(content)
             strategy = self._determine_strategy(content)
-            _log_router_debug(
-                "content_router_input",
-                **request_debug,
-                detected_content_type=detection.content_type.value,
-                detection_confidence=detection.confidence,
-                selected_strategy=strategy.value,
-                selection_reason="mixed_content" if mixed else "content_detection",
-            )
+            if debug_enabled:
+                _log_router_debug(
+                    "content_router_input",
+                    **request_debug,
+                    detected_content_type=detection.content_type.value,
+                    detection_confidence=detection.confidence,
+                    selected_strategy=strategy.value,
+                    selection_reason="mixed_content" if mixed else "content_detection",
+                )
 
             if strategy == CompressionStrategy.MIXED:
                 result = self._compress_mixed(content, context, question, bias=bias)
@@ -885,30 +899,31 @@ class ContentRouter(Transform):
         # forcing function for catching strategy-level regressions.
         # Empty routing_log (passthrough fast path) → no calls.
         self._observe(result)
-        _log_router_debug(
-            "content_router_output",
-            selected_strategy=result.strategy_used.value,
-            sections_processed=result.sections_processed,
-            total_original_tokens=result.total_original_tokens,
-            total_compressed_tokens=result.total_compressed_tokens,
-            tokens_saved=result.tokens_saved,
-            savings_percentage=result.savings_percentage,
-            compression_ratio=result.compression_ratio,
-            routing_log=[
-                {
-                    "content_type": decision.content_type.value,
-                    "strategy": decision.strategy.value,
-                    "original_tokens": decision.original_tokens,
-                    "compressed_tokens": decision.compressed_tokens,
-                    "confidence": decision.confidence,
-                    "section_index": decision.section_index,
-                    "compression_ratio": decision.compression_ratio,
-                }
-                for decision in result.routing_log
-            ],
-            original=result.original,
-            compressed=result.compressed,
-        )
+        if debug_enabled:
+            _log_router_debug(
+                "content_router_output",
+                selected_strategy=result.strategy_used.value,
+                sections_processed=result.sections_processed,
+                total_original_tokens=result.total_original_tokens,
+                total_compressed_tokens=result.total_compressed_tokens,
+                tokens_saved=result.tokens_saved,
+                savings_percentage=result.savings_percentage,
+                compression_ratio=result.compression_ratio,
+                routing_log=[
+                    {
+                        "content_type": decision.content_type.value,
+                        "strategy": decision.strategy.value,
+                        "original_tokens": decision.original_tokens,
+                        "compressed_tokens": decision.compressed_tokens,
+                        "confidence": decision.confidence,
+                        "section_index": decision.section_index,
+                        "compression_ratio": decision.compression_ratio,
+                    }
+                    for decision in result.routing_log
+                ],
+                original=result.original,
+                compressed=result.compressed,
+            )
         return result
 
     def _observe(self, result: RouterCompressionResult) -> None:
@@ -997,12 +1012,13 @@ class ContentRouter(Transform):
             RouterCompressionResult with reassembled content.
         """
         sections = split_into_sections(content)
-        _log_router_debug(
-            "content_router_mixed_sections",
-            section_count=len(sections),
-            sections=[_section_debug(section, idx) for idx, section in enumerate(sections)],
-            content=content,
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            _log_router_debug(
+                "content_router_mixed_sections",
+                section_count=len(sections),
+                sections=[_section_debug(section, idx) for idx, section in enumerate(sections)],
+                content=content,
+            )
 
         if not sections:
             return RouterCompressionResult(
@@ -1241,6 +1257,12 @@ class ContentRouter(Transform):
                 compressor_name = "KompressCompressor"
                 decision_reason = "text_uses_kompress"
 
+            elif strategy == CompressionStrategy.PASSTHROUGH:
+                compressed = content
+                compressed_tokens = original_tokens
+                compressor_name = "Passthrough"
+                decision_reason = "explicit_passthrough"
+
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
             decision_reason = "compression_exception"
@@ -1251,8 +1273,6 @@ class ContentRouter(Transform):
             fallback_eligible_strategy = strategy in {
                 CompressionStrategy.SMART_CRUSHER,
                 CompressionStrategy.CODE_AWARE,
-                CompressionStrategy.DIFF,
-                CompressionStrategy.LOG,
             }
             fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
             if fallback_eligible_strategy and fallback_no_savings:
@@ -1294,25 +1314,28 @@ class ContentRouter(Transform):
                                         f"{decision_reason}_fallback_log_after_no_savings"
                                     )
 
-            _log_router_debug(
-                "content_router_strategy_result",
-                requested_strategy=requested_strategy.value,
-                actual_strategy=actual_strategy.value,
-                strategy_chain=strategy_chain,
-                compressor=compressor_name,
-                reason=decision_reason,
-                language=language,
-                question=question,
-                bias=bias,
-                original_tokens=original_tokens,
-                compressed_tokens=compressed_tokens,
-                tokens_saved=max(0, original_tokens - compressed_tokens),
-                compression_ratio=compressed_tokens / original_tokens if original_tokens else 1.0,
-                json_shape=_json_shape(content),
-                input=content,
-                output=compressed,
-                error=error,
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                _log_router_debug(
+                    "content_router_strategy_result",
+                    requested_strategy=requested_strategy.value,
+                    actual_strategy=actual_strategy.value,
+                    strategy_chain=strategy_chain,
+                    compressor=compressor_name,
+                    reason=decision_reason,
+                    language=language,
+                    question=question,
+                    bias=bias,
+                    original_tokens=original_tokens,
+                    compressed_tokens=compressed_tokens,
+                    tokens_saved=max(0, original_tokens - compressed_tokens),
+                    compression_ratio=compressed_tokens / original_tokens
+                    if original_tokens
+                    else 1.0,
+                    json_shape=_json_shape(content),
+                    input=content,
+                    output=compressed,
+                    error=error,
+                )
             self._record_to_toin(
                 strategy=strategy,
                 content=content,
@@ -1326,25 +1349,26 @@ class ContentRouter(Transform):
 
         # Fallback: return unchanged
         strategy_chain.append(CompressionStrategy.PASSTHROUGH.value)
-        _log_router_debug(
-            "content_router_strategy_result",
-            requested_strategy=requested_strategy.value,
-            actual_strategy=CompressionStrategy.PASSTHROUGH.value,
-            strategy_chain=strategy_chain,
-            compressor=None,
-            reason=decision_reason,
-            language=language,
-            question=question,
-            bias=bias,
-            original_tokens=original_tokens,
-            compressed_tokens=original_tokens,
-            tokens_saved=0,
-            compression_ratio=1.0,
-            json_shape=_json_shape(content),
-            input=content,
-            output=content,
-            error=error,
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            _log_router_debug(
+                "content_router_strategy_result",
+                requested_strategy=requested_strategy.value,
+                actual_strategy=CompressionStrategy.PASSTHROUGH.value,
+                strategy_chain=strategy_chain,
+                compressor=None,
+                reason=decision_reason,
+                language=language,
+                question=question,
+                bias=bias,
+                original_tokens=original_tokens,
+                compressed_tokens=original_tokens,
+                tokens_saved=0,
+                compression_ratio=1.0,
+                json_shape=_json_shape(content),
+                input=content,
+                output=content,
+                error=error,
+            )
         return content, original_tokens, strategy_chain
 
     def _try_ml_compressor(
@@ -1529,8 +1553,10 @@ class ContentRouter(Transform):
         if self.config.enable_kompress:
             compressor = self._get_kompress()
             if compressor:
-                logger.info("Kompress model pre-loaded at startup")
+                backend = compressor.preload() if hasattr(compressor, "preload") else "unknown"
+                logger.info("Kompress model pre-loaded at startup backend=%s", backend)
                 status["kompress"] = "enabled"
+                status["kompress_backend"] = str(backend)
             else:
                 status["kompress"] = "unavailable"
 

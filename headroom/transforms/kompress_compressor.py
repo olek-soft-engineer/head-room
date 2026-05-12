@@ -403,6 +403,12 @@ class KompressCompressor(Transform):
     def __init__(self, config: KompressConfig | None = None):
         self.config = config or KompressConfig()
 
+    def preload(self) -> str:
+        """Load the backing model/tokenizer and return the selected backend."""
+
+        _model, _tokenizer, backend = _load_kompress(self.config.model_id, self.config.device)
+        return backend
+
     def compress(
         self,
         content: str,
