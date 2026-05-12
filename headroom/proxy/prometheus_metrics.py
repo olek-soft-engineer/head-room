@@ -150,6 +150,16 @@ class PrometheusMetrics:
         # Aggregate waste signals
         self.waste_signals_total: dict[str, int] = defaultdict(int)
 
+        # Cumulative ContentRouter protection counts. Each routing pass
+        # categorises every message — `user_msg`, `system_msg`,
+        # `recent_code`, `excluded_tool`, `analysis_ctx`, `small`,
+        # `ratio_too_high`, `already_compressed`, `non_string`,
+        # `content_blocks`. Surfacing these in `/stats` gives operators a
+        # way to diagnose "why is my compression rate low?" — e.g. a high
+        # `user_msg` count on OpenAI/Azure traffic explains why most
+        # input was protected and never reached the compressor (#454).
+        self.router_route_counts: dict[str, int] = defaultdict(int)
+
         # Provider-specific prefix cache tracking
         # Each provider has different cache economics:
         #   Anthropic: cache_read=0.1x, cache_write=1.25x, explicit breakpoints
@@ -359,6 +369,19 @@ class PrometheusMetrics:
         saved = original_tokens - compressed_tokens
         if saved > 0:
             self.tokens_saved_by_strategy[strategy] += saved
+
+    def record_router_route_counts(self, counts: dict[str, int]) -> None:
+        """Accumulate ContentRouter routing-category counts for a single
+        pass. The router emits a dict like ``{"user_msg": 12,
+        "recent_code": 4, ...}`` summarising how it categorised each
+        message in that request. Adding these into a long-running
+        counter gives `/stats` a session-level breakdown so operators
+        can see, e.g., that 80% of messages were protected as
+        `user_msg` and only 5% reached the compressor (#454).
+        """
+        for category, count in counts.items():
+            if count > 0:
+                self.router_route_counts[category] += int(count)
 
     def record_inbound_request(self, *, method: str, path: str) -> None:
         self.inbound_requests_total += 1
