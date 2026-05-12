@@ -36,7 +36,16 @@ def _reset_rtk_stats_cache(monkeypatch: pytest.MonkeyPatch) -> None:
         {"expires_at": 0.0, "has_value": False, "tool": None, "value": None}
     )
     proxy_helpers._rtk_session_baseline.update(
-        {"initialized": False, "tool": None, "total_commands": 0, "tokens_saved": 0}
+        {
+            "initialized": False,
+            "tool": None,
+            "total_commands": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "tokens_saved": 0,
+            "total_time_ms": 0,
+            "captured_at": 0.0,
+        }
     )
 
 
@@ -45,8 +54,22 @@ def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch
     now = {"value": 100.0}
     calls = {"run": 0}
     totals = [
-        {"total_commands": 7, "total_saved": 1234},
-        {"total_commands": 9, "total_saved": 1500},
+        {
+            "total_commands": 7,
+            "total_input": 2000,
+            "total_output": 766,
+            "total_saved": 1234,
+            "avg_savings_pct": 61.7,
+            "total_time_ms": 700,
+        },
+        {
+            "total_commands": 9,
+            "total_input": 2600,
+            "total_output": 1100,
+            "total_saved": 1500,
+            "avg_savings_pct": 57.69,
+            "total_time_ms": 1000,
+        },
     ]
 
     def _fake_run(*args, **kwargs):
@@ -65,26 +88,57 @@ def test_get_rtk_stats_memoizes_subprocess_calls(monkeypatch: pytest.MonkeyPatch
     second = proxy_helpers._get_rtk_stats()
 
     assert first == second
-    assert first == {
-        "tool": "rtk",
-        "label": "RTK",
-        "installed": True,
-        "total_commands": 0,
-        "tokens_saved": 0,
-        "avg_savings_pct": 0.0,
-    }
+    assert first["tool"] == "rtk"
+    assert first["label"] == "RTK"
+    assert first["installed"] is True
+    assert first["total_commands"] == 0
+    assert first["input_tokens"] == 0
+    assert first["output_tokens"] == 0
+    assert first["tokens_saved"] == 0
+    assert first["session_savings_pct"] is None
+    assert first["avg_savings_pct"] == 61.7
+    assert first["avg_savings_pct_scope"] == "lifetime"
+    assert first["lifetime_total_commands"] == 7
+    assert first["lifetime_input_tokens"] == 2000
+    assert first["lifetime_output_tokens"] == 766
+    assert first["lifetime_tokens_saved"] == 1234
+    assert first["session_baseline_total_commands"] == 7
+    assert first["session_baseline_input_tokens"] == 2000
+    assert first["session_baseline_output_tokens"] == 766
+    assert first["session_baseline_tokens_saved"] == 1234
+    assert first["session"]["tokens_saved"] == 0
+    assert first["lifetime"]["savings_pct"] == 61.7
+    assert first["sample_ttl_seconds"] == proxy_helpers.CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS
     assert calls["run"] == 1
 
     now["value"] += proxy_helpers.RTK_STATS_CACHE_TTL_SECONDS + 0.1
     third = proxy_helpers._get_rtk_stats()
 
-    assert third == {
-        "tool": "rtk",
-        "label": "RTK",
-        "installed": True,
-        "total_commands": 2,
+    assert third["tool"] == "rtk"
+    assert third["label"] == "RTK"
+    assert third["installed"] is True
+    assert third["total_commands"] == 2
+    assert third["input_tokens"] == 600
+    assert third["output_tokens"] == 334
+    assert third["tokens_saved"] == 266
+    assert third["session_savings_pct"] == pytest.approx(44.3333)
+    assert third["session_avg_time_ms"] == 150.0
+    assert third["lifetime_total_commands"] == 9
+    assert third["lifetime_input_tokens"] == 2600
+    assert third["lifetime_output_tokens"] == 1100
+    assert third["lifetime_tokens_saved"] == 1500
+    assert third["session_baseline_total_commands"] == 7
+    assert third["session_baseline_input_tokens"] == 2000
+    assert third["session_baseline_output_tokens"] == 766
+    assert third["session_baseline_tokens_saved"] == 1234
+    assert third["session"] == {
+        "commands": 2,
+        "input_tokens": 600,
+        "output_tokens": 334,
         "tokens_saved": 266,
-        "avg_savings_pct": 0.0,
+        "savings_pct": pytest.approx(44.3333),
+        "total_time_ms": 300,
+        "avg_time_ms": 150.0,
     }
     assert calls["run"] == 2
 
@@ -94,8 +148,20 @@ def test_get_context_tool_stats_reads_lean_ctx_gain(monkeypatch: pytest.MonkeyPa
     now = {"value": 100.0}
     calls = {"run": 0}
     totals = [
-        {"total_commands": 3, "tokens_saved": 400, "avg_savings_pct": 12.5},
-        {"total_commands": 5, "tokens_saved": 475, "avg_savings_pct": 15.0},
+        {
+            "total_commands": 3,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 600,
+            "tokens_saved": 400,
+            "avg_savings_pct": 40.0,
+        },
+        {
+            "total_commands": 5,
+            "total_input_tokens": 1250,
+            "total_output_tokens": 775,
+            "tokens_saved": 475,
+            "avg_savings_pct": 38.0,
+        },
     ]
 
     def _fake_run(args, **kwargs):
@@ -115,27 +181,35 @@ def test_get_context_tool_stats_reads_lean_ctx_gain(monkeypatch: pytest.MonkeyPa
     second = proxy_helpers._get_context_tool_stats()
 
     assert first == second
-    assert first == {
-        "tool": "lean-ctx",
-        "label": "lean-ctx",
-        "installed": True,
-        "total_commands": 0,
-        "tokens_saved": 0,
-        "avg_savings_pct": 12.5,
-    }
+    assert first["tool"] == "lean-ctx"
+    assert first["label"] == "lean-ctx"
+    assert first["installed"] is True
+    assert first["total_commands"] == 0
+    assert first["tokens_saved"] == 0
+    assert first["avg_savings_pct"] == 40.0
+    assert first["session_savings_pct"] is None
+    assert first["lifetime_total_commands"] == 3
+    assert first["lifetime_input_tokens"] == 1000
+    assert first["lifetime_output_tokens"] == 600
+    assert first["lifetime_tokens_saved"] == 400
     assert calls["run"] == 1
 
     now["value"] += proxy_helpers.CONTEXT_TOOL_STATS_CACHE_TTL_SECONDS + 0.1
     third = proxy_helpers._get_context_tool_stats()
 
-    assert third == {
-        "tool": "lean-ctx",
-        "label": "lean-ctx",
-        "installed": True,
-        "total_commands": 2,
-        "tokens_saved": 75,
-        "avg_savings_pct": 15.0,
-    }
+    assert third["tool"] == "lean-ctx"
+    assert third["label"] == "lean-ctx"
+    assert third["installed"] is True
+    assert third["total_commands"] == 2
+    assert third["input_tokens"] == 250
+    assert third["output_tokens"] == 175
+    assert third["tokens_saved"] == 75
+    assert third["avg_savings_pct"] == 38.0
+    assert third["avg_savings_pct_scope"] == "lifetime"
+    assert third["session_savings_pct"] == 30.0
+    assert third["lifetime_total_commands"] == 5
+    assert third["lifetime_tokens_saved"] == 475
+    assert third["session"]["savings_pct"] == 30.0
     assert calls["run"] == 2
 
 

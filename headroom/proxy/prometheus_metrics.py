@@ -106,6 +106,36 @@ class PrometheusMetrics:
         self.compressions_by_strategy: dict[str, int] = defaultdict(int)
         self.tokens_saved_by_strategy: dict[str, int] = defaultdict(int)
 
+        # Codex WebSocket compression observability. These are intentionally
+        # aggregate counters/sums, not per-unit storage, so /stats can answer
+        # routing questions without growing with traffic volume.
+        self.codex_ws_units_total = 0
+        self.codex_ws_units_modified_total = 0
+        self.codex_ws_units_to_kompress_total = 0
+        self.codex_ws_units_kompress_attempted_total = 0
+        self.codex_ws_units_by_strategy: dict[str, int] = defaultdict(int)
+        self.codex_ws_units_by_category: dict[str, int] = defaultdict(int)
+        self.codex_ws_units_by_content_type: dict[str, int] = defaultdict(int)
+        self.codex_ws_units_by_text_shape: dict[str, int] = defaultdict(int)
+        self.codex_ws_unit_elapsed_ms_sum = 0.0
+        self.codex_ws_unit_elapsed_ms_max = 0.0
+        self.codex_ws_unit_bytes_sum = 0
+        self.codex_ws_unit_tokens_before_sum = 0
+        self.codex_ws_unit_tokens_after_sum = 0
+        self.codex_ws_unit_tokens_saved_sum = 0
+
+        self.codex_ws_frames_attempted_total = 0
+        self.codex_ws_frames_compressed_total = 0
+        self.codex_ws_frames_failed_total = 0
+        self.codex_ws_frames_to_kompress_total = 0
+        self.codex_ws_frames_kompress_attempted_total = 0
+        self.codex_ws_frame_elapsed_ms_sum = 0.0
+        self.codex_ws_frame_elapsed_ms_max = 0.0
+        self.codex_ws_frame_bytes_before_sum = 0
+        self.codex_ws_frame_bytes_after_sum = 0
+        self.codex_ws_frame_attempted_tokens_sum = 0
+        self.codex_ws_frame_tokens_saved_sum = 0
+
         self.latency_sum_ms = 0.0
         self.latency_min_ms = float("inf")
         self.latency_max_ms = 0.0
@@ -241,6 +271,33 @@ class PrometheusMetrics:
 
             self.compressions_by_strategy.clear()
             self.tokens_saved_by_strategy.clear()
+
+            self.codex_ws_units_total = 0
+            self.codex_ws_units_modified_total = 0
+            self.codex_ws_units_to_kompress_total = 0
+            self.codex_ws_units_kompress_attempted_total = 0
+            self.codex_ws_units_by_strategy.clear()
+            self.codex_ws_units_by_category.clear()
+            self.codex_ws_units_by_content_type.clear()
+            self.codex_ws_units_by_text_shape.clear()
+            self.codex_ws_unit_elapsed_ms_sum = 0.0
+            self.codex_ws_unit_elapsed_ms_max = 0.0
+            self.codex_ws_unit_bytes_sum = 0
+            self.codex_ws_unit_tokens_before_sum = 0
+            self.codex_ws_unit_tokens_after_sum = 0
+            self.codex_ws_unit_tokens_saved_sum = 0
+
+            self.codex_ws_frames_attempted_total = 0
+            self.codex_ws_frames_compressed_total = 0
+            self.codex_ws_frames_failed_total = 0
+            self.codex_ws_frames_to_kompress_total = 0
+            self.codex_ws_frames_kompress_attempted_total = 0
+            self.codex_ws_frame_elapsed_ms_sum = 0.0
+            self.codex_ws_frame_elapsed_ms_max = 0.0
+            self.codex_ws_frame_bytes_before_sum = 0
+            self.codex_ws_frame_bytes_after_sum = 0
+            self.codex_ws_frame_attempted_tokens_sum = 0
+            self.codex_ws_frame_tokens_saved_sum = 0
 
             self.latency_sum_ms = 0.0
             self.latency_min_ms = float("inf")
@@ -382,6 +439,83 @@ class PrometheusMetrics:
         for category, count in counts.items():
             if count > 0:
                 self.router_route_counts[category] += int(count)
+
+    def record_codex_ws_unit(
+        self,
+        *,
+        strategy: str,
+        reason_category: str,
+        elapsed_ms: float,
+        text_bytes: int,
+        tokens_before: int,
+        tokens_after: int,
+        tokens_saved: int,
+        modified: bool,
+        strategy_chain: list[str] | None = None,
+        content_type: str = "unknown",
+        text_shape: str = "unknown",
+    ) -> None:
+        """Record one Codex WS compression unit decision."""
+
+        strategy = strategy or "unknown"
+        reason_category = reason_category or "unknown"
+        chain = strategy_chain or []
+
+        self.codex_ws_units_total += 1
+        self.codex_ws_units_by_strategy[strategy] += 1
+        self.codex_ws_units_by_category[reason_category] += 1
+        self.codex_ws_units_by_content_type[content_type or "unknown"] += 1
+        self.codex_ws_units_by_text_shape[text_shape or "unknown"] += 1
+        if modified:
+            self.codex_ws_units_modified_total += 1
+        if strategy == "kompress":
+            self.codex_ws_units_to_kompress_total += 1
+        if "kompress" in chain or strategy == "kompress":
+            self.codex_ws_units_kompress_attempted_total += 1
+
+        elapsed_ms = max(0.0, float(elapsed_ms))
+        self.codex_ws_unit_elapsed_ms_sum += elapsed_ms
+        self.codex_ws_unit_elapsed_ms_max = max(self.codex_ws_unit_elapsed_ms_max, elapsed_ms)
+        self.codex_ws_unit_bytes_sum += max(0, int(text_bytes))
+        self.codex_ws_unit_tokens_before_sum += max(0, int(tokens_before))
+        self.codex_ws_unit_tokens_after_sum += max(0, int(tokens_after))
+        self.codex_ws_unit_tokens_saved_sum += max(0, int(tokens_saved))
+
+    def record_codex_ws_frame(
+        self,
+        *,
+        elapsed_ms: float,
+        bytes_before: int,
+        bytes_after: int = 0,
+        attempted_tokens: int = 0,
+        tokens_saved: int = 0,
+        modified: bool = False,
+        failed: bool = False,
+        strategy_chain: list[str] | None = None,
+        final_strategies: list[str] | None = None,
+    ) -> None:
+        """Record one Codex WS response.create compression attempt."""
+
+        chain = strategy_chain or []
+        strategies = final_strategies or []
+
+        self.codex_ws_frames_attempted_total += 1
+        if modified:
+            self.codex_ws_frames_compressed_total += 1
+        if failed:
+            self.codex_ws_frames_failed_total += 1
+        if "kompress" in strategies:
+            self.codex_ws_frames_to_kompress_total += 1
+        if "kompress" in chain or "kompress" in strategies:
+            self.codex_ws_frames_kompress_attempted_total += 1
+
+        elapsed_ms = max(0.0, float(elapsed_ms))
+        self.codex_ws_frame_elapsed_ms_sum += elapsed_ms
+        self.codex_ws_frame_elapsed_ms_max = max(self.codex_ws_frame_elapsed_ms_max, elapsed_ms)
+        self.codex_ws_frame_bytes_before_sum += max(0, int(bytes_before))
+        self.codex_ws_frame_bytes_after_sum += max(0, int(bytes_after))
+        self.codex_ws_frame_attempted_tokens_sum += max(0, int(attempted_tokens))
+        self.codex_ws_frame_tokens_saved_sum += max(0, int(tokens_saved))
 
     def record_inbound_request(self, *, method: str, path: str) -> None:
         self.inbound_requests_total += 1

@@ -498,9 +498,16 @@ class HeadroomProxy(
         # Gauge: currently-running compression tasks. Mutated under
         # ``_compression_metrics_lock`` from worker threads + the asyncio
         # event loop.
+        self._compression_queued: int = 0
+        self._compression_queued_max: int = 0
+        self._compression_queue_timeouts: int = 0
+        self._compression_queue_wait_seconds_total: float = 0.0
+        self._compression_queue_wait_seconds_max: float = 0.0
         self._compression_in_flight: int = 0
         # High-water mark for in-flight count.
         self._compression_in_flight_max: int = 0
+        self._compression_run_seconds_total: float = 0.0
+        self._compression_run_seconds_max: float = 0.0
         # Counter: threads that finished AFTER their asyncio future hit the
         # timeout. Stuck-thread leak indicator.
         self._compression_leaked_threads: int = 0
@@ -683,10 +690,12 @@ class HeadroomProxy(
         actually cancel a thread that has started — Python has no way to
         preempt running CPython bytecode or in-flight Rust calls. The
         worker keeps running to completion, ignored. We detect this by
-        recording the start timestamp and incrementing
+        marking the call timed out on the asyncio side and incrementing
         ``_compression_leaked_threads`` from the worker's ``finally``
-        block when ``elapsed > timeout``. Operators can see leaked-thread
-        rate climbing in ``/stats`` before the pool fills up.
+        block after it eventually finishes. Jobs that time out before a
+        worker starts are removed from the queued gauge instead. Operators
+        can see leaked-thread rate and queue pressure climbing in
+        ``/stats`` before the pool fills up.
 
         Args:
             fn: A no-arg sync callable that runs the compression. Must not
@@ -706,24 +715,49 @@ class HeadroomProxy(
             unchanged.
         """
         loop = asyncio.get_running_loop()
-        start = time.monotonic()
+        queued_at = time.monotonic()
+        state = {"queued": True, "timed_out": False}
         with self._compression_metrics_lock:
-            self._compression_in_flight += 1
-            if self._compression_in_flight > self._compression_in_flight_max:
-                self._compression_in_flight_max = self._compression_in_flight
+            self._compression_queued += 1
+            if self._compression_queued > self._compression_queued_max:
+                self._compression_queued_max = self._compression_queued
 
         def _wrapped():  # noqa: ANN202
+            started_at = time.monotonic()
+            queue_wait = started_at - queued_at
+            with self._compression_metrics_lock:
+                if state["queued"]:
+                    self._compression_queued -= 1
+                    state["queued"] = False
+                self._compression_queue_wait_seconds_total += queue_wait
+                if queue_wait > self._compression_queue_wait_seconds_max:
+                    self._compression_queue_wait_seconds_max = queue_wait
+                self._compression_in_flight += 1
+                if self._compression_in_flight > self._compression_in_flight_max:
+                    self._compression_in_flight_max = self._compression_in_flight
             try:
                 return fn()
             finally:
-                elapsed = time.monotonic() - start
+                elapsed = time.monotonic() - started_at
                 with self._compression_metrics_lock:
                     self._compression_in_flight -= 1
-                    if elapsed > timeout:
+                    self._compression_run_seconds_total += elapsed
+                    if elapsed > self._compression_run_seconds_max:
+                        self._compression_run_seconds_max = elapsed
+                    if state["timed_out"]:
                         self._compression_leaked_threads += 1
 
         future = loop.run_in_executor(self._compression_executor, _wrapped)
-        return await asyncio.wait_for(future, timeout=timeout)
+        try:
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            with self._compression_metrics_lock:
+                state["timed_out"] = True
+                if state["queued"]:
+                    self._compression_queued -= 1
+                    state["queued"] = False
+                    self._compression_queue_timeouts += 1
+            raise
 
     def _get_compression_cache(self, session_id: str) -> CompressionCache:
         """Get or create a CompressionCache for a session.
@@ -1491,8 +1525,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # Snapshot compression executor metrics under their lock (gauges
         # mutated by worker threads; not safe to read without).
         with proxy._compression_metrics_lock:
+            _comp_queued = proxy._compression_queued
+            _comp_queued_max = proxy._compression_queued_max
+            _comp_queue_timeouts = proxy._compression_queue_timeouts
+            _comp_queue_wait_total = proxy._compression_queue_wait_seconds_total
+            _comp_queue_wait_max = proxy._compression_queue_wait_seconds_max
             _comp_in_flight = proxy._compression_in_flight
             _comp_in_flight_max = proxy._compression_in_flight_max
+            _comp_run_total = proxy._compression_run_seconds_total
+            _comp_run_max = proxy._compression_run_seconds_max
             _comp_leaked = proxy._compression_leaked_threads
         return {
             "anthropic_pre_upstream": {
@@ -1510,8 +1551,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
             "compression_executor": {
                 "max_workers": proxy.compression_max_workers,
+                "queued": _comp_queued,
+                "queued_max": _comp_queued_max,
+                "queue_timeouts_total": _comp_queue_timeouts,
+                "queue_wait_seconds_total": _comp_queue_wait_total,
+                "queue_wait_seconds_max": _comp_queue_wait_max,
+                "running": _comp_in_flight,
                 "in_flight": _comp_in_flight,
                 "in_flight_max": _comp_in_flight_max,
+                "run_seconds_total": _comp_run_total,
+                "run_seconds_max": _comp_run_max,
                 "leaked_threads_total": _comp_leaked,
                 "source": ("auto" if config.compression_max_workers is None else "explicit"),
             },
@@ -1782,6 +1831,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         max_ttfb_ms = round(m.ttfb_max_ms, 2) if m.ttfb_count > 0 else 0
 
+        def _pct(part: int | float, whole: int | float) -> float:
+            return round((float(part) / float(whole)) * 100.0, 2) if whole else 0.0
+
         # Get compression store stats
         store = get_compression_store()
         compression_stats = store.get_stats()
@@ -1808,6 +1860,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         )
         cli_tokens_avoided = (
             cli_filtering_stats.get("tokens_saved", 0) if cli_filtering_stats else 0
+        )
+        cli_filtering_session = (
+            cli_filtering_stats.get("session", {}) if cli_filtering_stats else {}
+        )
+        cli_filtering_lifetime = (
+            cli_filtering_stats.get("lifetime", {}) if cli_filtering_stats else {}
         )
         rtk_tokens_avoided = cli_tokens_avoided if cli_filtering_tool == "rtk" else 0
         lean_ctx_tokens_avoided = cli_tokens_avoided if cli_filtering_tool == "lean-ctx" else 0
@@ -1890,6 +1948,23 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                         "label": cli_filtering_label,
                         "tokens": cli_tokens_avoided,
                         "tokens_saved": cli_tokens_avoided,
+                        "session": cli_filtering_session,
+                        "lifetime": cli_filtering_lifetime,
+                        "session_savings_pct": (
+                            cli_filtering_stats.get("session_savings_pct")
+                            if cli_filtering_stats
+                            else None
+                        ),
+                        "lifetime_savings_pct": (
+                            cli_filtering_stats.get("lifetime_avg_savings_pct")
+                            if cli_filtering_stats
+                            else None
+                        ),
+                        "refresh_interval_seconds": (
+                            cli_filtering_stats.get("refresh_interval_seconds")
+                            if cli_filtering_stats
+                            else None
+                        ),
                         "included_in": "tokens.saved",
                         "description": (
                             f"Tokens avoided by CLI output filtering ({cli_filtering_label}) "
@@ -2009,6 +2084,65 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             else {},
             "compressions_by_strategy": dict(m.compressions_by_strategy),
             "tokens_saved_by_strategy": dict(m.tokens_saved_by_strategy),
+            "codex_ws": {
+                "units_total": m.codex_ws_units_total,
+                "units_modified_total": m.codex_ws_units_modified_total,
+                "units_by_strategy": dict(m.codex_ws_units_by_strategy),
+                "units_by_category": dict(m.codex_ws_units_by_category),
+                "units_by_content_type": dict(m.codex_ws_units_by_content_type),
+                "units_by_text_shape": dict(m.codex_ws_units_by_text_shape),
+                "units_to_kompress_total": m.codex_ws_units_to_kompress_total,
+                "units_kompress_attempted_total": m.codex_ws_units_kompress_attempted_total,
+                "units_to_kompress_percent": _pct(
+                    m.codex_ws_units_to_kompress_total,
+                    m.codex_ws_units_total,
+                ),
+                "units_kompress_attempted_percent": _pct(
+                    m.codex_ws_units_kompress_attempted_total,
+                    m.codex_ws_units_total,
+                ),
+                "unit_elapsed_ms": {
+                    "average": round(
+                        m.codex_ws_unit_elapsed_ms_sum / m.codex_ws_units_total,
+                        2,
+                    )
+                    if m.codex_ws_units_total
+                    else 0.0,
+                    "max": round(m.codex_ws_unit_elapsed_ms_max, 2),
+                },
+                "unit_bytes_sum": m.codex_ws_unit_bytes_sum,
+                "unit_tokens_before_sum": m.codex_ws_unit_tokens_before_sum,
+                "unit_tokens_after_sum": m.codex_ws_unit_tokens_after_sum,
+                "unit_tokens_saved_sum": m.codex_ws_unit_tokens_saved_sum,
+                "frames_attempted_total": m.codex_ws_frames_attempted_total,
+                "frames_compressed_total": m.codex_ws_frames_compressed_total,
+                "frames_failed_total": m.codex_ws_frames_failed_total,
+                "frames_to_kompress_total": m.codex_ws_frames_to_kompress_total,
+                "frames_kompress_attempted_total": (
+                    m.codex_ws_frames_kompress_attempted_total
+                ),
+                "frames_to_kompress_percent": _pct(
+                    m.codex_ws_frames_to_kompress_total,
+                    m.codex_ws_frames_attempted_total,
+                ),
+                "frames_kompress_attempted_percent": _pct(
+                    m.codex_ws_frames_kompress_attempted_total,
+                    m.codex_ws_frames_attempted_total,
+                ),
+                "frame_elapsed_ms": {
+                    "average": round(
+                        m.codex_ws_frame_elapsed_ms_sum / m.codex_ws_frames_attempted_total,
+                        2,
+                    )
+                    if m.codex_ws_frames_attempted_total
+                    else 0.0,
+                    "max": round(m.codex_ws_frame_elapsed_ms_max, 2),
+                },
+                "frame_bytes_before_sum": m.codex_ws_frame_bytes_before_sum,
+                "frame_bytes_after_sum": m.codex_ws_frame_bytes_after_sum,
+                "frame_attempted_tokens_sum": m.codex_ws_frame_attempted_tokens_sum,
+                "frame_tokens_saved_sum": m.codex_ws_frame_tokens_saved_sum,
+            },
             "waste_signals": dict(m.waste_signals_total) if m.waste_signals_total else {},
             # ContentRouter protection categories aggregated across the
             # session. Lets operators see, e.g., that 80% of messages

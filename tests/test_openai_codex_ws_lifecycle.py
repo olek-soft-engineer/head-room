@@ -360,7 +360,10 @@ async def test_ws_session_metrics_include_dashboard_performance_timings():
     handler = _DummyOpenAIHandler()
     handler.config.optimize = True
 
-    def _noop_compress(payload, *, model, request_id):
+    def _noop_compress(payload, *, model, request_id, timing=None):
+        if timing is not None:
+            timing["compression_live_unit_extraction"] = 2.0
+            timing["compression_unit_router_strategy_passthrough"] = 3.0
         return payload, False, 0, [], "test_noop", 10, 10, 0
 
     handler._compress_openai_responses_payload = _noop_compress  # type: ignore[method-assign]
@@ -374,6 +377,10 @@ async def test_ws_session_metrics_include_dashboard_performance_timings():
     assert recorded["ttfb_ms"] > 0
     assert recorded["pipeline_timing"]["codex_ws.compression"] > 0
     assert recorded["pipeline_timing"]["codex_ws.upstream_first_event"] > 0
+    assert recorded["pipeline_timing"]["codex_ws.compression_preflight_serialization"] > 0
+    assert recorded["pipeline_timing"]["codex_ws.compression_executor_wait_run"] > 0
+    assert recorded["pipeline_timing"]["codex_ws.compression_live_unit_extraction"] == 2.0
+    assert recorded["pipeline_timing"]["codex_ws.compression_unit_router_strategy_passthrough"] == 3.0
 
 
 @pytest.mark.asyncio

@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import contextlib
 import copy
 import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -42,6 +44,64 @@ from headroom.proxy.auth_mode import classify_auth_mode
 
 logger = logging.getLogger("headroom.proxy")
 
+_CODEX_WS_UNIT_ROUTER_MAX_WORKERS = 10
+_CODEX_WS_UNIT_ROUTER_SEMAPHORE = threading.BoundedSemaphore(
+    _CODEX_WS_UNIT_ROUTER_MAX_WORKERS
+)
+
+
+def _codex_ws_unit_worker_count(unit_count: int) -> int:
+    if unit_count <= 1:
+        return 1
+    raw = os.environ.get("HEADROOM_CODEX_WS_UNIT_WORKERS", "4")
+    try:
+        requested = int(raw)
+    except ValueError:
+        requested = 4
+    return max(1, min(unit_count, requested, _CODEX_WS_UNIT_ROUTER_MAX_WORKERS))
+
+
+def _codex_ws_text_shape(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return "empty"
+    if stripped.startswith("```"):
+        return "code_fence"
+    if stripped.startswith("<") and stripped.endswith(">"):
+        return "xml_or_html"
+    if stripped.startswith("["):
+        return "json_array_like"
+    if stripped.startswith("{"):
+        lines = [line for line in stripped.splitlines() if line.strip()]
+        if len(lines) > 1 and all(line.lstrip().startswith("{") for line in lines[:20]):
+            return "jsonl_like"
+        return "json_object_like"
+    if stripped.startswith("Traceback (most recent call last)"):
+        return "traceback"
+    lines = stripped.splitlines()
+    sample = lines[:50]
+    if sample:
+        timestamp_lines = sum(
+            1
+            for line in sample
+            if len(line) >= 10 and line[:4].isdigit() and line[4:5] == "-" and line[7:8] == "-"
+        )
+        level_lines = sum(
+            1
+            for line in sample
+            if any(level in line for level in (" ERROR ", " WARN ", " WARNING ", " INFO "))
+        )
+        search_lines = sum(
+            1
+            for line in sample
+            if ":" in line and line.split(":", 2)[1:2] and line.split(":", 2)[1].isdigit()
+        )
+        if timestamp_lines >= max(2, len(sample) // 5) or level_lines >= max(2, len(sample) // 5):
+            return "log_like"
+        if search_lines >= max(2, len(sample) // 3):
+            return "search_result_like"
+    return "plain_text_like"
+
 
 def _json_debug_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
@@ -49,6 +109,13 @@ def _json_debug_dumps(value: Any) -> str:
 
 def _log_codex_compression_debug(_event: str, **_payload: Any) -> None:
     return
+
+
+_CODEX_COMPRESSION_DEBUG_NOOP = _log_codex_compression_debug
+
+
+def _codex_compression_debug_enabled() -> bool:
+    return _log_codex_compression_debug is not _CODEX_COMPRESSION_DEBUG_NOOP
 
 
 def _json_shape(value: str) -> dict[str, Any]:
@@ -362,6 +429,7 @@ class OpenAIHandlerMixin:
         model: str,
         request_id: str,
         pass_id: str | None = None,
+        timing: dict[str, float] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], dict[str, int], list[str], int]:
         """Run ContentRouter on OpenAI Responses text units.
 
@@ -373,8 +441,17 @@ class OpenAIHandlerMixin:
         are intentionally not exposed as text units.
         """
 
+        debug_enabled = _codex_compression_debug_enabled()
+
         def _log(_event: str, **_fields: Any) -> None:
-            return
+            if debug_enabled:
+                _log_codex_compression_debug(
+                    _event,
+                    request_id=request_id,
+                    pass_id=pass_id,
+                    model=model,
+                    **_fields,
+                )
 
         input_items = payload.get("input")
         messages_items = payload.get("messages")
@@ -385,7 +462,7 @@ class OpenAIHandlerMixin:
             from headroom.transforms.compression_units import (
                 CompressionUnit,
                 RoutedCompressionUnit,
-                compress_units_with_router,
+                compress_unit_with_router,
                 find_content_router,
             )
         except Exception as exc:
@@ -447,75 +524,89 @@ class OpenAIHandlerMixin:
                 if isinstance(call_id, str) and call_id:
                     headroom_retrieve_call_ids.add(call_id)
 
+        timing_sink: dict[str, float] = timing if timing is not None else {}
+
+        def _add_timing(name: str, started_at: float) -> None:
+            timing_sink[name] = (
+                timing_sink.get(name, 0.0) + (time.perf_counter() - started_at) * 1000.0
+            )
+
+        extraction_started = time.perf_counter()
         candidates: list[tuple[int, tuple[str, int | None], str]] = []
         extraction_debug: list[dict[str, Any]] = []
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
-                extraction_debug.append(
-                    {
-                        "index": idx,
-                        "eligible": False,
-                        "reason": "item_not_dict",
-                        "item_type": type(item).__name__,
-                        "item": item,
-                    }
-                )
+                if debug_enabled:
+                    extraction_debug.append(
+                        {
+                            "index": idx,
+                            "eligible": False,
+                            "reason": "item_not_dict",
+                            "item_type": type(item).__name__,
+                            "item": item,
+                        }
+                    )
                 continue
             item_type = item.get("type")
             if item_type in self.OPENAI_RESPONSES_OUTPUT_TYPES:
                 call_id = item.get("call_id")
                 if isinstance(call_id, str) and call_id in headroom_retrieve_call_ids:
-                    extraction_debug.append(
-                        {
-                            "index": idx,
-                            "eligible": False,
-                            "reason": "headroom_retrieve_output_protected",
-                            "item_type": item_type,
-                            "call_id": call_id,
-                            "item": item,
-                        }
-                    )
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "headroom_retrieve_output_protected",
+                                "item_type": item_type,
+                                "call_id": call_id,
+                                "item": item,
+                            }
+                        )
                     continue
                 slot = _slot_text(item)
                 if slot is not None:
                     text, slot_ref = slot
                     candidates.append((idx, slot_ref, text))
-                    extraction_debug.append(
-                        {
-                            "index": idx,
-                            "eligible": True,
-                            "item_type": item_type,
-                            "role": item.get("role"),
-                            "slot": slot_ref,
-                            "text_chars": len(text),
-                            "text_bytes": len(text.encode("utf-8", errors="replace")),
-                            "text_json_shape": _json_shape(text),
-                            "item": item,
-                            "text": text,
-                        }
-                    )
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": True,
+                                "item_type": item_type,
+                                "role": item.get("role"),
+                                "slot": slot_ref,
+                                "text_chars": len(text),
+                                "text_bytes": len(text.encode("utf-8", errors="replace")),
+                                "text_json_shape": _json_shape(text),
+                                "item": item,
+                                "text": text,
+                            }
+                        )
                 else:
+                    if debug_enabled:
+                        extraction_debug.append(
+                            {
+                                "index": idx,
+                                "eligible": False,
+                                "reason": "output_type_without_text_slot",
+                                "item_type": item_type,
+                                "item": item,
+                            }
+                        )
+            else:
+                if debug_enabled:
                     extraction_debug.append(
                         {
                             "index": idx,
                             "eligible": False,
-                            "reason": "output_type_without_text_slot",
+                            "reason": "unsupported_item_type",
                             "item_type": item_type,
+                            "role": item.get("role"),
                             "item": item,
                         }
                     )
-            else:
-                extraction_debug.append(
-                    {
-                        "index": idx,
-                        "eligible": False,
-                        "reason": "unsupported_item_type",
-                        "item_type": item_type,
-                        "role": item.get("role"),
-                        "item": item,
-                    }
-                )
 
+        _add_timing("compression_live_unit_extraction", extraction_started)
         _log(
             "codex_compression_extraction",
             item_count=len(items),
@@ -535,7 +626,9 @@ class OpenAIHandlerMixin:
             )
             return payload, False, 0, [], {}, [], 0
 
+        deepcopy_started = time.perf_counter()
         updated = copy.deepcopy(payload)
+        _add_timing("compression_payload_deepcopy", deepcopy_started)
         updated_input_items = updated.get("input")
         updated_messages_items = updated.get("messages")
         updated_items = (
@@ -558,6 +651,7 @@ class OpenAIHandlerMixin:
         transforms: list[str] = []
         routed_units: list[RoutedCompressionUnit] = []
 
+        unit_build_started = time.perf_counter()
         unit_debug: list[dict[str, Any]] = []
         for item_idx, slot_ref, original_text in candidates:
             item = items[item_idx] if item_idx < len(items) else {}
@@ -574,23 +668,25 @@ class OpenAIHandlerMixin:
                 min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
-            unit_debug.append(
-                {
-                    "item_index": item_idx,
-                    "slot": slot_ref,
-                    "provider": unit.provider,
-                    "endpoint": unit.endpoint,
-                    "role": unit.role,
-                    "item_type": unit.item_type,
-                    "cache_zone": unit.cache_zone,
-                    "mutable": unit.mutable,
-                    "min_bytes": unit.min_bytes,
-                    "text_chars": len(unit.text),
-                    "text_bytes": len(unit.text.encode("utf-8", errors="replace")),
-                    "text_json_shape": _json_shape(unit.text),
-                    "text": unit.text,
-                }
-            )
+            if debug_enabled:
+                unit_debug.append(
+                    {
+                        "item_index": item_idx,
+                        "slot": slot_ref,
+                        "provider": unit.provider,
+                        "endpoint": unit.endpoint,
+                        "role": unit.role,
+                        "item_type": unit.item_type,
+                        "cache_zone": unit.cache_zone,
+                        "mutable": unit.mutable,
+                        "min_bytes": unit.min_bytes,
+                        "text_chars": len(unit.text),
+                        "text_bytes": len(unit.text.encode("utf-8", errors="replace")),
+                        "text_json_shape": _json_shape(unit.text),
+                        "text": unit.text,
+                    }
+                )
+        _add_timing("compression_unit_build", unit_build_started)
 
         _log(
             "codex_compression_units",
@@ -603,11 +699,83 @@ class OpenAIHandlerMixin:
         units_by_category: dict[str, int] = {}
         strategy_chain_union: list[str] = []
 
-        for slot, result in compress_units_with_router(
-            routed_units,
-            router=router,
-            tokenizer=tokenizer,
-        ):
+        def _compress_routed_unit(
+            routed: RoutedCompressionUnit,
+        ) -> tuple[object, Any, float]:
+            unit_started = time.perf_counter()
+            with _CODEX_WS_UNIT_ROUTER_SEMAPHORE:
+                result = compress_unit_with_router(routed.unit, router=router, tokenizer=tokenizer)
+            elapsed_ms = (time.perf_counter() - unit_started) * 1000.0
+            return routed.slot, result, elapsed_ms
+
+        router_total_started = time.perf_counter()
+        worker_count = _codex_ws_unit_worker_count(len(routed_units))
+        if worker_count <= 1:
+            routed_results = [_compress_routed_unit(routed) for routed in routed_units]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                routed_results = list(executor.map(_compress_routed_unit, routed_units))
+
+        for _, result, elapsed_ms in routed_results:
+            router_chain = list(result.router_result.strategy_chain) if result.router_result else []
+            router_content_type = (
+                result.router_result.routing_log[0].content_type.value
+                if result.router_result and result.router_result.routing_log
+                else "unknown"
+            )
+            timing_sink["compression_unit_router_total"] = (
+                timing_sink.get("compression_unit_router_total", 0.0) + elapsed_ms
+            )
+            timing_sink[f"compression_unit_router_strategy_{result.strategy}"] = (
+                timing_sink.get(f"compression_unit_router_strategy_{result.strategy}", 0.0)
+                + elapsed_ms
+            )
+            timing_sink[f"compression_unit_router_category_{result.reason_category}"] = (
+                timing_sink.get(
+                    f"compression_unit_router_category_{result.reason_category}", 0.0
+                )
+                + elapsed_ms
+            )
+            record_unit = getattr(getattr(self, "metrics", None), "record_codex_ws_unit", None)
+            if record_unit is not None:
+                record_unit(
+                    strategy=result.strategy,
+                    reason_category=result.reason_category,
+                    elapsed_ms=elapsed_ms,
+                    text_bytes=result.text_bytes,
+                    tokens_before=result.tokens_before,
+                    tokens_after=result.tokens_after,
+                    tokens_saved=result.tokens_saved,
+                    modified=result.modified,
+                    strategy_chain=router_chain,
+                    content_type=router_content_type,
+                    text_shape=_codex_ws_text_shape(result.original),
+                )
+            if elapsed_ms >= 1000.0:
+                logger.info(
+                    "[%s] WS /v1/responses slow compression unit "
+                    "elapsed_ms=%.0f strategy=%s category=%s modified=%s "
+                    "content_type=%s text_shape=%s bytes=%d min_bytes=%d "
+                    "tokens_before=%d tokens_after=%d tokens_saved=%d "
+                    "strategy_chain=%s",
+                    request_id,
+                    elapsed_ms,
+                    result.strategy,
+                    result.reason_category,
+                    result.modified,
+                    router_content_type,
+                    _codex_ws_text_shape(result.original),
+                    result.text_bytes,
+                    result.min_bytes,
+                    result.tokens_before,
+                    result.tokens_after,
+                    result.tokens_saved,
+                    router_chain,
+                )
+        _add_timing("compression_units_router_loop", router_total_started)
+
+        apply_started = time.perf_counter()
+        for slot, result, _elapsed_ms in routed_results:
             item_idx, slot_ref = slot
             router_chain = list(result.router_result.strategy_chain) if result.router_result else []
             for s in router_chain:
@@ -621,32 +789,33 @@ class OpenAIHandlerMixin:
             # role-protected, or in a frozen cache_zone don't count.
             if result.router_result is not None or result.modified:
                 attempted_input_tokens += result.tokens_before
-            _log(
-                "codex_compression_unit_result",
-                item_index=item_idx,
-                slot=slot_ref,
-                modified=result.modified,
-                reason=result.reason,
-                reason_category=cat,
-                text_bytes=result.text_bytes,
-                min_bytes=result.min_bytes,
-                strategy=result.strategy,
-                strategy_chain=router_chain,
-                tokens_before=result.tokens_before,
-                tokens_after=result.tokens_after,
-                tokens_saved=result.tokens_saved,
-                transforms_applied=result.transforms_applied,
-                router_strategy=(
-                    result.router_result.strategy_used.value if result.router_result else None
-                ),
-                router_summary=result.router_result.summary() if result.router_result else None,
-                router_routing_log=_routing_log_debug(result.router_result),
-                router_cache_hit=(
-                    result.router_result.cache_hit if result.router_result else False
-                ),
-                original=result.original,
-                compressed=result.compressed,
-            )
+            if debug_enabled:
+                _log(
+                    "codex_compression_unit_result",
+                    item_index=item_idx,
+                    slot=slot_ref,
+                    modified=result.modified,
+                    reason=result.reason,
+                    reason_category=cat,
+                    text_bytes=result.text_bytes,
+                    min_bytes=result.min_bytes,
+                    strategy=result.strategy,
+                    strategy_chain=router_chain,
+                    tokens_before=result.tokens_before,
+                    tokens_after=result.tokens_after,
+                    tokens_saved=result.tokens_saved,
+                    transforms_applied=result.transforms_applied,
+                    router_strategy=(
+                        result.router_result.strategy_used.value if result.router_result else None
+                    ),
+                    router_summary=result.router_result.summary() if result.router_result else None,
+                    router_routing_log=_routing_log_debug(result.router_result),
+                    router_cache_hit=(
+                        result.router_result.cache_hit if result.router_result else False
+                    ),
+                    original=result.original,
+                    compressed=result.compressed,
+                )
             if not result.modified:
                 continue
 
@@ -659,6 +828,7 @@ class OpenAIHandlerMixin:
             for transform in result.transforms_applied:
                 if transform not in transforms:
                     transforms.append(transform)
+        _add_timing("compression_unit_apply_results", apply_started)
 
         _log(
             "codex_compression_payload_result",
@@ -687,6 +857,7 @@ class OpenAIHandlerMixin:
         *,
         model: str,
         request_id: str,
+        timing: dict[str, float] | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -696,7 +867,16 @@ class OpenAIHandlerMixin:
         compressor, then splices accepted replacements back into the payload.
         """
 
+        timing_sink: dict[str, float] = timing if timing is not None else {}
+
+        def _add_timing(name: str, started_at: float) -> None:
+            timing_sink[name] = (
+                timing_sink.get(name, 0.0) + (time.perf_counter() - started_at) * 1000.0
+            )
+
+        input_serialization_started = time.perf_counter()
         input_bytes = json.dumps(payload).encode("utf-8")
+        _add_timing("compression_input_json_dump", input_serialization_started)
         # Codex/Responses requests can re-enter this method many times per
         # request_id (one per turn over the same websocket). Tag every
         # event in this single pass with a content-derived id so dashboards
@@ -707,54 +887,63 @@ class OpenAIHandlerMixin:
         # Identical pass_ids within one request_id indicate idempotent
         # retries on the same input bytes and are the only thing that
         # should be deduped.
-        pass_id = hashlib.sha256(input_bytes).hexdigest()[:12]
-        input_context_budget = _openai_responses_context_budget(payload)
-        _log_codex_compression_debug(
-            "codex_compression_payload_input",
-            request_id=request_id,
-            pass_id=pass_id,
-            model=model,
-            input_bytes=len(input_bytes),
-            context_budget=input_context_budget,
-            input_top_level_keys=list(payload.keys()),
-            input_field_type=type(payload.get("input")).__name__,
-            messages_field_type=type(payload.get("messages")).__name__,
-            payload=payload,
-        )
+        debug_enabled = _codex_compression_debug_enabled()
+        pass_id = hashlib.sha256(input_bytes).hexdigest()[:12] if debug_enabled else None
+        input_context_budget: dict[str, Any] | None = None
+        if debug_enabled:
+            input_context_budget = _openai_responses_context_budget(payload)
+            _log_codex_compression_debug(
+                "codex_compression_payload_input",
+                request_id=request_id,
+                pass_id=pass_id,
+                model=model,
+                input_bytes=len(input_bytes),
+                context_budget=input_context_budget,
+                input_top_level_keys=list(payload.keys()),
+                input_field_type=type(payload.get("input")).__name__,
+                messages_field_type=type(payload.get("messages")).__name__,
+                payload=payload,
+            )
         working = payload
         modified = False
         tokens_saved = 0
         transforms: list[str] = []
         reason: str | None = None
 
+        tool_compaction_started = time.perf_counter()
         compacted_payload, tools_modified, tools_before_bytes, tools_after_bytes = (
             _compact_openai_responses_tools(working)
         )
+        _add_timing("compression_tool_schema_compaction", tool_compaction_started)
         if tools_modified:
             working = compacted_payload
             modified = True
             reason = None
             transforms.append("openai:responses:tool_schema_compaction")
             try:
+                tool_token_started = time.perf_counter()
                 tokenizer = self.openai_provider.get_token_counter(model)
                 tokens_saved += max(
                     0,
                     tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
                     - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
                 )
+                _add_timing("compression_tool_schema_token_count", tool_token_started)
             except Exception:
                 pass
-            _log_codex_compression_debug(
-                "codex_tool_schema_compaction",
-                request_id=request_id,
-                pass_id=pass_id,
-                model=model,
-                modified=True,
-                tools_bytes_before=tools_before_bytes,
-                tools_bytes_after=tools_after_bytes,
-                tools_bytes_saved=tools_before_bytes - tools_after_bytes,
-            )
+            if debug_enabled:
+                _log_codex_compression_debug(
+                    "codex_tool_schema_compaction",
+                    request_id=request_id,
+                    pass_id=pass_id,
+                    model=model,
+                    modified=True,
+                    tools_bytes_before=tools_before_bytes,
+                    tools_bytes_after=tools_after_bytes,
+                    tools_bytes_saved=tools_before_bytes - tools_after_bytes,
+                )
 
+        live_units_started = time.perf_counter()
         (
             router_payload,
             router_modified,
@@ -768,7 +957,9 @@ class OpenAIHandlerMixin:
             model=model,
             request_id=request_id,
             pass_id=pass_id,
+            timing=timing_sink,
         )
+        _add_timing("compression_live_units_total", live_units_started)
         if router_modified:
             working = router_payload
             modified = True
@@ -788,20 +979,31 @@ class OpenAIHandlerMixin:
         attempted_input_tokens = int(router_attempted_tokens)
         if tools_modified:
             try:
+                attempted_token_started = time.perf_counter()
                 tokenizer = self.openai_provider.get_token_counter(model)
                 attempted_input_tokens += tokenizer.count_text(
                     _json_debug_dumps(payload.get("tools"))
                 )
+                _add_timing(
+                    "compression_tool_schema_attempted_token_count",
+                    attempted_token_started,
+                )
             except Exception:
                 pass
 
+        dedupe_started = time.perf_counter()
         deduped: list[str] = []
         for transform in transforms:
             if transform not in deduped:
                 deduped.append(transform)
+        _add_timing("compression_transform_dedupe", dedupe_started)
 
+        output_serialization_started = time.perf_counter()
         output_bytes = json.dumps(working).encode("utf-8")
-        output_context_budget = _openai_responses_context_budget(working)
+        _add_timing("compression_output_json_dump", output_serialization_started)
+        output_context_budget = (
+            _openai_responses_context_budget(working) if debug_enabled else None
+        )
         # One-line summary at INFO — the single event a human reading
         # logs should scan first to understand "what happened on this
         # pass". All the verbose per-event debug data stays available
@@ -825,41 +1027,42 @@ class OpenAIHandlerMixin:
         attempted_pct = (
             (tokens_saved / attempted_input_tokens) * 100.0 if attempted_input_tokens > 0 else 0.0
         )
-        _log_codex_compression_debug(
-            "codex_compression_pass_summary",
-            request_id=request_id,
-            pass_id=pass_id,
-            model=model,
-            modified=modified,
-            reason=reason,
-            input_bytes=len(input_bytes),
-            output_bytes=len(output_bytes),
-            bytes_saved=len(input_bytes) - len(output_bytes),
-            savings_pct=round(savings_pct, 2),
-            tokens_saved=tokens_saved,
-            attempted_input_tokens=attempted_input_tokens,
-            attempted_pct=round(attempted_pct, 2),
-            strategy_chain=strategy_chain,
-            units_by_category=units_by_category,
-            transforms=deduped,
-        )
-        _log_codex_compression_debug(
-            "codex_compression_payload_output",
-            request_id=request_id,
-            pass_id=pass_id,
-            model=model,
-            modified=modified,
-            reason=reason,
-            tokens_saved=tokens_saved,
-            attempted_input_tokens=attempted_input_tokens,
-            transforms=deduped,
-            input_bytes=len(input_bytes),
-            output_bytes=len(output_bytes),
-            context_budget_before=input_context_budget,
-            context_budget_after=output_context_budget,
-            input_payload=payload,
-            output_payload=working,
-        )
+        if debug_enabled:
+            _log_codex_compression_debug(
+                "codex_compression_pass_summary",
+                request_id=request_id,
+                pass_id=pass_id,
+                model=model,
+                modified=modified,
+                reason=reason,
+                input_bytes=len(input_bytes),
+                output_bytes=len(output_bytes),
+                bytes_saved=len(input_bytes) - len(output_bytes),
+                savings_pct=round(savings_pct, 2),
+                tokens_saved=tokens_saved,
+                attempted_input_tokens=attempted_input_tokens,
+                attempted_pct=round(attempted_pct, 2),
+                strategy_chain=strategy_chain,
+                units_by_category=units_by_category,
+                transforms=deduped,
+            )
+            _log_codex_compression_debug(
+                "codex_compression_payload_output",
+                request_id=request_id,
+                pass_id=pass_id,
+                model=model,
+                modified=modified,
+                reason=reason,
+                tokens_saved=tokens_saved,
+                attempted_input_tokens=attempted_input_tokens,
+                transforms=deduped,
+                input_bytes=len(input_bytes),
+                output_bytes=len(output_bytes),
+                context_budget_before=input_context_budget,
+                context_budget_after=output_context_budget,
+                input_payload=payload,
+                output_payload=working,
+            )
         return (
             working,
             modified,
@@ -877,15 +1080,33 @@ class OpenAIHandlerMixin:
         *,
         model: str,
         request_id: str,
-    ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
-        return await self._run_compression_in_executor(
-            lambda: self._compress_openai_responses_payload(
-                payload,
-                model=model,
-                request_id=request_id,
-            ),
+    ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
+        timing: dict[str, float] = {}
+
+        def _compress():  # noqa: ANN202
+            try:
+                return self._compress_openai_responses_payload(
+                    payload,
+                    model=model,
+                    request_id=request_id,
+                    timing=timing,
+                )
+            except TypeError as exc:
+                if "unexpected keyword argument 'timing'" not in str(exc):
+                    raise
+                return self._compress_openai_responses_payload(
+                    payload,
+                    model=model,
+                    request_id=request_id,
+                )
+
+        result = await self._run_compression_in_executor(
+            _compress,
             timeout=COMPRESSION_TIMEOUT_SECONDS,
         )
+        if len(result) == 8:
+            return (*result, timing)
+        return result
 
     async def handle_openai_chat(
         self,
@@ -2366,6 +2587,7 @@ class OpenAIHandlerMixin:
                     _bytes_before,
                     _bytes_after,
                     _attempted_tokens,
+                    _compression_timing,
                 ) = await self._compress_openai_responses_payload_in_executor(
                     body,
                     model=model,
@@ -3067,6 +3289,8 @@ class OpenAIHandlerMixin:
             ws_client_disconnect_seen = False
             ws_overhead_ms_total = 0.0
             ws_recorded_overhead_ms_total = 0.0
+            ws_compression_timing_totals: dict[str, float] = {}
+            ws_recorded_compression_timing_totals: dict[str, float] = {}
             ws_ttfb_ms: float | None = None
             ws_recorded_ttfb_ms = False
             _ws_bypass = self._headroom_bypass_enabled(ws_headers)
@@ -3094,6 +3318,29 @@ class OpenAIHandlerMixin:
                 if ws_overhead_ms_total > 0:
                     stage_timer.record("compression", ws_overhead_ms_total)
 
+            def _record_ws_compression_timing(name: str, duration_ms: float) -> None:
+                ws_compression_timing_totals[name] = (
+                    ws_compression_timing_totals.get(name, 0.0)
+                    + max(0.0, float(duration_ms))
+                )
+
+            def _codex_ws_final_strategies(timing: dict[str, float]) -> list[str]:
+                prefix = "compression_unit_router_strategy_"
+                return [
+                    name.removeprefix(prefix)
+                    for name, ms in timing.items()
+                    if name.startswith(prefix) and ms > 0
+                ]
+
+            def _codex_ws_strategy_chain(transforms: list[str]) -> list[str]:
+                chain: list[str] = []
+                for transform in transforms:
+                    if ":" in transform:
+                        continue
+                    if transform not in chain:
+                        chain.append(transform)
+                return chain
+
             def _current_ws_overhead_ms() -> float:
                 summary = stage_timer.summary()
                 return ws_overhead_ms_total + max(0.0, float(summary.get("memory_context") or 0.0))
@@ -3108,6 +3355,12 @@ class OpenAIHandlerMixin:
                     timing["codex_ws.compression"] = overhead_ms
                 if ttfb_ms > 0:
                     timing["codex_ws.ttfb"] = ttfb_ms
+
+                for stage_name, total_ms in ws_compression_timing_totals.items():
+                    recorded_ms = ws_recorded_compression_timing_totals.get(stage_name, 0.0)
+                    delta_ms = max(0.0, total_ms - recorded_ms)
+                    if delta_ms > 0:
+                        timing[f"codex_ws.{stage_name}"] = delta_ms
 
                 summary = stage_timer.summary()
                 for stage_name in (
@@ -3306,7 +3559,9 @@ class OpenAIHandlerMixin:
             # anyway so a JSON-shape edge case can never break the WS
             # session.
             if self.config.optimize and not _ws_bypass:
+                _first_frame_compression_elapsed_ms = 0.0
                 try:
+                    _preflight_started = time.perf_counter()
                     _ws_auth_mode = classify_auth_mode(ws_headers)
                     try:
                         _send_body = json.loads(first_msg_raw)
@@ -3320,6 +3575,12 @@ class OpenAIHandlerMixin:
                         _inner = _send_body["response"] if _wrapped else _send_body
                         _model = (_inner.get("model") if isinstance(_inner, dict) else None) or ""
 
+                        _preflight_ms = (time.perf_counter() - _preflight_started) * 1000.0
+                        _record_ws_compression_timing(
+                            "compression_preflight_serialization",
+                            _preflight_ms,
+                        )
+                        _record_ws_compression_overhead(_preflight_ms)
                         _compression_started = time.perf_counter()
                         try:
                             (
@@ -3331,22 +3592,55 @@ class OpenAIHandlerMixin:
                                 _bytes_before,
                                 _bytes_after,
                                 _ws_attempted_tokens,
+                                _ws_compression_timing,
                             ) = await self._compress_openai_responses_payload_in_executor(
                                 _inner,
                                 model=_model,
                                 request_id=request_id,
                             )
+                            for _timing_name, _timing_ms in _ws_compression_timing.items():
+                                _record_ws_compression_timing(_timing_name, _timing_ms)
                         finally:
+                            _first_frame_compression_elapsed_ms = (
+                                time.perf_counter() - _compression_started
+                            ) * 1000.0
+                            _record_ws_compression_timing(
+                                "compression_executor_wait_run",
+                                _first_frame_compression_elapsed_ms,
+                            )
                             _record_ws_compression_overhead(
-                                (time.perf_counter() - _compression_started) * 1000.0
+                                _first_frame_compression_elapsed_ms
+                            )
+                        record_frame = getattr(
+                            getattr(self, "metrics", None), "record_codex_ws_frame", None
+                        )
+                        if record_frame is not None:
+                            record_frame(
+                                elapsed_ms=_first_frame_compression_elapsed_ms,
+                                bytes_before=_bytes_before,
+                                bytes_after=_bytes_after,
+                                attempted_tokens=_ws_attempted_tokens,
+                                tokens_saved=_ws_saved,
+                                modified=_modified,
+                                strategy_chain=_codex_ws_strategy_chain(_ws_transforms),
+                                final_strategies=_codex_ws_final_strategies(
+                                    _ws_compression_timing
+                                ),
                             )
                         if _modified:
                             if isinstance(_new_inner, dict):
+                                _rewrite_started = time.perf_counter()
                                 if _wrapped:
                                     _send_body["response"] = _new_inner
                                 else:
                                     _send_body = _new_inner
                                 first_msg_raw = json.dumps(_send_body)
+                                _rewrite_ms = (time.perf_counter() - _rewrite_started) * 1000.0
+                                _record_ws_compression_timing(
+                                    "compression_payload_rewrite_json_dump",
+                                    _rewrite_ms,
+                                )
+                                _record_ws_compression_overhead(_rewrite_ms)
                                 tokens_saved += int(_ws_saved)
                                 attempted_input_tokens_total += int(_ws_attempted_tokens)
                                 for _t in _ws_transforms:
@@ -3363,6 +3657,7 @@ class OpenAIHandlerMixin:
                                     _ws_auth_mode.value,
                                     transforms_applied,
                                 )
+                                ws_frames_compressed += 1
                         else:
                             _log_ws_passthrough(
                                 _ws_reason or "no_compression",
@@ -3379,6 +3674,18 @@ class OpenAIHandlerMixin:
                             frame_type="unknown",
                         )
                 except Exception as _ce:
+                    if _first_frame_compression_elapsed_ms > 0:
+                        record_frame = getattr(
+                            getattr(self, "metrics", None), "record_codex_ws_frame", None
+                        )
+                        if record_frame is not None:
+                            record_frame(
+                                elapsed_ms=_first_frame_compression_elapsed_ms,
+                                bytes_before=len(
+                                    first_msg_raw.encode("utf-8", errors="replace")
+                                ),
+                                failed=True,
+                            )
                     logger.warning(
                         f"[{request_id}] WS /v1/responses compression failed; "
                         f"forwarding original frame: {type(_ce).__name__}: {_ce}"
@@ -3511,6 +3818,7 @@ class OpenAIHandlerMixin:
                                     raw_bytes=len(raw_msg.encode("utf-8", errors="replace")),
                                 )
                                 return raw_msg, False, "optimize_disabled"
+                            _preflight_started = time.perf_counter()
                             try:
                                 parsed_frame = json.loads(raw_msg)
                             except json.JSONDecodeError:
@@ -3547,9 +3855,18 @@ class OpenAIHandlerMixin:
                                     frame_type="response.create",
                                 )
                                 return raw_msg, False, "invalid_inner_payload"
+                            frame_compression_elapsed_ms = 0.0
                             try:
                                 model_for_frame = inner_payload.get("model") or ""
                                 _frame_auth_mode = classify_auth_mode(ws_headers)
+                                _preflight_ms = (
+                                    time.perf_counter() - _preflight_started
+                                ) * 1000.0
+                                _record_ws_compression_timing(
+                                    "compression_preflight_serialization",
+                                    _preflight_ms,
+                                )
+                                _record_ws_compression_overhead(_preflight_ms)
                                 _compression_started = time.perf_counter()
                                 try:
                                     (
@@ -3561,16 +3878,62 @@ class OpenAIHandlerMixin:
                                         bytes_before,
                                         bytes_after,
                                         frame_attempted_tokens,
+                                        frame_compression_timing,
                                     ) = await self._compress_openai_responses_payload_in_executor(
                                         inner_payload,
                                         model=model_for_frame,
                                         request_id=request_id,
                                     )
+                                    for _timing_name, _timing_ms in (
+                                        frame_compression_timing.items()
+                                    ):
+                                        _record_ws_compression_timing(_timing_name, _timing_ms)
                                 finally:
+                                    frame_compression_elapsed_ms = (
+                                        time.perf_counter() - _compression_started
+                                    ) * 1000.0
+                                    _record_ws_compression_timing(
+                                        "compression_executor_wait_run",
+                                        frame_compression_elapsed_ms,
+                                    )
                                     _record_ws_compression_overhead(
-                                        (time.perf_counter() - _compression_started) * 1000.0
+                                        frame_compression_elapsed_ms
+                                    )
+                                record_frame = getattr(
+                                    getattr(self, "metrics", None),
+                                    "record_codex_ws_frame",
+                                    None,
+                                )
+                                if record_frame is not None:
+                                    record_frame(
+                                        elapsed_ms=frame_compression_elapsed_ms,
+                                        bytes_before=bytes_before,
+                                        bytes_after=bytes_after,
+                                        attempted_tokens=frame_attempted_tokens,
+                                        tokens_saved=frame_saved,
+                                        modified=modified,
+                                        strategy_chain=_codex_ws_strategy_chain(
+                                            frame_transforms
+                                        ),
+                                        final_strategies=_codex_ws_final_strategies(
+                                            frame_compression_timing
+                                        ),
                                     )
                             except Exception as _frame_err:
+                                if frame_compression_elapsed_ms > 0:
+                                    record_frame = getattr(
+                                        getattr(self, "metrics", None),
+                                        "record_codex_ws_frame",
+                                        None,
+                                    )
+                                    if record_frame is not None:
+                                        record_frame(
+                                            elapsed_ms=frame_compression_elapsed_ms,
+                                            bytes_before=len(
+                                                raw_msg.encode("utf-8", errors="replace")
+                                            ),
+                                            failed=True,
+                                        )
                                 logger.warning(
                                     "[%s] WS /v1/responses frame compression "
                                     "failed; forwarding original: %s: %s",
@@ -3606,10 +3969,18 @@ class OpenAIHandlerMixin:
                                 )
                                 return raw_msg, False, "compressed_payload_not_dict"
                             if wrapped_frame:
+                                _rewrite_started = time.perf_counter()
                                 parsed_frame["response"] = new_inner
                                 rewritten = json.dumps(parsed_frame)
                             else:
+                                _rewrite_started = time.perf_counter()
                                 rewritten = json.dumps(new_inner)
+                            _rewrite_ms = (time.perf_counter() - _rewrite_started) * 1000.0
+                            _record_ws_compression_timing(
+                                "compression_payload_rewrite_json_dump",
+                                _rewrite_ms,
+                            )
+                            _record_ws_compression_overhead(_rewrite_ms)
                             tokens_saved += int(frame_saved)
                             attempted_input_tokens_total += int(frame_attempted_tokens)
                             for t in frame_transforms:
@@ -3889,6 +4260,9 @@ class OpenAIHandlerMixin:
                                     attempted_input_tokens_total
                                 )
                                 ws_recorded_overhead_ms_total = _current_ws_overhead_ms()
+                                ws_recorded_compression_timing_totals.update(
+                                    ws_compression_timing_totals
+                                )
                                 if ttfb_for_record_ms > 0:
                                     ws_recorded_ttfb_ms = True
 
