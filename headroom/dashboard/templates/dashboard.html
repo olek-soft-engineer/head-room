@@ -99,8 +99,8 @@
     <main class="p-6 max-w-7xl mx-auto">
         <template x-if="viewMode === 'session'">
             <div>
-        <!-- Hero Metrics (reordered: Savings $ -> Compression % -> Quality Confidence -> Overhead) -->
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+        <!-- Hero Metrics: Savings $ -> Compression % -> Overhead -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
             <!-- Savings ($) - proxy compression only, priced at model list rate -->
             <div class="bg-surface rounded-lg p-4 border border-border">
                 <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Proxy $ Saved</div>
@@ -120,12 +120,13 @@
                 <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Token Savings</div>
                 <div class="flex items-baseline gap-2">
                     <span class="text-3xl font-light tabular-nums text-accent" x-text="formatNumber(stats.tokens?.saved || 0)"></span>
-                    <!-- Active compression ratio: savings as fraction of what we *attempted*
-                         to compress (extracted units + tool schema). Excludes frozen-prefix
-                         bytes (user messages, system prompt, prior turns) we never touch for
-                         prefix-cache safety. The whole-request ratio is stored as
-                         `savings_percent` and shown as a small footnote for transparency. -->
-                    <span class="text-sm text-accent" x-text="(stats.tokens?.active_savings_percent || 0).toFixed(1) + '%'" title="Of compressible tokens attempted"></span>
+                    <!-- Active compression ratio: savings as a fraction of tokens we
+                         *attempted* to compress (extracted units + tool schema). When
+                         the attempted denominator is missing (backend-routed paths
+                         that don't yet wire per-message live-zone tracking), fall back
+                         to the whole-request ratio so the headline doesn't collapse to
+                         0% while compression is happening (issue #455). -->
+                    <span class="text-sm text-accent" x-text="headlineSavingsPercent.toFixed(1) + '%'" :title="headlineSavingsTitle"></span>
                 </div>
                 <div class="mt-1 text-xs text-gray-500 leading-relaxed">
                     <span x-text="'Proxy ' + formatNumber(stats.tokens?.proxy_compression_saved || 0) + ' (' + proxyShareOfTotal.toFixed(1) + '%)'"></span>
@@ -147,16 +148,6 @@
                         <path class="sparkline" :d="getSparkline(savingsHistory)"></path>
                     </svg>
                 </div>
-            </div>
-
-            <!-- Quality Confidence -->
-            <div class="bg-surface rounded-lg p-4 border border-border">
-                <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Compression Quality</div>
-                <div class="flex items-baseline gap-2">
-                    <span class="w-3 h-3 rounded-full mt-1" :class="confidenceColor"></span>
-                    <span class="text-3xl font-light tabular-nums" :class="confidenceTextColor" x-text="confidenceLabel"></span>
-                </div>
-                <div class="mt-2 text-xs text-gray-500" x-text="confidenceDetail"></div>
             </div>
 
             <!-- Headroom Overhead -->
@@ -844,14 +835,13 @@
                             <th class="px-4 py-3 font-medium text-right">Input</th>
                             <th class="px-4 py-3 font-medium text-right">Output</th>
                             <th class="px-4 py-3 font-medium text-right">Saved</th>
-                            <th class="px-4 py-3 font-medium text-right">Quality</th>
                             <th class="px-4 py-3 font-medium text-right">Latency</th>
                         </tr>
                     </thead>
                     <tbody class="divide-y divide-border">
                         <template x-for="req in (stats.recent_requests || [])" :key="req.request_id">
                             <tr>
-                                <td colspan="8" class="p-0">
+                                <td colspan="7" class="p-0">
                                     <div class="cursor-pointer" @click="toggleExpanded(req.request_id)">
                                         <div class="flex hover:bg-border/30 transition-colors">
                                             <div class="px-4 py-3 w-6 text-gray-500">
@@ -865,9 +855,6 @@
                                             <div class="px-4 py-3 text-right font-mono flex-1" x-text="formatNumber(req.output_tokens || 0)"></div>
                                             <div class="px-4 py-3 text-right flex-1">
                                                 <span class="text-accent font-mono" x-text="req.savings_percent.toFixed(0) + '%'"></span>
-                                            </div>
-                                            <div class="px-4 py-3 text-right flex-1">
-                                                <span class="w-2 h-2 rounded-full inline-block" :class="getRequestConfidenceColor(req)"></span>
                                             </div>
                                             <div class="px-4 py-3 text-right font-mono text-gray-400 flex-1" x-text="(req.total_latency_ms || 0).toFixed(0) + 'ms'"></div>
                                         </div>
@@ -1808,52 +1795,28 @@
                     return this.cliFilteringSaved / total * 100;
                 },
 
-                // --- Compression Confidence ---
-
-                get confidenceLevel() {
-                    const saved = this.stats.tokens?.proxy_compression_saved || 0;
-                    if (saved === 0) return 'none';
-                    const signals = this.stats.waste_signals || {};
-                    const totalWaste = Object.values(signals).reduce((a, b) => a + b, 0);
-                    if (totalWaste === 0) return 'unknown';
-                    const wasteRatio = totalWaste / saved;
-                    if (wasteRatio >= 0.7) return 'high';
-                    if (wasteRatio >= 0.3) return 'medium';
-                    return 'low';
+                // --- Headline savings percent ---
+                //
+                // Active ratio (saved / attempted) is the right metric when we have
+                // a working denominator. Some backend-routed paths don't yet
+                // populate `proxy_attempted_tokens` consistently — in that case
+                // the active number reads 0% even when compression is happening,
+                // so fall back to the whole-request ratio (`proxy_savings_percent`)
+                // instead of showing a misleading zero. Issue #455.
+                get headlineSavingsPercent() {
+                    const attempted = this.stats.tokens?.proxy_attempted_tokens || 0;
+                    const active = this.stats.tokens?.active_savings_percent || 0;
+                    if (attempted > 0 && active > 0) return active;
+                    return this.stats.tokens?.proxy_savings_percent || 0;
                 },
 
-                get confidenceColor() {
-                    const c = { high: 'bg-emerald-400', medium: 'bg-yellow-400', low: 'bg-red-400', none: 'bg-gray-500', unknown: 'bg-gray-500' };
-                    return c[this.confidenceLevel];
-                },
-
-                get confidenceTextColor() {
-                    const c = { high: 'text-emerald-400', medium: 'text-yellow-400', low: 'text-red-400', none: 'text-gray-500', unknown: 'text-gray-500' };
-                    return c[this.confidenceLevel];
-                },
-
-                get confidenceLabel() {
-                    const l = { high: 'High', medium: 'Medium', low: 'Low', none: '-', unknown: '-' };
-                    return l[this.confidenceLevel];
-                },
-
-                get confidenceDetail() {
-                    const saved = this.stats.tokens?.proxy_compression_saved || 0;
-                    if (saved === 0) return 'No compression yet';
-                    const signals = this.stats.waste_signals || {};
-                    const totalWaste = Object.values(signals).reduce((a, b) => a + b, 0);
-                    if (totalWaste === 0) return 'No waste signals detected';
-                    const pct = Math.round((totalWaste / saved) * 100);
-                    return pct + '% of removed tokens were identified waste';
-                },
-
-                getRequestConfidenceColor(req) {
-                    if (!req.waste_signals || req.tokens_saved === 0) return 'bg-gray-500';
-                    const totalWaste = Object.values(req.waste_signals).reduce((a, b) => a + b, 0);
-                    const ratio = totalWaste / req.tokens_saved;
-                    if (ratio >= 0.7) return 'bg-emerald-400';
-                    if (ratio >= 0.3) return 'bg-yellow-400';
-                    return 'bg-red-400';
+                get headlineSavingsTitle() {
+                    const attempted = this.stats.tokens?.proxy_attempted_tokens || 0;
+                    const active = this.stats.tokens?.active_savings_percent || 0;
+                    if (attempted > 0 && active > 0) {
+                        return 'Of compressible tokens attempted';
+                    }
+                    return 'Of whole pre-compression request (attempted-tokens metric unavailable)';
                 },
 
                 // --- Expandable Rows ---

@@ -136,6 +136,14 @@ class ProxyConfig:
     # Per-tool compression profiles
     tool_profiles: dict[str, Any] | None = None
 
+    # Opt in to compressing `user` role messages. Off by default because user
+    # content is typically the subject of the request and is part of the
+    # prefix-cache zone. Enable for OpenAI/Azure chat workloads where the bulk
+    # of input lives in user messages (pasted code/text, RAG context) and the
+    # router would otherwise have nothing eligible to compress.
+    # CLI: --compress-user-messages; env: HEADROOM_COMPRESS_USER_MESSAGES=1.
+    compress_user_messages: bool = False
+
     # Read lifecycle management
     read_lifecycle: bool = True
 

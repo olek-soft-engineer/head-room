@@ -356,6 +356,12 @@ class HeadroomProxy(
         # Token mode: allow compression of older excluded-tool results.
         if is_token_mode(config.mode):
             router_config.protect_recent_reads_fraction = 0.3
+        # `--compress-user-messages` flips the router's default skip rule.
+        # Off by default for prefix-cache safety; enabled for workloads where
+        # user-message content dominates input (OpenAI/Azure chat with pasted
+        # code/RAG context — see issue #454).
+        if config.compress_user_messages:
+            router_config.skip_user_messages = False
         transforms = [
             CacheAligner(CacheAlignerConfig(enabled=False)),
             ContentRouter(router_config, observer=self.metrics),
@@ -2004,6 +2010,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "compressions_by_strategy": dict(m.compressions_by_strategy),
             "tokens_saved_by_strategy": dict(m.tokens_saved_by_strategy),
             "waste_signals": dict(m.waste_signals_total) if m.waste_signals_total else {},
+            # ContentRouter protection categories aggregated across the
+            # session. Lets operators see, e.g., that 80% of messages
+            # were `user_msg` (protected) and only 5% reached the
+            # compressor — explains why compression rate is low and
+            # whether `--compress-user-messages` would help (#454).
+            "router": {
+                "route_counts": dict(m.router_route_counts) if m.router_route_counts else {},
+            },
             "savings_history": m.savings_history[-100:],  # Last 100 data points
             "display_session": display_session,
             "persistent_savings": persistent_savings,
@@ -3054,6 +3068,18 @@ if __name__ == "__main__":
         help="Per-tool compression profile: ToolName:level (e.g., Grep:conservative, Bash:moderate, WebFetch:aggressive). "
         "Can be specified multiple times. Also settable via HEADROOM_TOOL_PROFILES env var.",
     )
+    parser.add_argument(
+        "--compress-user-messages",
+        action="store_true",
+        help=(
+            "Opt in to compressing `user` role messages. Default is off because "
+            "user content is typically the subject of the request and is part of "
+            "the prefix-cache zone. Enable this for OpenAI/Azure chat workloads "
+            "where the bulk of input lives in user messages (pasted content, "
+            "RAG context, etc.) and you want the router to consider it eligible. "
+            "Also settable via HEADROOM_COMPRESS_USER_MESSAGES=1."
+        ),
+    )
 
     # Caching
     parser.add_argument("--no-cache", action="store_true", help="Disable caching")
@@ -3142,6 +3168,8 @@ if __name__ == "__main__":
         http2=not args.no_http2 and _get_env_bool("HEADROOM_HTTP2", True),
         tool_profiles=tool_profiles if tool_profiles else None,
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
+        compress_user_messages=args.compress_user_messages
+        or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
     )
 
     # Get worker and concurrency settings

@@ -2168,6 +2168,19 @@ class ContentRouter(Transform):
                 ", ".join(parts),
             )
 
+        # Forward route_counts to the observer so `/stats` can surface a
+        # session-level protection breakdown (issue #454). The observer
+        # may not implement this method on older versions; ignore
+        # AttributeError so a non-conforming observer doesn't poison
+        # routing.
+        if self._observer is not None and route_counts:
+            try:
+                self._observer.record_router_route_counts(route_counts)
+            except AttributeError:
+                pass
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug("Router observer raised (non-fatal): %s", e)
+
         all_transforms = lifecycle_transforms + transforms_applied
         return TransformResult(
             messages=transformed_messages,

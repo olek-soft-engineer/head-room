@@ -703,6 +703,14 @@ class StreamingMixin:
             )
 
         if getattr(self, "metrics", None) is not None:
+            # Active-compression denominator. No frozen_message_count is
+            # propagated to the streaming finalizer yet, so we fall
+            # back to the pre-comp request size (effective_optimized +
+            # tokens_saved). Per-message live-zone tracking is a
+            # follow-up; without this fallback the dashboard headline
+            # collapses to 0% for streaming traffic even though
+            # compression is happening (issue #455).
+            attempted_input_tokens = effective_optimized_tokens + tokens_saved
             await self.metrics.record_request(
                 provider=provider,
                 model=model,
@@ -718,6 +726,7 @@ class StreamingMixin:
                 cache_write_5m_tokens=cache_write_5m_tokens,
                 cache_write_1h_tokens=cache_write_1h_tokens,
                 uncached_input_tokens=uncached_input_tokens,
+                attempted_input_tokens=attempted_input_tokens,
             )
 
         # Log the request to the in-memory request logger so it shows up in
@@ -1346,6 +1355,11 @@ class StreamingMixin:
                 _backend_name = (
                     self.anthropic_backend.name if self.anthropic_backend else "anthropic"
                 )
+                # Active-compression denominator: pre-comp request size.
+                # Bedrock streaming doesn't propagate frozen_message_count
+                # here either; without this, attempted_input_tokens_total
+                # stays 0 and the dashboard headline reads 0% (#455).
+                attempted_input_tokens = optimized_tokens + tokens_saved
                 await self.metrics.record_request(
                     provider=_backend_name,
                     model=model,
@@ -1357,6 +1371,7 @@ class StreamingMixin:
                     overhead_ms=optimization_latency,
                     ttfb_ms=stream_state["ttfb_ms"] or 0,
                     pipeline_timing=pipeline_timing,
+                    attempted_input_tokens=attempted_input_tokens,
                 )
 
                 if self.cost_tracker:
@@ -1459,6 +1474,14 @@ class StreamingMixin:
                 yield b"data: [DONE]\n\n"
             finally:
                 total_latency = (time.time() - start_time) * 1000
+                # Active-compression denominator for backend-routed
+                # streaming. No per-message live-zone tracking is wired
+                # for this path yet (see the non-streaming sibling in
+                # openai.py for the same caveat), so use the full pre-
+                # comp request size. This keeps active_savings_percent
+                # in sync with proxy_savings_percent for this provider
+                # instead of collapsing the dashboard headline to 0%.
+                attempted_input_tokens = optimized_tokens + tokens_saved
                 await self.metrics.record_request(
                     provider=self.anthropic_backend.name,
                     model=model,
@@ -1470,6 +1493,7 @@ class StreamingMixin:
                     overhead_ms=optimization_latency,
                     pipeline_timing=pipeline_timing,
                     waste_signals=waste_signals,
+                    attempted_input_tokens=attempted_input_tokens,
                 )
 
                 # Mirror the Anthropic-stream path: log to RequestLogger so
