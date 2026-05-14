@@ -7,14 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import concurrent.futures
 import contextlib
 import copy
 import hashlib
 import json
 import logging
 import os
-import threading
 import time
 import uuid
 from datetime import datetime
@@ -41,22 +39,9 @@ import httpx
 from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode
+from headroom.proxy.cost import _summarize_transforms
 
 logger = logging.getLogger("headroom.proxy")
-
-_CODEX_WS_UNIT_ROUTER_MAX_WORKERS = 10
-_CODEX_WS_UNIT_ROUTER_SEMAPHORE = threading.BoundedSemaphore(_CODEX_WS_UNIT_ROUTER_MAX_WORKERS)
-
-
-def _codex_ws_unit_worker_count(unit_count: int) -> int:
-    if unit_count <= 1:
-        return 1
-    raw = os.environ.get("HEADROOM_CODEX_WS_UNIT_WORKERS", "4")
-    try:
-        requested = int(raw)
-    except ValueError:
-        requested = 4
-    return max(1, min(unit_count, requested, _CODEX_WS_UNIT_ROUTER_MAX_WORKERS))
 
 
 def _codex_ws_text_shape(text: str) -> str:
@@ -700,19 +685,26 @@ class OpenAIHandlerMixin:
         def _compress_routed_unit(
             routed: RoutedCompressionUnit,
         ) -> tuple[object, Any, float]:
+            # `elapsed_ms` is pure compute time. Prior to the P2 scheduler
+            # fix this was wall-clock-from-submit, which conflated
+            # semaphore wait with real work — passthrough units showed
+            # `elapsed_ms=60000+` in production logs even though they did
+            # no work. With the semaphore deleted, this timer is honest.
             unit_started = time.perf_counter()
-            with _CODEX_WS_UNIT_ROUTER_SEMAPHORE:
-                result = compress_unit_with_router(routed.unit, router=router, tokenizer=tokenizer)
+            result = compress_unit_with_router(routed.unit, router=router, tokenizer=tokenizer)
             elapsed_ms = (time.perf_counter() - unit_started) * 1000.0
             return routed.slot, result, elapsed_ms
 
+        # Units run serially within the frame-level worker thread. Frame-
+        # level parallelism is already provided by
+        # ``self._compression_executor`` (32 workers, sized
+        # ``min(32, cpu*4)``), which `_run_compression_in_executor`
+        # dispatches each frame onto. The prior per-call
+        # ``ThreadPoolExecutor`` + module-global
+        # ``threading.BoundedSemaphore(10)`` caused production cascades
+        # under ≥10 concurrent Codex sessions; both are deleted.
         router_total_started = time.perf_counter()
-        worker_count = _codex_ws_unit_worker_count(len(routed_units))
-        if worker_count <= 1:
-            routed_results = [_compress_routed_unit(routed) for routed in routed_units]
-        else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-                routed_results = list(executor.map(_compress_routed_unit, routed_units))
+        routed_results = [_compress_routed_unit(routed) for routed in routed_units]
 
         for _, result, elapsed_ms in routed_results:
             router_chain = list(result.router_result.strategy_chain) if result.router_result else []
@@ -4290,6 +4282,43 @@ class OpenAIHandlerMixin:
                                     overhead_ms=overhead_delta_ms,
                                     ttfb_ms=ttfb_for_record_ms,
                                     pipeline_timing=dashboard_pipeline_timing,
+                                )
+
+                                # Structured PERF log line so ``headroom perf``
+                                # counts this Codex turn. Pre-P2 this emit was
+                                # missing, which is why Codex traffic showed up
+                                # as ``Requests: 0`` in the perf report even
+                                # under heavy load — the same visibility bug
+                                # class as #327's "Cache write: 0" report.
+                                _perf_input_tokens = max(0, input_delta)
+                                _perf_cache_read = max(0, cache_read_delta)
+                                _perf_cache_write = max(0, cache_write_delta)
+                                _perf_cache_hit_pct = (
+                                    round(
+                                        _perf_cache_read
+                                        / (_perf_cache_read + _perf_cache_write)
+                                        * 100
+                                    )
+                                    if (_perf_cache_read + _perf_cache_write) > 0
+                                    else 0
+                                )
+                                _perf_tok_before = _perf_input_tokens + max(0, saved_delta)
+                                _perf_num_msgs = (
+                                    len(body.get("messages") or body.get("input") or [])
+                                    if isinstance(body, dict)
+                                    else 0
+                                )
+                                logger.info(
+                                    f"[{request_id}] PERF "
+                                    f"model={model_for_metrics} msgs={_perf_num_msgs} "
+                                    f"tok_before={_perf_tok_before} "
+                                    f"tok_after={_perf_input_tokens} "
+                                    f"tok_saved={max(0, saved_delta)} "
+                                    f"cache_read={_perf_cache_read} "
+                                    f"cache_write={_perf_cache_write} "
+                                    f"cache_hit_pct={_perf_cache_hit_pct} "
+                                    f"opt_ms={overhead_delta_ms:.0f} "
+                                    f"transforms={_summarize_transforms(transforms_applied)}"
                                 )
 
                                 ws_recorded_input_tokens_total = ws_input_tokens_total
