@@ -93,6 +93,14 @@ class DummyBatchHandler(batch_module.BatchHandlerMixin):
         self._request_counter += 1
         return f"req-{self._request_counter}"
 
+    async def _record_request_outcome(self, outcome) -> None:  # noqa: ANN001
+        # Mirror of HeadroomProxy._record_request_outcome for the batch
+        # mixin tests. Delegates to the free funnel so the wire shape
+        # matches production.
+        from headroom.proxy.outcome import emit_request_outcome
+
+        await emit_request_outcome(self, outcome)
+
     async def handle_passthrough(self, request, base_url):  # noqa: ANN001, ANN201
         return {"request": request, "base_url": base_url}
 
