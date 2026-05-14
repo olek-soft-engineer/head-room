@@ -90,6 +90,14 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         self.compression_executor_timeouts.append(timeout)
         return fn()
 
+    async def _record_request_outcome(self, outcome) -> None:
+        # Mirror of ``HeadroomProxy._record_request_outcome`` for the
+        # mixin tests. Delegates to the free funnel function so the
+        # wire shape is identical to production.
+        from headroom.proxy.outcome import emit_request_outcome
+
+        await emit_request_outcome(self, outcome)
+
 
 class _FakeWebSocketDisconnect(Exception):
     """Mirrors the ``WebSocketDisconnect`` type-name check in the handler.

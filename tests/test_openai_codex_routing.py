@@ -168,6 +168,13 @@ class _DummyOpenAIHandler(OpenAIHandlerMixin):
         # synchronously so MagicMock call_count assertions fire.
         return fn()
 
+    async def _record_request_outcome(self, outcome) -> None:
+        # Test stub: delegates to the production funnel so wire shape
+        # matches HeadroomProxy._record_request_outcome.
+        from headroom.proxy.outcome import emit_request_outcome
+
+        await emit_request_outcome(self, outcome)
+
     async def _stream_response(
         self,
         url: str,
