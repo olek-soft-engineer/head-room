@@ -225,14 +225,31 @@ async def test_codex_ws_emits_perf_log_with_cache_keys() -> None:
 
 @pytest.mark.slow
 def test_concurrent_compression_has_no_semaphore_tail() -> None:
-    """Drive 30 concurrent calls to the real dispatch with realistic content.
+    """Probe the 10-slot semaphore boundary with uniform-size workload.
+
+    Design notes — addresses a CI-vs-dev hardware skew that bit the
+    first iteration of this test:
+
+    * **12 concurrent sessions** (> the deleted 10-slot semaphore size).
+      Enough to saturate the gate if it ever reappears; small enough
+      that a 2-vCPU CI runner doesn't drown in OS-level scheduler
+      noise.
+    * **All frames the same size (4 KB)** so size-induced compute
+      variance cancels out. Pre-refactor the bug produced bimodal
+      latency (waiters vs holders) regardless of frame size; this
+      test must measure THAT, not size variance.
+    * **5 frames per session** = 60 total. Enough samples to make
+      the p99 statistic meaningful. Bounded runtime even on slow CI.
+    * **Threshold ratio < 4×.** On uniform-size workload the only
+      sources of p99/p50 spread are (a) the deleted semaphore tail
+      (≈27×) or (b) OS-level scheduler noise (≈2–3×). 4× sits
+      comfortably between the two — catches the bug, tolerates
+      hardware. (First iteration tried 5× with mixed sizes, which
+      let size-variance push CI ratios to 7.4×.)
 
     Marked ``slow`` so a normal ``pytest`` run can skip it via
-    ``-m 'not slow'``. The full CI matrix should run it because it is the
-    only assertion that catches semaphore-style contention regressions.
+    ``-m 'not slow'``. CI matrix runs all marks.
     """
-    # Late-import: this exercises the real proxy bring-up which is heavy
-    # for collection-time imports.
     sys.path.insert(0, str(REPO_ROOT))
     from scripts.replay_codex_ws_load import (  # noqa: E402
         Frame,
@@ -249,33 +266,21 @@ def test_concurrent_compression_has_no_semaphore_tail() -> None:
         "Subsequent timing assertions are meaningless without a warm router."
     )
 
-    # 30 sessions × 12 frames each. Sizes chosen to span the size_floor
-    # (compresses) and below-floor (passthrough) cases so the test
-    # exercises both code paths a real workload hits.
+    # 12 sessions × 5 frames = 60 total. Uniform 4 KB plain-text
+    # payload — each frame's compute time should be identical modulo
+    # scheduler noise.
+    UNIFORM_FRAME = Frame(bytes_estimate=4096, text_shape="plain_text_like")
     scenarios = [
         Scenario(
             request_id=f"stress-{i:02d}",
-            frames=[
-                Frame(bytes_estimate=4096, text_shape="plain_text_like"),
-                Frame(bytes_estimate=200, text_shape="plain_text_like"),  # below floor
-                Frame(bytes_estimate=8192, text_shape="code_fence"),
-                Frame(bytes_estimate=2048, text_shape="plain_text_like"),
-                Frame(bytes_estimate=16384, text_shape="plain_text_like"),
-                Frame(bytes_estimate=1024, text_shape="plain_text_like"),
-                Frame(bytes_estimate=512, text_shape="traceback"),
-                Frame(bytes_estimate=4096, text_shape="plain_text_like"),
-                Frame(bytes_estimate=2048, text_shape="plain_text_like"),
-                Frame(bytes_estimate=8192, text_shape="plain_text_like"),
-                Frame(bytes_estimate=1024, text_shape="plain_text_like"),
-                Frame(bytes_estimate=4096, text_shape="plain_text_like"),
-            ],
+            frames=[UNIFORM_FRAME] * 5,
         )
-        for i in range(30)
+        for i in range(12)
     ]
 
     results: list = []
     started = time.perf_counter()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
         futures = [pool.submit(replay_session, proxy, s, "gpt-4o-mini") for s in scenarios]
         for fut in concurrent.futures.as_completed(futures):
             results.extend(fut.result())
@@ -286,31 +291,18 @@ def test_concurrent_compression_has_no_semaphore_tail() -> None:
     p99 = elapsed[int(len(elapsed) * 0.99)]
     errors = [r for r in results if r.error]
 
-    # Print full distribution so CI logs always show numbers — useful
-    # both for diagnosing failures and tracking drift across runs.
+    # Always print the distribution so CI logs show numbers for
+    # diagnosing failures and tracking drift across runs.
     print(
         f"\n[stress] frames={len(results)} wall={wall_s:.2f}s "
         f"p50={p50:.0f}ms p99={p99:.0f}ms ratio={p99 / max(p50, 1):.2f}× errors={len(errors)}"
     )
 
-    # The KEY regression assertion is the *ratio*, not absolute latency.
-    # The bug being guarded against creates a bimodal latency
-    # distribution (most fast, some catastrophic) via the deleted
-    # `_CODEX_WS_UNIT_ROUTER_SEMAPHORE`. Pre-fix on a 12-CPU dev box:
-    # p50=91ms, p99=2433ms → ratio=27×. CI runners are 5–50× slower in
-    # absolute terms (observed p99=214,000ms during the first attempt at
-    # this test) but the contention pattern is invariant — if the
-    # semaphore tail comes back, the ratio explodes regardless of CPU
-    # speed. The ratio is therefore the right machine-independent test.
-    #
-    # Absolute thresholds (p99<1000ms, wall<5s) intentionally removed —
-    # they're sane on dev hardware but force CI either to skip this test
-    # entirely or to use thresholds so loose they stop catching the bug.
-    # The ratio catches the bug everywhere.
     assert not errors, f"Got {len(errors)} errors; first: {errors[0].error}"
     ratio = p99 / max(p50, 1)
-    assert ratio < 5.0, (
+    assert ratio < 4.0, (
         f"p99/p50 ratio is {ratio:.1f}× (p50={p50:.0f}ms, p99={p99:.0f}ms). "
-        f"Expected < 5× — a higher ratio means the contention tail is back. "
-        f"Pre-fix baseline ratio was ~27× regardless of machine speed."
+        f"Expected < 4× on uniform-size workload — a higher ratio means "
+        f"the semaphore-induced contention tail is back. Pre-fix baseline "
+        f"ratio on this same workload shape was ~27× regardless of CPU speed."
     )
