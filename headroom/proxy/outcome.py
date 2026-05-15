@@ -111,12 +111,24 @@ class RequestOutcome:
     # request_messages: only populated when ``config.log_full_messages``
     #     is enabled (off by default — message bodies are sensitive).
     # tags: client-provided routing/identification tags.
+    # client: identified harness driving the request (codex /
+    #     claude-code / aider / cursor / opencode / zed / ...).
+    #     ``None`` when neither the ``X-Client`` header nor the
+    #     User-Agent matched a known harness. Populated by handlers
+    #     via :func:`headroom.proxy.auth_mode.classify_client`. The
+    #     funnel surfaces this in the PERF log (``client=X``) and
+    #     copies it into ``RequestLog.tags["client"]`` so dashboards
+    #     can slice by harness without a separate column. This is the
+    #     one-field-add that proves the refactor pays out: per-
+    #     harness visibility appears across EVERY handler with zero
+    #     new bookkeeping at the call sites.
     transforms_applied: tuple[str, ...] = ()
     waste_signals: dict[str, int] | None = None
     num_messages: int = 0
     turn_id: str | None = None
     request_messages: list[dict[str, Any]] | None = None
     tags: dict[str, str] = field(default_factory=dict)
+    client: str | None = None
 
     # ── Derived (computed once, no caching needed — properties are cheap) ─
 
@@ -227,9 +239,16 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             uncached_tokens=outcome.uncached_input_tokens,
         )
 
-    # 3. Per-request log (optional).
+    # 3. Per-request log (optional). The ``client`` outcome field is
+    #    copied into ``tags["client"]`` so the dashboard's existing
+    #    tag-based filtering surfaces per-harness slicing for free —
+    #    no new RequestLog column needed. The original ``outcome.tags``
+    #    dict is not mutated (frozen dataclass + defensive copy).
     request_logger = getattr(handler, "logger", None)
     if request_logger is not None:
+        log_tags = dict(outcome.tags)
+        if outcome.client:
+            log_tags["client"] = outcome.client
         request_logger.log(
             RequestLog(
                 request_id=outcome.request_id,
@@ -243,7 +262,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
                 savings_percent=outcome.savings_pct,
                 optimization_latency_ms=outcome.overhead_ms,
                 total_latency_ms=outcome.total_latency_ms,
-                tags=outcome.tags,
+                tags=log_tags,
                 cache_hit=outcome.cache_hit,
                 transforms_applied=list(outcome.transforms_applied),
                 waste_signals=outcome.waste_signals,
@@ -252,7 +271,11 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
             )
         )
 
-    # 4. Structured PERF log line.
+    # 4. Structured PERF log line. ``client=X`` is appended only when
+    #    a harness was identified — keeps the unidentified-traffic
+    #    line unchanged, and gives ``headroom perf --client X``
+    #    parsers a clean key to filter on.
+    client_part = f" client={outcome.client}" if outcome.client else ""
     logger.info(
         f"[{outcome.request_id}] PERF "
         f"model={outcome.model} msgs={outcome.num_messages} "
@@ -262,4 +285,5 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         f"cache_hit_pct={outcome.cache_hit_pct} "
         f"opt_ms={outcome.overhead_ms:.0f} "
         f"transforms={_summarize_transforms(list(outcome.transforms_applied))}"
+        f"{client_part}"
     )

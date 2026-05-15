@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 import httpx
 
 from headroom.pipeline import PipelineStage, summarize_routing_markers
-from headroom.proxy.auth_mode import classify_auth_mode
+from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -589,6 +589,10 @@ class AnthropicHandlerMixin:
             # body is undecipherable → 502.
             headers.pop("accept-encoding", None)
             tags = self._extract_tags(headers)
+            # Identify the harness (codex / claude-code / aider / etc.)
+            # from User-Agent or X-Client. Surfaced via the funnel into
+            # PERF logs and RequestLog.tags — see RequestOutcome.client.
+            client = classify_client(headers)
             # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
             # headers AFTER `_extract_tags` reads them. Inbound bypass gating
             # uses `request.headers.get(...)` directly above; memory user-id
@@ -720,6 +724,7 @@ class AnthropicHandlerMixin:
                             total_latency_ms=optimization_latency,
                             overhead_ms=optimization_latency,
                             num_messages=len(messages),
+                            client=client,
                         )
                     )
 
@@ -1645,6 +1650,7 @@ class AnthropicHandlerMixin:
                                 transforms_applied=tuple(transforms_applied),
                                 num_messages=len(body.get("messages", [])),
                                 tags=tags,
+                                client=client,
                                 turn_id=compute_turn_id(
                                     model, body.get("system"), body.get("messages")
                                 ),
@@ -2157,6 +2163,7 @@ class AnthropicHandlerMixin:
                             transforms_applied=tuple(transforms_applied),
                             num_messages=len(messages),
                             tags=tags,
+                            client=client,
                             turn_id=compute_turn_id(
                                 model, body.get("system"), body.get("messages")
                             ),
@@ -2330,6 +2337,7 @@ class AnthropicHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
+        client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -2497,6 +2505,7 @@ class AnthropicHandlerMixin:
                     overhead_ms=optimization_latency,
                     pipeline_timing=pipeline_timing,
                     num_messages=len(compressed_requests),
+                    client=client,
                 )
             )
 
@@ -2578,6 +2587,7 @@ class AnthropicHandlerMixin:
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
+        client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -2613,6 +2623,7 @@ class AnthropicHandlerMixin:
                 tokens_saved=0,
                 attempted_input_tokens=0,
                 total_latency_ms=latency_ms,
+                client=client,
             )
         )
 
@@ -2697,6 +2708,7 @@ class AnthropicHandlerMixin:
 
         headers = dict(request.headers.items())
         headers.pop("host", None)
+        client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -2788,6 +2800,7 @@ class AnthropicHandlerMixin:
                 tokens_saved=0,
                 attempted_input_tokens=0,
                 total_latency_ms=latency_ms,
+                client=client,
             )
         )
 

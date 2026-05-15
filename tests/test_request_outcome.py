@@ -104,6 +104,55 @@ def test_optional_fields_default_to_neutral_values() -> None:
     assert o.turn_id is None
     assert o.request_messages is None
     assert o.tags == {}
+    assert o.client is None  # unidentified harness
+
+
+def test_client_field_round_trips() -> None:
+    """The ``client`` field is the proof point that the refactor pays
+    out across harnesses — one field-add gives every dashboard a
+    per-harness dimension for free.
+    """
+    o = _outcome(client="codex")
+    assert o.client == "codex"
+
+
+# ── classify_client — the harness ID source ─────────────────────────
+
+
+def test_classify_client_recognises_known_harness_user_agents() -> None:
+    from headroom.proxy.auth_mode import classify_client
+
+    cases = [
+        ({"User-Agent": "codex-cli/0.30.0 (osx)"}, "codex"),
+        ({"User-Agent": "claude-code/1.4.2"}, "claude-code"),
+        ({"User-Agent": "claude-cli/2.0"}, "claude-code"),  # aliased
+        ({"User-Agent": "cursor/0.42.1 (electron)"}, "cursor"),
+        ({"User-Agent": "aider/0.50.0"}, "aider"),
+        ({"User-Agent": "zed/0.143.0"}, "zed"),
+        ({"User-Agent": "opencode/1.0"}, "opencode"),
+        ({"User-Agent": "github-copilot/x.y.z"}, "copilot"),
+    ]
+    for headers, expected in cases:
+        assert classify_client(headers) == expected, headers
+
+
+def test_classify_client_x_client_header_wins_over_user_agent() -> None:
+    from headroom.proxy.auth_mode import classify_client
+
+    # X-Client wins even when UA matches a different harness
+    h = {"User-Agent": "codex-cli/0.30.0", "X-Client": "my-custom-harness"}
+    assert classify_client(h) == "my-custom-harness"
+
+
+def test_classify_client_returns_none_for_unknown_traffic() -> None:
+    """``None`` is the loud "unidentified" signal — downstream consumers
+    can group these as "unknown" rather than silently bucketing into
+    a default that would mislead dashboards."""
+    from headroom.proxy.auth_mode import classify_client
+
+    assert classify_client({"User-Agent": "Mozilla/5.0"}) is None
+    assert classify_client({}) is None
+    assert classify_client({"User-Agent": ""}) is None
 
 
 # ── Funnel contract (_record_request_outcome) ──────────────────────────
@@ -303,3 +352,72 @@ async def test_funnel_emits_perf_log_with_canonical_shape(
     assert "cache_write=100" in line
     assert "cache_hit_pct=67" in line  # 200/(200+100) * 100 = 67
     assert "opt_ms=12" in line
+
+
+# ── Funnel: per-client analytics surface ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_funnel_appends_client_to_perf_log_when_set() -> None:
+    """``headroom perf --client X`` filtering relies on the ``client=X``
+    token at the end of the PERF line. Absent client means no token —
+    the PERF line stays clean for unidentified traffic."""
+    h = _FunnelHarness()
+    target = logging.getLogger("headroom.proxy")
+    captured: list[logging.LogRecord] = []
+
+    class _H(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = _H(level=logging.INFO)
+    target.addHandler(handler)
+    prior_level = target.level
+    target.setLevel(logging.INFO)
+    try:
+        await h._record_request_outcome(_outcome(client="codex"))
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(prior_level)
+
+    perf_lines = [r.getMessage() for r in captured if " PERF " in r.getMessage()]
+    assert len(perf_lines) == 1
+    assert "client=codex" in perf_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_funnel_omits_client_from_perf_log_when_unidentified() -> None:
+    """When ``client`` is None the PERF line must NOT include a
+    bogus ``client=`` token — that would mislead the parser into
+    bucketing unidentified traffic as the empty string."""
+    h = _FunnelHarness()
+    target = logging.getLogger("headroom.proxy")
+    captured: list[logging.LogRecord] = []
+
+    class _H(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = _H(level=logging.INFO)
+    target.addHandler(handler)
+    prior_level = target.level
+    target.setLevel(logging.INFO)
+    try:
+        await h._record_request_outcome(_outcome(client=None))
+    finally:
+        target.removeHandler(handler)
+        target.setLevel(prior_level)
+
+    perf_lines = [r.getMessage() for r in captured if " PERF " in r.getMessage()]
+    assert len(perf_lines) == 1
+    assert "client=" not in perf_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_funnel_stamps_client_into_request_log_tags() -> None:
+    """Dashboards already filter on RequestLog.tags. Copying ``client``
+    into tags gives per-harness slicing for free with no new column."""
+    h = _FunnelHarness()
+    await h._record_request_outcome(_outcome(client="aider"))
+    assert len(h.logger.logs) == 1
+    assert h.logger.logs[0].tags.get("client") == "aider"

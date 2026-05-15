@@ -38,7 +38,7 @@ import httpx
 
 from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
-from headroom.proxy.auth_mode import classify_auth_mode
+from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.cost import _summarize_transforms
 from headroom.proxy.outcome import RequestOutcome
 
@@ -1226,6 +1226,7 @@ class OpenAIHandlerMixin:
         # if httpx lacks brotli support the response body is undecipherable → 502.
         headers.pop("accept-encoding", None)
         tags = self._extract_tags(headers)
+        client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Inbound bypass gating
         # uses `request.headers.get(...)` above; memory user-id reads
@@ -1311,6 +1312,7 @@ class OpenAIHandlerMixin:
                         from_response_cache=True,
                         total_latency_ms=_cache_hit_latency,
                         num_messages=len(messages),
+                        client=client,
                     )
                 )
 
@@ -1826,6 +1828,7 @@ class OpenAIHandlerMixin:
                             request_messages=body.get("messages")
                             if getattr(self.config, "log_full_messages", False)
                             else None,
+                            client=client,
                         )
                     )
 
@@ -2142,6 +2145,7 @@ class OpenAIHandlerMixin:
                         request_messages=body.get("messages")
                         if getattr(self.config, "log_full_messages", False)
                         else None,
+                        client=client,
                     )
                 )
 
@@ -2299,6 +2303,7 @@ class OpenAIHandlerMixin:
         # if httpx lacks brotli support the response body is undecipherable → 502.
         headers.pop("accept-encoding", None)
         tags = self._extract_tags(headers)
+        client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Memory user-id reads
         # `request.headers` below.
@@ -2847,6 +2852,7 @@ class OpenAIHandlerMixin:
                         request_messages=messages
                         if getattr(self.config, "log_full_messages", False)
                         else None,
+                        client=client,
                     )
                 )
 
@@ -2922,6 +2928,9 @@ class OpenAIHandlerMixin:
 
         # Forward client headers to upstream, adding required OpenAI-Beta header
         ws_headers = dict(websocket.headers)
+        # Identify the WS harness before downstream auth/header rewrites.
+        # Captured in closure so per-turn RequestOutcome can stamp it.
+        client = classify_client(ws_headers)
         _ws_url_obj = getattr(websocket, "url", None)
         _ws_url = str(_ws_url_obj) if _ws_url_obj is not None else ""
         _ws_path = getattr(_ws_url_obj, "path", "") if _ws_url_obj is not None else ""
@@ -4247,6 +4256,7 @@ class OpenAIHandlerMixin:
                                         )
                                         if isinstance(body, dict)
                                         else 0,
+                                        client=client,
                                     )
                                 )
 
@@ -4817,6 +4827,7 @@ class OpenAIHandlerMixin:
                         pipeline_timing=final_pipeline_timing,
                         transforms_applied=tuple(transforms_applied),
                         tags=ws_session_tags,
+                        client=client,
                     )
                 )
                 ws_recorded_overhead_ms_total = _current_ws_overhead_ms()
@@ -5309,6 +5320,7 @@ class OpenAIHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("accept-encoding", None)
+        client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -5374,6 +5386,7 @@ class OpenAIHandlerMixin:
                     tokens_saved=0,
                     attempted_input_tokens=0,
                     total_latency_ms=latency_ms,
+                    client=client,
                 )
             )
 

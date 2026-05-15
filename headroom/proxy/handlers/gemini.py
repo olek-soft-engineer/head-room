@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from fastapi import Request
     from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -193,6 +194,7 @@ class GeminiHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         tags = self._extract_tags(headers)
+        client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Memory user-id reads
         # `request.headers` below.
@@ -499,6 +501,7 @@ class GeminiHandlerMixin:
                     transforms_applied=tuple(transforms_applied),
                     num_messages=len(body.get("contents", [])),
                     tags=tags or {},
+                    client=client,
                 )
                 await self._record_request_outcome(outcome)
 
@@ -591,6 +594,8 @@ class GeminiHandlerMixin:
         headers.pop("content-length", None)
         headers.pop("accept-encoding", None)
         tags = self._extract_tags(headers)
+        # Note: streaming handlers delegate to _stream_response, which
+        # does its own classify_client. No need to compute here.
         is_antigravity = self._is_cloudcode_antigravity_request(body, headers)
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound headers
         # AFTER `_extract_tags` and `is_cloudcode_antigravity` reads.
@@ -718,6 +723,8 @@ class GeminiHandlerMixin:
         headers.pop("host", None)
         headers.pop("content-length", None)
         tags = self._extract_tags(headers)
+        # Streaming variant — delegates to _stream_response which
+        # classifies the client itself from headers.
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -802,6 +809,7 @@ class GeminiHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("content-length", None)
+        client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -923,6 +931,7 @@ class GeminiHandlerMixin:
                     attempted_input_tokens=compressed_tokens + tokens_saved,
                     total_latency_ms=total_latency,
                     transforms_applied=tuple(transforms_applied),
+                    client=client,
                 )
             )
 

@@ -12,6 +12,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from headroom.proxy.auth_mode import classify_client
 from headroom.proxy.helpers import compute_turn_id, jitter_delay_ms
 
 if TYPE_CHECKING:
@@ -583,6 +584,7 @@ class StreamingMixin:
         original_messages: list[dict] | None = None,
         full_sse_data: str = "",
         parsed_response: dict[str, Any] | None = None,
+        client: str | None = None,
     ) -> None:
         from headroom.proxy.outcome import RequestOutcome
 
@@ -704,6 +706,7 @@ class StreamingMixin:
             transforms_applied=tuple(transforms_applied),
             num_messages=len(body.get("messages", [])),
             tags=tags or {},
+            client=client,
             request_messages=body.get("messages")
             if getattr(self.config, "log_full_messages", False)
             else None,
@@ -749,6 +752,10 @@ class StreamingMixin:
 
         from headroom.proxy.helpers import MAX_SSE_BUFFER_SIZE
 
+        # Identify the harness (codex / claude-code / aider / cursor /
+        # ...) from the *client's* User-Agent before copilot-auth
+        # potentially rewrites headers for upstream.
+        client = classify_client(headers)
         headers = await apply_copilot_api_auth(headers, url=url)
         start_time = time.time()
 
@@ -962,6 +969,7 @@ class StreamingMixin:
                 pipeline_timing=pipeline_timing,
                 prefix_tracker=prefix_tracker,
                 original_messages=original_messages,
+                client=client,
             )
             return Response(
                 content=error_content,
@@ -1218,6 +1226,7 @@ class StreamingMixin:
                     original_messages=original_messages,
                     full_sse_data=_final_full_sse_data,
                     parsed_response=parsed_response,
+                    client=client,
                 )
 
         return StreamingResponse(
@@ -1248,6 +1257,8 @@ class StreamingMixin:
         from fastapi.responses import StreamingResponse
 
         from headroom.proxy.outcome import RequestOutcome
+
+        client = classify_client(headers)
 
         start_time = time.time()
 
@@ -1343,6 +1354,7 @@ class StreamingMixin:
                     transforms_applied=tuple(transforms_applied),
                     num_messages=len(body.get("messages", [])),
                     tags=tags or {},
+                    client=client,
                     turn_id=compute_turn_id(model, body.get("system"), body.get("messages")),
                     request_messages=body.get("messages")
                     if getattr(self.config, "log_full_messages", False)
@@ -1392,6 +1404,7 @@ class StreamingMixin:
         from headroom.proxy.outcome import RequestOutcome
 
         assert self.anthropic_backend is not None
+        client = classify_client(headers)
 
         async def generate():
             stream_state: dict[str, Any] = {
@@ -1488,6 +1501,7 @@ class StreamingMixin:
                     transforms_applied=tuple(transforms_applied),
                     num_messages=len(body.get("messages", [])),
                     tags=tags or {},
+                    client=client,
                     request_messages=body.get("messages")
                     if getattr(self.config, "log_full_messages", False)
                     else None,
