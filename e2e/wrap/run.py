@@ -714,7 +714,8 @@ def verify_openclaw_wrap(
             "--proxy-port",
             str(port),
             "--startup-timeout-ms",
-            "5000",
+            # 5s is too tight for cold Python+pyo3 import on a busy CI runner.
+            "30000",
             "--verbose",
         ],
         env=base_env,
