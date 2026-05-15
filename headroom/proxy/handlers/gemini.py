@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from headroom.proxy.auth_mode import classify_client
+from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -323,8 +324,17 @@ class GeminiHandlerMixin:
         optimized_tokens = original_tokens
 
         _compression_failed = False
-        _license_ok = self.usage_reporter.should_compress if self.usage_reporter else True
-        if self.config.optimize and messages and _license_ok:
+        _decision = CompressionDecision.decide(
+            headers=request.headers,
+            config=self.config,
+            usage_reporter=self.usage_reporter,
+            messages=messages,
+        )
+        if not _decision.should_compress:
+            logger.info(
+                f"[{request_id}] Compression skipped: reason={_decision.passthrough_reason}"
+            )
+        if _decision.should_compress:
             try:
                 # Use OpenAI pipeline (similar message format)
                 context_limit = self.openai_provider.get_context_limit(model)
@@ -626,8 +636,17 @@ class GeminiHandlerMixin:
         optimized_tokens = original_tokens
         transforms_applied: list[str] = []
 
-        _license_ok = self.usage_reporter.should_compress if self.usage_reporter else True
-        if self.config.optimize and messages and _license_ok:
+        _decision = CompressionDecision.decide(
+            headers=request.headers,
+            config=self.config,
+            usage_reporter=self.usage_reporter,
+            messages=messages,
+        )
+        if not _decision.should_compress:
+            logger.info(
+                f"[{request_id}] Compression skipped: reason={_decision.passthrough_reason}"
+            )
+        if _decision.should_compress:
             try:
                 context_limit = self.openai_provider.get_context_limit(model)
                 result = self.openai_pipeline.apply(
@@ -857,7 +876,17 @@ class GeminiHandlerMixin:
         transforms_applied: list[str] = []
         optimized_messages = messages
 
-        if self.config.optimize and messages:
+        _decision = CompressionDecision.decide(
+            headers=request.headers,
+            config=self.config,
+            usage_reporter=self.usage_reporter,
+            messages=messages,
+        )
+        if not _decision.should_compress:
+            logger.info(
+                f"[{request_id}] Compression skipped: reason={_decision.passthrough_reason}"
+            )
+        if _decision.should_compress:
             try:
                 context_limit = self.openai_provider.get_context_limit(model)
                 result = self.openai_pipeline.apply(
