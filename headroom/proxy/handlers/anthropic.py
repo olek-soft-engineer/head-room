@@ -25,6 +25,7 @@ import httpx
 
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
+from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
@@ -886,8 +887,17 @@ class AnthropicHandlerMixin:
 
             _compression_failed = False
             original_messages = messages  # Preserve for 400-retry fallback
-            _license_ok = self.usage_reporter.should_compress if self.usage_reporter else True
-            if self.config.optimize and messages and not _bypass and _license_ok:
+            _decision = CompressionDecision.decide(
+                headers=request.headers,
+                config=self.config,
+                usage_reporter=self.usage_reporter,
+                messages=messages,
+            )
+            if not _decision.should_compress:
+                logger.info(
+                    f"[{request_id}] Compression skipped: reason={_decision.passthrough_reason}"
+                )
+            if _decision.should_compress:
                 try:
                     from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS
 
