@@ -13,7 +13,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from headroom.proxy.auth_mode import classify_client
-from headroom.proxy.helpers import compute_turn_id, jitter_delay_ms
+from headroom.proxy.helpers import jitter_delay_ms
 
 if TYPE_CHECKING:
     from fastapi.responses import Response, StreamingResponse
@@ -677,39 +677,35 @@ class StreamingMixin:
                 original_messages=next_original,
             )
 
-        # Active-compression denominator. No frozen_message_count is
-        # propagated to the streaming finalizer yet, so we fall back to
-        # the pre-comp request size (effective_optimized + tokens_saved).
-        # Per-message live-zone tracking is a follow-up; without this
-        # fallback the dashboard headline collapses to 0% for streaming
-        # traffic even though compression is happening (issue #455).
-        attempted_input_tokens = effective_optimized_tokens + tokens_saved
-
-        outcome = RequestOutcome(
-            request_id=request_id,
+        # Active-compression denominator (``attempted_input_tokens``) is
+        # derived inside ``RequestOutcome.from_stream`` as
+        # ``optimized_tokens + tokens_saved``. No frozen_message_count
+        # propagates to the streaming finalizer yet — per-message
+        # live-zone tracking is a follow-up. Without this fallback the
+        # dashboard headline collapses to 0% even when compression is
+        # happening (issue #455).
+        outcome = RequestOutcome.from_stream(
+            body=body,
             provider=provider,
             model=model,
+            request_id=request_id,
             original_tokens=effective_original_tokens,
             optimized_tokens=effective_optimized_tokens,
             output_tokens=output_tokens,
             tokens_saved=tokens_saved,
-            attempted_input_tokens=attempted_input_tokens,
+            transforms_applied=transforms_applied,
+            total_latency_ms=total_latency,
+            overhead_ms=optimization_latency,
+            tags=tags,
+            client=client,
+            log_full_messages=getattr(self.config, "log_full_messages", False),
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
             cache_write_5m_tokens=cache_write_5m_tokens,
             cache_write_1h_tokens=cache_write_1h_tokens,
             uncached_input_tokens=uncached_input_tokens,
-            total_latency_ms=total_latency,
-            overhead_ms=optimization_latency,
             ttfb_ms=stream_state["ttfb_ms"] or total_latency,
             pipeline_timing=pipeline_timing,
-            transforms_applied=tuple(transforms_applied),
-            num_messages=len(body.get("messages", [])),
-            tags=tags or {},
-            client=client,
-            request_messages=body.get("messages")
-            if getattr(self.config, "log_full_messages", False)
-            else None,
         )
         await self._record_request_outcome(outcome)
 
@@ -1330,35 +1326,31 @@ class StreamingMixin:
                 _backend_name = (
                     self.anthropic_backend.name if self.anthropic_backend else "anthropic"
                 )
-                # Active-compression denominator: pre-comp request size.
-                # Bedrock streaming doesn't propagate frozen_message_count
-                # here either; without this, attempted_input_tokens_total
-                # stays 0 and the dashboard headline reads 0% (#455).
-                outcome = RequestOutcome(
-                    request_id=request_id,
+                # Active-compression denominator derived inside
+                # ``from_stream`` as ``optimized + saved``. Bedrock
+                # doesn't propagate frozen_message_count either — same
+                # fallback as the SSE finalizer (#455).
+                outcome = RequestOutcome.from_stream(
+                    body=body,
                     provider=_backend_name,
                     model=model,
+                    request_id=request_id,
                     original_tokens=original_tokens,
                     optimized_tokens=optimized_tokens,
                     output_tokens=stream_state["output_tokens"],
                     tokens_saved=tokens_saved,
-                    attempted_input_tokens=optimized_tokens + tokens_saved,
+                    transforms_applied=transforms_applied,
+                    total_latency_ms=total_latency,
+                    overhead_ms=optimization_latency,
+                    tags=tags,
+                    client=client,
+                    log_full_messages=getattr(self.config, "log_full_messages", False),
                     cache_read_tokens=stream_state["cache_read_input_tokens"],
                     cache_write_tokens=stream_state["cache_creation_input_tokens"],
                     cache_write_5m_tokens=stream_state["cache_creation_ephemeral_5m_input_tokens"],
                     cache_write_1h_tokens=stream_state["cache_creation_ephemeral_1h_input_tokens"],
-                    total_latency_ms=total_latency,
-                    overhead_ms=optimization_latency,
                     ttfb_ms=stream_state["ttfb_ms"] or 0,
                     pipeline_timing=pipeline_timing,
-                    transforms_applied=tuple(transforms_applied),
-                    num_messages=len(body.get("messages", [])),
-                    tags=tags or {},
-                    client=client,
-                    turn_id=compute_turn_id(model, body.get("system"), body.get("messages")),
-                    request_messages=body.get("messages")
-                    if getattr(self.config, "log_full_messages", False)
-                    else None,
                 )
                 await self._record_request_outcome(outcome)
 
@@ -1481,30 +1473,27 @@ class StreamingMixin:
                 # comp request size. This keeps active_savings_percent
                 # in sync with proxy_savings_percent for this provider
                 # instead of collapsing the dashboard headline to 0%.
-                outcome = RequestOutcome(
-                    request_id=request_id,
+                outcome = RequestOutcome.from_stream(
+                    body=body,
                     provider=self.anthropic_backend.name,
                     model=model,
+                    request_id=request_id,
                     original_tokens=original_tokens,
                     optimized_tokens=optimized_tokens,
                     output_tokens=output_tokens,
                     tokens_saved=tokens_saved,
-                    attempted_input_tokens=optimized_tokens + tokens_saved,
+                    transforms_applied=transforms_applied,
+                    total_latency_ms=total_latency,
+                    overhead_ms=optimization_latency,
+                    tags=tags,
+                    client=client,
+                    log_full_messages=getattr(self.config, "log_full_messages", False),
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
                     uncached_input_tokens=uncached_input_tokens,
                     cache_inferred=cache_inferred,
-                    total_latency_ms=total_latency,
-                    overhead_ms=optimization_latency,
                     pipeline_timing=pipeline_timing,
                     waste_signals=waste_signals,
-                    transforms_applied=tuple(transforms_applied),
-                    num_messages=len(body.get("messages", [])),
-                    tags=tags or {},
-                    client=client,
-                    request_messages=body.get("messages")
-                    if getattr(self.config, "log_full_messages", False)
-                    else None,
                 )
                 await self._record_request_outcome(outcome)
 

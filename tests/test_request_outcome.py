@@ -421,3 +421,150 @@ async def test_funnel_stamps_client_into_request_log_tags() -> None:
     await h._record_request_outcome(_outcome(client="aider"))
     assert len(h.logger.logs) == 1
     assert h.logger.logs[0].tags.get("client") == "aider"
+
+
+# ── from_stream classmethod (streaming-finalizer construction shape) ──
+#
+# Three streaming finalizers (``_finalize_stream_response``,
+# ``_stream_response_bedrock``, ``_stream_openai_via_backend``) each used
+# to construct ``RequestOutcome(...)`` inline with the same body- and
+# config-derived fields — ``attempted_input_tokens``, ``num_messages``,
+# ``request_messages``, ``turn_id``, tuple-conversion of
+# ``transforms_applied``, ``tags`` normalization. One site (Bedrock)
+# computed ``turn_id``; the other two silently dropped it — a real bug
+# the helper fixes by computing it uniformly. ``from_stream`` is the
+# canonical construction point so the three finalizers cannot drift
+# apart on derivation logic again.
+
+
+def _stream_kwargs(**overrides: Any) -> dict[str, Any]:
+    """Minimal kwargs for ``RequestOutcome.from_stream``; override per test."""
+    base: dict[str, Any] = {
+        "body": {"messages": [{"role": "user", "content": "hi"}]},
+        "provider": "anthropic",
+        "model": "claude-sonnet-4",
+        "request_id": "req-1",
+        "original_tokens": 1000,
+        "optimized_tokens": 300,
+        "output_tokens": 50,
+        "tokens_saved": 700,
+        "transforms_applied": ["smart_crusher"],
+        "total_latency_ms": 1234.5,
+        "overhead_ms": 12.3,
+        "tags": {"a": "b"},
+        "client": "codex",
+        "log_full_messages": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_from_stream_returns_request_outcome() -> None:
+    o = RequestOutcome.from_stream(**_stream_kwargs())
+    assert isinstance(o, RequestOutcome)
+
+
+def test_from_stream_derives_attempted_input_tokens_from_optimized_plus_saved() -> None:
+    """One of the six derivations the three finalizers each computed
+    inline. Centralising it makes the dashboard's active-savings
+    denominator structurally consistent across providers (#454/#455)."""
+    o = RequestOutcome.from_stream(**_stream_kwargs(optimized_tokens=300, tokens_saved=700))
+    assert o.attempted_input_tokens == 1000
+
+
+def test_from_stream_counts_messages_from_body() -> None:
+    """``num_messages`` powers PERF ``msgs=N``. Computing it from the
+    body in one place prevents the historical drift where some sites
+    used ``original_messages`` and others used ``body["messages"]``."""
+    body = {"messages": [{"role": "user", "content": "1"}, {"role": "user", "content": "2"}]}
+    assert RequestOutcome.from_stream(**_stream_kwargs(body=body)).num_messages == 2
+
+
+def test_from_stream_handles_missing_messages_key() -> None:
+    """Empty body — e.g. a probe request — must yield num_messages=0,
+    not raise KeyError. All three pre-refactor sites used
+    ``len(body.get("messages", []))`` so the contract is already
+    "default to 0"."""
+    assert RequestOutcome.from_stream(**_stream_kwargs(body={})).num_messages == 0
+
+
+def test_from_stream_always_computes_turn_id() -> None:
+    """The bug the helper is fixing: pre-refactor, only the Bedrock
+    finalizer called ``compute_turn_id``. Sites 1 and 3 silently dropped
+    it, breaking the dashboard's multi-turn-session grouping for every
+    Anthropic-SSE and OpenAI-via-backend request. The helper computes
+    it uniformly."""
+    body = {
+        "messages": [{"role": "user", "content": "hi"}],
+        "system": "you are helpful",
+    }
+    o = RequestOutcome.from_stream(**_stream_kwargs(body=body, model="claude-sonnet-4"))
+    assert o.turn_id is not None
+    assert isinstance(o.turn_id, str)
+    # Stable: same body+model produces the same turn_id.
+    o2 = RequestOutcome.from_stream(**_stream_kwargs(body=body, model="claude-sonnet-4"))
+    assert o.turn_id == o2.turn_id
+
+
+def test_from_stream_converts_transforms_to_tuple() -> None:
+    """``transforms_applied`` is typed as ``tuple[str, ...]`` on the
+    dataclass (frozen → must be hashable/immutable). Callers pass lists.
+    The helper does the conversion so no caller has to remember."""
+    o = RequestOutcome.from_stream(**_stream_kwargs(transforms_applied=["a", "b"]))
+    assert o.transforms_applied == ("a", "b")
+    assert isinstance(o.transforms_applied, tuple)
+
+
+def test_from_stream_normalises_none_tags_to_empty_dict() -> None:
+    """``tags=None`` is the common case (no routing tags); the dataclass
+    contract is ``dict[str, str]``. Pre-refactor each site wrote
+    ``tags or {}``; the helper does it once."""
+    assert RequestOutcome.from_stream(**_stream_kwargs(tags=None)).tags == {}
+
+
+def test_from_stream_omits_request_messages_when_log_full_messages_disabled() -> None:
+    """``log_full_messages=False`` is the default; message bodies are
+    sensitive (tool outputs, secrets) and must not land in the request
+    log unless explicitly enabled."""
+    body = {"messages": [{"role": "user", "content": "secret"}]}
+    o = RequestOutcome.from_stream(**_stream_kwargs(body=body, log_full_messages=False))
+    assert o.request_messages is None
+
+
+def test_from_stream_includes_request_messages_when_log_full_messages_enabled() -> None:
+    """Same path, opt-in for full-message logging — used by
+    /transformations/feed when the operator enables it."""
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+    o = RequestOutcome.from_stream(**_stream_kwargs(body=body, log_full_messages=True))
+    assert o.request_messages == body["messages"]
+
+
+def test_from_stream_threads_provider_specific_cache_fields() -> None:
+    """Anthropic populates all five cache fields; OpenAI-via-backend
+    sets ``cache_inferred=True``; Gemini populates read only. The
+    helper must pass each through without forcing every caller to
+    pass every field."""
+    o = RequestOutcome.from_stream(
+        **_stream_kwargs(),
+        cache_read_tokens=100,
+        cache_write_tokens=200,
+        cache_write_5m_tokens=150,
+        cache_write_1h_tokens=50,
+        uncached_input_tokens=10,
+    )
+    assert o.cache_read_tokens == 100
+    assert o.cache_write_tokens == 200
+    assert o.cache_write_5m_tokens == 150
+    assert o.cache_write_1h_tokens == 50
+    assert o.uncached_input_tokens == 10
+    assert o.cache_inferred is False  # default — only set True by OpenAI sites
+
+
+def test_from_stream_threads_waste_signals_for_openai_via_backend_site() -> None:
+    """Only the OpenAI-via-backend finalizer populates ``waste_signals``;
+    the helper threads it through as an optional kwarg."""
+    o = RequestOutcome.from_stream(
+        **_stream_kwargs(),
+        waste_signals={"skipped_units": 3, "applied_units": 7},
+    )
+    assert o.waste_signals == {"skipped_units": 3, "applied_units": 7}
