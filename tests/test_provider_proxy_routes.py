@@ -149,7 +149,6 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
         "handle_gemini_stream_generate_content",
         "handle_gemini_count_tokens",
         "handle_google_cloudcode_stream",
-        "handle_databricks_invocations",
         "handle_google_batch_create",
         "handle_google_batch_results",
         "handle_google_batch_passthrough",
@@ -196,9 +195,6 @@ def test_provider_specific_routes_delegate_to_expected_proxy_handlers(monkeypatc
         )
         assert client.post("/v1/v1internal:streamGenerateContent").json()["handler"] == (
             "handle_google_cloudcode_stream"
-        )
-        assert client.post("/serving-endpoints/demo/invocations").json()["handler"] == (
-            "handle_databricks_invocations"
         )
         assert client.post("/v1beta/models/demo:batchGenerateContent").json()["handler"] == (
             "handle_google_batch_create"

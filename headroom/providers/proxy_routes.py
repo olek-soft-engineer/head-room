@@ -236,10 +236,6 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     async def google_cloudcode_stream_generate_content_v1(request: Request):
         return await proxy.handle_google_cloudcode_stream(request)
 
-    @app.post("/serving-endpoints/{model}/invocations")
-    async def databricks_invocations(request: Request, model: str):
-        return await proxy.handle_databricks_invocations(request, model)
-
     @app.get("/v1/models")
     async def list_models(request: Request):
         chatgpt_response = await _handle_chatgpt_model_metadata(

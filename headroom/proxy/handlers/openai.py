@@ -38,8 +38,9 @@ import httpx
 
 from headroom.copilot_auth import apply_copilot_api_auth, build_copilot_upstream_url
 from headroom.pipeline import PipelineStage, summarize_routing_markers
-from headroom.proxy.auth_mode import classify_auth_mode
+from headroom.proxy.auth_mode import classify_auth_mode, classify_client
 from headroom.proxy.cost import _summarize_transforms
+from headroom.proxy.outcome import RequestOutcome
 
 logger = logging.getLogger("headroom.proxy")
 
@@ -1225,6 +1226,7 @@ class OpenAIHandlerMixin:
         # if httpx lacks brotli support the response body is undecipherable → 502.
         headers.pop("accept-encoding", None)
         tags = self._extract_tags(headers)
+        client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Inbound bypass gating
         # uses `request.headers.get(...)` above; memory user-id reads
@@ -1292,14 +1294,26 @@ class OpenAIHandlerMixin:
                     messages=messages,
                     metadata={"cache_hit": True, "path": "/v1/chat/completions"},
                 )
-                await self.metrics.record_request(
-                    provider="openai",
-                    model=model,
-                    input_tokens=0,
-                    output_tokens=0,
-                    tokens_saved=0,  # Savings already counted when response was cached
-                    latency_ms=(time.time() - start_time) * 1000,
-                    cached=True,
+                # Response-cache hit: same pattern as the anthropic
+                # cache-hit site. ``from_response_cache=True`` is the
+                # distinct signal that the proxy served from its own
+                # semantic cache (not upstream prompt cache).
+                _cache_hit_latency = (time.time() - start_time) * 1000
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=request_id,
+                        provider="openai",
+                        model=model,
+                        original_tokens=0,
+                        optimized_tokens=0,
+                        output_tokens=0,
+                        tokens_saved=0,
+                        attempted_input_tokens=0,
+                        from_response_cache=True,
+                        total_latency_ms=_cache_hit_latency,
+                        num_messages=len(messages),
+                        client=client,
+                    )
                 )
 
                 # Remove compression headers from cached response
@@ -1781,64 +1795,42 @@ class OpenAIHandlerMixin:
                             content=backend_response.body,
                         )
 
-                    # Track metrics
+                    # OpenAI Chat via backend (LiteLLM/AnyLLM), non-
+                    # streaming. No per-message live-zone tracking yet
+                    # — use full pre-comp request size as the attempted
+                    # denominator so this provider's contribution to
+                    # active_savings is its whole-request ratio.
+                    # Cache extraction from the backend response body
+                    # is not wired here yet (follow-up); funnel passes
+                    # zeros for cache fields, matching pre-refactor
+                    # behaviour.
                     total_latency = (time.time() - start_time) * 1000
                     usage = backend_response.body.get("usage", {})
                     output_tokens = usage.get("completion_tokens", 0)
                     total_input_tokens = usage.get("prompt_tokens", optimized_tokens)
-
-                    # OpenAI Chat: no per-message live-zone tracking
-                    # yet. Use full pre-comp request size as the
-                    # attempted denominator so this provider's
-                    # contribution to the aggregate active_savings ratio
-                    # equals its whole-request ratio. Per-message
-                    # eligibility (tool_result-shaped messages, current
-                    # turn vs cached) is a follow-up.
-                    attempted_input_tokens = total_input_tokens + tokens_saved
-                    await self.metrics.record_request(
-                        provider=self.anthropic_backend.name,
-                        model=model,
-                        input_tokens=total_input_tokens,
-                        output_tokens=output_tokens,
-                        tokens_saved=tokens_saved,
-                        latency_ms=total_latency,
-                        cached=False,
-                        overhead_ms=optimization_latency,
-                        pipeline_timing=pipeline_timing,
-                        waste_signals=waste_signals_dict,
-                        attempted_input_tokens=attempted_input_tokens,
-                    )
-
-                    # Mirror the streaming path: log to RequestLogger so
-                    # /stats.recent_requests sees the OpenAI-via-backend
-                    # non-streaming path. Previously this path was silent.
-                    if getattr(self, "logger", None) is not None:
-                        from headroom.proxy.models import RequestLog
-
-                        self.logger.log(
-                            RequestLog(
-                                request_id=request_id,
-                                timestamp=datetime.now().isoformat(),
-                                provider=self.anthropic_backend.name,
-                                model=model,
-                                input_tokens_original=original_tokens,
-                                input_tokens_optimized=optimized_tokens,
-                                output_tokens=output_tokens,
-                                tokens_saved=tokens_saved,
-                                savings_percent=(tokens_saved / original_tokens * 100)
-                                if original_tokens > 0
-                                else 0,
-                                optimization_latency_ms=optimization_latency,
-                                total_latency_ms=total_latency,
-                                tags=tags or {},
-                                cache_hit=False,
-                                transforms_applied=transforms_applied,
-                                waste_signals=waste_signals_dict,
-                                request_messages=body.get("messages")
-                                if getattr(self.config, "log_full_messages", False)
-                                else None,
-                            )
+                    await self._record_request_outcome(
+                        RequestOutcome(
+                            request_id=request_id,
+                            provider=self.anthropic_backend.name,
+                            model=model,
+                            original_tokens=original_tokens,
+                            optimized_tokens=total_input_tokens,
+                            output_tokens=output_tokens,
+                            tokens_saved=tokens_saved,
+                            attempted_input_tokens=total_input_tokens + tokens_saved,
+                            total_latency_ms=total_latency,
+                            overhead_ms=optimization_latency,
+                            pipeline_timing=pipeline_timing,
+                            waste_signals=waste_signals_dict,
+                            transforms_applied=tuple(transforms_applied),
+                            num_messages=len(body.get("messages", [])),
+                            tags=tags or {},
+                            request_messages=body.get("messages")
+                            if getattr(self.config, "log_full_messages", False)
+                            else None,
+                            client=client,
                         )
+                    )
 
                     if tokens_saved > 0:
                         logger.info(
@@ -2124,60 +2116,38 @@ class OpenAIHandlerMixin:
                     "endpoint": "chat_completions",
                 }
 
-                # OpenAI Chat (streaming path): fallback denominator —
-                # full pre-comp size. See note at the non-streaming
-                # path for the eligible-only follow-up.
-                attempted_input_tokens = total_input_tokens + tokens_saved
-                await self.metrics.record_request(
-                    provider="openai",
-                    model=model,
-                    input_tokens=total_input_tokens,
-                    output_tokens=output_tokens,
-                    tokens_saved=tokens_saved,
-                    latency_ms=total_latency,
-                    overhead_ms=optimization_latency,
-                    pipeline_timing=pipeline_timing,
-                    waste_signals=waste_signals_dict,
-                    cache_read_tokens=cache_read_tokens,
-                    cache_write_tokens=cache_write_tokens,
-                    uncached_input_tokens=uncached_input_tokens,
-                    attempted_input_tokens=attempted_input_tokens,
-                )
+                # OpenAI Chat direct (non-backend) non-streaming.
+                # Fallback denominator: full pre-comp size — see
+                # equivalent note at the backend-routed sibling.
+                from headroom.proxy.helpers import compute_turn_id
 
-                # Per-request log entry for /transformations/feed +
-                # /stats `recent_requests`. Without this the dashboard
-                # only shows aggregates for non-streaming OpenAI traffic.
-                # Mirror of the streaming.py + anthropic.py wiring.
-                if getattr(self, "logger", None) is not None:
-                    from headroom.proxy.helpers import compute_turn_id
-                    from headroom.proxy.models import RequestLog
-
-                    self.logger.log(
-                        RequestLog(
-                            request_id=request_id,
-                            timestamp=datetime.now().isoformat(),
-                            provider="openai",
-                            model=model,
-                            input_tokens_original=original_tokens,
-                            input_tokens_optimized=optimized_tokens,
-                            output_tokens=output_tokens,
-                            tokens_saved=tokens_saved,
-                            savings_percent=(tokens_saved / original_tokens * 100)
-                            if original_tokens > 0
-                            else 0,
-                            optimization_latency_ms=optimization_latency,
-                            total_latency_ms=total_latency,
-                            tags=_chat_log_tags,
-                            cache_hit=False,
-                            transforms_applied=transforms_applied,
-                            request_messages=body.get("messages")
-                            if getattr(self.config, "log_full_messages", False)
-                            else None,
-                            turn_id=compute_turn_id(
-                                model, body.get("system"), body.get("messages")
-                            ),
-                        )
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=request_id,
+                        provider="openai",
+                        model=model,
+                        original_tokens=original_tokens,
+                        optimized_tokens=total_input_tokens,
+                        output_tokens=output_tokens,
+                        tokens_saved=tokens_saved,
+                        attempted_input_tokens=total_input_tokens + tokens_saved,
+                        cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=cache_write_tokens,
+                        uncached_input_tokens=uncached_input_tokens,
+                        total_latency_ms=total_latency,
+                        overhead_ms=optimization_latency,
+                        pipeline_timing=pipeline_timing,
+                        waste_signals=waste_signals_dict,
+                        transforms_applied=tuple(transforms_applied),
+                        num_messages=len(body.get("messages", [])),
+                        tags=_chat_log_tags,
+                        turn_id=compute_turn_id(model, body.get("system"), body.get("messages")),
+                        request_messages=body.get("messages")
+                        if getattr(self.config, "log_full_messages", False)
+                        else None,
+                        client=client,
                     )
+                )
 
                 if tokens_saved > 0:
                     logger.info(
@@ -2333,6 +2303,7 @@ class OpenAIHandlerMixin:
         # if httpx lacks brotli support the response body is undecipherable → 502.
         headers.pop("accept-encoding", None)
         tags = self._extract_tags(headers)
+        client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Memory user-id reads
         # `request.headers` below.
@@ -2852,52 +2823,38 @@ class OpenAIHandlerMixin:
                     "endpoint": "responses_http",
                 }
 
-                await self.metrics.record_request(
-                    provider="openai",
-                    model=model,
-                    input_tokens=total_input_tokens,
-                    output_tokens=output_tokens,
-                    tokens_saved=tokens_saved,
-                    latency_ms=total_latency,
-                    overhead_ms=optimization_latency,
-                    cache_read_tokens=cache_read_tokens,
-                    cache_write_tokens=cache_write_tokens,
-                    uncached_input_tokens=uncached_input_tokens,
-                    attempted_input_tokens=attempted_input_tokens,
-                )
+                # OpenAI Responses HTTP (non-WS, non-streaming). Codex
+                # uses this path when configured for HTTP transport.
+                # Pre-refactor `cache_hit` was hardcoded False on
+                # RequestLog even when cache_read>0 — funnel derives
+                # it correctly.
+                from headroom.proxy.helpers import compute_turn_id
 
-                # Per-request log entry for /transformations/feed +
-                # /stats `recent_requests`. Mirror of streaming.py /
-                # anthropic.py wiring; without this the dashboard's
-                # per-request feed misses every Codex HTTP turn.
-                if getattr(self, "logger", None) is not None:
-                    from headroom.proxy.helpers import compute_turn_id
-                    from headroom.proxy.models import RequestLog
-
-                    self.logger.log(
-                        RequestLog(
-                            request_id=request_id,
-                            timestamp=datetime.now().isoformat(),
-                            provider="openai",
-                            model=model,
-                            input_tokens_original=effective_original_tokens,
-                            input_tokens_optimized=effective_optimized_tokens,
-                            output_tokens=output_tokens,
-                            tokens_saved=tokens_saved,
-                            savings_percent=(tokens_saved / effective_original_tokens * 100)
-                            if effective_original_tokens > 0
-                            else 0,
-                            optimization_latency_ms=optimization_latency,
-                            total_latency_ms=total_latency,
-                            tags=_resp_log_tags,
-                            cache_hit=False,
-                            transforms_applied=transforms_applied,
-                            request_messages=messages
-                            if getattr(self.config, "log_full_messages", False)
-                            else None,
-                            turn_id=compute_turn_id(model, body.get("instructions"), messages),
-                        )
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=request_id,
+                        provider="openai",
+                        model=model,
+                        original_tokens=effective_original_tokens,
+                        optimized_tokens=effective_optimized_tokens,
+                        output_tokens=output_tokens,
+                        tokens_saved=tokens_saved,
+                        attempted_input_tokens=attempted_input_tokens,
+                        cache_read_tokens=cache_read_tokens,
+                        cache_write_tokens=cache_write_tokens,
+                        uncached_input_tokens=uncached_input_tokens,
+                        total_latency_ms=total_latency,
+                        overhead_ms=optimization_latency,
+                        transforms_applied=tuple(transforms_applied),
+                        num_messages=len(messages) if isinstance(messages, list) else 0,
+                        tags=_resp_log_tags,
+                        turn_id=compute_turn_id(model, body.get("instructions"), messages),
+                        request_messages=messages
+                        if getattr(self.config, "log_full_messages", False)
+                        else None,
+                        client=client,
                     )
+                )
 
                 logger.info(f"[{request_id}] /v1/responses {model}: {total_input_tokens:,} tokens")
 
@@ -2971,6 +2928,9 @@ class OpenAIHandlerMixin:
 
         # Forward client headers to upstream, adding required OpenAI-Beta header
         ws_headers = dict(websocket.headers)
+        # Identify the WS harness before downstream auth/header rewrites.
+        # Captured in closure so per-turn RequestOutcome can stamp it.
+        client = classify_client(ws_headers)
         _ws_url_obj = getattr(websocket, "url", None)
         _ws_url = str(_ws_url_obj) if _ws_url_obj is not None else ""
         _ws_path = getattr(_ws_url_obj, "path", "") if _ws_url_obj is not None else ""
@@ -4254,34 +4214,50 @@ class OpenAIHandlerMixin:
                                     return
 
                                 model_for_metrics = str(body.get("model") or "unknown")
-                                if self.cost_tracker:
-                                    self.cost_tracker.record_tokens(
-                                        model_for_metrics,
-                                        max(0, saved_delta),
-                                        max(0, input_delta),
-                                        cache_read_tokens=max(0, cache_read_delta),
-                                        cache_write_tokens=max(0, cache_write_delta),
-                                        uncached_tokens=max(0, uncached_delta),
-                                    )
                                 latency_ms = (
                                     (time.perf_counter() * 1000.0 - response_started_ms)
                                     if response_started_ms is not None
                                     else 0.0
                                 )
-                                await self.metrics.record_request(
-                                    provider="openai",
-                                    model=model_for_metrics,
-                                    input_tokens=max(0, input_delta),
-                                    output_tokens=max(0, output_delta),
-                                    tokens_saved=max(0, saved_delta),
-                                    latency_ms=latency_ms,
-                                    cache_read_tokens=max(0, cache_read_delta),
-                                    cache_write_tokens=max(0, cache_write_delta),
-                                    uncached_input_tokens=max(0, uncached_delta),
-                                    attempted_input_tokens=max(0, attempted_delta),
-                                    overhead_ms=overhead_delta_ms,
-                                    ttfb_ms=ttfb_for_record_ms,
-                                    pipeline_timing=dashboard_pipeline_timing,
+                                # Per-turn record: delta values capture
+                                # this turn's contribution since the
+                                # Codex WS handler accumulates session
+                                # totals. Pre-refactor this site
+                                # emitted only metrics + cost_tracker
+                                # — no RequestLog, no PERF — so Codex
+                                # traffic was invisible to
+                                # ``headroom perf`` and the recent-
+                                # requests feed. Funnel restores all
+                                # four effects uniformly per turn.
+                                # ``ws_session_tags`` is not yet bound
+                                # at per-turn time (set at session-end
+                                # below); pass empty so the funnel
+                                # gets a real dict.
+                                await self._record_request_outcome(
+                                    RequestOutcome(
+                                        request_id=request_id,
+                                        provider="openai",
+                                        model=model_for_metrics,
+                                        original_tokens=max(0, input_delta) + max(0, saved_delta),
+                                        optimized_tokens=max(0, input_delta),
+                                        output_tokens=max(0, output_delta),
+                                        tokens_saved=max(0, saved_delta),
+                                        attempted_input_tokens=max(0, attempted_delta),
+                                        cache_read_tokens=max(0, cache_read_delta),
+                                        cache_write_tokens=max(0, cache_write_delta),
+                                        uncached_input_tokens=max(0, uncached_delta),
+                                        total_latency_ms=latency_ms,
+                                        overhead_ms=overhead_delta_ms,
+                                        ttfb_ms=ttfb_for_record_ms,
+                                        pipeline_timing=dashboard_pipeline_timing,
+                                        transforms_applied=tuple(transforms_applied),
+                                        num_messages=len(
+                                            body.get("messages") or body.get("input") or []
+                                        )
+                                        if isinstance(body, dict)
+                                        else 0,
+                                        client=client,
+                                    )
                                 )
 
                                 # Structured PERF log line so ``headroom perf``
@@ -4825,29 +4801,34 @@ class OpenAIHandlerMixin:
                 or final_overhead_delta_ms > 0
                 or final_ttfb_ms > 0
             ):
-                if self.cost_tracker:
-                    self.cost_tracker.record_tokens(
-                        model_name,
-                        residual_tokens_saved,
-                        residual_input_tokens,
+                # Session-end residual: tokens not captured by any
+                # per-turn record (e.g. signaling frames after the
+                # last response.completed). The funnel emits the full
+                # bookkeeping quartet for the residual; the explicit
+                # session-summary RequestLog below remains a separate
+                # entry (different semantics — cumulative session
+                # totals vs delta residual).
+                await self._record_request_outcome(
+                    RequestOutcome(
+                        request_id=request_id,
+                        provider="openai",
+                        model=model_name,
+                        original_tokens=residual_input_tokens + residual_tokens_saved,
+                        optimized_tokens=residual_input_tokens,
+                        output_tokens=residual_output_tokens,
+                        tokens_saved=residual_tokens_saved,
+                        attempted_input_tokens=residual_attempted_input_tokens,
                         cache_read_tokens=residual_cache_read_tokens,
                         cache_write_tokens=residual_cache_write_tokens,
-                        uncached_tokens=residual_uncached_input_tokens,
+                        uncached_input_tokens=residual_uncached_input_tokens,
+                        total_latency_ms=ws_session_duration_ms,
+                        overhead_ms=final_overhead_delta_ms,
+                        ttfb_ms=final_ttfb_ms,
+                        pipeline_timing=final_pipeline_timing,
+                        transforms_applied=tuple(transforms_applied),
+                        tags=ws_session_tags,
+                        client=client,
                     )
-                await self.metrics.record_request(
-                    provider="openai",
-                    model=model_name,
-                    input_tokens=residual_input_tokens,
-                    output_tokens=residual_output_tokens,
-                    tokens_saved=residual_tokens_saved,
-                    latency_ms=ws_session_duration_ms,
-                    cache_read_tokens=residual_cache_read_tokens,
-                    cache_write_tokens=residual_cache_write_tokens,
-                    uncached_input_tokens=residual_uncached_input_tokens,
-                    attempted_input_tokens=residual_attempted_input_tokens,
-                    overhead_ms=final_overhead_delta_ms,
-                    ttfb_ms=final_ttfb_ms,
-                    pipeline_timing=final_pipeline_timing,
                 )
                 ws_recorded_overhead_ms_total = _current_ws_overhead_ms()
                 if final_ttfb_ms > 0:
@@ -5339,6 +5320,7 @@ class OpenAIHandlerMixin:
         headers = dict(request.headers.items())
         headers.pop("host", None)
         headers.pop("accept-encoding", None)
+        client = classify_client(headers)
         # PR-A5 (P5-49): strip internal x-headroom-* before forwarding upstream.
         from headroom.proxy.helpers import _strip_internal_headers, log_outbound_headers
 
@@ -5386,17 +5368,26 @@ class OpenAIHandlerMixin:
         response_headers.pop("content-encoding", None)
         response_headers.pop("content-length", None)  # Length changed after decompression
 
-        # Track stats for passthrough requests
+        # Passthrough request: forwarded upstream with no transforms.
+        # Still recorded so dashboards see traffic on the passthrough
+        # endpoints. Funnel handles the "no tokens, no cache" shape
+        # via zero defaults.
         if endpoint_name and provider:
             latency_ms = (time.time() - start_time) * 1000
-            await self.metrics.record_request(
-                provider=provider,
-                model=f"passthrough:{endpoint_name}",
-                input_tokens=0,
-                output_tokens=0,
-                tokens_saved=0,
-                latency_ms=latency_ms,
-                cached=False,
+            request_id = await self._next_request_id()
+            await self._record_request_outcome(
+                RequestOutcome(
+                    request_id=request_id,
+                    provider=provider,
+                    model=f"passthrough:{endpoint_name}",
+                    original_tokens=0,
+                    optimized_tokens=0,
+                    output_tokens=0,
+                    tokens_saved=0,
+                    attempted_input_tokens=0,
+                    total_latency_ms=latency_ms,
+                    client=client,
+                )
             )
 
         return Response(
@@ -5404,59 +5395,3 @@ class OpenAIHandlerMixin:
             status_code=response.status_code,
             headers=response_headers,
         )
-
-    async def handle_databricks_invocations(
-        self,
-        request: Request,
-        model: str,
-    ) -> Response | StreamingResponse:
-        """Handle Databricks native /serving-endpoints/{model}/invocations endpoint.
-
-        This enables using the Databricks CLI directly with Headroom:
-            databricks serving-endpoints query <model> --profile HEADROOM --json '{"messages": [...]}'
-
-        The request/response format is identical to OpenAI chat completions,
-        so we inject the model from the path and delegate to handle_openai_chat.
-        """
-        from fastapi.responses import JSONResponse
-
-        from headroom.proxy.helpers import _read_request_json
-
-        request_id = await self._next_request_id()
-
-        try:
-            body = await _read_request_json(request)
-        except Exception as e:
-            logger.error(f"[{request_id}] Failed to parse Databricks request body: {e}")
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "error": {
-                        "message": f"Invalid JSON: {e}",
-                        "type": "invalid_request_error",
-                    }
-                },
-            )
-
-        # Inject model from path into body (Databricks CLI passes model in URL, not body)
-        body["model"] = model
-
-        logger.info(f"[{request_id}] Databricks invocation: model={model}")
-
-        # Create a new request with the modified body
-        # We reuse the OpenAI chat handler since the format is identical
-        from starlette.requests import Request as StarletteRequest
-
-        # Build new scope with the body already parsed
-        scope = dict(request.scope)
-
-        # Create a simple receive function that returns our modified body
-        body_bytes = json.dumps(body).encode()
-
-        async def receive():
-            return {"type": "http.request", "body": body_bytes}
-
-        modified_request = StarletteRequest(scope, receive)
-
-        # Delegate to the OpenAI chat handler (same format)
-        return await self.handle_openai_chat(modified_request)

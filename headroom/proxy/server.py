@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from ..backends.base import Backend
     from ..cache.compression_cache import CompressionCache
     from ..memory.tracker import MemoryTracker
+    from .outcome import RequestOutcome
 
 
 import httpx
@@ -1148,6 +1149,23 @@ class HeadroomProxy(
             avg_latency = m.latency_sum_ms / m.latency_count
             logger.info(f"Avg latency:           {avg_latency:.0f}ms")
         logger.info("=" * 70)
+
+    async def _record_request_outcome(self, outcome: RequestOutcome) -> None:
+        """Single funnel for per-request bookkeeping.
+
+        Thin wrapper around :func:`headroom.proxy.outcome.emit_request_outcome`
+        so call sites can write ``await self._record_request_outcome(outcome)``
+        (idiomatic) instead of ``await emit_request_outcome(self, outcome)``.
+        The real implementation lives in ``outcome.py`` as a free function so
+        test dummies and provider mixins can call it without inheriting from
+        ``HeadroomProxy``.
+
+        See ``docs/superpowers/specs/P0-proxy-pipeline-audit.md`` for the
+        divergence catalog this funnel collapses.
+        """
+        from headroom.proxy.outcome import emit_request_outcome
+
+        await emit_request_outcome(self, outcome)
 
     async def _next_request_id(self) -> str:
         """Generate unique request ID."""
