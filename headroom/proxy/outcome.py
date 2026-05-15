@@ -173,6 +173,83 @@ class RequestOutcome:
             return 0.0
         return self.tokens_saved / self.original_tokens * 100.0
 
+    @classmethod
+    def from_stream(
+        cls,
+        *,
+        body: dict[str, Any],
+        provider: str,
+        model: str,
+        request_id: str,
+        original_tokens: int,
+        optimized_tokens: int,
+        output_tokens: int,
+        tokens_saved: int,
+        transforms_applied: list[str] | tuple[str, ...],
+        total_latency_ms: float,
+        overhead_ms: float,
+        tags: dict[str, str] | None,
+        client: str | None,
+        log_full_messages: bool = False,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        cache_write_5m_tokens: int = 0,
+        cache_write_1h_tokens: int = 0,
+        uncached_input_tokens: int = 0,
+        cache_inferred: bool = False,
+        ttfb_ms: float = 0.0,
+        pipeline_timing: dict[str, float] | None = None,
+        waste_signals: dict[str, int] | None = None,
+    ) -> RequestOutcome:
+        """Construct an outcome from the locals available at streaming
+        finalize. Three streaming finalizers
+        (``_finalize_stream_response``, ``_stream_response_bedrock``,
+        ``_stream_openai_via_backend``) each duplicated the same body- and
+        config-derived fields inline. This classmethod is the single
+        construction point so derivation logic can't drift apart again.
+
+        Centralises six derivations:
+
+          * ``attempted_input_tokens = optimized_tokens + tokens_saved``
+          * ``num_messages = len(body["messages"])``
+          * ``request_messages`` conditional on ``log_full_messages``
+          * ``turn_id`` via ``compute_turn_id`` — pre-refactor only the
+            Bedrock site computed this; sites 1 and 3 silently dropped it,
+            breaking multi-turn-session grouping on Anthropic-SSE and
+            OpenAI-via-backend traffic
+          * ``transforms_applied`` list → tuple (frozen-dataclass contract)
+          * ``tags or {}`` normalization
+        """
+        from headroom.proxy.helpers import compute_turn_id
+
+        return cls(
+            request_id=request_id,
+            provider=provider,
+            model=model,
+            original_tokens=original_tokens,
+            optimized_tokens=optimized_tokens,
+            output_tokens=output_tokens,
+            tokens_saved=tokens_saved,
+            attempted_input_tokens=optimized_tokens + tokens_saved,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            cache_write_5m_tokens=cache_write_5m_tokens,
+            cache_write_1h_tokens=cache_write_1h_tokens,
+            uncached_input_tokens=uncached_input_tokens,
+            cache_inferred=cache_inferred,
+            total_latency_ms=total_latency_ms,
+            overhead_ms=overhead_ms,
+            ttfb_ms=ttfb_ms,
+            pipeline_timing=pipeline_timing,
+            transforms_applied=tuple(transforms_applied),
+            waste_signals=waste_signals,
+            num_messages=len(body.get("messages", [])),
+            turn_id=compute_turn_id(model, body.get("system"), body.get("messages")),
+            tags=tags or {},
+            client=client,
+            request_messages=body.get("messages") if log_full_messages else None,
+        )
+
 
 # ── The funnel ───────────────────────────────────────────────────────
 
