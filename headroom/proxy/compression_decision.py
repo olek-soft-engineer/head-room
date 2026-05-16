@@ -145,3 +145,24 @@ class CompressionDecision:
             license_allows=license_ok,
             has_messages=has_msgs,
         )
+
+    def apply_to_tags(self, tags: dict[str, str]) -> None:
+        """Stamp the passthrough reason into a tags dict for downstream
+        observability.
+
+        Mutates ``tags`` in place. No-op when ``should_compress=True``
+        (compressing requests don't carry a ``passthrough_reason`` tag —
+        absence vs presence is itself the signal).
+
+        Handler call pattern, after ``CompressionDecision.decide(...)``::
+
+            tags = self._extract_tags(headers)
+            _decision = CompressionDecision.decide(...)
+            _decision.apply_to_tags(tags)
+            # ... tags now carries passthrough_reason if applicable;
+            # every downstream RequestOutcome(tags=tags, ...) inherits
+            # it for free, which flows through emit_request_outcome()
+            # → RequestLog.tags → dashboard.
+        """
+        if self.passthrough_reason is not None:
+            tags["passthrough_reason"] = self.passthrough_reason

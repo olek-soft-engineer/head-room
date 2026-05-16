@@ -330,6 +330,7 @@ class GeminiHandlerMixin:
             usage_reporter=self.usage_reporter,
             messages=messages,
         )
+        _decision.apply_to_tags(tags)
         if not _decision.should_compress:
             logger.info(
                 f"[{request_id}] Compression skipped: reason={_decision.passthrough_reason}"
@@ -642,6 +643,7 @@ class GeminiHandlerMixin:
             usage_reporter=self.usage_reporter,
             messages=messages,
         )
+        _decision.apply_to_tags(tags)
         if not _decision.should_compress:
             logger.info(
                 f"[{request_id}] Compression skipped: reason={_decision.passthrough_reason}"
@@ -876,12 +878,18 @@ class GeminiHandlerMixin:
         transforms_applied: list[str] = []
         optimized_messages = messages
 
+        # countTokens is the one Gemini handler that didn't pull tags
+        # out of headers; sibling handlers do and thread them into the
+        # outcome. Extract here so apply_to_tags below has a dict to
+        # mutate and the outcome at end-of-call inherits the tag.
+        tags = self._extract_tags(request.headers)
         _decision = CompressionDecision.decide(
             headers=request.headers,
             config=self.config,
             usage_reporter=self.usage_reporter,
             messages=messages,
         )
+        _decision.apply_to_tags(tags)
         if not _decision.should_compress:
             logger.info(
                 f"[{request_id}] Compression skipped: reason={_decision.passthrough_reason}"
@@ -960,6 +968,7 @@ class GeminiHandlerMixin:
                     attempted_input_tokens=compressed_tokens + tokens_saved,
                     total_latency_ms=total_latency,
                     transforms_applied=tuple(transforms_applied),
+                    tags=tags,
                     client=client,
                 )
             )

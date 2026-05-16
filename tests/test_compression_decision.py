@@ -380,3 +380,112 @@ def test_decide_with_missing_messages_field_on_body() -> None:
     d = CompressionDecision.decide(headers={}, config=_config(), usage_reporter=None, messages=None)
     assert d.should_compress is False
     assert d.passthrough_reason == "no_messages"
+
+
+# ── apply_to_tags: thread passthrough_reason into RequestOutcome.tags ─
+#
+# Handlers compute ``tags = self._extract_tags(headers)`` at entry and
+# pass that dict through to every downstream ``RequestOutcome``
+# construction. ``decision.apply_to_tags(tags)`` is a one-liner mutation
+# at the post-decision point that gives every downstream outcome the
+# ``passthrough_reason`` for free — no need to thread the decision
+# through five layers of helper calls. The outcome funnel then surfaces
+# ``tags["passthrough_reason"]`` in ``RequestLog.tags`` (dashboard
+# slicing) — same mechanism the funnel already uses for ``client``.
+
+
+def test_apply_to_tags_stamps_reason_when_passthrough() -> None:
+    """On a passthrough decision, ``apply_to_tags`` mutates the supplied
+    tags dict in place with ``passthrough_reason = <the reason>``. This
+    is the single integration point between the input-side decision and
+    the output-side ``RequestOutcome``."""
+    d = CompressionDecision.decide(
+        headers={"x-headroom-bypass": "true"},
+        config=_config(),
+        usage_reporter=None,
+        messages=_msgs(),
+    )
+    tags: dict[str, str] = {}
+    d.apply_to_tags(tags)
+    assert tags == {"passthrough_reason": "bypass_header"}
+
+
+def test_apply_to_tags_is_a_noop_when_compressing() -> None:
+    """When the decision is "compress" (``passthrough_reason is None``),
+    the tags dict must be left untouched — no spurious
+    ``passthrough_reason=None`` string entry, which would mislead any
+    dashboard that filters on tag presence."""
+    d = CompressionDecision.decide(
+        headers={}, config=_config(), usage_reporter=None, messages=_msgs()
+    )
+    assert d.should_compress is True
+    tags: dict[str, str] = {"client": "codex"}
+    d.apply_to_tags(tags)
+    assert tags == {"client": "codex"}  # untouched
+    assert "passthrough_reason" not in tags
+
+
+def test_apply_to_tags_preserves_pre_existing_entries() -> None:
+    """``apply_to_tags`` is a mutator over the existing tags dict, not
+    a replacement. Pre-existing entries (``client``, custom routing
+    tags, etc.) must survive unchanged."""
+    d = CompressionDecision.decide(
+        headers={}, config=_config(optimize=False), usage_reporter=None, messages=_msgs()
+    )
+    tags: dict[str, str] = {"client": "aider", "route": "alpha"}
+    d.apply_to_tags(tags)
+    assert tags == {
+        "client": "aider",
+        "route": "alpha",
+        "passthrough_reason": "compression_disabled",
+    }
+
+
+def test_apply_to_tags_for_every_passthrough_reason() -> None:
+    """Every passthrough reason name must round-trip through
+    ``apply_to_tags`` exactly — these strings are the dashboard's
+    slicing keys; a typo would silently break filtering."""
+    reason_to_inputs: dict[str, dict[str, Any]] = {
+        "bypass_header": {
+            "headers": {"x-headroom-bypass": "true"},
+            "config": _config(),
+            "usage_reporter": None,
+            "messages": _msgs(),
+        },
+        "compression_disabled": {
+            "headers": {},
+            "config": _config(optimize=False),
+            "usage_reporter": None,
+            "messages": _msgs(),
+        },
+        "no_messages": {
+            "headers": {},
+            "config": _config(),
+            "usage_reporter": None,
+            "messages": [],
+        },
+        "license_denied": {
+            "headers": {},
+            "config": _config(),
+            "usage_reporter": _usage_reporter(should_compress=False),
+            "messages": _msgs(),
+        },
+    }
+    for expected_reason, decide_kwargs in reason_to_inputs.items():
+        d = CompressionDecision.decide(**decide_kwargs)
+        tags: dict[str, str] = {}
+        d.apply_to_tags(tags)
+        assert tags.get("passthrough_reason") == expected_reason, expected_reason
+
+
+def test_apply_to_tags_overwrites_a_pre_existing_passthrough_reason() -> None:
+    """If a tag with the same key existed before (a contrived case —
+    handlers don't write this tag elsewhere), the decision overwrites
+    it. The decision is the canonical source of truth for this tag;
+    anything earlier was stale or wrong."""
+    d = CompressionDecision.decide(
+        headers={}, config=_config(optimize=False), usage_reporter=None, messages=_msgs()
+    )
+    tags: dict[str, str] = {"passthrough_reason": "stale_value"}
+    d.apply_to_tags(tags)
+    assert tags["passthrough_reason"] == "compression_disabled"

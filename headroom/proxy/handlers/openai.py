@@ -1409,6 +1409,7 @@ class OpenAIHandlerMixin:
             usage_reporter=self.usage_reporter,
             messages=messages,
         )
+        _decision.apply_to_tags(tags)
         if not _decision.should_compress:
             logger.info(
                 f"[{request_id}] Compression skipped: reason={_decision.passthrough_reason}"
