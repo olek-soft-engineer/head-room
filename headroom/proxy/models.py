@@ -144,6 +144,11 @@ class ProxyConfig:
     # CLI: --compress-user-messages; env: HEADROOM_COMPRESS_USER_MESSAGES=1.
     compress_user_messages: bool = False
 
+    # Extra tool names whose outputs are never compressed, merged with the
+    # built-in DEFAULT_EXCLUDE_TOOLS. None means built-in defaults only.
+    # CLI: --exclude-tools <name1,name2>; env: HEADROOM_EXCLUDE_TOOLS=<name1,name2>
+    exclude_tools: set[str] | None = None
+
     # Read lifecycle management
     read_lifecycle: bool = True
 
