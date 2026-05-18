@@ -75,6 +75,7 @@ from headroom.ccr import (
 )
 from headroom.config import (
     CacheAlignerConfig,
+    DEFAULT_EXCLUDE_TOOLS,
     ReadLifecycleConfig,
 )
 from headroom.dashboard import get_dashboard_html
@@ -354,6 +355,10 @@ class HeadroomProxy(
             tool_profiles=config.tool_profiles,
             read_lifecycle=ReadLifecycleConfig(enabled=config.read_lifecycle),
         )
+        # A non-None exclude_tools replaces DEFAULT_EXCLUDE_TOOLS in
+        # ContentRouter, so merge rather than assign.
+        if config.exclude_tools:
+            router_config.exclude_tools = set(DEFAULT_EXCLUDE_TOOLS) | config.exclude_tools
         # Token mode: allow compression of older excluded-tool results.
         if is_token_mode(config.mode):
             router_config.protect_recent_reads_fraction = 0.3
@@ -3134,6 +3139,27 @@ def _get_env_str(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def _parse_exclude_tools(cli_excludes: str | None) -> set[str]:
+    """Parse extra never-compress tool names from CLI args and env var.
+
+    Both --exclude-tools and HEADROOM_EXCLUDE_TOOLS are comma-separated
+    (e.g. "WebSearch,WebFetch"). Each name is added in both original and
+    lowercase form for case-insensitive matching, mirroring
+    DEFAULT_EXCLUDE_TOOLS. Unset/empty -> empty set (DEFAULT_EXCLUDE_TOOLS
+    used unchanged).
+    """
+    raw = ",".join(
+        s for s in (cli_excludes, os.environ.get("HEADROOM_EXCLUDE_TOOLS")) if s
+    )
+    names: set[str] = set()
+    for entry in raw.split(","):
+        name = entry.strip()
+        if name:
+            names.add(name)
+            names.add(name.lower())
+    return names
+
+
 def _parse_tool_profiles(cli_profiles: list[str]) -> dict[str, Any]:
     """Parse tool profiles from CLI args and HEADROOM_TOOL_PROFILES env var.
 
@@ -3266,6 +3292,13 @@ if __name__ == "__main__":
             "Also settable via HEADROOM_COMPRESS_USER_MESSAGES=1."
         ),
     )
+    parser.add_argument(
+        "--exclude-tools",
+        default=None,
+        help="Comma-separated tool names whose output is never compressed, "
+        "merged with the built-in defaults (e.g., WebSearch,WebFetch). "
+        "Also settable via HEADROOM_EXCLUDE_TOOLS env var.",
+    )
 
     # Caching
     parser.add_argument("--no-cache", action="store_true", help="Disable caching")
@@ -3322,6 +3355,8 @@ if __name__ == "__main__":
 
     # Parse per-tool compression profiles from CLI and env var
     tool_profiles = _parse_tool_profiles(args.tool_profile)
+    # Parse extra never-compress tools from CLI and env var
+    exclude_tools = _parse_exclude_tools(args.exclude_tools)
 
     config = ProxyConfig(
         host=_get_env_str("HEADROOM_HOST", args.host),
@@ -3353,6 +3388,7 @@ if __name__ == "__main__":
         max_keepalive_connections=_get_env_int("HEADROOM_MAX_KEEPALIVE", args.max_keepalive),
         http2=not args.no_http2 and _get_env_bool("HEADROOM_HTTP2", True),
         tool_profiles=tool_profiles if tool_profiles else None,
+        exclude_tools=exclude_tools if exclude_tools else None,
         mode=normalize_proxy_mode(_get_env_str("HEADROOM_MODE", PROXY_MODE_TOKEN)),
         compress_user_messages=args.compress_user_messages
         or _get_env_bool("HEADROOM_COMPRESS_USER_MESSAGES", False),
