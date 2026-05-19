@@ -622,6 +622,8 @@ class MemoryHandler:
         user_id: str,
         messages: list[dict[str, Any]],
         request_context: RequestContext | None = None,
+        *,
+        ranker: Any | None = None,
     ) -> str | None:
         """Search memories and format as context injection.
 
@@ -636,6 +638,14 @@ class MemoryHandler:
                 omitted, behaves as before this fix — single-bucket search
                 against the legacy backend. Production handlers always
                 pass it; tests / mocks can keep the simpler call shape.
+            ranker: Optional :class:`~headroom.proxy.memory_ranker.MemoryRanker`
+                — re-ranks the backend's cosine-only candidates by an
+                additional signal (recency, source, access count, …).
+                When ``None`` (default), behaviour is identical to pre-
+                this-PR: pure cosine + min_similarity floor. When
+                provided, candidates are adapted to
+                :class:`MemoryCandidate`, re-ranked, then re-filtered by
+                ``min_similarity`` on the boosted score.
 
         Returns:
             Formatted context string, or None if no relevant memories.
@@ -689,23 +699,48 @@ class MemoryHandler:
                 )
                 return None
 
-            # Filter by minimum similarity
-            filtered_results = [r for r in results if r.score >= self.config.min_similarity]
+            # Optional re-rank: when a MemoryRanker is provided, adapt
+            # results to MemoryCandidate, re-rank, then filter by
+            # min_similarity on the BOOSTED score. The re-rank can
+            # promote a fresh weak-cosine memory above a stale strong-
+            # cosine one (RecencyBoostRanker default behaviour).
+            if ranker is not None:
+                from headroom.proxy.memory_ranker import MemoryCandidate
 
-            if not filtered_results:
-                logger.debug(
-                    f"Memory: {len(results)} memories found but none above threshold "
-                    f"{self.config.min_similarity}"
-                )
-                return None
+                candidates = [MemoryCandidate.from_backend_result(r) for r in results]
+                ranked = ranker.rank(candidates)
+                # Filter on the post-rank score (the ranker may have
+                # boosted or attenuated original cosine values).
+                ranked = [c for c in ranked if c.score >= self.config.min_similarity]
+                if not ranked:
+                    logger.debug(
+                        f"Memory: {len(results)} memories found but none above threshold "
+                        f"{self.config.min_similarity} after re-rank"
+                    )
+                    return None
+                memory_lines = []
+                for i, candidate in enumerate(ranked, 1):
+                    memory_lines.append(f"{i}. {candidate.content}")
+                    if candidate.related_entities:
+                        entities_str = ", ".join(candidate.related_entities[:3])
+                        memory_lines.append(f"   (Related: {entities_str})")
+            else:
+                # Pre-PR-this behaviour: pure cosine, no boost.
+                filtered_results = [r for r in results if r.score >= self.config.min_similarity]
 
-            # Format as context
-            memory_lines = []
-            for i, result in enumerate(filtered_results, 1):
-                memory_lines.append(f"{i}. {result.memory.content}")
-                if hasattr(result, "related_entities") and result.related_entities:
-                    entities_str = ", ".join(result.related_entities[:3])
-                    memory_lines.append(f"   (Related: {entities_str})")
+                if not filtered_results:
+                    logger.debug(
+                        f"Memory: {len(results)} memories found but none above threshold "
+                        f"{self.config.min_similarity}"
+                    )
+                    return None
+
+                memory_lines = []
+                for i, result in enumerate(filtered_results, 1):
+                    memory_lines.append(f"{i}. {result.memory.content}")
+                    if hasattr(result, "related_entities") and result.related_entities:
+                        entities_str = ", ".join(result.related_entities[:3])
+                        memory_lines.append(f"   (Related: {entities_str})")
 
         except Exception as e:
             logger.warning(f"Memory: Search failed for user {effective_user_id}: {e}")

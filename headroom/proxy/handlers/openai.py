@@ -1200,8 +1200,19 @@ class OpenAIHandlerMixin:
         if _bypass:
             logger.info(f"[{request_id}] Bypass: skipping compression (header)")
 
-        # Image compression: tile alignment + ML-based technique routing
-        if self.config.image_optimize and messages and not _bypass:
+        # Image compression: tile alignment + ML-based technique routing.
+        # Gated on ImageCompressionDecision — same value-type pattern
+        # as CompressionDecision + MemoryDecision; locks bypass-respect
+        # in tests so a future site can't drift.
+        from headroom.proxy.image_compression_decision import ImageCompressionDecision
+
+        _image_decision = ImageCompressionDecision.decide(
+            headers=request.headers, config=self.config, messages=messages
+        )
+        # tags is populated downstream at L1229 — defer apply_to_tags
+        # to where the tags dict exists. The decision is captured here
+        # so the conditional is uniform with the other gates.
+        if _image_decision.should_compress:
             from headroom.proxy.helpers import _get_image_compressor
 
             compressor = None
@@ -1229,6 +1240,10 @@ class OpenAIHandlerMixin:
         headers.pop("accept-encoding", None)
         tags = extract_tags(headers)
         client = classify_client(headers)
+        # Surface the image-compression decision (computed earlier) into
+        # tags now that the tags dict exists. Same observability pattern
+        # the funnel uses for passthrough_reason + memory_skip_reason.
+        _image_decision.apply_to_tags(tags)
         # PR-A5 (P5-49): strip internal x-headroom-* from upstream-bound
         # headers AFTER `_extract_tags` reads them. Inbound bypass gating
         # uses `request.headers.get(...)` above; memory user-id reads
