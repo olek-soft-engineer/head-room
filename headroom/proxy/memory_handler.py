@@ -624,13 +624,16 @@ class MemoryHandler:
         request_context: RequestContext | None = None,
         *,
         ranker: Any | None = None,
+        query: Any | None = None,
+        budget: Any | None = None,
     ) -> str | None:
         """Search memories and format as context injection.
 
         Args:
             user_id: User identifier for memory scoping (the base user
                 id, derived from ``x-headroom-user-id`` upstream).
-            messages: Conversation messages (used to extract query).
+            messages: Conversation messages (used to extract query when
+                ``query`` is not provided).
             request_context: Optional request envelope (headers, system
                 prompt, base user id). When provided, memory retrieval
                 is scoped to the resolved workspace / project so memories
@@ -641,28 +644,38 @@ class MemoryHandler:
             ranker: Optional :class:`~headroom.proxy.memory_ranker.MemoryRanker`
                 — re-ranks the backend's cosine-only candidates by an
                 additional signal (recency, source, access count, …).
-                When ``None`` (default), behaviour is identical to pre-
-                this-PR: pure cosine + min_similarity floor. When
-                provided, candidates are adapted to
-                :class:`MemoryCandidate`, re-ranked, then re-filtered by
-                ``min_similarity`` on the boosted score.
+                When ``None`` (default), behaviour is pure cosine +
+                ``budget.min_similarity`` floor. When provided, candidates
+                are adapted to :class:`MemoryCandidate`, re-ranked, then
+                re-filtered by ``budget.min_similarity`` on the boosted
+                score.
+            query: Optional :class:`MemoryQuery` — multi-source, full-
+                fidelity retrieval query. When provided, takes precedence
+                over the ``messages``-derived query. Constructed at the
+                handler from latest user msg + recent tool outputs +
+                recent assistant turns; preserves full input fidelity (no
+                500-char truncation).
+            budget: Optional :class:`MemoryInjectionBudget` — bounds the
+                returned formatted block by tokens / entries / min
+                similarity. When ``None``, defaults are taken from
+                ``self.config`` so the existing top_k / min_similarity
+                contract is preserved. Both the no-ranker and the with-
+                ranker paths honour the same budget.
 
         Returns:
             Formatted context string, or None if no relevant memories.
 
         PR-B6: When ``self.config.mode == MemoryMode.TOOL``, this method
         returns ``None`` unconditionally so the proxy never auto-injects.
-        The model must call ``memory_search`` explicitly to retrieve. This
-        is the single chokepoint that gates auto-injection across all
-        provider handlers (Anthropic /v1/messages, OpenAI /v1/chat/completions,
-        OpenAI /v1/responses).
+        The model must call ``memory_search`` explicitly to retrieve.
         """
+        from headroom.proxy.memory_injection import MemoryInjectionBudget
+
         if not self.config.inject_context:
             return None
 
         # PR-B6: Tool mode disables auto-injection. The model calls
-        # ``memory_search`` to retrieve when it wants to. Log the skip
-        # decision so cache-affecting routing remains observable.
+        # ``memory_search`` to retrieve when it wants to.
         if self.config.mode == MemoryMode.TOOL:
             logger.info(
                 "event=memory_mode_skip mode=tool user_id=%s reason=tool_mode_no_auto_injection",
@@ -676,18 +689,36 @@ class MemoryHandler:
 
         backend, scope, effective_user_id = self._resolve_for_request(user_id, request_context)
 
-        # Extract query from last user message
-        query = self._extract_user_query(messages)
-        if not query:
-            logger.debug("Memory: No user query found for context search")
+        # Build the embedding query. When the handler provides a
+        # MemoryQuery, use its multi-source untruncated input; otherwise
+        # fall back to extracting from messages (kept for legacy callers
+        # / tests). Full fidelity in both paths.
+        if query is not None:
+            query_text = query.to_embedding_input()
+        else:
+            query_text = self._extract_user_query(messages)
+        if not query_text:
+            logger.debug("Memory: No query text for context search")
             return None
+
+        # Compose the budget: explicit per-call wins; otherwise derive
+        # from self.config so existing top_k/min_similarity callers see
+        # no behaviour change.
+        effective_budget = (
+            budget
+            if budget is not None
+            else MemoryInjectionBudget(
+                max_entries=self.config.top_k,
+                min_similarity=self.config.min_similarity,
+            )
+        )
 
         try:
             # Search memories on the per-request resolved backend.
             results = await backend.search_memories(
-                query=query,
+                query=query_text,
                 user_id=effective_user_id,
-                top_k=self.config.top_k,
+                top_k=effective_budget.max_entries,
                 include_related=True,
             )
 
@@ -701,9 +732,11 @@ class MemoryHandler:
 
             # Optional re-rank: when a MemoryRanker is provided, adapt
             # results to MemoryCandidate, re-rank, then filter by
-            # min_similarity on the BOOSTED score. The re-rank can
-            # promote a fresh weak-cosine memory above a stale strong-
-            # cosine one (RecencyBoostRanker default behaviour).
+            # ``budget.min_similarity`` on the BOOSTED score. The re-rank
+            # can promote a fresh weak-cosine memory above a stale
+            # strong-cosine one (RecencyBoostRanker default behaviour).
+            # Cap by ``budget.max_entries`` after filtering so the budget
+            # contract is honoured on both branches.
             if ranker is not None:
                 from headroom.proxy.memory_ranker import MemoryCandidate
 
@@ -711,13 +744,14 @@ class MemoryHandler:
                 ranked = ranker.rank(candidates)
                 # Filter on the post-rank score (the ranker may have
                 # boosted or attenuated original cosine values).
-                ranked = [c for c in ranked if c.score >= self.config.min_similarity]
+                ranked = [c for c in ranked if c.score >= effective_budget.min_similarity]
                 if not ranked:
                     logger.debug(
                         f"Memory: {len(results)} memories found but none above threshold "
-                        f"{self.config.min_similarity} after re-rank"
+                        f"{effective_budget.min_similarity} after re-rank"
                     )
                     return None
+                ranked = ranked[: effective_budget.max_entries]
                 memory_lines = []
                 for i, candidate in enumerate(ranked, 1):
                     memory_lines.append(f"{i}. {candidate.content}")
@@ -725,15 +759,22 @@ class MemoryHandler:
                         entities_str = ", ".join(candidate.related_entities[:3])
                         memory_lines.append(f"   (Related: {entities_str})")
             else:
-                # Pre-PR-this behaviour: pure cosine, no boost.
-                filtered_results = [r for r in results if r.score >= self.config.min_similarity]
+                # No ranker: pure cosine + budget min_similarity floor.
+                filtered_results = [
+                    r for r in results if r.score >= effective_budget.min_similarity
+                ]
 
                 if not filtered_results:
                     logger.debug(
                         f"Memory: {len(results)} memories found but none above threshold "
-                        f"{self.config.min_similarity}"
+                        f"{effective_budget.min_similarity}"
                     )
                     return None
+
+                # Cap entry count via the budget (defence-in-depth —
+                # backend already gets top_k=max_entries but this enforces
+                # it on post-filter results too).
+                filtered_results = filtered_results[: effective_budget.max_entries]
 
                 memory_lines = []
                 for i, result in enumerate(filtered_results, 1):
@@ -758,12 +799,19 @@ The following information was previously saved in this scope:
 
 Use this context to provide personalized and contextually relevant responses."""
 
+        # Apply the token-budget cap on the formatted block. Pre-this-
+        # PR there was no cap — up to ~4000 tokens could be injected
+        # per request. The budget bounds the output without touching
+        # the input query (which stays full-fidelity per MemoryQuery).
+        context = effective_budget.apply_to_text(context)
+
         logger.info(
-            "event=memory_inject user=%s scope=%s count=%d chars=%d",
+            "event=memory_inject user=%s scope=%s count=%d chars=%d budget_tokens=%d",
             effective_user_id,
             scope.display_name if scope else "<legacy>",
             len(memory_lines),
             len(context),
+            effective_budget.max_tokens,
         )
         return context
 
@@ -831,7 +879,13 @@ Use this context to provide personalized and contextually relevant responses."""
         raise ValueError(f"Unknown provider {provider!r}; expected 'anthropic' or 'openai'")
 
     def _extract_user_query(self, messages: list[dict[str, Any]]) -> str:
-        """Extract the user query from the last user message."""
+        """Extract the user query from the last user message.
+
+        Returns the FULL message text — no truncation. The embedding
+        model handles its own context window. (Pre-this-PR this
+        method capped at 500 chars, silently throwing away signal —
+        none of Letta/Mem0/Cognee/Supermemory truncate.)
+        """
         for msg in reversed(messages):
             if msg.get("role") != "user":
                 continue
@@ -839,14 +893,14 @@ Use this context to provide personalized and contextually relevant responses."""
             content = msg.get("content", "")
 
             if isinstance(content, str):
-                return content[:500]  # Limit query length
+                return content
 
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict) and block.get("type") == "text":
                         text = str(block.get("text", ""))
                         if text:
-                            return text[:500]
+                            return text
 
         return ""
 
