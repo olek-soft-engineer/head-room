@@ -116,3 +116,41 @@ def test_outcome_call_sites_pass_client_kwarg() -> None:
             "`client = classify_client(headers)` and thread `client=client` "
             "into the outcome construction. See PR #473 for the pattern."
         )
+
+
+# ── Invariant: image-compression must route through ImageCompressionDecision ──
+
+
+import re  # noqa: E402  -- only used by the image-decision invariant below
+
+
+def test_no_raw_image_optimize_gate_in_handlers() -> None:
+    """Locks the post-this-PR contract: image compression must be
+    gated by :class:`ImageCompressionDecision`, not by an inline
+    ``if self.config.image_optimize and messages and not _bypass:``
+    conjunction. Pre-PR-this both sites used the raw conjunction;
+    consolidating into a value type means a future site (e.g., new
+    provider handler) can't drift on bypass-respect or skip-reason
+    observability.
+
+    Allowed forms after this PR:
+    * ``if _image_decision.should_compress``
+    * ``if _image_decision.should_compress and ...``
+    """
+    pattern = re.compile(r"^\s*if\s*\(?\s*self\.config\.image_optimize\s+and\s+messages\b")
+    offenders: list[tuple[str, int, str]] = []
+    for f in HANDLER_FILES:
+        text = f.read_text(encoding="utf-8")
+        for i, line in enumerate(text.splitlines(), start=1):
+            if pattern.match(line):
+                offenders.append((f.name, i, line.rstrip()))
+    if offenders:
+        formatted = "\n".join(f"  {f}:{ln}  {src!r}" for f, ln, src in offenders)
+        pytest.fail(
+            f"{len(offenders)} handler site(s) use the pre-PR raw image "
+            "gate `if self.config.image_optimize and messages [and ...]`:\n"
+            f"{formatted}\n\n"
+            "Replace with `ImageCompressionDecision.decide(...)` + "
+            "`if _image_decision.should_compress:`. See "
+            "headroom/proxy/image_compression_decision.py for the pattern."
+        )

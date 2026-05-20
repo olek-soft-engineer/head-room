@@ -883,12 +883,18 @@ class AnthropicHandlerMixin:
             # turn becomes historical on the next request, so even "latest turn only"
             # rewrites can invalidate the next cache read when the client resends the
             # original transcript.
-            if (
-                self.config.image_optimize
-                and messages
-                and not _bypass
-                and not is_cache_mode(self.config.mode)
-            ):
+            #
+            # Bypass / image_optimize / messages gating routes through
+            # ImageCompressionDecision for uniformity with CompressionDecision +
+            # MemoryDecision. The cache_mode check stays inline because it's
+            # Anthropic-specific (sites in openai.py / gemini.py don't have it).
+            from headroom.proxy.image_compression_decision import ImageCompressionDecision
+
+            _image_decision = ImageCompressionDecision.decide(
+                headers=request.headers, config=self.config, messages=messages
+            )
+            _image_decision.apply_to_tags(tags)
+            if _image_decision.should_compress and not is_cache_mode(self.config.mode):
                 compressor = None
                 try:
                     compressor = _get_image_compressor()
