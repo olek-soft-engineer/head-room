@@ -50,21 +50,28 @@ class MemoryCandidate:
     created_at: datetime | None = None
     source: str | None = None  # e.g. "memory_save" | "traffic_learner" | "inline"
     related_entities: tuple[str, ...] = field(default_factory=tuple)
+    # Backend memory ID. Empty string when not preserved (test fixtures,
+    # legacy callers). Rendered as ``[id]`` in the auto-tail block so the
+    # model can pass it to memory_update / memory_delete directly.
+    id: str = ""
 
     @classmethod
     def from_backend_result(cls, result: object) -> MemoryCandidate:
         """Adapter from backend ``MemoryResult`` shape to ``MemoryCandidate``.
 
         The backend returns objects with ``.score``, ``.memory.content``,
-        and (optionally) ``.memory.created_at`` (str ISO timestamp) +
-        ``.related_entities``. This adapter flattens that to the
-        ranker's expected shape and parses the timestamp to ``datetime``.
+        ``.memory.id``, and (optionally) ``.memory.created_at`` (str ISO
+        timestamp) + ``.related_entities``. This adapter flattens that to
+        the ranker's expected shape and parses the timestamp to
+        ``datetime``.
 
         Missing / unparseable timestamps → ``None`` (recency-neutral).
+        Missing IDs → ``""`` (rendered as ``[?]`` in the auto-tail block).
         """
         score = float(getattr(result, "score", 0.0))
         memory = getattr(result, "memory", None)
         content = str(getattr(memory, "content", "")) if memory is not None else ""
+        memory_id = str(getattr(memory, "id", "") or "") if memory is not None else ""
         raw_dt = getattr(memory, "created_at", None) if memory is not None else None
         created_at = _parse_created_at(raw_dt)
         raw_related = getattr(result, "related_entities", None) or ()
@@ -77,6 +84,7 @@ class MemoryCandidate:
             created_at=created_at,
             source=source,
             related_entities=related,
+            id=memory_id,
         )
 
 

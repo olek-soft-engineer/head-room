@@ -60,6 +60,49 @@ def test_candidate_is_frozen() -> None:
         raise AssertionError("MemoryCandidate must be frozen")
 
 
+def test_from_backend_result_preserves_memory_id() -> None:
+    """The adapter must carry ``memory.id`` through to MemoryCandidate.id
+    so the auto-tail block can render it as the bracketed handle the
+    model uses for memory_update / memory_delete. Pre-this-fix the
+    adapter dropped the ID, which silently regressed the [id] auto-tail
+    format on the ranker path."""
+
+    class _Mem:
+        id = "mem_abc_123"
+        content = "User prefers Python."
+        created_at = None
+        metadata = {"source": "memory_save"}
+
+    class _Result:
+        memory = _Mem()
+        score = 0.91
+        related_entities = ("python",)
+
+    cand = MemoryCandidate.from_backend_result(_Result())
+    assert cand.id == "mem_abc_123"
+    assert cand.content == "User prefers Python."
+    assert cand.score == 0.91
+
+
+def test_from_backend_result_handles_missing_id() -> None:
+    """Defensive: legacy backend rows without an ID become ``id=""``;
+    the auto-tail formatter renders ``[?]`` for those rows, no crash."""
+
+    class _Mem:
+        # no .id attribute
+        content = "legacy row"
+        created_at = None
+        metadata = {}
+
+    class _Result:
+        memory = _Mem()
+        score = 0.5
+        related_entities = ()
+
+    cand = MemoryCandidate.from_backend_result(_Result())
+    assert cand.id == ""
+
+
 # ── RecencyBoostRanker contract ──────────────────────────────────────
 
 
