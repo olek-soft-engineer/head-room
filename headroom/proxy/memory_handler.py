@@ -649,6 +649,7 @@ class MemoryHandler:
         messages: list[dict[str, Any]],
         request_context: RequestContext | None = None,
         *,
+        ranker: Any | None = None,
         query: Any | None = None,
         budget: Any | None = None,
     ) -> str | None:
@@ -662,7 +663,18 @@ class MemoryHandler:
             request_context: Optional request envelope (headers, system
                 prompt, base user id). When provided, memory retrieval
                 is scoped to the resolved workspace / project so memories
-                from unrelated projects can never bleed in (GH #462).
+                from unrelated projects can never bleed in (GH #462). When
+                omitted, behaves as before this fix — single-bucket search
+                against the legacy backend. Production handlers always
+                pass it; tests / mocks can keep the simpler call shape.
+            ranker: Optional :class:`~headroom.proxy.memory_ranker.MemoryRanker`
+                — re-ranks the backend's cosine-only candidates by an
+                additional signal (recency, source, access count, …).
+                When ``None`` (default), behaviour is pure cosine +
+                ``budget.min_similarity`` floor. When provided, candidates
+                are adapted to :class:`MemoryCandidate`, re-ranked, then
+                re-filtered by ``budget.min_similarity`` on the boosted
+                score.
             query: Optional :class:`MemoryQuery` — multi-source, full-
                 fidelity retrieval query. When provided, takes precedence
                 over the ``messages``-derived query. Constructed at the
@@ -673,7 +685,8 @@ class MemoryHandler:
                 returned formatted block by tokens / entries / min
                 similarity. When ``None``, defaults are taken from
                 ``self.config`` so the existing top_k / min_similarity
-                contract is preserved.
+                contract is preserved. Both the no-ranker and the with-
+                ranker paths honour the same budget.
 
         Returns:
             Formatted context string, or None if no relevant memories.
@@ -743,35 +756,66 @@ class MemoryHandler:
                 )
                 return None
 
-            # Filter by minimum similarity using the budget.
-            filtered_results = [r for r in results if r.score >= effective_budget.min_similarity]
+            # Optional re-rank: when a MemoryRanker is provided, adapt
+            # results to MemoryCandidate, re-rank, then filter by
+            # ``budget.min_similarity`` on the BOOSTED score. The re-rank
+            # can promote a fresh weak-cosine memory above a stale
+            # strong-cosine one (RecencyBoostRanker default behaviour).
+            # Cap by ``budget.max_entries`` after filtering so the budget
+            # contract is honoured on both branches.
+            # Each rendered row carries the memory ID in [brackets] so
+            # the model can address it directly via memory_update /
+            # memory_delete without round-tripping through memory_search.
+            # Both branches below render the same `i. [id] content` shape
+            # so the format is stable regardless of whether a ranker is
+            # in play.
+            if ranker is not None:
+                from headroom.proxy.memory_ranker import MemoryCandidate
 
-            if not filtered_results:
-                logger.debug(
-                    f"Memory: {len(results)} memories found but none above threshold "
-                    f"{effective_budget.min_similarity}"
-                )
-                return None
+                candidates = [MemoryCandidate.from_backend_result(r) for r in results]
+                ranked = ranker.rank(candidates)
+                # Filter on the post-rank score (the ranker may have
+                # boosted or attenuated original cosine values).
+                ranked = [c for c in ranked if c.score >= effective_budget.min_similarity]
+                if not ranked:
+                    logger.debug(
+                        f"Memory: {len(results)} memories found but none above threshold "
+                        f"{effective_budget.min_similarity} after re-rank"
+                    )
+                    return None
+                ranked = ranked[: effective_budget.max_entries]
+                memory_lines = []
+                for i, candidate in enumerate(ranked, 1):
+                    memory_id = candidate.id or "?"
+                    memory_lines.append(f"{i}. [{memory_id}] {candidate.content}")
+                    if candidate.related_entities:
+                        entities_str = ", ".join(candidate.related_entities[:3])
+                        memory_lines.append(f"   (Related: {entities_str})")
+            else:
+                # No ranker: pure cosine + budget min_similarity floor.
+                filtered_results = [
+                    r for r in results if r.score >= effective_budget.min_similarity
+                ]
 
-            # Cap entry count via the budget (defence-in-depth — backend
-            # already gets top_k=max_entries but this enforces it on
-            # post-filter results too).
-            filtered_results = filtered_results[: effective_budget.max_entries]
+                if not filtered_results:
+                    logger.debug(
+                        f"Memory: {len(results)} memories found but none above threshold "
+                        f"{effective_budget.min_similarity}"
+                    )
+                    return None
 
-            # Format as context. Each row prefixes the memory ID so the
-            # model can address it directly (e.g.,
-            # ``memory_update(id, ...)``) without first calling
-            # ``memory_search`` to discover IDs. Pre-this-PR the block
-            # only carried content; the model had to round-trip through
-            # search to do any UPDATE / DELETE on a row visible in the
-            # auto-injected tail.
-            memory_lines = []
-            for i, result in enumerate(filtered_results, 1):
-                memory_id = getattr(result.memory, "id", None) or "?"
-                memory_lines.append(f"{i}. [{memory_id}] {result.memory.content}")
-                if hasattr(result, "related_entities") and result.related_entities:
-                    entities_str = ", ".join(result.related_entities[:3])
-                    memory_lines.append(f"   (Related: {entities_str})")
+                # Cap entry count via the budget (defence-in-depth —
+                # backend already gets top_k=max_entries but this enforces
+                # it on post-filter results too).
+                filtered_results = filtered_results[: effective_budget.max_entries]
+
+                memory_lines = []
+                for i, result in enumerate(filtered_results, 1):
+                    memory_id = getattr(result.memory, "id", None) or "?"
+                    memory_lines.append(f"{i}. [{memory_id}] {result.memory.content}")
+                    if hasattr(result, "related_entities") and result.related_entities:
+                        entities_str = ", ".join(result.related_entities[:3])
+                        memory_lines.append(f"   (Related: {entities_str})")
 
         except Exception as e:
             logger.warning(f"Memory: Search failed for user {effective_user_id}: {e}")
