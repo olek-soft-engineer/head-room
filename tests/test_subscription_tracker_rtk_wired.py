@@ -3,19 +3,25 @@
 Phase G of the Headroom realignment retires the dead ``tokens_saved_rtk``
 field by sourcing it from RTK's own stats endpoint (``rtk gain --format
 json`` via :func:`headroom.proxy.helpers._get_rtk_stats`) and writing the
-per-call delta into ``HeadroomContribution.tokens_saved_rtk``. Previously,
-the field silently mirrored ``tokens_saved_cli_filtering`` — making the
-two counters identical at all times and breaking the dashboard's ability
-to distinguish proxy-side compression from wrap-side RTK savings.
+per-call delta into ``HeadroomContribution.tokens_saved_rtk``.
+
+PR-G2 remediation (C1): the tracker reads the SESSION-incremental
+``session.tokens_saved`` field of the helper payload, NOT the raw
+``lifetime_tokens_saved`` counter. The helper de-baselines per proxy
+session at startup, so the first poll after process startup correctly
+reads 0 instead of the entire pre-Headroom RTK history.
 
 These tests pin the wiring:
 
 1. The delta is computed correctly across two consecutive
-   :meth:`update_contribution` calls (monotonic counter advances).
+   :meth:`update_contribution` calls (monotonic session counter advances).
 2. ``tokens_saved_rtk`` is exactly zero when ``_get_rtk_stats()`` returns
    ``None`` (RTK not installed / not selected).
 3. ``_last_rtk_tokens_saved`` advances monotonically; deltas are not
-   replayed across calls when the lifetime counter does not move.
+   replayed across calls when the session counter does not move.
+4. First poll reads 0 when the helper reports a fresh session baseline
+   (the C1 regression fix — previously this poll emitted the entire RTK
+   lifetime as a phantom delta).
 
 Realignment build constraints honored:
 
@@ -23,15 +29,14 @@ Realignment build constraints honored:
   structured-logged and yields ``tokens_saved_rtk = 0`` (test 4).
 - Configurable: ``HEADROOM_RTK_WIRING=disabled`` opts the polling out and
   produces a clean zero, exercised by ``test_disabled_env_returns_zero``.
-- Structured logs: each failure path emits a ``event=…`` line; the tests
-  do not pin the log payload to avoid coupling, but the helper signatures
-  surface them.
-- Comprehensive tests: 6 unit tests + 1 explicit delta test cover the
-  contract.
+- Structured logs: each failure path emits a ``event=…`` line; the
+  ``caplog`` assertions below pin the log payload so the "no silent
+  fallback" constraint is verified.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import pytest
@@ -41,10 +46,32 @@ from headroom.subscription.tracker import SubscriptionTracker
 
 
 def _build_tracker(monkeypatch: pytest.MonkeyPatch) -> SubscriptionTracker:
-    """Construct a tracker with persistence disabled (unit-test isolation)."""
+    """Construct a tracker with persistence + multi-worker lock disabled.
+
+    Tests use ``_build_tracker`` to keep persistence side effects out of
+    unit tests and to force the RTK poll lock to "owner" so polling runs.
+    """
 
     monkeypatch.setattr(SubscriptionTracker, "_load_persisted_state", lambda self: None)
+    monkeypatch.setattr(SubscriptionTracker, "_try_acquire_rtk_poll_lock", lambda self: True)
     return SubscriptionTracker(enabled=True)
+
+
+def _session_payload(tokens_saved: int, *, lifetime: int | None = None) -> dict[str, Any]:
+    """Build a stats payload mimicking ``_get_context_tool_stats``.
+
+    The tracker reads ``session.tokens_saved``. We always include the
+    lifetime field so we can verify the tracker no longer reads it.
+    """
+
+    if lifetime is None:
+        lifetime = tokens_saved + 50_000  # arbitrary pre-Headroom history
+    return {
+        "tokens_saved": tokens_saved,  # session-incremental (canonical)
+        "lifetime_tokens_saved": lifetime,
+        "session": {"tokens_saved": tokens_saved},
+        "lifetime": {"tokens_saved": lifetime},
+    }
 
 
 def _stub_rtk_stats(
@@ -77,25 +104,30 @@ def _stub_rtk_stats(
 # ---------------------------------------------------------------------------
 
 
-def test_tokens_saved_rtk_populated_from_rtk_stats(
+def test_tokens_saved_rtk_populated_from_session_field(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """First call seeds the baseline; second call writes the positive delta."""
+    """First call seeds the baseline at the session counter, not lifetime.
+
+    PR-G2 remediation (C1): previously the tracker read
+    ``lifetime_tokens_saved`` and emitted the entire pre-Headroom RTK
+    history as a phantom delta on the first poll. After the C1 fix the
+    tracker reads ``session.tokens_saved`` which the helper has already
+    de-baselined per proxy session.
+    """
 
     tracker = _build_tracker(monkeypatch)
     monkeypatch.delenv(tracker_module._RTK_WIRING_ENV, raising=False)
     _stub_rtk_stats(
         monkeypatch,
         [
-            {"lifetime_tokens_saved": 100},
-            {"lifetime_tokens_saved": 175},
+            _session_payload(tokens_saved=100, lifetime=50_100),
+            _session_payload(tokens_saved=175, lifetime=50_175),
         ],
     )
 
-    # First call — establishes the baseline at 100, contributes 100 (the
-    # tracker starts at _last_rtk_tokens_saved == 0, so the first delta is
-    # the full lifetime total). That matches the spec: the field reflects
-    # cumulative session savings observed by the tracker.
+    # First call — session counter is 100 (50 000 lifetime history was
+    # rebaselined by the helper at proxy startup, so we DON'T see it).
     tracker.update_contribution()
     contribution_after_first = tracker._state.contribution.tokens_saved_rtk
     assert contribution_after_first == 100
@@ -105,6 +137,37 @@ def test_tokens_saved_rtk_populated_from_rtk_stats(
     tracker.update_contribution()
     assert tracker._state.contribution.tokens_saved_rtk == 175
     assert tracker._last_rtk_tokens_saved == 175
+
+
+def test_first_poll_zero_when_session_baseline_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C1 fix verification: a freshly-baselined session yields zero on first poll.
+
+    The helper's session baseline is captured at proxy startup. A brand
+    new proxy with no RTK invocations since startup reports
+    ``session.tokens_saved == 0`` even though ``lifetime_tokens_saved``
+    may be enormous (months of accumulated RTK history). The tracker must
+    NOT emit the lifetime as a phantom delta.
+    """
+
+    tracker = _build_tracker(monkeypatch)
+    monkeypatch.delenv(tracker_module._RTK_WIRING_ENV, raising=False)
+    _stub_rtk_stats(
+        monkeypatch,
+        [
+            # Pre-Headroom lifetime = 50 000 tokens. Helper rebaselines at
+            # startup so session = 0.
+            _session_payload(tokens_saved=0, lifetime=50_000),
+        ],
+    )
+
+    tracker.update_contribution()
+
+    assert tracker._state.contribution.tokens_saved_rtk == 0, (
+        "first poll must NOT emit pre-Headroom RTK history as a phantom delta"
+    )
+    assert tracker._last_rtk_tokens_saved == 0
 
 
 def test_delta_computed_correctly_across_polls(
@@ -117,9 +180,9 @@ def test_delta_computed_correctly_across_polls(
     _stub_rtk_stats(
         monkeypatch,
         [
-            {"lifetime_tokens_saved": 0},  # baseline at zero
-            {"lifetime_tokens_saved": 50},
-            {"lifetime_tokens_saved": 250},
+            _session_payload(tokens_saved=0),  # baseline at zero
+            _session_payload(tokens_saved=50),
+            _session_payload(tokens_saved=250),
         ],
     )
 
@@ -162,16 +225,16 @@ def test_rtk_stats_none_yields_zero_delta(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_last_rtk_advances_monotonically(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Two polls returning the same lifetime total contribute exactly once."""
+    """Two polls returning the same session total contribute exactly once."""
 
     tracker = _build_tracker(monkeypatch)
     monkeypatch.delenv(tracker_module._RTK_WIRING_ENV, raising=False)
     _stub_rtk_stats(
         monkeypatch,
         [
-            {"lifetime_tokens_saved": 42},
-            {"lifetime_tokens_saved": 42},  # no movement
-            {"lifetime_tokens_saved": 42},  # still no movement
+            _session_payload(tokens_saved=42),
+            _session_payload(tokens_saved=42),  # no movement
+            _session_payload(tokens_saved=42),  # still no movement
         ],
     )
 
@@ -191,16 +254,16 @@ def test_last_rtk_advances_monotonically(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_counter_regression_rebaselines_without_negative_delta(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RTK DB rebuild drops the lifetime total — re-baseline, do not subtract."""
+    """Helper rebaselines the session counter — re-baseline, do not subtract."""
 
     tracker = _build_tracker(monkeypatch)
     monkeypatch.delenv(tracker_module._RTK_WIRING_ENV, raising=False)
     _stub_rtk_stats(
         monkeypatch,
         [
-            {"lifetime_tokens_saved": 500},
-            {"lifetime_tokens_saved": 100},  # regression!
-            {"lifetime_tokens_saved": 150},
+            _session_payload(tokens_saved=500),
+            _session_payload(tokens_saved=100),  # regression!
+            _session_payload(tokens_saved=150),
         ],
     )
 
@@ -211,7 +274,7 @@ def test_counter_regression_rebaselines_without_negative_delta(
     tracker.update_contribution()
     # Regression: contribution stays at 500 (no negative subtraction).
     assert tracker._state.contribution.tokens_saved_rtk == 500
-    # Baseline now points at the new (smaller) lifetime total so subsequent
+    # Baseline now points at the new (smaller) session total so subsequent
     # polls can compute a meaningful delta.
     assert tracker._last_rtk_tokens_saved == 100
 
@@ -226,10 +289,15 @@ def test_counter_regression_rebaselines_without_negative_delta(
 # ---------------------------------------------------------------------------
 
 
-def test_rtk_stats_exception_zero_delta_no_throw(
+def test_rtk_stats_exception_zero_delta_no_throw_with_log(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A raised ``_get_rtk_stats()`` is caught, logged, and yields 0 delta."""
+    """A raised ``_get_rtk_stats()`` is caught, structured-logged, yields 0.
+
+    PR-G2 remediation (H3): pins the loud-log requirement so the
+    "no silent fallback" constraint is verified.
+    """
 
     tracker = _build_tracker(monkeypatch)
     monkeypatch.delenv(tracker_module._RTK_WIRING_ENV, raising=False)
@@ -239,11 +307,16 @@ def test_rtk_stats_exception_zero_delta_no_throw(
 
     monkeypatch.setattr("headroom.proxy.helpers._get_rtk_stats", boom)
 
+    caplog.set_level(logging.WARNING, logger="headroom.subscription.tracker")
+
     # Must not raise.
     tracker.update_contribution()
 
     assert tracker._state.contribution.tokens_saved_rtk == 0
     assert tracker._last_rtk_tokens_saved == 0
+    assert any(
+        "event=subscription_rtk_stats_fetch_failed" in rec.getMessage() for rec in caplog.records
+    ), "expected structured log on RTK stats fetch failure"
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +332,7 @@ def test_disabled_env_returns_zero(monkeypatch: pytest.MonkeyPatch) -> None:
 
     polls = _stub_rtk_stats(
         monkeypatch,
-        [{"lifetime_tokens_saved": 999}],
+        [_session_payload(tokens_saved=999)],
     )
 
     tracker.update_contribution()
@@ -282,7 +355,7 @@ def test_explicit_rtk_override_skips_poll(monkeypatch: pytest.MonkeyPatch) -> No
     tracker = _build_tracker(monkeypatch)
     monkeypatch.delenv(tracker_module._RTK_WIRING_ENV, raising=False)
 
-    polls = _stub_rtk_stats(monkeypatch, [{"lifetime_tokens_saved": 999}])
+    polls = _stub_rtk_stats(monkeypatch, [_session_payload(tokens_saved=999)])
 
     tracker.update_contribution(tokens_saved_rtk=17)
 
@@ -305,10 +378,261 @@ def test_cli_filtering_no_longer_mirrors_rtk(monkeypatch: pytest.MonkeyPatch) ->
 
     tracker = _build_tracker(monkeypatch)
     monkeypatch.delenv(tracker_module._RTK_WIRING_ENV, raising=False)
-    _stub_rtk_stats(monkeypatch, [{"lifetime_tokens_saved": 25}])
+    _stub_rtk_stats(monkeypatch, [_session_payload(tokens_saved=25)])
 
     tracker.update_contribution(tokens_saved_cli_filtering=8)
 
     assert tracker._state.contribution.tokens_saved_cli_filtering == 8
     # rtk comes from the polled delta, not from cli_filtering.
     assert tracker._state.contribution.tokens_saved_rtk == 25
+
+
+# ---------------------------------------------------------------------------
+# Test 8 (H1) — invalid HEADROOM_RTK_WIRING fails loudly at startup
+# ---------------------------------------------------------------------------
+
+
+def test_garbage_wiring_env_raises_at_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """PR-G2 remediation (H1, M4): bad env value crashes startup loudly.
+
+    Previously the typo would be silently swallowed at every
+    ``update_contribution`` call. Now :func:`configure_subscription_tracker`
+    validates eagerly and raises ``ValueError``.
+    """
+
+    monkeypatch.setenv(tracker_module._RTK_WIRING_ENV, "garbage")
+    # Reset the singleton so configure() actually runs the validator.
+    monkeypatch.setattr(tracker_module, "_tracker_instance", None)
+
+    with pytest.raises(ValueError, match="HEADROOM_RTK_WIRING"):
+        tracker_module.configure_subscription_tracker(enabled=True)
+
+
+def test_garbage_wiring_env_logs_loudly_at_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If env is flipped to garbage AFTER startup, runtime path emits ERROR.
+
+    This is the defence-in-depth tier — startup-validation is the primary
+    barrier (test above) but a env-var rotation could still flip the value
+    mid-run.
+    """
+
+    tracker = _build_tracker(monkeypatch)
+    # Set garbage AFTER tracker construction so the constructor doesn't see it.
+    monkeypatch.setenv(tracker_module._RTK_WIRING_ENV, "garbage")
+
+    caplog.set_level(logging.ERROR, logger="headroom.subscription.tracker")
+
+    tracker.update_contribution()
+
+    assert tracker._state.contribution.tokens_saved_rtk == 0
+    assert any(
+        rec.levelno >= logging.ERROR and "event=subscription_rtk_invalid_env" in rec.getMessage()
+        for rec in caplog.records
+    ), "expected ERROR-level structured log on invalid HEADROOM_RTK_WIRING"
+
+
+# ---------------------------------------------------------------------------
+# Test 9 (C2) — restart-seeding behavior: no phantom delta on second process
+# ---------------------------------------------------------------------------
+
+
+def test_restart_does_not_emit_phantom_delta(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """PR-G2 remediation (C2): post-restart first poll must not phantom.
+
+    Scenario:
+    1. Tracker A runs, accumulates ``c.tokens_saved_rtk = 100``, persists.
+    2. Process restarts (tracker B loads from disk).
+    3. First poll on tracker B: helper returns ``session.tokens_saved = 5``
+       (small new value since startup). Delta = 5 - 0 = 5. Cumulative =
+       100 + 5 = 105. NOT 100 + 50 000 (lifetime).
+
+    The C1 fix (read session, not lifetime) inherently dissolves this
+    because the helper rebaselines session counters at every proxy
+    startup. This test verifies that property.
+    """
+
+    monkeypatch.delenv(tracker_module._RTK_WIRING_ENV, raising=False)
+    monkeypatch.setattr(SubscriptionTracker, "_try_acquire_rtk_poll_lock", lambda self: True)
+
+    persist_path = tmp_path / "state.json"
+
+    # Phase 1 — tracker A runs and persists state with non-zero counters.
+    _stub_rtk_stats(
+        monkeypatch,
+        [_session_payload(tokens_saved=100, lifetime=50_100)],
+    )
+    tracker_a = SubscriptionTracker(persist_path=persist_path, enabled=True)
+    tracker_a.update_contribution()
+    assert tracker_a._state.contribution.tokens_saved_rtk == 100
+    tracker_a._persist_state()
+
+    # Phase 2 — simulate process restart. New tracker loads state from
+    # disk. Helper rebaselines (session counter starts fresh at 5 — only
+    # one RTK invocation since restart).
+    _stub_rtk_stats(
+        monkeypatch,
+        [_session_payload(tokens_saved=5, lifetime=50_105)],
+    )
+    tracker_b = SubscriptionTracker(persist_path=persist_path, enabled=True)
+    # Loaded from disk.
+    assert tracker_b._state.contribution.tokens_saved_rtk == 100
+    # Tracker B's _last_rtk_tokens_saved starts at 0 (correct — the
+    # session baseline was just re-pinned in the helper).
+    assert tracker_b._last_rtk_tokens_saved == 0
+
+    tracker_b.update_contribution()
+    # 100 (loaded) + 5 (new session delta) = 105. NOT 50 100 + anything.
+    assert tracker_b._state.contribution.tokens_saved_rtk == 105
+
+
+# ---------------------------------------------------------------------------
+# Test 10 (M2 + M3) — legacy state file migration
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_state_migrates_rtk_from_cli_filtering(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """PR-G2 remediation (M2): pre-G2 state has no ``rtk_raw`` key.
+
+    Pre-G2 the ``rtk`` field silently mirrored ``cli_filtering`` (the
+    exact bug PR-G2 retires). When loading a legacy file we treat the
+    aliased ``rtk`` value as the authoritative rtk_raw so historical
+    accumulation isn't silently zeroed. A migration log line is emitted.
+    """
+
+    import json
+
+    persist_path = tmp_path / "legacy.json"
+    persist_path.write_text(
+        json.dumps(
+            {
+                "contribution": {
+                    "tokens_submitted": 50,
+                    "tokens_saved": {
+                        "proxy_compression": 10,
+                        "cli_filtering": 42,
+                        "rtk": 42,  # pre-G2 alias
+                        "cache_reads": 3,
+                        # NO rtk_raw / cli_filtering_raw keys (legacy)
+                    },
+                    "savings_usd": {"compression": 0.0, "cache": 0.0},
+                },
+                "poll_count": 7,
+            }
+        )
+    )
+
+    caplog.set_level(logging.INFO, logger="headroom.subscription.tracker")
+
+    tracker = SubscriptionTracker(persist_path=persist_path, enabled=True)
+
+    # Legacy ``rtk == cli_filtering`` got carried forward into rtk_raw.
+    assert tracker._state.contribution.tokens_saved_rtk == 42
+    assert tracker._state.contribution.tokens_saved_cli_filtering == 42
+    # Migration log emitted.
+    assert any(
+        "event=subscription_state_legacy_load" in rec.getMessage() for rec in caplog.records
+    ), "expected legacy migration structured log"
+
+
+# ---------------------------------------------------------------------------
+# Test 11 (H2) — helper logs structured warning on subprocess failure
+# ---------------------------------------------------------------------------
+
+
+def test_rtk_subprocess_failure_logs_structured_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """PR-G2 remediation (H2): synthetic-zero path must log loudly.
+
+    Without this, a broken RTK and a healthy "0 tokens saved" RTK are
+    indistinguishable at the tracker layer.
+    """
+
+    import subprocess as _subprocess
+
+    from headroom.proxy import helpers as _helpers
+
+    monkeypatch.setattr(_helpers, "get_rtk_path", lambda: None, raising=False)
+
+    # The above branch returns early before invoking subprocess — not the
+    # one we want. Instead, force the subprocess to fail.
+    monkeypatch.setattr(
+        "headroom.proxy.helpers.get_rtk_path",
+        lambda: "/tmp/nonexistent-rtk",
+    )
+
+    class FakeResult:
+        returncode = 1
+        stdout = ""
+        stderr = "rtk: database not found"
+
+    def fake_run(*args: Any, **kwargs: Any) -> FakeResult:
+        return FakeResult()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    caplog.set_level(logging.WARNING, logger="headroom.proxy")
+
+    payload = _helpers._read_rtk_lifetime_stats()
+    assert payload is not None
+    assert payload["tokens_saved"] == 0
+    assert any("event=rtk_stats_subprocess_failed" in rec.getMessage() for rec in caplog.records), (
+        "expected structured warning when RTK subprocess fails"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 12 (C3) — multi-worker poll deduplication via file lock
+# ---------------------------------------------------------------------------
+
+
+def test_multi_worker_only_one_polls(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    """PR-G2 remediation (C3): two trackers sharing a state path elect one owner.
+
+    The owner polls; the non-owner returns 0 from ``_poll_rtk_delta``.
+    Without this gate each worker would add the same RTK delta to its
+    own ``c.tokens_saved_rtk``, inflating dashboard savings by N× workers.
+    """
+
+    monkeypatch.delenv(tracker_module._RTK_WIRING_ENV, raising=False)
+
+    # Both trackers share a state directory so they share the lock file.
+    persist_path = tmp_path / "state.json"
+    lock_path = tmp_path / ".rtk_poll_lock"
+    monkeypatch.setenv(tracker_module._RTK_POLL_LOCK_ENV, str(lock_path))
+
+    _stub_rtk_stats(
+        monkeypatch,
+        [_session_payload(tokens_saved=100)],
+    )
+
+    # Worker A — first to attempt acquisition wins.
+    tracker_a = SubscriptionTracker(persist_path=persist_path, enabled=True)
+    # Worker B — same lock path; flock will fail.
+    tracker_b = SubscriptionTracker(persist_path=persist_path, enabled=True)
+
+    tracker_a.update_contribution()
+    tracker_b.update_contribution()
+
+    # Owner polled and got 100; non-owner returned 0.
+    a_rtk = tracker_a._state.contribution.tokens_saved_rtk
+    b_rtk = tracker_b._state.contribution.tokens_saved_rtk
+    # One worker saw the full 100; the other saw 0. (Order is OS-dependent
+    # but exactly one owns the lock.)
+    assert {a_rtk, b_rtk} == {0, 100}, (
+        f"expected exactly one worker to poll; got a={a_rtk}, b={b_rtk}"
+    )
+
+    # Cleanup so subsequent tests don't see a stale lock.
+    tracker_a._release_rtk_poll_lock()
+    tracker_b._release_rtk_poll_lock()

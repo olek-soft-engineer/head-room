@@ -1118,6 +1118,16 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
                 summary=summary if isinstance(summary, dict) else {},
             )
         else:
+            # PR-G2 remediation (H2): structured log the synthetic-zero path
+            # so downstream consumers (subscription tracker, dashboards) can
+            # distinguish a healthy "RTK ran and saved nothing" from a broken
+            # "RTK failed and we faked zero".
+            stderr_excerpt = (result.stderr or "")[:200]
+            logger.warning(
+                "event=rtk_stats_subprocess_failed reason=non_zero_exit rc=%s stderr=%r",
+                result.returncode,
+                stderr_excerpt,
+            )
             return {
                 "tool": _CONTEXT_TOOL_RTK,
                 "label": _context_tool_label(_CONTEXT_TOOL_RTK),
@@ -1131,7 +1141,15 @@ def _read_rtk_lifetime_stats() -> dict[str, Any] | None:
                 "lifetime_avg_savings_pct": 0.0,
                 "total_time_ms": 0,
             }
-    except Exception:
+    except Exception as exc:
+        # PR-G2 remediation (H2): log the exception path too. Reason is the
+        # exception class name (without payload — RTK exceptions can carry
+        # filesystem paths).
+        logger.warning(
+            "event=rtk_stats_subprocess_failed reason=%s error=%s",
+            type(exc).__name__,
+            exc,
+        )
         return {
             "tool": _CONTEXT_TOOL_RTK,
             "label": _context_tool_label(_CONTEXT_TOOL_RTK),
