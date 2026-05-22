@@ -994,6 +994,64 @@ def _inject_memory_agents_md(file_path: Path) -> bool:
     return True
 
 
+def _inject_continue_rtk_systemmessage(config_file: Path, verbose: bool = False) -> bool:
+    """Inject the rtk instructions block into Continue's ``.continue/config.json``.
+
+    Continue's schema supports a top-level ``systemMessage`` string applied to
+    every model. We treat the RTK marker as the idempotency token: if a prior
+    ``systemMessage`` already contains the ``<!-- headroom:rtk-instructions -->``
+    marker we leave it alone. Otherwise we either set the field (if absent) or
+    append the rtk block to the existing string with a separator.
+
+    The config file is read/written as JSON. Malformed JSON is left untouched
+    and the helper returns ``False`` — we do not silently overwrite user data.
+    Returns ``True`` if the instructions were successfully written or already
+    present.
+    """
+    if config_file.exists():
+        try:
+            content = config_file.read_text()
+        except OSError as exc:
+            click.echo(f"  Warning: could not read {config_file}: {exc}")
+            return False
+        if not content.strip():
+            data: dict[str, Any] = {}
+        else:
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError as exc:
+                click.echo(
+                    f"  Warning: {config_file} is not valid JSON ({exc.msg}); "
+                    "not modifying — fix the file manually before re-running."
+                )
+                return False
+            if not isinstance(parsed, dict):
+                click.echo(
+                    f"  Warning: {config_file} top-level value is not an object; "
+                    "Continue expects a JSON object — leaving file untouched."
+                )
+                return False
+            data = parsed
+    else:
+        data = {}
+
+    existing_msg = data.get("systemMessage")
+    if isinstance(existing_msg, str) and _RTK_MARKER in existing_msg:
+        if verbose:
+            click.echo(f"  rtk instructions already in {config_file.name}")
+        return True
+
+    if isinstance(existing_msg, str) and existing_msg.strip():
+        data["systemMessage"] = existing_msg.rstrip() + "\n\n" + RTK_INSTRUCTIONS_BLOCK
+    else:
+        data["systemMessage"] = RTK_INSTRUCTIONS_BLOCK
+
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(json.dumps(data, indent=2) + "\n")
+    click.echo(f"  rtk instructions injected into {config_file}")
+    return True
+
+
 def _resolve_copilot_provider_type(backend: str | None, provider_type: str) -> str:
     """Resolve Copilot BYOK provider type for the current proxy backend."""
     return _copilot_resolve_provider_type(backend, provider_type)
@@ -1752,6 +1810,10 @@ def wrap() -> None:
         headroom wrap copilot -- --model claude-sonnet-4-20250514
         headroom wrap aider               # Aider
         headroom wrap cursor              # Cursor (prints config instructions)
+        headroom wrap cline               # Cline (VS Code; prints config instructions)
+        headroom wrap continue            # Continue (VS Code/JetBrains; injects systemMessage)
+        headroom wrap goose               # Goose (Block) CLI
+        headroom wrap openhands           # OpenHands CLI
         headroom wrap openclaw            # OpenClaw plugin bootstrap
 
     \b
@@ -1760,9 +1822,7 @@ def wrap() -> None:
           sets the right env vars, and launches the wrapped CLI.
         - `headroom proxy` — just the proxy. Use this with any
           OpenAI/Anthropic-compatible client by setting
-          ANTHROPIC_BASE_URL / OPENAI_BASE_URL yourself. Required for
-          tools without a dedicated `wrap` subcommand
-          (e.g. opencode, Cline, Continue).
+          ANTHROPIC_BASE_URL / OPENAI_BASE_URL yourself.
 
     \b
     Note: `headroom wrap opencode` does NOT exist. For opencode, run
@@ -2624,6 +2684,480 @@ def cursor(
         raise SystemExit(1) from e
     finally:
         cleanup()
+
+
+# =============================================================================
+# Cline (VS Code extension)
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+def cline(
+    port: int,
+    no_rtk: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    verbose: bool,
+    prepare_only: bool,
+) -> None:
+    """Start Headroom proxy for use with Cline (VS Code extension).
+
+    \b
+    Cline is a VS Code extension that reads its API configuration from the
+    VS Code settings UI, not from environment variables. This command starts
+    the proxy, sets up the selected CLI context tool (injecting RTK guidance
+    into .clinerules at the project root), and prints the Cline settings the
+    user should configure.
+
+    \b
+    After running this command, open Cline's settings in VS Code and configure
+    the API Base URL to point at the local Headroom proxy.
+
+    \b
+    Examples:
+        headroom wrap cline                  # Start proxy + .clinerules instructions
+        headroom wrap cline --no-context-tool # Proxy only, no CLI context tool
+        headroom wrap cline --port 9999      # Custom proxy port
+    """
+    if not no_rtk:
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            click.echo("  Setting up lean-ctx for Cline...")
+            _setup_lean_ctx_agent("cline", verbose=verbose)
+        else:
+            click.echo("  Setting up rtk for Cline...")
+            rtk_path = _ensure_rtk_binary(verbose=verbose)
+            if rtk_path:
+                clinerules = Path.cwd() / ".clinerules"
+                _inject_rtk_instructions(clinerules, verbose=verbose)
+
+    if prepare_only:
+        return
+
+    proxy_holder: list[subprocess.Popen | None] = [None]
+    cleanup = _make_cleanup(proxy_holder, port)
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    try:
+        click.echo()
+        click.echo("  ╔═══════════════════════════════════════════════╗")
+        click.echo("  ║             HEADROOM WRAP: CLINE              ║")
+        click.echo("  ╚═══════════════════════════════════════════════╝")
+        click.echo()
+
+        proxy_holder[0] = _ensure_proxy(
+            port, no_proxy, learn=learn, memory=memory, agent_type="cline"
+        )
+
+        anthropic_base = _claude_proxy_base_url(port)
+        openai_base = f"http://127.0.0.1:{port}/v1"
+        click.echo()
+        click.echo("  Configure Cline in VS Code:")
+        click.echo("    Settings > Cline > API Provider")
+        click.echo(f"    Anthropic Base URL: {anthropic_base}")
+        click.echo(f"    OpenAI Compatible Base URL: {openai_base}")
+        if not no_rtk:
+            click.echo()
+            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+                click.echo("  lean-ctx configured for Cline")
+            else:
+                click.echo("  rtk instructions injected into .clinerules")
+            click.echo("  Cline will use token-optimized commands automatically.")
+        click.echo()
+        click.echo("  Press Ctrl+C to stop the proxy.")
+        click.echo()
+
+        try:
+            while True:
+                time.sleep(1)
+                proc = proxy_holder[0]
+                if proc and proc.poll() is not None:
+                    click.echo("  Proxy process exited unexpectedly.")
+                    raise SystemExit(1)
+        except KeyboardInterrupt:
+            click.echo("\n  Shutting down...")
+
+    except SystemExit:
+        raise
+    except Exception as e:
+        click.echo(f"  Error: {e}")
+        raise SystemExit(1) from e
+    finally:
+        cleanup()
+
+
+# =============================================================================
+# Continue (VS Code / JetBrains extension)
+# =============================================================================
+
+
+@wrap.command("continue", context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path, file_okay=True, dir_okay=False),
+    default=None,
+    help="Path to Continue config.json (default: ./.continue/config.json)",
+)
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+def continue_dev(
+    port: int,
+    no_rtk: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    config_path: Path | None,
+    verbose: bool,
+    prepare_only: bool,
+) -> None:
+    """Start Headroom proxy for use with Continue (VS Code / JetBrains).
+
+    \b
+    Continue reads its model configuration from .continue/config.json (a JSON
+    document with a top-level ``systemMessage`` and a ``models`` array). This
+    command starts the proxy, sets up the selected CLI context tool by
+    extending ``systemMessage`` with RTK guidance, and prints the per-model
+    ``apiBase`` the user should configure manually.
+
+    \b
+    Continue is an IDE extension — its API base URL is configured per-model
+    in config.json (or via the IDE UI), not via environment variables. The
+    config file is overridable via --config.
+
+    \b
+    Examples:
+        headroom wrap continue                # Start proxy + inject systemMessage
+        headroom wrap continue --no-context-tool   # Proxy only
+        headroom wrap continue --port 9999    # Custom proxy port
+        headroom wrap continue --config path/to/config.json
+    """
+    config_file = config_path or (Path.cwd() / ".continue" / "config.json")
+
+    if not no_rtk:
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            click.echo("  Setting up lean-ctx for Continue...")
+            _setup_lean_ctx_agent("continue", verbose=verbose)
+        else:
+            click.echo("  Setting up rtk for Continue...")
+            rtk_path = _ensure_rtk_binary(verbose=verbose)
+            if rtk_path:
+                _inject_continue_rtk_systemmessage(config_file, verbose=verbose)
+
+    if prepare_only:
+        return
+
+    proxy_holder: list[subprocess.Popen | None] = [None]
+    cleanup = _make_cleanup(proxy_holder, port)
+    signal.signal(signal.SIGINT, cleanup)
+    signal.signal(signal.SIGTERM, cleanup)
+
+    try:
+        click.echo()
+        click.echo("  ╔═══════════════════════════════════════════════╗")
+        click.echo("  ║           HEADROOM WRAP: CONTINUE             ║")
+        click.echo("  ╚═══════════════════════════════════════════════╝")
+        click.echo()
+
+        proxy_holder[0] = _ensure_proxy(
+            port, no_proxy, learn=learn, memory=memory, agent_type="continue"
+        )
+
+        anthropic_base = _claude_proxy_base_url(port)
+        openai_base = f"http://127.0.0.1:{port}/v1"
+        click.echo()
+        click.echo("  Configure Continue in your IDE:")
+        click.echo(f"    Edit {config_file} and set, per model:")
+        click.echo(f'      "apiBase": "{openai_base}"          # OpenAI-compatible models')
+        click.echo(f'      "apiBase": "{anthropic_base}"       # Anthropic models')
+        if not no_rtk:
+            click.echo()
+            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+                click.echo("  lean-ctx configured for Continue")
+            else:
+                click.echo(f"  rtk instructions injected into {config_file.name} systemMessage")
+            click.echo("  Continue will use token-optimized commands automatically.")
+        click.echo()
+        click.echo("  Press Ctrl+C to stop the proxy.")
+        click.echo()
+
+        try:
+            while True:
+                time.sleep(1)
+                proc = proxy_holder[0]
+                if proc and proc.poll() is not None:
+                    click.echo("  Proxy process exited unexpectedly.")
+                    raise SystemExit(1)
+        except KeyboardInterrupt:
+            click.echo("\n  Shutting down...")
+
+    except SystemExit:
+        raise
+    except Exception as e:
+        click.echo(f"  Error: {e}")
+        raise SystemExit(1) from e
+    finally:
+        cleanup()
+
+
+# =============================================================================
+# Goose (Block)
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
+)
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("goose_args", nargs=-1, type=click.UNPROCESSED)
+def goose(
+    port: int,
+    no_rtk: bool,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    goose_args: tuple,
+) -> None:
+    """Launch Goose (Block) CLI through Headroom proxy.
+
+    \b
+    Sets OPENAI_BASE_URL and ANTHROPIC_BASE_URL to route Goose's API calls
+    through Headroom. Sets up the selected CLI context tool by injecting RTK
+    guidance into .goosehints at the project root (Goose reads this file as
+    extra system context).
+
+    \b
+    Examples:
+        headroom wrap goose                          # Start proxy + context tool + goose
+        headroom wrap goose -- session               # Start a Goose session
+        headroom wrap goose -- --provider anthropic  # Pass args to goose
+        headroom wrap goose --no-context-tool        # Skip CLI context-tool setup
+    """
+    if not no_rtk:
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            click.echo("  Setting up lean-ctx for Goose...")
+            _setup_lean_ctx_agent("goose", verbose=verbose)
+        else:
+            click.echo("  Setting up rtk for Goose...")
+            rtk_path = _ensure_rtk_binary(verbose=verbose)
+            if rtk_path:
+                # Goose reads .goosehints from the project root as extra context.
+                goosehints = Path.cwd() / ".goosehints"
+                _inject_rtk_instructions(goosehints, verbose=verbose)
+
+    if prepare_only:
+        return
+
+    goose_bin = shutil.which("goose")
+    if not goose_bin:
+        click.echo("Error: 'goose' not found in PATH.")
+        click.echo("Install Goose: https://block.github.io/goose/")
+        raise SystemExit(1)
+
+    # Goose accepts OpenAI- and Anthropic-compatible providers; route both.
+    env = os.environ.copy()
+    openai_base = f"http://127.0.0.1:{port}/v1"
+    anthropic_base = _claude_proxy_base_url(port)
+    env["OPENAI_BASE_URL"] = openai_base
+    env["OPENAI_API_BASE"] = openai_base
+    env["ANTHROPIC_BASE_URL"] = anthropic_base
+    env_vars_display = [
+        f"OPENAI_BASE_URL={openai_base}",
+        f"ANTHROPIC_BASE_URL={anthropic_base}",
+    ]
+
+    _launch_tool(
+        binary=goose_bin,
+        args=goose_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="GOOSE",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="goose",
+        code_graph=code_graph,
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+    )
+
+
+# =============================================================================
+# OpenHands
+# =============================================================================
+
+
+@wrap.command(context_settings={"ignore_unknown_options": True})
+@click.option("--port", "-p", default=8787, type=int, help="Proxy port (default: 8787)")
+@click.option(
+    "--no-context-tool",
+    "--no-rtk",
+    "no_rtk",
+    is_flag=True,
+    help="Skip CLI context-tool setup",
+)
+@click.option(
+    "--code-graph",
+    is_flag=True,
+    help="Enable code graph indexing via codebase-memory-mcp (optional)",
+)
+@click.option("--no-proxy", is_flag=True, help="Skip proxy startup (use existing proxy)")
+@click.option("--learn", is_flag=True, help="Enable live traffic learning")
+@click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
+@click.option(
+    "--backend", default=None, help="API backend: 'anthropic', 'anyllm', 'litellm-vertex', etc."
+)
+@click.option("--anyllm-provider", default=None, help="Provider for any-llm backend")
+@click.option("--region", default=None, help="Cloud region for Bedrock/Vertex")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output")
+@click.option("--prepare-only", is_flag=True, hidden=True)
+@click.argument("openhands_args", nargs=-1, type=click.UNPROCESSED)
+def openhands(
+    port: int,
+    no_rtk: bool,
+    code_graph: bool,
+    no_proxy: bool,
+    learn: bool,
+    memory: bool,
+    backend: str | None,
+    anyllm_provider: str | None,
+    region: str | None,
+    verbose: bool,
+    prepare_only: bool,
+    openhands_args: tuple,
+) -> None:
+    """Launch OpenHands CLI through Headroom proxy.
+
+    \b
+    Sets OPENAI_BASE_URL / ANTHROPIC_BASE_URL to route OpenHands' API calls
+    through Headroom. Instructions are injected via the
+    ``OPENHANDS_INSTRUCTIONS`` environment variable at launch time so the
+    on-disk OpenHands config is left untouched.
+
+    \b
+    Examples:
+        headroom wrap openhands                # Start proxy + context tool + openhands
+        headroom wrap openhands -- --task ...  # Pass args to openhands
+        headroom wrap openhands --no-context-tool
+    """
+    if not no_rtk:
+        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+            click.echo("  Setting up lean-ctx for OpenHands...")
+            _setup_lean_ctx_agent("openhands", verbose=verbose)
+        else:
+            click.echo("  Setting up rtk for OpenHands...")
+            _ensure_rtk_binary(verbose=verbose)
+
+    if prepare_only:
+        return
+
+    openhands_bin = shutil.which("openhands")
+    if not openhands_bin:
+        click.echo("Error: 'openhands' not found in PATH.")
+        click.echo("Install OpenHands: https://docs.all-hands.dev/")
+        raise SystemExit(1)
+
+    env = os.environ.copy()
+    openai_base = f"http://127.0.0.1:{port}/v1"
+    anthropic_base = _claude_proxy_base_url(port)
+    env["OPENAI_BASE_URL"] = openai_base
+    env["OPENAI_API_BASE"] = openai_base
+    env["ANTHROPIC_BASE_URL"] = anthropic_base
+    # Also set LLM_BASE_URL for OpenHands' generic LLM provider config.
+    env["LLM_BASE_URL"] = openai_base
+    if not no_rtk:
+        # Inject rtk guidance via env var so OpenHands picks it up as the
+        # session's instruction prefix. Appending instead of overwriting any
+        # pre-existing OPENHANDS_INSTRUCTIONS so user-supplied instructions are
+        # preserved.
+        existing_instructions = env.get("OPENHANDS_INSTRUCTIONS", "")
+        if _RTK_MARKER in existing_instructions:
+            # Already injected (re-invocation in the same shell session).
+            pass
+        elif existing_instructions.strip():
+            env["OPENHANDS_INSTRUCTIONS"] = (
+                existing_instructions.rstrip() + "\n\n" + RTK_INSTRUCTIONS_BLOCK
+            )
+        else:
+            env["OPENHANDS_INSTRUCTIONS"] = RTK_INSTRUCTIONS_BLOCK
+
+    env_vars_display = [
+        f"OPENAI_BASE_URL={openai_base}",
+        f"ANTHROPIC_BASE_URL={anthropic_base}",
+        f"LLM_BASE_URL={openai_base}",
+    ]
+    if not no_rtk and "OPENHANDS_INSTRUCTIONS" in env:
+        env_vars_display.append("OPENHANDS_INSTRUCTIONS=<rtk instructions injected>")
+
+    _launch_tool(
+        binary=openhands_bin,
+        args=openhands_args,
+        env=env,
+        port=port,
+        no_proxy=no_proxy,
+        tool_label="OPENHANDS",
+        env_vars_display=env_vars_display,
+        learn=learn,
+        memory=memory,
+        agent_type="openhands",
+        code_graph=code_graph,
+        backend=backend,
+        anyllm_provider=anyllm_provider,
+        region=region,
+    )
 
 
 # =============================================================================
