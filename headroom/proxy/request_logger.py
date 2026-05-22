@@ -8,6 +8,15 @@ Phase G PR-G3 (P4-45): base64-encoded image payloads in the
 ``request_messages`` / ``response_content`` are redacted before
 write to keep request logs small. Multi-MB base64 strings would
 otherwise saturate the JSONL log and the in-memory deque.
+
+Remediation (M2, M5): the redactor now ONLY fires inside known
+image-bearing JSON paths or against strings that carry an explicit
+``data:image/...;base64,`` URL prefix. The earlier "density
+heuristic" over-fired on encrypted blobs, signed tokens, minified
+JSON, and tool outputs. The replacement placeholder now reports
+the UTF-8 byte length under a ``bytes=`` label (was character
+length; for the ASCII base64 alphabet the two happen to coincide
+but the label is now accurate for any future Unicode payload).
 """
 
 from __future__ import annotations
@@ -19,6 +28,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -40,74 +50,124 @@ IMAGE_BASE64_REDACT_THRESHOLD_BYTES = 1024
 # Phase G PR-G3 — replacement-marker format. Operators can grep the
 # JSONL for ``<image:base64-redacted`` to count the redactions; the
 # byte count keeps cost attribution honest even after redaction.
+# M5: ``bytes=`` is the UTF-8 byte length, not the character count.
 IMAGE_BASE64_REPLACEMENT_TEMPLATE = "<image:base64-redacted bytes={n}>"
 
-# Constants for log redaction counter export (Prometheus). The Rust
-# proxy owns the canonical metric; the Python side increments a
-# best-effort module-level counter so tests and the in-process
-# ``/stats`` endpoint can read back the redaction rate.
+# M2: JSON field names that carry image payloads in either the
+# Anthropic or OpenAI shapes. Strings reached via one of these key
+# names (at any depth) are eligible for the redaction heuristic.
+# Anything OUTSIDE these paths is left untouched even if it looks
+# base64-shaped — encrypted blobs, signed tokens, minified JSON,
+# tool outputs all live elsewhere and stay verbatim.
+IMAGE_BEARING_FIELD_NAMES: frozenset[str] = frozenset(
+    {
+        # Anthropic image-block shape: ``{"type":"image","source":{"type":"base64","data":"..."}}``.
+        "data",
+        # OpenAI vision shape: ``{"type":"image_url","image_url":{"url":"data:image/..."}}``.
+        "url",
+        # OpenAI Responses input_image: ``{"type":"input_image","image_url":"..."}``
+        # — string-valued directly under the key (not nested).
+        "image_url",
+        # Some SDKs put the URL under ``image`` directly. Tolerated.
+        "image",
+        # Anthropic vision blocks sometimes wrap under ``source.data``;
+        # ``source`` is a container, not a string field, so it doesn't
+        # need to be in this set, but the data string itself is keyed
+        # by ``data`` (already above).
+    }
+)
+
+# M2: explicit data-URL MIME prefix. A string starting with this
+# prefix is always treated as an image payload, regardless of where
+# it lives in the JSON — operators occasionally embed data URLs in
+# arbitrary fields and we want those redacted to keep logs small.
+_DATA_IMAGE_URL_PREFIX = "data:image/"
+
+
+# Constants for log redaction counter export (Prometheus). The
+# Python proxy's ``/metrics`` exporter surfaces
+# ``proxy_image_generation_call_log_redacted_total`` from this
+# module-level counter. C3 remediation: the Rust proxy previously
+# held a dead counter; that's been removed in favour of this
+# Python-side counter, which is the natural owner.
 _redactions_total: int = 0
+_redactions_lock = Lock()
 
 
 def redactions_total() -> int:
     """Return the running count of base64 redactions performed.
 
-    Exposed for unit tests + the legacy Python ``/stats`` endpoint.
-    The canonical observability surface is the Rust proxy's
-    ``proxy_image_generation_call_log_redacted_total`` metric.
+    Exposed for unit tests, the legacy Python ``/stats`` endpoint,
+    and the Prometheus exporter
+    (``proxy_image_generation_call_log_redacted_total``).
     """
-    return _redactions_total
+    with _redactions_lock:
+        return _redactions_total
 
 
-def _looks_like_base64_image(value: str) -> bool:
-    """Heuristic: does ``value`` look like a base64-encoded image?
+def _is_base64_image_payload(value: str) -> bool:
+    """Return True if ``value`` is an over-threshold base64 image.
 
-    Two patterns we recognise:
+    Per M2 remediation the prior bare-base64 density heuristic
+    over-fired on non-image content (encrypted blobs, signed
+    tokens, minified JSON, tool outputs). We now only consider a
+    string an image payload when EITHER:
 
-    * Raw base64 over the threshold (Anthropic ``source.data`` shape).
-    * ``data:image/<subtype>;base64,<payload>`` data URLs (OpenAI
-      vision shape). The ``;base64,`` substring is the load-bearing
-      signal — any data URL with that segment over the threshold gets
-      redacted, even if the MIME type isn't ``image/...`` (because
-      the cost-of-logging is paid the same way).
+    1. It starts with ``data:image/`` (an explicit data URL),
+       OR
+    2. The caller has already established the string lives inside
+       an image-bearing JSON path (see ``IMAGE_BEARING_FIELD_NAMES``)
+       AND the string itself is over the byte threshold.
 
-    Returns ``False`` for short strings (under the threshold) and for
-    any non-string value. Per realignment build-constraint "no
-    regexes", we use prefix/substring checks instead of pattern
-    matching.
+    Case (2) is decided by the caller (``_redact_value``) which
+    threads ``in_image_path`` through the recursion; this helper
+    handles case (1) on its own.
     """
     if not isinstance(value, str):
         return False
     if len(value) < IMAGE_BASE64_REDACT_THRESHOLD_BYTES:
         return False
-    if value.startswith("data:") and ";base64," in value[:64]:
-        return True
-    # Bare base64 payload: heuristic — over-threshold string with no
-    # whitespace and a high alpha-num+/+= density. We sample the first
-    # 256 bytes for speed (the full string can be megabytes).
-    head = value[:256]
-    base64_chars = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
-    matches = sum(1 for ch in head if ch in base64_chars)
-    return matches / len(head) > 0.95
+    return value.startswith(_DATA_IMAGE_URL_PREFIX)
 
 
-def _redact_value(value: Any) -> Any:
+def _redact_value(value: Any, *, in_image_path: bool = False) -> Any:
     """Recursively redact base64-image payloads in a JSON-ish value.
 
     Returns a new structure with any over-threshold base64 string
     replaced by the placeholder. Non-string, non-container values
     pass through unchanged.
+
+    ``in_image_path`` is True when the caller reached this value
+    via one of the ``IMAGE_BEARING_FIELD_NAMES`` keys; once inside
+    an image-bearing field, any over-threshold string is treated
+    as an image payload (M2: prevents redaction of unrelated
+    base64-shaped content outside known image fields).
     """
     global _redactions_total
     if isinstance(value, str):
-        if _looks_like_base64_image(value):
-            _redactions_total += 1
-            return IMAGE_BASE64_REPLACEMENT_TEMPLATE.format(n=len(value))
+        # Always-redact: explicit data URL, regardless of path.
+        # Also redact when the caller signalled image-bearing path
+        # AND the string is over threshold (no density check — the
+        # path tells us it's an image).
+        should_redact = _is_base64_image_payload(value) or (
+            in_image_path and len(value) >= IMAGE_BASE64_REDACT_THRESHOLD_BYTES
+        )
+        if should_redact:
+            with _redactions_lock:
+                _redactions_total += 1
+            byte_len = len(value.encode("utf-8"))
+            return IMAGE_BASE64_REPLACEMENT_TEMPLATE.format(n=byte_len)
         return value
     if isinstance(value, Mapping):
-        return {k: _redact_value(v) for k, v in value.items()}
+        return {
+            k: _redact_value(
+                v,
+                in_image_path=(k in IMAGE_BEARING_FIELD_NAMES),
+            )
+            for k, v in value.items()
+        }
     if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
-        return [_redact_value(item) for item in value]
+        return [_redact_value(item, in_image_path=in_image_path) for item in value]
     return value
 
 
@@ -118,7 +178,7 @@ def redact_image_base64(payload: Any) -> Any:
     over-threshold base64 string with a size-only placeholder.
     Idempotent — applying twice yields the same structure.
     """
-    return _redact_value(payload)
+    return _redact_value(payload, in_image_path=False)
 
 
 class RequestLogger:

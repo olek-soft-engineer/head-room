@@ -730,22 +730,24 @@ pub(crate) async fn forward_http(
             }
         };
 
+        // C2 fix: snapshot the original buffered byte-length AND the
+        // dispatcher's "is this a passthrough arm?" decision BEFORE
+        // `outcome` is consumed by the match below. The
+        // passthrough-bytes-modified alarm fires when a path that
+        // promised byte-equal passthrough produces a different
+        // length downstream.
+        let original_buffered_len = buffered.len();
+        let outcome_is_passthrough_class = matches!(
+            outcome,
+            compression::Outcome::NoCompression | compression::Outcome::Passthrough { .. }
+        );
         let body_to_send = match outcome {
             compression::Outcome::NoCompression => {
                 // PR-B2: forward the *original* buffered bytes. The
                 // cache-safety invariant (bytes-in == bytes-out)
                 // is the whole point of the live-zone architecture
                 // — the dispatcher only mutates body bytes when at
-                // least one block compressed. PR-B2's no-op
-                // skeleton always lands here. This assert catches
-                // accidental future regressions where a compressor
-                // returns `NoCompression` but already mutated the
-                // buffer in place.
-                debug_assert_eq!(
-                    buffered.len(),
-                    buffered.len(),
-                    "buffered bytes length must remain stable on the NoCompression path"
-                );
+                // least one block compressed.
                 buffered
             }
             // PR-B3+ produces `Compressed` from the live-zone
@@ -758,6 +760,7 @@ pub(crate) async fn forward_http(
                 tokens_after,
                 strategies_applied,
                 markers_inserted,
+                per_strategy_tokens,
             } => {
                 tracing::info!(
                     request_id = %request_id,
@@ -769,25 +772,50 @@ pub(crate) async fn forward_http(
                     markers = markers_inserted.len(),
                     "compression applied"
                 );
-                // Phase G PR-G3: emit one
+                // Phase G PR-G3 + H1: emit one
                 // `proxy_compression_ratio_by_strategy` sample per
-                // strategy actually applied. We do NOT have a
-                // per-block content_type breakdown here — the
-                // aggregate `tokens_before` / `tokens_after` is
-                // strategy-wise rather than content-type-wise, so we
-                // label `content_type=aggregate`. Per-block fanout
-                // would require threading the manifest through to
-                // this layer; that's a future PR if dashboards need
-                // it.
-                if tokens_before > 0 && tokens_after < tokens_before {
-                    for strategy in &strategies_applied {
+                // strategy with the *strategy's own* before/after
+                // token counts. The pre-H1 code emitted the same
+                // aggregate ratio for every strategy in
+                // `strategies_applied`, so Phase H per-strategy
+                // dashboards read garbage when multiple strategies
+                // ran on one body. We now plumb per-strategy tokens
+                // from the manifest at the wrapper site
+                // (`live_zone_anthropic`, `live_zone_openai`,
+                // `live_zone_responses`).
+                //
+                // Fallback: when `per_strategy_tokens` is empty —
+                // i.e. the Outcome came from a Phase E
+                // normalization pass that doesn't track per-strategy
+                // tokens — we emit one aggregate-labelled sample so
+                // dashboards still see *that* a compression ran. We
+                // log loudly so this is visible.
+                if !per_strategy_tokens.is_empty() {
+                    for entry in &per_strategy_tokens {
                         crate::observability::observe_compression_ratio(
-                            strategy,
+                            entry.strategy,
                             "aggregate",
-                            tokens_before,
-                            tokens_after,
+                            entry.original_tokens,
+                            entry.compressed_tokens,
                         );
                     }
+                } else if tokens_before > 0 && tokens_after < tokens_before {
+                    tracing::debug!(
+                        event = "compression_ratio_emit_aggregate_only",
+                        request_id = %request_id,
+                        path = %path_for_log,
+                        strategies = ?strategies_applied,
+                        reason = "no_per_strategy_tokens",
+                        "emitting one aggregate-labelled compression_ratio sample because \
+                         the dispatcher did not surface per-strategy token counts \
+                         (Phase E normalization paths)"
+                    );
+                    crate::observability::observe_compression_ratio(
+                        "aggregate",
+                        "aggregate",
+                        tokens_before,
+                        tokens_after,
+                    );
                 }
                 body
             }
@@ -801,6 +829,24 @@ pub(crate) async fn forward_http(
                 buffered
             }
         };
+
+        // C2 fix: cache-safety alarm. When the dispatcher returned
+        // `NoCompression` or `Passthrough`, the post-dispatcher body
+        // MUST be byte-length-equal to the original buffered body.
+        // Any delta is an accidental cache-poisoning regression and
+        // the alarm metric `proxy_passthrough_bytes_modified_total{path}`
+        // fires with the byte delta as its increment. We check BEFORE
+        // the PR-E4 prompt_cache_key injector runs because that
+        // injector is a legitimate, intentional byte mutation gated
+        // on PAYG; it must not trip the alarm.
+        if outcome_is_passthrough_class && body_to_send.len() != original_buffered_len {
+            let delta = body_to_send.len().abs_diff(original_buffered_len) as u64;
+            crate::observability::record_passthrough_bytes_modified(
+                &path_for_log,
+                delta,
+                &request_id,
+            );
+        }
 
         // PR-E4: OpenAI `prompt_cache_key` auto-injection.
         //
@@ -1242,17 +1288,12 @@ async fn run_sse_state_machine(
                     }
                 }
             }
-            // Phase G PR-G3: emit per-session cache-hit-rate from
-            // the final accumulated `usage`. Anthropic's
-            // `message_delta` strictly grows token counts, so the
-            // accumulator's final values are the right denominator.
-            // `compute_cache_hit_rate` returns `None` for zero
-            // denominators → log + skip, never synthesise a sample.
-            match crate::observability::compute_cache_hit_rate(
-                state.usage.input_tokens,
-                state.usage.cache_read_input_tokens,
-                state.usage.cache_creation_input_tokens,
-            ) {
+            // Phase G PR-G3 + H2: emit per-session cache-hit-rate
+            // ONLY when the stream completed cleanly with
+            // `message_stop`. The gate is encapsulated by the
+            // pure function `compute_anthropic_session_hit_rate`
+            // so the H2 contract has a unit-testable surface.
+            match crate::observability::cache_hit_rate::compute_anthropic_session_hit_rate(&state) {
                 Some(rate) => {
                     crate::observability::observe_cache_hit_rate(
                         crate::observability::cache_hit_rate_provider::ANTHROPIC,
@@ -1265,8 +1306,11 @@ async fn run_sse_state_machine(
                         event = "cache_hit_rate_skipped",
                         request_id = %request_id,
                         provider = "anthropic",
-                        reason = "zero_denominator",
-                        "skipping proxy_cache_hit_rate_per_session: no input tokens"
+                        status = ?state.status,
+                        input_tokens = state.usage.input_tokens,
+                        cache_read_input_tokens = state.usage.cache_read_input_tokens,
+                        cache_creation_input_tokens = state.usage.cache_creation_input_tokens,
+                        "skipping proxy_cache_hit_rate_per_session: H2 gate or zero denominator"
                     );
                 }
             }
@@ -1311,7 +1355,9 @@ async fn run_sse_state_machine(
             // chunk. OpenAI only emits this when
             // `stream_options.include_usage = true`; absence is a
             // signal, not a fallback condition — `usage = None` →
-            // skip.
+            // skip. The H2 gate is implicit here: the final usage
+            // chunk only arrives when the stream completed (it's
+            // OpenAI's terminal-status equivalent).
             if let Some(usage) = &state.usage {
                 let input_tokens = usage
                     .get("prompt_tokens")
@@ -1322,29 +1368,48 @@ async fn run_sse_state_machine(
                     .and_then(|d| d.get("cached_tokens"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                // OpenAI's `prompt_tokens` already INCLUDES cached
-                // tokens (per Chat Completions API docs), so the
-                // denominator is `prompt_tokens`, not the sum. The
-                // numerator is `cached_tokens`; `input_tokens` arg to
-                // `compute_cache_hit_rate` carries the *non-cached*
-                // portion (denom-only), so we synthesise that here.
-                let non_cached = input_tokens.saturating_sub(cached_tokens);
-                match crate::observability::compute_cache_hit_rate(non_cached, cached_tokens, 0) {
-                    Some(rate) => {
-                        crate::observability::observe_cache_hit_rate(
-                            crate::observability::cache_hit_rate_provider::OPENAI_CHAT,
-                            &request_id,
-                            rate,
-                        );
-                    }
-                    None => {
-                        tracing::debug!(
-                            event = "cache_hit_rate_skipped",
-                            request_id = %request_id,
-                            provider = "openai_chat",
-                            reason = "zero_denominator",
-                            "skipping proxy_cache_hit_rate_per_session: no input tokens"
-                        );
+                // M1: `cached_tokens > input_tokens` is a wire-
+                // format pathology — log + skip instead of silently
+                // clamping (saturating_sub would yield 0 → fake 1.0
+                // hit-rate sample).
+                if cached_tokens > input_tokens {
+                    tracing::warn!(
+                        event = "cache_hit_rate_skipped",
+                        request_id = %request_id,
+                        provider = "openai_chat",
+                        reason = "cached_gt_input",
+                        input_tokens = input_tokens,
+                        cached_tokens = cached_tokens,
+                        "skipping proxy_cache_hit_rate_per_session: cached_tokens > prompt_tokens \
+                         (wire-format pathology; clamping would synthesise a bad sample)"
+                    );
+                } else {
+                    // OpenAI's `prompt_tokens` already INCLUDES cached
+                    // tokens (per Chat Completions API docs), so the
+                    // denominator is `prompt_tokens`, not the sum. The
+                    // numerator is `cached_tokens`; `input_tokens` arg
+                    // to `compute_cache_hit_rate` carries the
+                    // *non-cached* portion (denom-only), so we
+                    // synthesise that here.
+                    let non_cached = input_tokens - cached_tokens;
+                    match crate::observability::compute_cache_hit_rate(non_cached, cached_tokens, 0)
+                    {
+                        Some(rate) => {
+                            crate::observability::observe_cache_hit_rate(
+                                crate::observability::cache_hit_rate_provider::OPENAI_CHAT,
+                                &request_id,
+                                rate,
+                            );
+                        }
+                        None => {
+                            tracing::debug!(
+                                event = "cache_hit_rate_skipped",
+                                request_id = %request_id,
+                                provider = "openai_chat",
+                                reason = "zero_denominator",
+                                "skipping proxy_cache_hit_rate_per_session: no input tokens"
+                            );
+                        }
                     }
                 }
             } else {
@@ -1389,48 +1454,93 @@ async fn run_sse_state_machine(
                     }
                 }
             }
-            // Phase G PR-G3: cache hit rate + service_tier +
-            // response status from the final `response.completed`
-            // payload. The Responses API uses `input_tokens` /
+            // Phase G PR-G3 + H2: cache hit rate + service_tier +
+            // response status emit ONLY when the stream reached a
+            // terminal status (`response.completed/failed/incomplete`).
+            // Mid-stream client disconnects close the channel without
+            // a terminal — `terminal_status().is_none()` then guards
+            // emit so we don't observe garbage samples.
+            //
+            // The Responses API uses `input_tokens` /
             // `cached_input_tokens` shape (Responses-specific —
             // distinct from Chat Completions' `prompt_tokens`).
-            if let Some(usage) = &state.usage {
-                let input_tokens = usage
-                    .get("input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let cached_tokens = usage
-                    .get("input_tokens_details")
-                    .and_then(|d| d.get("cached_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                // Like Chat, `input_tokens` already INCLUDES cached
-                // tokens, so split for the helper.
-                let non_cached = input_tokens.saturating_sub(cached_tokens);
-                match crate::observability::compute_cache_hit_rate(non_cached, cached_tokens, 0) {
-                    Some(rate) => {
-                        crate::observability::observe_cache_hit_rate(
-                            crate::observability::cache_hit_rate_provider::OPENAI_RESPONSES,
-                            &request_id,
-                            rate,
-                        );
-                    }
-                    None => {
-                        tracing::debug!(
+            let stream_completed = state.terminal_status().is_some();
+            if stream_completed {
+                if let Some(usage) = &state.usage {
+                    let input_tokens = usage
+                        .get("input_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let cached_tokens = usage
+                        .get("input_tokens_details")
+                        .and_then(|d| d.get("cached_tokens"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    // M1: a cached count greater than input is a
+                    // wire-format pathology — usage shouldn't have
+                    // `cached > input` for OpenAI Responses. Per
+                    // "no silent fallbacks", log + skip the emit
+                    // instead of silently clamping.
+                    if cached_tokens > input_tokens {
+                        tracing::warn!(
                             event = "cache_hit_rate_skipped",
                             request_id = %request_id,
                             provider = "openai_responses",
-                            reason = "zero_denominator",
-                            "skipping proxy_cache_hit_rate_per_session: no input tokens"
+                            reason = "cached_gt_input",
+                            input_tokens = input_tokens,
+                            cached_tokens = cached_tokens,
+                            "skipping proxy_cache_hit_rate_per_session: cached_tokens > input_tokens \
+                             (wire-format pathology; clamping would synthesise a bad sample)"
                         );
+                    } else {
+                        // Like Chat, `input_tokens` already INCLUDES cached
+                        // tokens, so split for the helper.
+                        let non_cached = input_tokens - cached_tokens;
+                        match crate::observability::compute_cache_hit_rate(
+                            non_cached,
+                            cached_tokens,
+                            0,
+                        ) {
+                            Some(rate) => {
+                                crate::observability::observe_cache_hit_rate(
+                                    crate::observability::cache_hit_rate_provider::OPENAI_RESPONSES,
+                                    &request_id,
+                                    rate,
+                                );
+                            }
+                            None => {
+                                tracing::debug!(
+                                    event = "cache_hit_rate_skipped",
+                                    request_id = %request_id,
+                                    provider = "openai_responses",
+                                    reason = "zero_denominator",
+                                    "skipping proxy_cache_hit_rate_per_session: no input tokens"
+                                );
+                            }
+                        }
                     }
                 }
+            } else {
+                tracing::debug!(
+                    event = "cache_hit_rate_skipped",
+                    request_id = %request_id,
+                    provider = "openai_responses",
+                    reason = "stream_did_not_complete",
+                    "skipping proxy_cache_hit_rate_per_session: no terminal status seen"
+                );
             }
             // Service tier + status are sourced from
             // `state.last_response_envelope` populated by the
             // ResponseState on `response.completed/failed/incomplete`.
+            //
+            // C1 fix: the tier value comes from the upstream response
+            // body; even though the upstream is more trustworthy than
+            // a client-side header, an unrecognised value would still
+            // grow the metric vector unboundedly. We bucket through
+            // the same validator the request-side handler uses.
             if let Some(tier) = state.service_tier.as_deref() {
-                crate::observability::record_service_tier(tier, &request_id);
+                let bucketed = crate::observability::metric_names::service_tier::validate(tier);
+                crate::observability::record_service_tier(bucketed, &request_id);
             }
             if let Some(status) = state.terminal_status() {
                 crate::observability::record_response_status(

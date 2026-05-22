@@ -120,12 +120,18 @@ pub async fn handle_responses(
     // bodies do NOT fabricate a tier — per realignment build-
     // constraint "no silent fallbacks", we just skip the emit and
     // log at debug.
+    //
+    // C1 fix: every raw value is validated against the bounded
+    // `service_tier` vocabulary BEFORE being used as a label so a
+    // malicious client cannot blow up label cardinality with
+    // arbitrary strings.
     if let Some(tier) = extract_request_service_tier(&body) {
         let request_id_for_metric = headers
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("<no-request-id>");
-        observability::record_service_tier(&tier, request_id_for_metric);
+        let bucketed = crate::observability::metric_names::service_tier::validate(&tier);
+        observability::record_service_tier(bucketed, request_id_for_metric);
     } else {
         tracing::debug!(
             event = "service_tier_skipped",
@@ -167,10 +173,12 @@ pub async fn handle_responses(
 /// Phase G PR-G3: best-effort parse of `service_tier` from the
 /// inbound request body. Returns `None` when the body is not valid
 /// JSON, not an object, or lacks the field. The spec defines the
-/// field as a string ∈ {auto, default, flex, on_demand, priority};
-/// we do NOT validate against that set here so wire-format drift
-/// (e.g. OpenAI adding a tier we haven't enumerated yet) surfaces
-/// in the metric rather than getting silently dropped.
+/// field as a string ∈ {auto, default, flex, on_demand, priority,
+/// scale}; the returned raw string is normalised against the
+/// bounded vocabulary at the call site via
+/// [`crate::observability::metric_names::service_tier::validate`]
+/// so an arbitrary inbound value cannot drive metric-label
+/// cardinality unbounded (C1 fix).
 fn extract_request_service_tier(body: &Bytes) -> Option<String> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     v.get("service_tier")

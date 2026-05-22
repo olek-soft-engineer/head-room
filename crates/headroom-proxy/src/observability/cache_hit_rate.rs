@@ -118,6 +118,31 @@ pub fn compute_hit_rate(
     Some(cache_read_input_tokens as f64 / denom as f64)
 }
 
+/// H2 gate: should we observe a cache-hit-rate sample for this
+/// Anthropic session?
+///
+/// Returns `Some(rate)` ONLY when the stream completed cleanly
+/// (`state.status == MessageStop`) AND the denominator is non-zero.
+/// A client disconnect mid-stream closes the channel too — without
+/// this gate we'd observe a half-finished session that has only
+/// `message_start` usage and pollute the histogram with garbage.
+///
+/// Extracted from `proxy.rs::run_sse_state_machine` so the H2
+/// contract is unit-testable independent of the global Prometheus
+/// registry (which parallel tests share).
+pub fn compute_anthropic_session_hit_rate(
+    state: &crate::sse::anthropic::AnthropicStreamState,
+) -> Option<f64> {
+    if state.status != crate::sse::anthropic::StreamStatus::MessageStop {
+        return None;
+    }
+    compute_hit_rate(
+        state.usage.input_tokens,
+        state.usage.cache_read_input_tokens,
+        state.usage.cache_creation_input_tokens,
+    )
+}
+
 /// Observe one per-session sample.
 ///
 /// `provider` MUST be one of the [`provider`] constants — callers
@@ -125,11 +150,31 @@ pub fn compute_hit_rate(
 /// do not validate the label here because the cardinality is bounded
 /// by the static call sites; an invalid label would be a bug, not a
 /// runtime mismatch.
+///
+/// M3 fix: NaN / non-finite inputs are loud-skipped instead of
+/// silently observed. `f64::clamp(0.0, 1.0)` returns NaN when the
+/// input is NaN, so the prior implementation could pollute the
+/// histogram with NaN samples in release builds (the debug_assert
+/// was compiled out). Per "no silent fallbacks", an unexpected NaN
+/// surfaces in the logs rather than getting eaten.
 pub fn observe(provider: &'static str, request_id: &str, hit_rate: f64) {
+    if !hit_rate.is_finite() {
+        tracing::warn!(
+            event = "cache_hit_rate_non_finite",
+            metric = METRIC_PROXY_CACHE_HIT_RATE_PER_SESSION,
+            provider = provider,
+            request_id = %request_id,
+            hit_rate = hit_rate,
+            "refusing to observe a non-finite cache hit rate; this is a caller bug"
+        );
+        return;
+    }
     debug_assert!(
         (0.0..=1.0).contains(&hit_rate),
         "cache hit rate must be in [0.0, 1.0]; got {hit_rate}"
     );
+    // After the is_finite guard, clamp can only normalise legitimate
+    // edge-of-range floats (1.0 + epsilon etc.) and never produces NaN.
     let clamped = hit_rate.clamp(0.0, 1.0);
     histogram(super::prometheus::registry())
         .with_label_values(&[provider])
@@ -174,5 +219,122 @@ mod tests {
         // Degenerate: no tokens at all. Caller should skip the
         // observation, not coerce to 0.0.
         assert!(compute_hit_rate(0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn observe_nan_skipped_loudly() {
+        // M3: a NaN input must NOT reach the histogram. The
+        // pre-fix code clamped via `f64::clamp(0.0, 1.0)` which
+        // returns NaN for NaN input — a NaN sample in release
+        // builds was the bug. After the fix we log + skip.
+        // The histogram count for this synthetic provider stays
+        // at whatever it was before the call.
+        let label = "test_nan_provider_v1";
+        // Drive a guaranteed-clean session count via a real
+        // observation, then push a NaN and assert no count move.
+        observe(label, "req-nan-baseline", 0.5);
+        let before = histogram(super::super::prometheus::registry())
+            .with_label_values(&[label])
+            .get_sample_count();
+        observe(label, "req-nan-attempt", f64::NAN);
+        let after = histogram(super::super::prometheus::registry())
+            .with_label_values(&[label])
+            .get_sample_count();
+        assert_eq!(
+            before, after,
+            "NaN must not be observed; expected count unchanged from {before} to {after}"
+        );
+    }
+
+    #[test]
+    fn h2_aborted_anthropic_stream_returns_none() {
+        // H2: a stream that closes without `message_stop` (Open
+        // state) MUST NOT produce a sample, regardless of usage
+        // values.
+        use crate::sse::anthropic::{AnthropicStreamState, StreamStatus, UsageBuilder};
+        let state = AnthropicStreamState {
+            status: StreamStatus::Open,
+            usage: UsageBuilder {
+                input_tokens: 800,
+                cache_read_input_tokens: 200,
+                output_tokens: 50,
+                cache_creation_input_tokens: 0,
+            },
+            ..Default::default()
+        };
+        assert!(
+            compute_anthropic_session_hit_rate(&state).is_none(),
+            "H2 gate must skip emission for non-completed stream"
+        );
+    }
+
+    #[test]
+    fn h2_errored_anthropic_stream_returns_none() {
+        // H2: an Errored stream is also not "completed cleanly" —
+        // skip the observation.
+        use crate::sse::anthropic::{AnthropicStreamState, StreamStatus, UsageBuilder};
+        let state = AnthropicStreamState {
+            status: StreamStatus::Errored,
+            usage: UsageBuilder {
+                input_tokens: 800,
+                cache_read_input_tokens: 200,
+                output_tokens: 50,
+                cache_creation_input_tokens: 0,
+            },
+            ..Default::default()
+        };
+        assert!(
+            compute_anthropic_session_hit_rate(&state).is_none(),
+            "H2 gate must skip emission for errored stream"
+        );
+    }
+
+    #[test]
+    fn h2_completed_anthropic_stream_returns_rate() {
+        // H2 positive case: MessageStop + non-zero usage → return
+        // the rate so the caller can observe it.
+        use crate::sse::anthropic::{AnthropicStreamState, StreamStatus, UsageBuilder};
+        let state = AnthropicStreamState {
+            status: StreamStatus::MessageStop,
+            usage: UsageBuilder {
+                input_tokens: 800,
+                cache_read_input_tokens: 200,
+                output_tokens: 50,
+                cache_creation_input_tokens: 0,
+            },
+            ..Default::default()
+        };
+        let rate = compute_anthropic_session_hit_rate(&state).expect("completed stream emits");
+        // 200 / (800 + 200 + 0) = 0.2
+        assert!((rate - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn h2_completed_but_zero_denominator_returns_none() {
+        // Even on a completed stream, a zero-token request returns
+        // None — per "no silent fallbacks", no synthesised 0.0.
+        use crate::sse::anthropic::{AnthropicStreamState, StreamStatus, UsageBuilder};
+        let state = AnthropicStreamState {
+            status: StreamStatus::MessageStop,
+            usage: UsageBuilder::default(),
+            ..Default::default()
+        };
+        assert!(compute_anthropic_session_hit_rate(&state).is_none());
+    }
+
+    #[test]
+    fn observe_infinity_skipped_loudly() {
+        // Same contract for +/- infinity.
+        let label = "test_inf_provider_v1";
+        observe(label, "req-inf-baseline", 0.5);
+        let before = histogram(super::super::prometheus::registry())
+            .with_label_values(&[label])
+            .get_sample_count();
+        observe(label, "req-pos-inf", f64::INFINITY);
+        observe(label, "req-neg-inf", f64::NEG_INFINITY);
+        let after = histogram(super::super::prometheus::registry())
+            .with_label_values(&[label])
+            .get_sample_count();
+        assert_eq!(before, after);
     }
 }

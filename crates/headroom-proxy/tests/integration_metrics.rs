@@ -323,41 +323,103 @@ async fn passthrough_bytes_modified_zero_when_no_compression() {
     assert_eq!(resp.status(), 200);
 
     let scrape = scrape_metrics(&proxy.url()).await;
-    // The `prometheus` crate v0.13 skips empty MetricVecs entirely
-    // in `gather()` — neither HELP/TYPE nor rows appear until the
-    // counter has been incremented with at least one label-set.
-    // For the "must stay 0" alarm-able metric this absence IS the
-    // signal: if the counter is silent, no passthrough policy has
-    // been violated. The PromQL alarm queries
-    // `rate(proxy_passthrough_bytes_modified_total[5m]) > 0`, which
-    // is `0` (the metric doesn't exist) by definition.
-    let any_row = scrape
-        .lines()
-        .any(|l| l.starts_with("proxy_passthrough_bytes_modified_total{"));
+    // H3 contract: `handle_metrics` force-zeroes every counter /
+    // gauge MetricVec under a sentinel `__init__` label tuple on
+    // each scrape. That makes HELP/TYPE + a zero row visible from
+    // boot so operators have a predictable scrape shape (the
+    // pre-H3 behaviour where the family was absent until first
+    // emit was confusing — operators would `curl /metrics` on a
+    // fresh boot and see nothing). The "must stay 0" alarm
+    // semantic is still preserved because the row only carries
+    // the sentinel label, not a real production path label.
     assert!(
-        !any_row,
-        "counter should have no rows when nothing modified passthrough; got: {scrape}"
+        scrape.contains("# HELP proxy_passthrough_bytes_modified_total"),
+        "scrape missing proxy_passthrough_bytes_modified_total HELP on fresh boot (H3): {scrape}"
     );
-    // The HELP/TYPE descriptor is registered eagerly in
-    // `handle_metrics`, but `gather()` skips empty families so the
-    // descriptor only surfaces after the first emit. We assert the
-    // counter is reachable via the public helper to pin behaviour
-    // (the helper is what the SSE/handler emit sites call).
+    assert!(
+        scrape.contains("# TYPE proxy_passthrough_bytes_modified_total counter"),
+        "scrape missing proxy_passthrough_bytes_modified_total TYPE on fresh boot (H3): {scrape}"
+    );
+    let init_row = find_value_with_labels(
+        &scrape,
+        "proxy_passthrough_bytes_modified_total",
+        &[("path", "__init__")],
+    )
+    .expect("H3 contract: __init__ row must appear on fresh boot");
+    assert!(
+        (init_row - 0.0).abs() < f64::EPSILON,
+        "H3 sentinel __init__ row must read 0 on fresh boot; got {init_row}"
+    );
+    // The `/v1/messages` path label MUST NOT appear — the
+    // dispatcher returned NoCompression and no bytes were
+    // mutated, so the alarm did not fire. (Other tests in this
+    // suite may have populated rows under their own
+    // `path="/integration_test_*"` labels; we filter to the real
+    // production path label that THIS test would have produced.)
+    let messages_row = find_value_with_labels(
+        &scrape,
+        "proxy_passthrough_bytes_modified_total",
+        &[("path", "/v1/messages")],
+    );
+    assert!(
+        messages_row.is_none(),
+        "counter must have no row for /v1/messages when nothing modified passthrough; \
+         got value {messages_row:?}"
+    );
+
+    // Public helper still works to drive a real-path row.
     use headroom_proxy::observability::record_passthrough_bytes_modified;
     record_passthrough_bytes_modified(
         "/integration_test_passthrough_synthetic",
-        0,
+        7,
         "integration_test_request_id_passthrough_v1",
     );
-    // After a (zero-delta) increment, the row should appear.
     let scrape_after_touch = scrape_metrics(&proxy.url()).await;
+    let touched = find_value_with_labels(
+        &scrape_after_touch,
+        "proxy_passthrough_bytes_modified_total",
+        &[("path", "/integration_test_passthrough_synthetic")],
+    )
+    .expect("real-path row must appear after record_passthrough_bytes_modified");
     assert!(
-        scrape_after_touch.contains("# HELP proxy_passthrough_bytes_modified_total"),
-        "scrape missing proxy_passthrough_bytes_modified_total HELP after touch"
+        touched >= 7.0,
+        "expected ≥7 byte delta after touch; got {touched}"
     );
+
+    proxy.shutdown().await;
+}
+
+// ============================================================================
+// C2 wire-up: a request that is supposed to passthrough byte-equal
+// but whose body bytes change is detected and the alarm fires.
+// We exercise the public helper directly because forcing an
+// accidental byte mutation at the dispatcher level is itself a
+// regression we don't want to provoke deliberately. The helper-
+// level test confirms the metric vector + label semantics, and the
+// production-path test in `passthrough_bytes_modified_zero_when_no_compression`
+// confirms the alarm STAYS silent on the happy path.
+// ============================================================================
+
+#[tokio::test]
+async fn passthrough_bytes_modified_alarm_fires_with_byte_delta_label() {
+    use headroom_proxy::observability::record_passthrough_bytes_modified;
+
+    // Unique path label so this test owns its row.
+    const TEST_PATH: &str = "/integration_test_c2_alarm_v1";
+    record_passthrough_bytes_modified(TEST_PATH, 42, "integration_test_c2_request_id_v1");
+    record_passthrough_bytes_modified(TEST_PATH, 13, "integration_test_c2_request_id_v2");
+
+    let proxy = start_proxy_with("http://127.0.0.1:1", |_| {}).await;
+    let scrape = scrape_metrics(&proxy.url()).await;
+    let value = find_value_with_labels(
+        &scrape,
+        "proxy_passthrough_bytes_modified_total",
+        &[("path", TEST_PATH)],
+    )
+    .expect("C2 alarm row must appear");
     assert!(
-        scrape_after_touch.contains("# TYPE proxy_passthrough_bytes_modified_total counter"),
-        "scrape missing proxy_passthrough_bytes_modified_total TYPE after touch"
+        (value - 55.0).abs() < f64::EPSILON,
+        "C2 alarm increment must reflect summed byte deltas (42 + 13 = 55); got {value}"
     );
 
     proxy.shutdown().await;
@@ -403,7 +465,9 @@ async fn responses_passthrough_upstream() -> (SocketAddr, tokio::task::JoinHandl
 }
 
 #[tokio::test]
-async fn service_tier_logged() {
+async fn service_tier_logged_known_value() {
+    // C1: spec-defined `service_tier` value lands in its own
+    // bucket without going through the `"other"` sentinel.
     let (addr, _server) = responses_passthrough_upstream().await;
     let proxy = start_proxy_with(&format!("http://{addr}"), |c| {
         c.compression_mode = headroom_proxy::config::CompressionMode::Off;
@@ -411,11 +475,9 @@ async fn service_tier_logged() {
     })
     .await;
 
-    // Unique tier value so this test owns its own row.
-    const TEST_TIER: &str = "integration_test_tier_priority_v1";
     let body = json!({
         "model": "gpt-5",
-        "service_tier": TEST_TIER,
+        "service_tier": "priority",
         "input": [
             {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
         ]
@@ -434,15 +496,108 @@ async fn service_tier_logged() {
     let tier_count = find_value_with_labels(
         &scrape,
         "proxy_service_tier_count_total",
-        &[("tier", TEST_TIER)],
+        &[("tier", "priority")],
     )
-    .expect("service tier counter row must appear");
+    .expect("service tier counter row must appear under 'priority'");
     assert!(
         tier_count >= 1.0,
         "expected ≥1 service_tier increment; got {tier_count}"
     );
 
     proxy.shutdown().await;
+}
+
+#[tokio::test]
+async fn service_tier_unknown_bucketed_to_other() {
+    // C1: a malicious or drifting client sends an unrecognised
+    // service_tier value. The bounded-vocabulary validator MUST
+    // bucket it to "other" so a malicious client can't blow up
+    // the metric vector cardinality.
+    let (addr, _server) = responses_passthrough_upstream().await;
+    let proxy = start_proxy_with(&format!("http://{addr}"), |c| {
+        c.compression_mode = headroom_proxy::config::CompressionMode::Off;
+        c.enable_responses_streaming = true;
+    })
+    .await;
+
+    // Two distinct unknown values — both must bucket to "other".
+    for unknown_tier in [
+        "integration_test_unknown_tier_alpha_v1",
+        "integration_test_unknown_tier_beta_v1",
+    ] {
+        let body = json!({
+            "model": "gpt-5",
+            "service_tier": unknown_tier,
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}
+            ]
+        });
+        let resp = reqwest::Client::new()
+            .post(format!("{}/v1/responses", proxy.url()))
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(&body).unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let _ = resp.bytes().await.unwrap();
+    }
+
+    let scrape = scrape_metrics(&proxy.url()).await;
+    // Neither raw value may appear as a label — they must be
+    // bucketed.
+    assert!(
+        !scrape.contains("integration_test_unknown_tier_alpha_v1"),
+        "raw unknown tier value leaked into metrics (cardinality DoS): {scrape}"
+    );
+    assert!(
+        !scrape.contains("integration_test_unknown_tier_beta_v1"),
+        "raw unknown tier value leaked into metrics (cardinality DoS): {scrape}"
+    );
+    // The "other" bucket must have been incremented at least twice.
+    let other_count = find_value_with_labels(
+        &scrape,
+        "proxy_service_tier_count_total",
+        &[("tier", "other")],
+    )
+    .expect("'other' bucket row must appear");
+    assert!(
+        other_count >= 2.0,
+        "expected ≥2 increments on 'other' bucket (one per unknown tier sent); got {other_count}"
+    );
+
+    proxy.shutdown().await;
+}
+
+#[test]
+fn service_tier_validate_known_returns_canonical_constant() {
+    use headroom_proxy::observability::metric_names::service_tier;
+    // Spec-defined values pass through verbatim — strict equality
+    // against the &'static constants so a typo in the validator
+    // surfaces here.
+    assert_eq!(service_tier::validate("auto"), service_tier::AUTO);
+    assert_eq!(service_tier::validate("default"), service_tier::DEFAULT);
+    assert_eq!(service_tier::validate("flex"), service_tier::FLEX);
+    assert_eq!(service_tier::validate("on_demand"), service_tier::ON_DEMAND);
+    assert_eq!(service_tier::validate("priority"), service_tier::PRIORITY);
+    assert_eq!(service_tier::validate("scale"), service_tier::SCALE);
+}
+
+#[test]
+fn service_tier_validate_unknown_returns_other_sentinel() {
+    use headroom_proxy::observability::metric_names::service_tier;
+    // C1: anything outside the bounded vocab buckets to OTHER.
+    assert_eq!(
+        service_tier::validate("nonsense_value"),
+        service_tier::OTHER
+    );
+    assert_eq!(service_tier::validate(""), service_tier::OTHER);
+    // Case-sensitive: spec is case-sensitive on these strings.
+    assert_eq!(service_tier::validate("PRIORITY"), service_tier::OTHER);
+    assert_eq!(service_tier::validate("Auto"), service_tier::OTHER);
+    // Extremely long / arbitrary attacker input → still bucketed.
+    let attack = "A".repeat(10_000);
+    assert_eq!(service_tier::validate(&attack), service_tier::OTHER);
 }
 
 // ============================================================================
@@ -501,6 +656,73 @@ async fn incomplete_status_logged_with_reason() {
 
 // ============================================================================
 // Bonus coverage: rate-limit gauge plumbing via the public helper.
+// ============================================================================
+
+// ============================================================================
+// H1 per-strategy ratio: drive `observe_compression_ratio` twice
+// with different strategy names + tokens, and assert each strategy
+// row has its OWN sum (not the same aggregate replicated).
+// ============================================================================
+
+#[tokio::test]
+async fn compression_ratio_per_strategy_does_not_replicate_aggregate() {
+    // Pre-H1 the proxy emitted the same `aggregate` ratio per
+    // strategy when multiple strategies ran on one body. This test
+    // exercises the helper directly with two distinct strategies +
+    // distinct ratios so the histogram's _sum lines for each
+    // strategy must differ.
+    use headroom_proxy::observability::observe_compression_ratio;
+
+    const STRAT_HEAVY: &str = "h1_test_heavy_v1";
+    const STRAT_LIGHT: &str = "h1_test_light_v1";
+    const CT: &str = "h1_test_content_type_v1";
+
+    // Strategy A: original=1000 tokens → compressed=200 (ratio 0.20).
+    observe_compression_ratio(STRAT_HEAVY, CT, 1000, 200);
+    // Strategy B: original=1000 tokens → compressed=800 (ratio 0.80).
+    observe_compression_ratio(STRAT_LIGHT, CT, 1000, 800);
+
+    let proxy = start_proxy_with("http://127.0.0.1:1", |_| {}).await;
+    let scrape = scrape_metrics(&proxy.url()).await;
+
+    let sum_heavy = find_value_with_labels(
+        &scrape,
+        "proxy_compression_ratio_by_strategy_sum",
+        &[("strategy", STRAT_HEAVY), ("content_type", CT)],
+    )
+    .expect("heavy-strategy sum row");
+    let sum_light = find_value_with_labels(
+        &scrape,
+        "proxy_compression_ratio_by_strategy_sum",
+        &[("strategy", STRAT_LIGHT), ("content_type", CT)],
+    )
+    .expect("light-strategy sum row");
+    // The sums must NOT be equal — if they are, the per-strategy
+    // wiring regressed to the pre-H1 "emit same aggregate per
+    // strategy" behavior.
+    assert!(
+        (sum_heavy - sum_light).abs() > 1e-9,
+        "per-strategy sums are equal: heavy={sum_heavy} light={sum_light} — \
+         H1 regression: did we re-emit the aggregate ratio per strategy?"
+    );
+    // Spot-check the actual ratios.
+    assert!(
+        sum_heavy < sum_light,
+        "heavy strategy ratio (0.20) must be < light strategy ratio (0.80): \
+         heavy={sum_heavy} light={sum_light}"
+    );
+
+    proxy.shutdown().await;
+}
+
+// ============================================================================
+// H2 aborted stream: a client disconnect mid-stream closes the
+// channel without `message_stop`. Unit-tested in
+// `crate::observability::cache_hit_rate::tests` because the
+// integration-level approach is flaky against the shared global
+// Prometheus registry (other tests in the suite emit on the same
+// `provider="anthropic"` label, making delta-based assertions
+// non-deterministic).
 // ============================================================================
 
 #[tokio::test]

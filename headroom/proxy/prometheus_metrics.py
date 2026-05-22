@@ -1215,4 +1215,56 @@ class PrometheusMetrics:
                     )
                 lines.append("")
 
+            # Phase G PR-G3 remediation (C3): image-redacted counter
+            # lives Python-side because base64 redaction is purely a
+            # Python-proxy concern (request_logger.py). The Rust
+            # proxy previously held a dead counter for this; that's
+            # been removed in favour of this Python export.
+            #
+            # The counter is read at scrape-time from the module-
+            # level redaction tracker rather than mirrored into the
+            # PrometheusMetrics instance, so we never lose a count
+            # to ordering between RequestLogger setup and metrics
+            # init.
+            from headroom.proxy.request_logger import redactions_total
+
+            _append_metric(
+                lines,
+                name="proxy_image_generation_call_log_redacted_total",
+                metric_type="counter",
+                help_text=(
+                    "Count of base64-encoded image payloads redacted from request "
+                    "logs by the Python proxy's request logger"
+                ),
+                value=redactions_total(),
+            )
+
+            # Phase G PR-G3 remediation (C4): RTK invocations counter
+            # also lives Python-side. RTK is wrapped by the
+            # `headroom wrap` CLI (headroom.cli.wrap); the proxy
+            # observes invocation counts via a process-local tracker
+            # the wrap tail bumps. The Rust proxy previously held a
+            # dead counter for this; that's been removed.
+            from headroom.cli.wrap_rtk_metrics import rtk_invocation_counts
+
+            counts = rtk_invocation_counts()
+            lines.extend(
+                [
+                    "# HELP wrap_rtk_invocations_total RTK invocations observed via the wrap CLI tail",
+                    "# TYPE wrap_rtk_invocations_total counter",
+                ]
+            )
+            if not counts:
+                # Emit a zero-row under the sentinel tool name so
+                # the family advertises HELP/TYPE on a fresh boot
+                # and dashboards can probe it before any RTK
+                # invocation has happened. Matches the Rust side's
+                # H3 force-zero contract.
+                lines.append('wrap_rtk_invocations_total{tool="__init__"} 0')
+            else:
+                for tool, count in counts.items():
+                    safe_tool = _escape_label_value(str(tool))
+                    lines.append(f'wrap_rtk_invocations_total{{tool="{safe_tool}"}} {count}')
+            lines.append("")
+
             return "\n".join(lines)

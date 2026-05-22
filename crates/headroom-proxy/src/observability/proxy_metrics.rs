@@ -13,9 +13,7 @@ use std::sync::OnceLock;
 use prometheus::{IntCounterVec, IntGaugeVec, Opts, Registry};
 
 use super::metric_names::{
-    LABEL_PATH, LABEL_PROVIDER, LABEL_STATUS, LABEL_TIER, LABEL_TOOL,
-    METRIC_PROXY_IMAGE_GENERATION_CALL_LOG_REDACTED_TOTAL,
-    METRIC_PROXY_IMAGE_GENERATION_CALL_LOG_REDACTED_TOTAL_HELP,
+    LABEL_PATH, LABEL_PROVIDER, LABEL_STATUS, LABEL_TIER,
     METRIC_PROXY_PASSTHROUGH_BYTES_MODIFIED_TOTAL,
     METRIC_PROXY_PASSTHROUGH_BYTES_MODIFIED_TOTAL_HELP,
     METRIC_PROXY_RATE_LIMIT_REMAINING_INPUT_TOKENS,
@@ -26,7 +24,6 @@ use super::metric_names::{
     METRIC_PROXY_RATE_LIMIT_REMAINING_TOKENS, METRIC_PROXY_RATE_LIMIT_REMAINING_TOKENS_HELP,
     METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL, METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL_HELP,
     METRIC_PROXY_SERVICE_TIER_COUNT_TOTAL, METRIC_PROXY_SERVICE_TIER_COUNT_TOTAL_HELP,
-    METRIC_WRAP_RTK_INVOCATIONS_TOTAL, METRIC_WRAP_RTK_INVOCATIONS_TOTAL_HELP,
 };
 
 // ---------- proxy_passthrough_bytes_modified_total{path} ----------
@@ -269,7 +266,11 @@ pub fn record_response_status(status: &str, reason: Option<&str>, request_id: &s
     response_status_counter(super::prometheus::registry())
         .with_label_values(&[status])
         .inc();
-    tracing::info!(
+    // Optional-3: aligned with the peer `record_*` helpers in this
+    // module which all use `debug!` for the metric-correlation log
+    // line. INFO was inconsistent and produced extra log volume
+    // during normal Responses traffic.
+    tracing::debug!(
         event = "metric_recorded",
         metric = METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL,
         status = %status,
@@ -279,74 +280,18 @@ pub fn record_response_status(status: &str, reason: Option<&str>, request_id: &s
     );
 }
 
-// ---------- proxy_image_generation_call_log_redacted_total ----------
-
-pub fn image_redacted_counter(registry: &Registry) -> &'static IntCounterVec {
-    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
-    COUNTER.get_or_init(|| {
-        let opts = Opts::new(
-            METRIC_PROXY_IMAGE_GENERATION_CALL_LOG_REDACTED_TOTAL,
-            METRIC_PROXY_IMAGE_GENERATION_CALL_LOG_REDACTED_TOTAL_HELP,
-        );
-        // Unlabelled metric — but `IntCounterVec` with zero labels
-        // is still the right type for symmetry with the rest of the
-        // module. A bare `IntCounter` would diverge in registration
-        // shape and read site.
-        let counter = IntCounterVec::new(opts, &[])
-            .expect("proxy_image_generation_call_log_redacted_total descriptor is well-formed");
-        registry
-            .register(Box::new(counter.clone()))
-            .expect("proxy_image_generation_call_log_redacted_total registers exactly once");
-        counter
-    })
-}
-
-pub fn record_image_redacted() {
-    image_redacted_counter(super::prometheus::registry())
-        .with_label_values(&[])
-        .inc();
-    tracing::debug!(
-        event = "metric_recorded",
-        metric = METRIC_PROXY_IMAGE_GENERATION_CALL_LOG_REDACTED_TOTAL,
-        "incremented proxy_image_generation_call_log_redacted_total"
-    );
-}
-
-// ---------- wrap_rtk_invocations_total{tool} ----------
-//
-// RTK lives on the wrap-CLI side; the proxy never invokes it. The
-// counter is registered here so the central /metrics scrape exposes
-// it and the wrap-side tail can `inc()` via the registry. The wrap
-// side polls `rtk gain --format json` and increments by the delta.
-
-pub fn rtk_invocations_counter(registry: &Registry) -> &'static IntCounterVec {
-    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
-    COUNTER.get_or_init(|| {
-        let opts = Opts::new(
-            METRIC_WRAP_RTK_INVOCATIONS_TOTAL,
-            METRIC_WRAP_RTK_INVOCATIONS_TOTAL_HELP,
-        );
-        let counter = IntCounterVec::new(opts, &[LABEL_TOOL])
-            .expect("wrap_rtk_invocations_total descriptor is well-formed");
-        registry
-            .register(Box::new(counter.clone()))
-            .expect("wrap_rtk_invocations_total registers exactly once");
-        counter
-    })
-}
-
-pub fn record_rtk_invocation(tool: &str, delta: u64) {
-    rtk_invocations_counter(super::prometheus::registry())
-        .with_label_values(&[tool])
-        .inc_by(delta);
-    tracing::debug!(
-        event = "metric_recorded",
-        metric = METRIC_WRAP_RTK_INVOCATIONS_TOTAL,
-        tool = %tool,
-        delta = delta,
-        "incremented wrap_rtk_invocations_total"
-    );
-}
+// Phase G PR-G3 remediation (C3 + C4): the image-redacted counter
+// and the wrap_rtk_invocations counter were originally registered
+// here but neither had a production emit site that crossed the
+// Python/Rust boundary. Both have moved Python-side
+// (`headroom.proxy.request_logger::redactions_total` and
+// `headroom.cli.wrap_rtk_metrics::rtk_invocation_counts`) and the
+// Python proxy's `/metrics` exporter surfaces them — see
+// `docs/observability.md` for the placement decision. Keeping a
+// dead Rust counter would (a) violate the "no dead metrics
+// registered" review finding and (b) mislead Phase H canary
+// dashboards into expecting two scrape sources for what is really
+// one Python-side counter.
 
 #[cfg(test)]
 mod tests {

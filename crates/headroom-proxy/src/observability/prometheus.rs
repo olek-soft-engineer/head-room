@@ -217,21 +217,50 @@ pub async fn handle_metrics() -> Response {
 
     // Phase G PR-G3: same idea for the new proxy-wide metric families.
     // Lazy `OnceLock`-backed singletons; touching each here forces
-    // registration on first scrape so HELP/TYPE lines appear even
-    // before traffic has driven a single increment.
+    // registration on first scrape.
+    //
+    // H3 fix: registration alone is NOT enough — the prometheus
+    // crate's v0.13 `gather()` skips empty MetricVec families
+    // entirely (no HELP/TYPE lines either). Operators who curl
+    // /metrics on a fresh boot would otherwise see NO trace of the
+    // catalogue. We force-touch each counter / gauge MetricVec
+    // with a sentinel `__init__` label so HELP/TYPE + a zero row
+    // appear from boot and dashboards/alarms have a predictable
+    // scrape shape. Counters with the `__init__` label increment
+    // by 0, so the alarm-able "must stay 0" semantic of
+    // `proxy_passthrough_bytes_modified_total` is preserved
+    // (the family becomes visible, the rate stays 0).
+    //
+    // Histograms are NOT force-zeroed: a synthetic `observe(0.0)`
+    // would pollute the per-label distribution. The two histogram
+    // families (`proxy_cache_hit_rate_per_session` and
+    // `proxy_compression_ratio_by_strategy`) only surface in the
+    // scrape after the first real session, by design.
     let reg = registry();
     let _ = super::cache_hit_rate::histogram(reg);
     let _ = super::compression_ratio::ratio_histogram(reg);
-    let _ = super::compression_ratio::rejected_counter(reg);
-    let _ = super::proxy_metrics::passthrough_bytes_modified_counter(reg);
-    let _ = super::proxy_metrics::rate_limit_remaining_requests_gauge(reg);
-    let _ = super::proxy_metrics::rate_limit_remaining_tokens_gauge(reg);
-    let _ = super::proxy_metrics::rate_limit_remaining_input_tokens_gauge(reg);
-    let _ = super::proxy_metrics::rate_limit_remaining_output_tokens_gauge(reg);
-    let _ = super::proxy_metrics::service_tier_counter(reg);
-    let _ = super::proxy_metrics::response_status_counter(reg);
-    let _ = super::proxy_metrics::image_redacted_counter(reg);
-    let _ = super::proxy_metrics::rtk_invocations_counter(reg);
+    let rejected_counter = super::compression_ratio::rejected_counter(reg);
+    let passthrough_counter = super::proxy_metrics::passthrough_bytes_modified_counter(reg);
+    let rl_requests_gauge = super::proxy_metrics::rate_limit_remaining_requests_gauge(reg);
+    let rl_tokens_gauge = super::proxy_metrics::rate_limit_remaining_tokens_gauge(reg);
+    let rl_input_gauge = super::proxy_metrics::rate_limit_remaining_input_tokens_gauge(reg);
+    let rl_output_gauge = super::proxy_metrics::rate_limit_remaining_output_tokens_gauge(reg);
+    let tier_counter = super::proxy_metrics::service_tier_counter(reg);
+    let status_counter = super::proxy_metrics::response_status_counter(reg);
+
+    const INIT_SENTINEL: &str = "__init__";
+    rejected_counter
+        .with_label_values(&[INIT_SENTINEL])
+        .inc_by(0);
+    passthrough_counter
+        .with_label_values(&[INIT_SENTINEL])
+        .inc_by(0);
+    rl_requests_gauge.with_label_values(&[INIT_SENTINEL]).set(0);
+    rl_tokens_gauge.with_label_values(&[INIT_SENTINEL]).set(0);
+    rl_input_gauge.with_label_values(&[INIT_SENTINEL]).set(0);
+    rl_output_gauge.with_label_values(&[INIT_SENTINEL]).set(0);
+    tier_counter.with_label_values(&[INIT_SENTINEL]).inc_by(0);
+    status_counter.with_label_values(&[INIT_SENTINEL]).inc_by(0);
 
     let metric_families = registry().gather();
     let mut buffer = Vec::with_capacity(2048);

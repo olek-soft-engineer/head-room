@@ -94,29 +94,15 @@ pub const METRIC_PROXY_RESPONSE_STATUS_COUNT_TOTAL_HELP: &str =
      'incomplete' detail lands in the structured log paired with each \
      increment.";
 
-// ---------- proxy_image_generation_call_log_redacted_total ----------
-
-pub const METRIC_PROXY_IMAGE_GENERATION_CALL_LOG_REDACTED_TOTAL: &str =
-    "proxy_image_generation_call_log_redacted_total";
-pub const METRIC_PROXY_IMAGE_GENERATION_CALL_LOG_REDACTED_TOTAL_HELP: &str =
-    "Count of base64-encoded image payloads redacted from request logs. \
-     Driven from the Python proxy's request logger (large multi-MB \
-     base64 strings replaced with size-only placeholders).";
-
-// ---------- wrap_rtk_invocations_total ----------
-
-pub const METRIC_WRAP_RTK_INVOCATIONS_TOTAL: &str = "wrap_rtk_invocations_total";
-pub const METRIC_WRAP_RTK_INVOCATIONS_TOTAL_HELP: &str =
-    "Count of RTK invocations observed via the wrap-CLI polling of \
-     `rtk gain --format json`, broken down by the rewritten command \
-     (`git`, `ls`, `cargo`, …).";
-
-// ---------- wrap_rtk_tokens_saved_per_session ----------
-
-pub const METRIC_WRAP_RTK_TOKENS_SAVED_PER_SESSION: &str = "wrap_rtk_tokens_saved_per_session";
-pub const METRIC_WRAP_RTK_TOKENS_SAVED_PER_SESSION_HELP: &str =
-    "Tokens saved by RTK during one wrap session, observed once at \
-     session end. Histogram so dashboards can render a distribution.";
+// Phase G PR-G3 remediation (C3 + C4): the metric-name constants
+// for `proxy_image_generation_call_log_redacted_total`,
+// `wrap_rtk_invocations_total`, and `wrap_rtk_tokens_saved_per_session`
+// were removed because the underlying counters had no production
+// emit site on the Rust side. The same metrics are exported by the
+// Python proxy (`headroom/proxy/prometheus_metrics.py`) which is the
+// natural owner: image redaction is a Python-proxy operation and RTK
+// invocation tracking lives in the wrap CLI, both Python-side
+// surfaces. See `docs/observability.md`.
 
 // ---------- shared label keys ----------
 
@@ -126,20 +112,54 @@ pub const LABEL_CONTENT_TYPE: &str = "content_type";
 pub const LABEL_PATH: &str = "path";
 pub const LABEL_TIER: &str = "tier";
 pub const LABEL_STATUS: &str = "status";
-pub const LABEL_TOOL: &str = "tool";
 
 // ---------- bounded label vocabularies ----------
 
 /// OpenAI service-tier values per the Responses API spec
-/// (`service_tier` field on the response object). The proxy logs
-/// anything outside this set under the literal value so wire-format
-/// drift is loud rather than silently bucketed.
+/// (`service_tier` field on the response object). The metric label
+/// vocabulary is **strictly** this set plus a `"scale"` value
+/// (documented in OpenAI's tier-pricing page) and a sentinel
+/// `"other"` bucket for anything else, so a malicious client posting
+/// `{"service_tier":"<random>"}` per request cannot blow up
+/// cardinality.
 pub mod service_tier {
     pub const AUTO: &str = "auto";
     pub const DEFAULT: &str = "default";
     pub const FLEX: &str = "flex";
     pub const ON_DEMAND: &str = "on_demand";
     pub const PRIORITY: &str = "priority";
+    pub const SCALE: &str = "scale";
+    /// Sentinel for any unknown / unrecognised tier value. Prevents
+    /// label-cardinality DoS from arbitrary inbound JSON.
+    pub const OTHER: &str = "other";
+
+    /// Validate an inbound `service_tier` string against the bounded
+    /// vocabulary. Returns the matching `&'static` constant or
+    /// [`OTHER`] for any unrecognised value (with a tracing::warn so
+    /// wire-format drift is loud rather than silently bucketed).
+    ///
+    /// The matching is case-sensitive — the OpenAI spec is
+    /// case-sensitive on these strings; a case-different value is
+    /// treated as drift, not as the same tier.
+    pub fn validate(raw: &str) -> &'static str {
+        match raw {
+            AUTO => AUTO,
+            DEFAULT => DEFAULT,
+            FLEX => FLEX,
+            ON_DEMAND => ON_DEMAND,
+            PRIORITY => PRIORITY,
+            SCALE => SCALE,
+            _ => {
+                tracing::warn!(
+                    event = "service_tier_unknown",
+                    raw = %raw,
+                    bucket = OTHER,
+                    "unknown service_tier value bucketed to 'other' to bound cardinality"
+                );
+                OTHER
+            }
+        }
+    }
 }
 
 /// OpenAI Responses terminal-status vocabulary. `in_progress` is the
