@@ -66,7 +66,15 @@ const LATENCY_BUCKETS_SECONDS: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 1
 
 /// Lazy singleton registry. Borrowed by `handle_metrics` for
 /// scrape rendering and by every metric registration helper.
-fn registry() -> &'static Registry {
+///
+/// Visibility note: `pub(super)` is intentional — the Phase G PR-G3
+/// metric modules (`cache_hit_rate`, `compression_ratio`,
+/// `proxy_metrics`) live alongside this one and reach for the shared
+/// singleton at register time. External callers should NOT touch the
+/// registry directly; they go through the per-metric `record_*`
+/// helpers, which keeps registration centralised and emit sites
+/// uniform.
+pub(super) fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(Registry::new)
 }
@@ -189,10 +197,14 @@ pub fn record_bedrock_eventstream_message(model: &str, region: &str, event_type:
 
 /// Axum handler for `GET /metrics`. Renders the registry in the
 /// Prometheus text format. Per Phase D acceptance: the scrape MUST
-/// include the three Bedrock metrics above as soon as they have
-/// been touched at least once; un-touched counter vectors expose
-/// their HELP/TYPE lines but no labelled rows (Prometheus's
-/// documented behaviour, not a regression).
+/// include each metric family as soon as it has been touched at
+/// least once with a label set. The `prometheus` v0.13 crate skips
+/// empty `MetricVec` families from `gather()`, so until a counter
+/// has incremented (or a histogram has observed) once, neither its
+/// HELP/TYPE nor any row appears — a documented quirk we lean on
+/// for the "must stay 0" alarm-able `proxy_passthrough_bytes_modified_total`
+/// surface: its absence FROM the scrape is itself the proof the
+/// alarm is silent.
 pub async fn handle_metrics() -> Response {
     // Force lazy registration so the HELP/TYPE descriptor lines
     // appear in the scrape even before any request has hit the
@@ -202,6 +214,24 @@ pub async fn handle_metrics() -> Response {
     let _ = invoke_counter();
     let _ = invoke_latency();
     let _ = eventstream_counter();
+
+    // Phase G PR-G3: same idea for the new proxy-wide metric families.
+    // Lazy `OnceLock`-backed singletons; touching each here forces
+    // registration on first scrape so HELP/TYPE lines appear even
+    // before traffic has driven a single increment.
+    let reg = registry();
+    let _ = super::cache_hit_rate::histogram(reg);
+    let _ = super::compression_ratio::ratio_histogram(reg);
+    let _ = super::compression_ratio::rejected_counter(reg);
+    let _ = super::proxy_metrics::passthrough_bytes_modified_counter(reg);
+    let _ = super::proxy_metrics::rate_limit_remaining_requests_gauge(reg);
+    let _ = super::proxy_metrics::rate_limit_remaining_tokens_gauge(reg);
+    let _ = super::proxy_metrics::rate_limit_remaining_input_tokens_gauge(reg);
+    let _ = super::proxy_metrics::rate_limit_remaining_output_tokens_gauge(reg);
+    let _ = super::proxy_metrics::service_tier_counter(reg);
+    let _ = super::proxy_metrics::response_status_counter(reg);
+    let _ = super::proxy_metrics::image_redacted_counter(reg);
+    let _ = super::proxy_metrics::rtk_invocations_counter(reg);
 
     let metric_families = registry().gather();
     let mut buffer = Vec::with_capacity(2048);

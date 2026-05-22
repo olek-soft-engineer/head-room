@@ -769,6 +769,26 @@ pub(crate) async fn forward_http(
                     markers = markers_inserted.len(),
                     "compression applied"
                 );
+                // Phase G PR-G3: emit one
+                // `proxy_compression_ratio_by_strategy` sample per
+                // strategy actually applied. We do NOT have a
+                // per-block content_type breakdown here — the
+                // aggregate `tokens_before` / `tokens_after` is
+                // strategy-wise rather than content-type-wise, so we
+                // label `content_type=aggregate`. Per-block fanout
+                // would require threading the manifest through to
+                // this layer; that's a future PR if dashboards need
+                // it.
+                if tokens_before > 0 && tokens_after < tokens_before {
+                    for strategy in &strategies_applied {
+                        crate::observability::observe_compression_ratio(
+                            strategy,
+                            "aggregate",
+                            tokens_before,
+                            tokens_after,
+                        );
+                    }
+                }
                 body
             }
             compression::Outcome::Passthrough { reason } => {
@@ -902,6 +922,49 @@ pub(crate) async fn forward_http(
     };
 
     let resp_headers = filter_response_headers(upstream_resp.headers());
+
+    // Phase G PR-G3: extract upstream rate-limit headers from this
+    // response and record them as gauges. The `provider` label is
+    // chosen by which of the upstream `request-id` shapes we saw
+    // (Anthropic vs OpenAI). When neither shape was detected we
+    // skip emission rather than guessing — per realignment build-
+    // constraint "no silent fallbacks".
+    let rate_limit_snapshot =
+        crate::observability::extract_rate_limit_snapshot(upstream_resp.headers());
+    let rate_limit_provider: Option<&'static str> = if upstream_request_id_anthropic.is_some() {
+        Some(crate::observability::cache_hit_rate_provider::ANTHROPIC)
+    } else if upstream_request_id_openai.is_some() {
+        // We can't distinguish chat vs responses purely from the
+        // request-id header; the `path_for_log` is more specific.
+        Some(if path_for_log.contains("/v1/responses") {
+            crate::observability::cache_hit_rate_provider::OPENAI_RESPONSES
+        } else {
+            crate::observability::cache_hit_rate_provider::OPENAI_CHAT
+        })
+    } else {
+        None
+    };
+    if let Some(provider) = rate_limit_provider {
+        crate::observability::record_rate_limit_snapshot(
+            provider,
+            &rate_limit_snapshot,
+            &request_id,
+        );
+    } else if rate_limit_snapshot.remaining_requests.is_some()
+        || rate_limit_snapshot.remaining_tokens.is_some()
+        || rate_limit_snapshot.remaining_input_tokens.is_some()
+        || rate_limit_snapshot.remaining_output_tokens.is_some()
+    {
+        // Headers present but provider unattributable. Log loud so
+        // operators see the wire-format drift; do not emit unlabelled
+        // metrics.
+        tracing::debug!(
+            event = "rate_limit_snapshot_unattributable",
+            request_id = %request_id,
+            path = %path_for_log,
+            "rate-limit headers present but provider couldn't be inferred; skipping gauge emit"
+        );
+    }
 
     // Stream response body back without buffering. Wrap errors so mid-stream
     // upstream failures are logged rather than silently truncating the client.
@@ -1179,6 +1242,34 @@ async fn run_sse_state_machine(
                     }
                 }
             }
+            // Phase G PR-G3: emit per-session cache-hit-rate from
+            // the final accumulated `usage`. Anthropic's
+            // `message_delta` strictly grows token counts, so the
+            // accumulator's final values are the right denominator.
+            // `compute_cache_hit_rate` returns `None` for zero
+            // denominators → log + skip, never synthesise a sample.
+            match crate::observability::compute_cache_hit_rate(
+                state.usage.input_tokens,
+                state.usage.cache_read_input_tokens,
+                state.usage.cache_creation_input_tokens,
+            ) {
+                Some(rate) => {
+                    crate::observability::observe_cache_hit_rate(
+                        crate::observability::cache_hit_rate_provider::ANTHROPIC,
+                        &request_id,
+                        rate,
+                    );
+                }
+                None => {
+                    tracing::debug!(
+                        event = "cache_hit_rate_skipped",
+                        request_id = %request_id,
+                        provider = "anthropic",
+                        reason = "zero_denominator",
+                        "skipping proxy_cache_hit_rate_per_session: no input tokens"
+                    );
+                }
+            }
             tracing::info!(
                 request_id = %request_id,
                 provider = "anthropic",
@@ -1216,6 +1307,55 @@ async fn run_sse_state_machine(
                     }
                 }
             }
+            // Phase G PR-G3: emit cache-hit-rate from the final usage
+            // chunk. OpenAI only emits this when
+            // `stream_options.include_usage = true`; absence is a
+            // signal, not a fallback condition — `usage = None` →
+            // skip.
+            if let Some(usage) = &state.usage {
+                let input_tokens = usage
+                    .get("prompt_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let cached_tokens = usage
+                    .get("prompt_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                // OpenAI's `prompt_tokens` already INCLUDES cached
+                // tokens (per Chat Completions API docs), so the
+                // denominator is `prompt_tokens`, not the sum. The
+                // numerator is `cached_tokens`; `input_tokens` arg to
+                // `compute_cache_hit_rate` carries the *non-cached*
+                // portion (denom-only), so we synthesise that here.
+                let non_cached = input_tokens.saturating_sub(cached_tokens);
+                match crate::observability::compute_cache_hit_rate(non_cached, cached_tokens, 0) {
+                    Some(rate) => {
+                        crate::observability::observe_cache_hit_rate(
+                            crate::observability::cache_hit_rate_provider::OPENAI_CHAT,
+                            &request_id,
+                            rate,
+                        );
+                    }
+                    None => {
+                        tracing::debug!(
+                            event = "cache_hit_rate_skipped",
+                            request_id = %request_id,
+                            provider = "openai_chat",
+                            reason = "zero_denominator",
+                            "skipping proxy_cache_hit_rate_per_session: no input tokens"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    event = "cache_hit_rate_skipped",
+                    request_id = %request_id,
+                    provider = "openai_chat",
+                    reason = "no_usage_chunk",
+                    "skipping proxy_cache_hit_rate_per_session: stream_options.include_usage=false"
+                );
+            }
             tracing::info!(
                 request_id = %request_id,
                 provider = "openai_chat",
@@ -1249,11 +1389,64 @@ async fn run_sse_state_machine(
                     }
                 }
             }
+            // Phase G PR-G3: cache hit rate + service_tier +
+            // response status from the final `response.completed`
+            // payload. The Responses API uses `input_tokens` /
+            // `cached_input_tokens` shape (Responses-specific —
+            // distinct from Chat Completions' `prompt_tokens`).
+            if let Some(usage) = &state.usage {
+                let input_tokens = usage
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let cached_tokens = usage
+                    .get("input_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                // Like Chat, `input_tokens` already INCLUDES cached
+                // tokens, so split for the helper.
+                let non_cached = input_tokens.saturating_sub(cached_tokens);
+                match crate::observability::compute_cache_hit_rate(non_cached, cached_tokens, 0) {
+                    Some(rate) => {
+                        crate::observability::observe_cache_hit_rate(
+                            crate::observability::cache_hit_rate_provider::OPENAI_RESPONSES,
+                            &request_id,
+                            rate,
+                        );
+                    }
+                    None => {
+                        tracing::debug!(
+                            event = "cache_hit_rate_skipped",
+                            request_id = %request_id,
+                            provider = "openai_responses",
+                            reason = "zero_denominator",
+                            "skipping proxy_cache_hit_rate_per_session: no input tokens"
+                        );
+                    }
+                }
+            }
+            // Service tier + status are sourced from
+            // `state.last_response_envelope` populated by the
+            // ResponseState on `response.completed/failed/incomplete`.
+            if let Some(tier) = state.service_tier.as_deref() {
+                crate::observability::record_service_tier(tier, &request_id);
+            }
+            if let Some(status) = state.terminal_status() {
+                crate::observability::record_response_status(
+                    status,
+                    state.incomplete_reason.as_deref(),
+                    &request_id,
+                );
+            }
             tracing::info!(
                 request_id = %request_id,
                 provider = "openai_responses",
                 items = state.items.len(),
                 has_usage = state.usage.is_some(),
+                service_tier = state.service_tier.as_deref().unwrap_or(""),
+                terminal_status = state.terminal_status().unwrap_or(""),
+                incomplete_reason = state.incomplete_reason.as_deref().unwrap_or(""),
                 "sse stream closed"
             );
         }
