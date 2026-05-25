@@ -560,16 +560,13 @@ def test_rtk_subprocess_failure_logs_structured_warning(
 
     import subprocess as _subprocess
 
+    # `_read_rtk_lifetime_stats` does a LOCAL import: `from headroom.rtk
+    # import get_rtk_path`. That means patching the alias on `helpers`
+    # doesn't bind — we must patch the source module.
+    import headroom.rtk as _rtk
     from headroom.proxy import helpers as _helpers
 
-    monkeypatch.setattr(_helpers, "get_rtk_path", lambda: None, raising=False)
-
-    # The above branch returns early before invoking subprocess — not the
-    # one we want. Instead, force the subprocess to fail.
-    monkeypatch.setattr(
-        "headroom.proxy.helpers.get_rtk_path",
-        lambda: "/tmp/nonexistent-rtk",
-    )
+    monkeypatch.setattr(_rtk, "get_rtk_path", lambda: "/tmp/nonexistent-rtk")
 
     class FakeResult:
         returncode = 1
