@@ -550,38 +550,43 @@ def test_legacy_state_migrates_rtk_from_cli_filtering(
 
 def test_rtk_subprocess_failure_logs_structured_warning(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """PR-G2 remediation (H2): synthetic-zero path must log loudly.
 
     Without this, a broken RTK and a healthy "0 tokens saved" RTK are
     indistinguishable at the tracker layer.
+
+    Implementation note: earlier attempts used pytest's ``caplog`` fixture
+    (both scoped to ``logger="headroom.proxy"`` and root-level capture).
+    Both passed locally but failed in CI — likely a logger-propagation /
+    handler-config difference in the CI test harness. The robust approach
+    is to mock ``_helpers.logger.warning`` directly: when the production
+    code calls ``logger.warning(...)`` the mock intercepts regardless of
+    propagation, formatters, or handler order.
     """
 
-    # `_read_rtk_lifetime_stats` does a LOCAL import: `from headroom.rtk
-    # import get_rtk_path`. Patch the source module so the local import
-    # picks it up. Point at a definitely-nonexistent absolute path so
-    # the real `subprocess.run` raises FileNotFoundError — that's the
-    # cleanest way to drive the helper's `except` branch (the one that
-    # emits the structured warning) without mocking subprocess itself.
-    # Patching subprocess.run via monkeypatch is fragile across CI
-    # logger-propagation configs; letting real subprocess raise is
-    # deterministic everywhere.
+    from unittest.mock import MagicMock
+
     import headroom.rtk as _rtk
     from headroom.proxy import helpers as _helpers
 
+    # Point get_rtk_path at a definitely-nonexistent absolute path so the
+    # real ``subprocess.run`` raises FileNotFoundError → except branch
+    # fires the structured warning.
     monkeypatch.setattr(_rtk, "get_rtk_path", lambda: "/nonexistent/headroom-test-rtk")
 
-    # Capture from the root logger so propagation config can't hide the
-    # warning (an earlier attempt scoped to "headroom.proxy" passed
-    # locally but failed in CI).
-    caplog.set_level(logging.WARNING)
+    mock_warning = MagicMock()
+    monkeypatch.setattr(_helpers.logger, "warning", mock_warning)
 
     payload = _helpers._read_rtk_lifetime_stats()
     assert payload is not None
     assert payload["tokens_saved"] == 0
-    assert any("event=rtk_stats_subprocess_failed" in rec.getMessage() for rec in caplog.records), (
-        "expected structured warning when RTK subprocess fails"
+
+    # Concatenate all warning call args so the failure message shows what
+    # the helper actually emitted (debug aid for CI flakes).
+    all_warning_calls = " ".join(str(call) for call in mock_warning.call_args_list)
+    assert "event=rtk_stats_subprocess_failed" in all_warning_calls, (
+        f"expected structured warning; actual logger.warning calls: {mock_warning.call_args_list}"
     )
 
 
