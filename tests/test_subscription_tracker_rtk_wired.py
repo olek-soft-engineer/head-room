@@ -558,27 +558,24 @@ def test_rtk_subprocess_failure_logs_structured_warning(
     indistinguishable at the tracker layer.
     """
 
-    import subprocess as _subprocess
-
     # `_read_rtk_lifetime_stats` does a LOCAL import: `from headroom.rtk
-    # import get_rtk_path`. That means patching the alias on `helpers`
-    # doesn't bind — we must patch the source module.
+    # import get_rtk_path`. Patch the source module so the local import
+    # picks it up. Point at a definitely-nonexistent absolute path so
+    # the real `subprocess.run` raises FileNotFoundError — that's the
+    # cleanest way to drive the helper's `except` branch (the one that
+    # emits the structured warning) without mocking subprocess itself.
+    # Patching subprocess.run via monkeypatch is fragile across CI
+    # logger-propagation configs; letting real subprocess raise is
+    # deterministic everywhere.
     import headroom.rtk as _rtk
     from headroom.proxy import helpers as _helpers
 
-    monkeypatch.setattr(_rtk, "get_rtk_path", lambda: "/tmp/nonexistent-rtk")
+    monkeypatch.setattr(_rtk, "get_rtk_path", lambda: "/nonexistent/headroom-test-rtk")
 
-    class FakeResult:
-        returncode = 1
-        stdout = ""
-        stderr = "rtk: database not found"
-
-    def fake_run(*args: Any, **kwargs: Any) -> FakeResult:
-        return FakeResult()
-
-    monkeypatch.setattr(_subprocess, "run", fake_run)
-
-    caplog.set_level(logging.WARNING, logger="headroom.proxy")
+    # Capture from the root logger so propagation config can't hide the
+    # warning (an earlier attempt scoped to "headroom.proxy" passed
+    # locally but failed in CI).
+    caplog.set_level(logging.WARNING)
 
     payload = _helpers._read_rtk_lifetime_stats()
     assert payload is not None
