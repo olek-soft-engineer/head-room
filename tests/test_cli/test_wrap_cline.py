@@ -91,3 +91,37 @@ def test_wrap_cline_preserves_existing_clinerules_content(
     content = clinerules.read_text()
     assert "Always use Python 3.12." in content
     assert wrap_mod._RTK_MARKER in content
+
+
+# ---------------------------------------------------------------------------
+# M4: Ctrl-C during prelude emits a clear "interrupted, marker may be on disk"
+# message and exits non-zero.
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_cline_keyboardinterrupt_during_prelude_emits_clear_message(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl-C between marker injection and proxy startup must signal clearly."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+
+    def raise_kbd_interrupt(*args, **kwargs):  # noqa: ANN002, ANN003
+        # Simulate the user hitting Ctrl-C right after the prelude wrote the
+        # .clinerules marker but before _ensure_proxy returns. We trigger via
+        # _ensure_rtk_binary side-effect so the marker file exists on disk.
+        marker_path = tmp_path / ".clinerules"
+        marker_path.write_text(wrap_mod.RTK_INSTRUCTIONS_BLOCK)
+        raise KeyboardInterrupt
+
+    with patch.object(wrap_mod, "_ensure_rtk_binary", side_effect=raise_kbd_interrupt):
+        result = runner.invoke(main, ["wrap", "cline", "--prepare-only"])
+
+    assert result.exit_code == 130
+    assert "interrupted" in result.output.lower()
+    assert "idempotent" in result.output.lower()
+    # marker file is on disk
+    assert (tmp_path / ".clinerules").exists()
+    assert str(tmp_path / ".clinerules") in result.output

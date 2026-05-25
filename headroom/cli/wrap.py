@@ -890,6 +890,26 @@ def _restore_codex_provider_config() -> tuple[str, Path]:
     return "noop", config_file
 
 
+def _emit_wrap_interrupted(agent: str, marker_path: Path | None) -> None:
+    """Log a clear interruption message after a partial wrap setup.
+
+    Called when a wrap subcommand catches ``KeyboardInterrupt`` between marker
+    injection and proxy startup. The marker file (if any) is left on disk —
+    re-running the same ``headroom wrap <agent>`` command is idempotent and
+    safe.
+    """
+    if marker_path is not None:
+        click.echo(
+            f"\n  Wrap was interrupted; marker file at {marker_path} is on "
+            f"disk. Rerun `headroom wrap {agent}` to retry — it's idempotent."
+        )
+    else:
+        click.echo(
+            f"\n  Wrap was interrupted before any on-disk changes. Rerun "
+            f"`headroom wrap {agent}` to retry — it's idempotent."
+        )
+
+
 def _inject_rtk_instructions(file_path: Path, verbose: bool = False) -> bool:
     """Inject rtk instructions into a file (AGENTS.md, .cursorrules, etc.).
 
@@ -994,19 +1014,79 @@ def _inject_memory_agents_md(file_path: Path) -> bool:
     return True
 
 
+def _apply_rtk_to_systemmessage_field(
+    container: dict[str, Any],
+    location_label: str,
+    verbose: bool = False,
+) -> tuple[bool, bool]:
+    """Apply the RTK block to ``container["systemMessage"]`` in place.
+
+    Returns ``(changed, ok)``:
+
+    * ``changed`` is ``True`` if the field was written (or rewritten) on this
+      call. ``False`` for idempotent skips and for refusals.
+    * ``ok`` is ``True`` for "RTK guidance is now present (or refused-safely)",
+      ``False`` only for refusals where the user must intervene. Callers
+      surface ``not ok`` as a warning to the user.
+
+    Refusal cases (loud, no silent overwrite):
+
+    * ``systemMessage`` exists and is **not a string** (dict / list / number).
+      We never clobber user data of an unknown shape. The user must remove or
+      clear the field before re-running.
+    """
+    existing_msg = container.get("systemMessage")
+
+    if isinstance(existing_msg, str) and _RTK_MARKER in existing_msg:
+        if verbose:
+            click.echo(f"  rtk instructions already in {location_label}")
+        return False, True
+
+    if existing_msg is None or (isinstance(existing_msg, str) and not existing_msg.strip()):
+        container["systemMessage"] = RTK_INSTRUCTIONS_BLOCK
+        return True, True
+
+    if isinstance(existing_msg, str):
+        container["systemMessage"] = existing_msg.rstrip() + "\n\n" + RTK_INSTRUCTIONS_BLOCK
+        return True, True
+
+    # Non-string, non-null value present — refuse loudly. We will not clobber
+    # user data of unknown shape.
+    click.echo(
+        f"  Warning: {location_label} systemMessage is not a string "
+        f"(type={type(existing_msg).__name__}); refusing to overwrite. "
+        "To opt in, remove or clear the existing systemMessage value and re-run."
+    )
+    return False, False
+
+
 def _inject_continue_rtk_systemmessage(config_file: Path, verbose: bool = False) -> bool:
     """Inject the rtk instructions block into Continue's ``.continue/config.json``.
 
-    Continue's schema supports a top-level ``systemMessage`` string applied to
-    every model. We treat the RTK marker as the idempotency token: if a prior
-    ``systemMessage`` already contains the ``<!-- headroom:rtk-instructions -->``
-    marker we leave it alone. Otherwise we either set the field (if absent) or
-    append the rtk block to the existing string with a separator.
+    Continue's schema supports both a top-level ``systemMessage`` string and a
+    per-model ``systemMessage`` on each entry in the ``models`` array. The
+    per-model value, when set, overrides the top-level one — so users with
+    per-model configs would otherwise silently get no RTK guidance. This
+    helper writes the RTK block into **every** ``systemMessage`` site:
+
+    * top-level ``systemMessage``
+    * each ``models[i].systemMessage`` where ``models[i]`` is a dict
+
+    The RTK marker (``<!-- headroom:rtk-instructions -->``) is the idempotency
+    token: if a prior ``systemMessage`` already contains the marker we leave
+    that site alone. If the existing value is a non-empty string we append
+    with a separator. If the existing value is **non-string** (dict / list /
+    number) we refuse loudly and leave it untouched — we do not clobber user
+    data of unknown shape. To opt in to overwrite, the user must clear the
+    existing value first.
 
     The config file is read/written as JSON. Malformed JSON is left untouched
-    and the helper returns ``False`` — we do not silently overwrite user data.
-    Returns ``True`` if the instructions were successfully written or already
-    present.
+    and the helper returns ``False``. Note: Continue's modern config is
+    YAML-first; users on the YAML schema should configure systemMessage
+    through that file instead — this helper only handles the JSON variant.
+
+    Returns ``True`` if injection succeeded (or was already idempotent at
+    every site); ``False`` if any site refused or the file was malformed.
     """
     if config_file.exists():
         try:
@@ -1035,21 +1115,41 @@ def _inject_continue_rtk_systemmessage(config_file: Path, verbose: bool = False)
     else:
         data = {}
 
-    existing_msg = data.get("systemMessage")
-    if isinstance(existing_msg, str) and _RTK_MARKER in existing_msg:
-        if verbose:
-            click.echo(f"  rtk instructions already in {config_file.name}")
-        return True
+    any_changed = False
+    all_ok = True
 
-    if isinstance(existing_msg, str) and existing_msg.strip():
-        data["systemMessage"] = existing_msg.rstrip() + "\n\n" + RTK_INSTRUCTIONS_BLOCK
-    else:
-        data["systemMessage"] = RTK_INSTRUCTIONS_BLOCK
+    # 1. Top-level systemMessage.
+    changed, ok = _apply_rtk_to_systemmessage_field(
+        data, location_label=f"{config_file.name} (top-level)", verbose=verbose
+    )
+    any_changed = any_changed or changed
+    all_ok = all_ok and ok
 
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    config_file.write_text(json.dumps(data, indent=2) + "\n")
-    click.echo(f"  rtk instructions injected into {config_file}")
-    return True
+    # 2. Per-model systemMessage. Continue's models[] entry overrides the
+    # top-level value when set, so we must visit each one.
+    models = data.get("models")
+    if isinstance(models, list):
+        for idx, model in enumerate(models):
+            if not isinstance(model, dict):
+                continue
+            label = f"{config_file.name} models[{idx}]"
+            if isinstance(model.get("title"), str):
+                label = f"{config_file.name} models[{idx}] ({model['title']})"
+            changed_i, ok_i = _apply_rtk_to_systemmessage_field(
+                model, location_label=label, verbose=verbose
+            )
+            any_changed = any_changed or changed_i
+            all_ok = all_ok and ok_i
+
+    if any_changed:
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(json.dumps(data, indent=2) + "\n")
+        click.echo(f"  rtk instructions injected into {config_file}")
+    elif all_ok and verbose:
+        # Idempotent re-run with no refusals — nothing to do.
+        click.echo(f"  rtk instructions already present in {config_file.name}")
+
+    return all_ok
 
 
 def _resolve_copilot_provider_type(backend: str | None, provider_type: str) -> str:
@@ -2728,21 +2828,39 @@ def cline(
     the API Base URL to point at the local Headroom proxy.
 
     \b
+    Uninstall: there is no ``headroom unwrap cline`` subcommand. To remove the
+    injected guidance, hand-edit ``.clinerules`` at the project root and
+    delete everything between ``<!-- headroom:rtk-instructions -->`` and
+    ``<!-- /headroom:rtk-instructions -->`` (inclusive). If ``lean-ctx`` mode
+    is selected, the lean-ctx agent name ``cline`` may not be recognized by
+    the local lean-ctx binary; a warning is printed in that case and setup
+    is skipped silently.
+
+    \b
     Examples:
         headroom wrap cline                  # Start proxy + .clinerules instructions
         headroom wrap cline --no-context-tool # Proxy only, no CLI context tool
         headroom wrap cline --port 9999      # Custom proxy port
     """
-    if not no_rtk:
-        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-            click.echo("  Setting up lean-ctx for Cline...")
-            _setup_lean_ctx_agent("cline", verbose=verbose)
-        else:
-            click.echo("  Setting up rtk for Cline...")
-            rtk_path = _ensure_rtk_binary(verbose=verbose)
-            if rtk_path:
-                clinerules = Path.cwd() / ".clinerules"
-                _inject_rtk_instructions(clinerules, verbose=verbose)
+    # Pre-compute the marker path so the KeyboardInterrupt handler can report
+    # its location even if the interrupt fires before _inject_rtk_instructions
+    # returns (e.g., during the inner _ensure_rtk_binary download).
+    clinerules: Path | None = Path.cwd() / ".clinerules" if not no_rtk else None
+    try:
+        if not no_rtk:
+            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+                click.echo("  Setting up lean-ctx for Cline...")
+                _setup_lean_ctx_agent("cline", verbose=verbose)
+            else:
+                click.echo("  Setting up rtk for Cline...")
+                rtk_path = _ensure_rtk_binary(verbose=verbose)
+                if rtk_path and clinerules is not None:
+                    _inject_rtk_instructions(clinerules, verbose=verbose)
+    except KeyboardInterrupt:
+        _emit_wrap_interrupted(
+            "cline", clinerules if (clinerules and clinerules.exists()) else None
+        )
+        raise SystemExit(130) from None
 
     if prepare_only:
         return
@@ -2851,6 +2969,29 @@ def continue_dev(
     config file is overridable via --config.
 
     \b
+    Note: Continue's modern config is YAML-first (``.continue/config.yaml``).
+    This helper only writes the JSON variant. Users on the YAML schema should
+    configure ``systemMessage`` through that file by hand.
+
+    \b
+    Per-model handling: Continue overrides top-level ``systemMessage`` with
+    per-model ``systemMessage`` when set, so this command also injects into
+    each ``models[i].systemMessage`` if the ``models`` array is present.
+    Existing non-string ``systemMessage`` values are NEVER overwritten — the
+    command warns loudly and leaves them in place. To opt in, clear the
+    existing value first.
+
+    \b
+    Uninstall: there is no ``headroom unwrap continue`` subcommand. To remove
+    the injected guidance, hand-edit ``.continue/config.json`` and delete
+    everything between ``<!-- headroom:rtk-instructions -->`` and
+    ``<!-- /headroom:rtk-instructions -->`` (inclusive) from every
+    ``systemMessage`` field — both top-level and inside ``models[*]``. If
+    ``lean-ctx`` mode is selected, the lean-ctx agent name ``continue`` may
+    not be recognized by the local lean-ctx binary; a warning is printed in
+    that case and setup is skipped silently.
+
+    \b
     Examples:
         headroom wrap continue                # Start proxy + inject systemMessage
         headroom wrap continue --no-context-tool   # Proxy only
@@ -2859,15 +3000,19 @@ def continue_dev(
     """
     config_file = config_path or (Path.cwd() / ".continue" / "config.json")
 
-    if not no_rtk:
-        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-            click.echo("  Setting up lean-ctx for Continue...")
-            _setup_lean_ctx_agent("continue", verbose=verbose)
-        else:
-            click.echo("  Setting up rtk for Continue...")
-            rtk_path = _ensure_rtk_binary(verbose=verbose)
-            if rtk_path:
-                _inject_continue_rtk_systemmessage(config_file, verbose=verbose)
+    try:
+        if not no_rtk:
+            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+                click.echo("  Setting up lean-ctx for Continue...")
+                _setup_lean_ctx_agent("continue", verbose=verbose)
+            else:
+                click.echo("  Setting up rtk for Continue...")
+                rtk_path = _ensure_rtk_binary(verbose=verbose)
+                if rtk_path:
+                    _inject_continue_rtk_systemmessage(config_file, verbose=verbose)
+    except KeyboardInterrupt:
+        _emit_wrap_interrupted("continue", config_file if config_file.exists() else None)
+        raise SystemExit(130) from None
 
     if prepare_only:
         return
@@ -2978,23 +3123,42 @@ def goose(
     extra system context).
 
     \b
+    Uninstall: there is no ``headroom unwrap goose`` subcommand. To remove the
+    injected guidance, hand-edit ``.goosehints`` at the project root and
+    delete everything between ``<!-- headroom:rtk-instructions -->`` and
+    ``<!-- /headroom:rtk-instructions -->`` (inclusive). If ``lean-ctx`` mode
+    is selected, the lean-ctx agent name ``goose`` may not be recognized by
+    the local lean-ctx binary; a warning is printed in that case and setup
+    is skipped silently.
+
+    \b
     Examples:
         headroom wrap goose                          # Start proxy + context tool + goose
         headroom wrap goose -- session               # Start a Goose session
         headroom wrap goose -- --provider anthropic  # Pass args to goose
         headroom wrap goose --no-context-tool        # Skip CLI context-tool setup
     """
-    if not no_rtk:
-        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-            click.echo("  Setting up lean-ctx for Goose...")
-            _setup_lean_ctx_agent("goose", verbose=verbose)
-        else:
-            click.echo("  Setting up rtk for Goose...")
-            rtk_path = _ensure_rtk_binary(verbose=verbose)
-            if rtk_path:
-                # Goose reads .goosehints from the project root as extra context.
-                goosehints = Path.cwd() / ".goosehints"
-                _inject_rtk_instructions(goosehints, verbose=verbose)
+    # Pre-compute the marker path so the KeyboardInterrupt handler can report
+    # its location even if the interrupt fires before _inject_rtk_instructions
+    # returns (e.g., during the inner _ensure_rtk_binary download).
+    goosehints: Path | None = Path.cwd() / ".goosehints" if not no_rtk else None
+    try:
+        if not no_rtk:
+            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+                click.echo("  Setting up lean-ctx for Goose...")
+                _setup_lean_ctx_agent("goose", verbose=verbose)
+            else:
+                click.echo("  Setting up rtk for Goose...")
+                rtk_path = _ensure_rtk_binary(verbose=verbose)
+                if rtk_path and goosehints is not None:
+                    # Goose reads .goosehints from the project root as extra
+                    # context.
+                    _inject_rtk_instructions(goosehints, verbose=verbose)
+    except KeyboardInterrupt:
+        _emit_wrap_interrupted(
+            "goose", goosehints if (goosehints and goosehints.exists()) else None
+        )
+        raise SystemExit(130) from None
 
     if prepare_only:
         return
@@ -3088,18 +3252,41 @@ def openhands(
     on-disk OpenHands config is left untouched.
 
     \b
+    The ``OPENHANDS_INSTRUCTIONS`` value injected by this command contains the
+    ``<!-- headroom:rtk-instructions -->`` marker. To uninstall, simply do not
+    set ``OPENHANDS_INSTRUCTIONS`` in the parent shell — this command never
+    writes to disk, so nothing to clean up. If ``lean-ctx`` mode is selected,
+    the lean-ctx agent name ``openhands`` may not be recognized by the local
+    lean-ctx binary; a warning is printed in that case and rtk-style guidance
+    falls through.
+
+    \b
     Examples:
         headroom wrap openhands                # Start proxy + context tool + openhands
         headroom wrap openhands -- --task ...  # Pass args to openhands
         headroom wrap openhands --no-context-tool
     """
-    if not no_rtk:
-        if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
-            click.echo("  Setting up lean-ctx for OpenHands...")
-            _setup_lean_ctx_agent("openhands", verbose=verbose)
-        else:
-            click.echo("  Setting up rtk for OpenHands...")
-            _ensure_rtk_binary(verbose=verbose)
+    rtk_path: Path | None = None
+    try:
+        if not no_rtk:
+            if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
+                click.echo("  Setting up lean-ctx for OpenHands...")
+                _setup_lean_ctx_agent("openhands", verbose=verbose)
+            else:
+                click.echo("  Setting up rtk for OpenHands...")
+                rtk_path = _ensure_rtk_binary(verbose=verbose)
+                if not rtk_path:
+                    click.echo(
+                        "  Error: rtk install failed; refusing to inject "
+                        "OPENHANDS_INSTRUCTIONS without rtk. Install rtk "
+                        "manually and re-run, or pass --no-context-tool to "
+                        "skip rtk."
+                    )
+                    raise SystemExit(1)
+    except KeyboardInterrupt:
+        # openhands never writes to disk — no marker file to flag.
+        _emit_wrap_interrupted("openhands", None)
+        raise SystemExit(130) from None
 
     if prepare_only:
         return
@@ -3118,14 +3305,15 @@ def openhands(
     env["ANTHROPIC_BASE_URL"] = anthropic_base
     # Also set LLM_BASE_URL for OpenHands' generic LLM provider config.
     env["LLM_BASE_URL"] = openai_base
-    if not no_rtk:
+    if not no_rtk and rtk_path:
         # Inject rtk guidance via env var so OpenHands picks it up as the
-        # session's instruction prefix. Appending instead of overwriting any
-        # pre-existing OPENHANDS_INSTRUCTIONS so user-supplied instructions are
-        # preserved.
+        # session's instruction prefix. Appending instead of overwriting
+        # any pre-existing OPENHANDS_INSTRUCTIONS so user-supplied content
+        # is preserved. The marker check guards against double-injection
+        # when the user inherits an env var that already has the rtk block.
         existing_instructions = env.get("OPENHANDS_INSTRUCTIONS", "")
         if _RTK_MARKER in existing_instructions:
-            # Already injected (re-invocation in the same shell session).
+            # Already injected — pre-existing env var contains marker.
             pass
         elif existing_instructions.strip():
             env["OPENHANDS_INSTRUCTIONS"] = (

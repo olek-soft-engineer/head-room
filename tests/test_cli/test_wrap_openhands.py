@@ -173,3 +173,86 @@ def test_wrap_openhands_no_context_tool_does_not_inject(
     env = captured["env"]
     assert isinstance(env, dict)
     assert "OPENHANDS_INSTRUCTIONS" not in env or env["OPENHANDS_INSTRUCTIONS"] == ""
+
+
+# ---------------------------------------------------------------------------
+# M3: rtk install failure must fail loudly — no silent fallback to env
+# injection without rtk on disk.
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_openhands_rtk_install_failure_aborts_loudly(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If rtk install fails, command must exit non-zero with a clear error."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("OPENHANDS_INSTRUCTIONS", raising=False)
+
+    launch_called: list[bool] = []
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        launch_called.append(True)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="openhands"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=None):
+                result = runner.invoke(main, ["wrap", "openhands"])
+
+    assert result.exit_code == 1
+    assert "rtk install failed" in result.output
+    assert "--no-context-tool" in result.output
+    # _launch_tool must NOT have been invoked when rtk install fails.
+    assert launch_called == []
+
+
+def test_wrap_openhands_rtk_install_failure_with_no_context_tool_still_launches(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--no-context-tool bypasses rtk entirely — should still launch."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENHANDS_INSTRUCTIONS", raising=False)
+
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with patch.object(wrap_mod.shutil, "which", return_value="openhands"):
+        with patch.object(wrap_mod, "_launch_tool", side_effect=fake_launch_tool):
+            with patch.object(wrap_mod, "_ensure_rtk_binary", return_value=None) as ensure:
+                result = runner.invoke(main, ["wrap", "openhands", "--no-context-tool"])
+
+    assert result.exit_code == 0, result.output
+    # rtk should never have been queried.
+    ensure.assert_not_called()
+    env = captured["env"]
+    assert "OPENHANDS_INSTRUCTIONS" not in env or env["OPENHANDS_INSTRUCTIONS"] == ""
+
+
+# ---------------------------------------------------------------------------
+# M4: Ctrl-C during prelude emits a clear "no on-disk changes" message.
+# openhands never writes to disk (env-var injection only).
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_openhands_keyboardinterrupt_during_prelude_emits_clear_message(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl-C during the prelude must signal cleanly with no on-disk artifact."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+    monkeypatch.delenv("OPENHANDS_INSTRUCTIONS", raising=False)
+
+    with patch.object(wrap_mod, "_ensure_rtk_binary", side_effect=KeyboardInterrupt):
+        result = runner.invoke(main, ["wrap", "openhands"])
+
+    assert result.exit_code == 130
+    assert "interrupted" in result.output.lower()
+    assert "idempotent" in result.output.lower()

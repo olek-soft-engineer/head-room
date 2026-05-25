@@ -115,3 +115,34 @@ def test_wrap_goose_no_context_tool_skips_goosehints(
     assert result.exit_code == 0, result.output
     assert not (tmp_path / ".goosehints").exists()
     ensure.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# M4: Ctrl-C during prelude.
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_goose_keyboardinterrupt_during_prelude_emits_clear_message(
+    runner: CliRunner,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl-C between marker injection and proxy start must signal clearly."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("HEADROOM_CONTEXT_TOOL", raising=False)
+
+    def raise_kbd(*args, **kwargs):  # noqa: ANN002, ANN003
+        # Simulate Ctrl-C after the prelude wrote .goosehints but before the
+        # tool was launched. The marker file exists on disk.
+        marker_path = tmp_path / ".goosehints"
+        marker_path.write_text(wrap_mod.RTK_INSTRUCTIONS_BLOCK)
+        raise KeyboardInterrupt
+
+    with patch.object(wrap_mod, "_ensure_rtk_binary", side_effect=raise_kbd):
+        result = runner.invoke(main, ["wrap", "goose", "--prepare-only"])
+
+    assert result.exit_code == 130
+    assert "interrupted" in result.output.lower()
+    assert "idempotent" in result.output.lower()
+    assert (tmp_path / ".goosehints").exists()
+    assert ".goosehints" in result.output
