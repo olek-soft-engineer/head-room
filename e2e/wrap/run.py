@@ -26,6 +26,14 @@ CODEX_PORT = 28888
 AIDER_PORT = 28889
 CURSOR_PORT = 28890
 OPENCLAW_PROXY_PORT = 28891
+# Phase G PR-G1: new wrap subcommands. Smoke-tested via --prepare-only since
+# their CLIs may not exist on the e2e image and the wrap commands without
+# --prepare-only block on the proxy. The wiring is otherwise covered by the
+# unit tests in tests/test_cli/test_wrap_{cline,continue,goose,openhands}.py.
+CLINE_PORT = 28892
+CONTINUE_PORT = 28893
+GOOSE_PORT = 28894
+OPENHANDS_PORT = 28895
 
 
 def log(message: str) -> None:
@@ -697,6 +705,71 @@ def verify_cursor_wrap(base_env: dict[str, str], project_dir: Path) -> None:
         stop_process(proc)
 
 
+def verify_cline_wrap(base_env: dict[str, str], project_dir: Path) -> None:
+    """Smoke test: `wrap cline --prepare-only` writes RTK guidance to .clinerules."""
+    run(
+        ["headroom", "wrap", "cline", "--prepare-only", "--port", str(CLINE_PORT)],
+        env=base_env,
+        cwd=project_dir,
+        timeout=60,
+    )
+    clinerules = project_dir / ".clinerules"
+    assert_true(clinerules.exists(), "Cline wrap should create .clinerules")
+    assert_true(
+        RTK_MARKER in clinerules.read_text(encoding="utf-8"),
+        "Cline wrap should inject RTK instructions",
+    )
+
+
+def verify_continue_wrap(base_env: dict[str, str], project_dir: Path) -> None:
+    """Smoke test: `wrap continue --prepare-only` injects RTK into .continue/config.json."""
+    run(
+        ["headroom", "wrap", "continue", "--prepare-only", "--port", str(CONTINUE_PORT)],
+        env=base_env,
+        cwd=project_dir,
+        timeout=60,
+    )
+    config_file = project_dir / ".continue" / "config.json"
+    assert_true(config_file.exists(), "Continue wrap should create .continue/config.json")
+    data = json.loads(config_file.read_text(encoding="utf-8"))
+    system_message = data.get("systemMessage", "")
+    assert_true(
+        RTK_MARKER in system_message,
+        "Continue wrap should inject RTK instructions into systemMessage",
+    )
+
+
+def verify_goose_wrap(base_env: dict[str, str], project_dir: Path) -> None:
+    """Smoke test: `wrap goose --prepare-only` writes RTK guidance to .goosehints."""
+    run(
+        ["headroom", "wrap", "goose", "--prepare-only", "--port", str(GOOSE_PORT)],
+        env=base_env,
+        cwd=project_dir,
+        timeout=60,
+    )
+    goosehints = project_dir / ".goosehints"
+    assert_true(goosehints.exists(), "Goose wrap should create .goosehints")
+    assert_true(
+        RTK_MARKER in goosehints.read_text(encoding="utf-8"),
+        "Goose wrap should inject RTK instructions",
+    )
+
+
+def verify_openhands_wrap(base_env: dict[str, str], project_dir: Path) -> None:
+    """Smoke test: `wrap openhands --prepare-only` exits clean and ensures rtk is present.
+
+    OpenHands wires instructions via the OPENHANDS_INSTRUCTIONS env var at launch
+    time (no on-disk artifact), so --prepare-only just exercises the rtk-binary
+    setup path. The env-var wiring is covered by the unit tests.
+    """
+    run(
+        ["headroom", "wrap", "openhands", "--prepare-only", "--port", str(OPENHANDS_PORT)],
+        env=base_env,
+        cwd=project_dir,
+        timeout=60,
+    )
+
+
 def verify_openclaw_wrap(
     base_env: dict[str, str],
     project_dir: Path,
@@ -827,6 +900,10 @@ def main() -> None:
             verify_codex_wrap(base_env, project_dir, log_dir, mock_server)
             verify_aider_wrap(base_env, project_dir, log_dir)
             verify_cursor_wrap(base_env, project_dir)
+            verify_cline_wrap(base_env, project_dir)
+            verify_continue_wrap(base_env, project_dir)
+            verify_goose_wrap(base_env, project_dir)
+            verify_openhands_wrap(base_env, project_dir)
             local_plugin_dir = prepare_local_openclaw_plugin(base_env, tmp_dir)
             verify_openclaw_wrap(base_env, project_dir, local_plugin_dir)
         finally:
