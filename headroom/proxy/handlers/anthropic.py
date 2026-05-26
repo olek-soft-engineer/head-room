@@ -38,6 +38,64 @@ class AnthropicHandlerMixin:
     """Mixin providing Anthropic API handler methods for HeadroomProxy."""
 
     @staticmethod
+    def _resolve_ccr_workspace(
+        request: Any,
+        body: Any,
+    ) -> tuple[str, str | None]:
+        """Resolve (workspace_key, workspace_label) for CCR scoping.
+
+        Uses the same ``ProjectResolver`` the memory subsystem uses
+        (``headroom/memory/storage_router.py``) so CCR and memory always
+        agree on which project a request belongs to. Tier order matches:
+        ``x-headroom-project-id`` → ``x-headroom-cwd`` → CLI override →
+        ``cwd:`` line in the system prompt.
+
+        Returns:
+            ``(workspace_key, workspace_label)``. If no signal yields a
+            project, returns ``("", None)`` — the empty key is the
+            fail-closed signal that callers gate on (skipping
+            ``track_compression`` and ``analyze_query`` entirely
+            rather than tracking under an empty workspace which would
+            create un-matchable entries).
+
+        See also: the 2026-05-26 cross-project leak report which
+        motivated this scoping (Python content from project ``tamag0``
+        surfaced inside a Ruby ``daphni-rails`` session).
+        """
+        from headroom.memory.storage_router import (
+            ProjectResolver,
+        )
+        from headroom.memory.storage_router import (
+            RequestContext as _CtxFor,
+        )
+        from headroom.memory.storage_router import (
+            extract_system_prompt as _extract_sys_prompt,
+        )
+
+        try:
+            ctx = _CtxFor(
+                headers=dict(request.headers),
+                system_prompt=_extract_sys_prompt(body),
+                base_user_id=request.headers.get("x-headroom-user-id", ""),
+                project_root_override=None,
+            )
+            ident = ProjectResolver().resolve(ctx)
+        except Exception as exc:  # noqa: BLE001
+            # ProjectResolver is best-effort — log loudly and fail
+            # closed so a malformed request doesn't crash the proxy
+            # AND doesn't accidentally bypass the workspace filter.
+            logger.warning(
+                "event=ccr_workspace_resolve_failed error=%s; "
+                "CCR proactive expansion disabled for this request",
+                exc,
+            )
+            return "", None
+
+        if ident is None:
+            return "", None
+        return ident[0], ident[1]
+
+    @staticmethod
     def _tool_sort_key(tool: dict[str, Any]) -> tuple[str, str]:
         """Deterministic sort key for Anthropic/OpenAI-style tool definitions."""
         name = (
@@ -1229,9 +1287,25 @@ class AnthropicHandlerMixin:
                             f"hashes_seen={len(injector.detected_hashes)})"
                         )
 
+                # CCR workspace scoping: resolve a stable project identity
+                # for the request once and reuse it for both track_compression
+                # AND analyze_query. The shared `self.ccr_context_tracker`
+                # is process-global across all sessions/projects served by
+                # this proxy; without this gate, Project A's compressed
+                # sample content keyword-matches Project B's later query
+                # and gets surfaced as "relevant" — see
+                # `headroom/ccr/context_tracker.py` module docstring for
+                # the 2026-05-26 leak report (Python from tamag0
+                # injected into a daphni-rails Ruby session).
+                ccr_workspace_key, ccr_workspace_label = self._resolve_ccr_workspace(request, body)
+
                 if injector.has_compressed_content:
-                    # Track compression in context tracker for multi-turn awareness
-                    if self.ccr_context_tracker:
+                    # Track compression in context tracker for multi-turn awareness.
+                    # Gated on a resolved workspace: tracking under an empty
+                    # workspace would create entries that the workspace-filter
+                    # in analyze_query can never match. Fail-closed per
+                    # `feedback_no_silent_fallbacks`.
+                    if self.ccr_context_tracker and ccr_workspace_key:
                         self._turn_counter += 1
                         for hash_key in injector.detected_hashes:
                             # Get compression metadata from store
@@ -1244,12 +1318,24 @@ class AnthropicHandlerMixin:
                                     tool_name=entry.get("tool_name"),
                                     original_count=entry.get("original_item_count", 0),
                                     compressed_count=entry.get("compressed_item_count", 0),
+                                    workspace_key=ccr_workspace_key,
                                     query_context=entry.get("query_context", ""),
                                     sample_content=entry.get("compressed_content", "")[:500],
                                 )
+                    elif self.ccr_context_tracker and not ccr_workspace_key:
+                        logger.info(
+                            f"[{request_id}] CCR: workspace unresolved; skipping "
+                            "track_compression (fail-closed — no x-headroom-cwd / "
+                            "x-headroom-project-id header and no cwd: in system prompt)"
+                        )
 
-            # CCR Proactive Expansion: Check if current query needs expanded context
-            if self.ccr_context_tracker and self.config.ccr_proactive_expansion:
+            # CCR Proactive Expansion: Check if current query needs expanded context.
+            # Same workspace gate as track_compression above.
+            if (
+                self.ccr_context_tracker
+                and self.config.ccr_proactive_expansion
+                and ccr_workspace_key
+            ):
                 # Extract user query from messages
                 user_query = ""
                 for msg in reversed(messages):
@@ -1266,14 +1352,19 @@ class AnthropicHandlerMixin:
 
                 if user_query:
                     recommendations = self.ccr_context_tracker.analyze_query(
-                        user_query, self._turn_counter
+                        user_query,
+                        self._turn_counter,
+                        workspace_key=ccr_workspace_key,
                     )
                     if recommendations:
                         expansions = self.ccr_context_tracker.execute_expansions(recommendations)
                         if expansions:
-                            # Add expanded context to the system message or as additional context
+                            # Add expanded context to the system message or as additional context.
+                            # Pass workspace_label so the injected block declares its provenance
+                            # — symmetric with the memory-injection block header.
                             expansion_text = self.ccr_context_tracker.format_expansions_for_context(
-                                expansions
+                                expansions,
+                                workspace_label=ccr_workspace_label,
                             )
                             logger.info(
                                 f"[{request_id}] CCR: Proactively expanded {len(expansions)} context(s) "

@@ -345,3 +345,89 @@ def test_anthropic_assistant_message_helper_requires_assistant_role() -> None:
     assert AnthropicHandlerMixin._assistant_message_from_response_json(
         {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
     ) == {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+
+
+# ============================================================================
+# CCR workspace resolution (cross-project leak fix, 2026-05-26).
+#
+# These tests pin the `_resolve_ccr_workspace` static helper that the
+# anthropic handler uses to scope the proactive-expansion cache by
+# project identity. The resolver shares its tier order with the memory
+# subsystem's ProjectResolver: x-headroom-project-id → x-headroom-cwd →
+# system-prompt `cwd:` line. Returns `("", None)` on no signal — the
+# fail-closed signal that callers gate on.
+# ============================================================================
+
+
+def _fake_request(headers: dict[str, str]) -> SimpleNamespace:
+    """Minimal Starlette/FastAPI-shaped request object for resolver tests."""
+    return SimpleNamespace(headers=headers)
+
+
+def test_resolve_ccr_workspace_explicit_project_id_wins() -> None:
+    """x-headroom-project-id is the highest-priority signal."""
+    request = _fake_request({"x-headroom-project-id": "my-cool-project"})
+    body = {}
+    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    assert key == "my-cool-project"
+    assert label == "my-cool-project"
+
+
+def test_resolve_ccr_workspace_cwd_header() -> None:
+    """x-headroom-cwd produces a stable per-cwd key + basename label."""
+    request = _fake_request({"x-headroom-cwd": "/home/user/code/daphni-rails"})
+    body = {}
+    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    # Key format: "{basename}-{sha256[:16]}" — stable per absolute cwd.
+    assert key.startswith("daphni-rails-")
+    assert len(key) >= len("daphni-rails-") + 16
+    assert label == "daphni-rails"
+
+
+def test_resolve_ccr_workspace_two_cwds_get_distinct_keys() -> None:
+    """Two different cwds produce different workspace keys (cross-leak prevention)."""
+    key_a, _ = AnthropicHandlerMixin._resolve_ccr_workspace(
+        _fake_request({"x-headroom-cwd": "/home/user/code/daphni-rails"}), {}
+    )
+    key_b, _ = AnthropicHandlerMixin._resolve_ccr_workspace(
+        _fake_request({"x-headroom-cwd": "/home/user/code/tamag0"}), {}
+    )
+    assert key_a != key_b, "different cwds must yield different workspace keys"
+
+
+def test_resolve_ccr_workspace_no_signal_returns_empty() -> None:
+    """No project-id, no cwd header, no system prompt → fail-closed signal."""
+    request = _fake_request({})
+    body = {}
+    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    assert key == ""
+    assert label is None
+
+
+def test_resolve_ccr_workspace_system_prompt_cwd_fallback() -> None:
+    """System prompt with `cwd:` line is the lowest-tier fallback."""
+    request = _fake_request({})
+    body = {
+        "system": [{"type": "text", "text": "You are helpful.\ncwd: /home/u/code/my-project\nGo."}]
+    }
+    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    # The label is the basename of the cwd extracted from the prompt.
+    assert label == "my-project"
+    assert key.startswith("my-project-")
+
+
+def test_resolve_ccr_workspace_malformed_request_returns_empty() -> None:
+    """A request whose headers attribute can't be dict()-ed fails closed, not crashes."""
+
+    class _BrokenHeaders:
+        def __iter__(self):
+            raise RuntimeError("boom")
+
+    request = SimpleNamespace(headers=_BrokenHeaders())
+    body = {}
+    # The helper catches the exception, logs it, and returns the fail-
+    # closed sentinel ("", None). Critically, it does NOT raise — the
+    # proxy must continue serving the request even if CCR scoping fails.
+    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    assert key == ""
+    assert label is None
