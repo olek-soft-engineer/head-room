@@ -916,3 +916,159 @@ def test_release_workflow_runs_dry_run_on_pull_request() -> None:
         "must not be cancelled — partial PyPI/Docker state is worse than "
         "a slow CI queue)."
     )
+
+
+def test_release_yml_triggers_on_release_published_not_every_push_to_main() -> None:
+    """release.yml fires when release-please publishes a release, not per main push.
+
+    The prior trigger (`push: branches: [main]`) caused a fresh wheel
+    matrix to be uploaded to PyPI for every merged `fix:`/`feat:` PR.
+    PyPI enforces a 10 GiB per-project storage quota and the project
+    breached it in May 2026 (publish-pypi failing on every main merge
+    from PR #482 forward). The fix routes releases through
+    release-please's release-PR pattern: bot opens/maintains a
+    `chore: release vX.Y.Z` PR aggregating conventional-commit traffic;
+    merging that PR creates the tag + GitHub Release; THAT release
+    event is what triggers this workflow.
+
+    Reverting to a per-push trigger would re-create the quota
+    blowup. This test fails any refactor that does so silently.
+    """
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    on_block_end = content.index("\nconcurrency:")
+    on_block = content[:on_block_end]
+
+    assert "\n  release:\n    types: [published]" in on_block, (
+        "release.yml must trigger on the `release: published` event so "
+        "release-please's release-PR merge is the only way to publish — "
+        "see .github/workflows/release-please.yml."
+    )
+    assert "\n  push:\n    branches: [main]" not in on_block, (
+        "release.yml MUST NOT trigger on every push to main. That pattern "
+        "burned PyPI's 10 GiB storage quota (one fresh wheel matrix per "
+        "merged PR). Route releases through release-please instead."
+    )
+
+
+def test_release_yml_resolves_manual_ver_from_release_tag() -> None:
+    """When fired by release event, MANUAL_VER must come from the release tag.
+
+    release_version.py defaults to deriving the next version from git
+    log + canonical pyproject.toml version. On a release-published
+    run, that derivation would re-bump past the version the bot just
+    tagged, producing wheels for the wrong version. The detect-version
+    job must read `github.event.release.tag_name` and strip the leading
+    `v` so the SemVer parser accepts it.
+    """
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    assert "Resolve MANUAL_VER from trigger" in content, (
+        "detect-version must include a step that resolves MANUAL_VER from "
+        "the trigger context (release.tag_name on release events; "
+        "inputs.version on workflow_dispatch)."
+    )
+    assert "RELEASE_TAG: ${{ github.event.release.tag_name }}" in content, (
+        "Resolver must read the tag from github.event.release.tag_name."
+    )
+    assert "${RELEASE_TAG#v}" in content, (
+        "Resolver must strip the leading 'v' from the release tag — "
+        "release_version.py's SemVer regex rejects 'v0.9.2'."
+    )
+    assert "MANUAL_VER: ${{ steps.manualver.outputs.value }}" in content, (
+        "Compute-version step must consume the resolver's output."
+    )
+
+
+def test_release_yml_preserves_release_please_notes_when_release_exists() -> None:
+    """create-release must not clobber release-please's auto-generated notes.
+
+    release-please creates the GitHub Release with an auto-generated
+    changelog body when its release PR merges. If create-release then
+    runs `gh release edit --notes-file .changelog.md`, the bot's
+    changelog gets overwritten with this workflow's full-history
+    fallback (which has no `--since` bound when MANUAL_VER is set
+    and previous_tag comes back empty). Keep the bot's notes intact;
+    only update title.
+    """
+    content = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    create_release_idx = content.index("\n  create-release:")
+    create_release_block = content[create_release_idx:]
+
+    assert 'gh release edit "$TAG" --title "$TITLE"\n' in create_release_block, (
+        "When the release already exists (release-please case), the edit "
+        "must only sync title — NOT pass --notes-file, which would "
+        "clobber the bot's auto-generated changelog."
+    )
+
+
+def test_release_please_workflow_exists_and_targets_main() -> None:
+    """The release-please bot workflow must be present and watch main."""
+    rp_path = ROOT / ".github" / "workflows" / "release-please.yml"
+    assert rp_path.exists(), (
+        "release-please.yml is the bot that opens/maintains the release "
+        "PR. Without it, no release ever fires (release.yml now only "
+        "triggers on the release event the bot emits)."
+    )
+
+    content = rp_path.read_text(encoding="utf-8")
+    assert "googleapis/release-please-action@v4" in content, (
+        "release-please.yml must use the v4 action — earlier versions "
+        "have different manifest semantics."
+    )
+    assert "branches: [main]" in content, (
+        "release-please.yml must watch main; that's where the bot reads "
+        "conventional-commit traffic to compute version bumps."
+    )
+    assert "config-file: .release-please-config.json" in content
+    assert "manifest-file: .release-please-manifest.json" in content
+    assert "pull-requests: write" in content, (
+        "Bot needs write permission to open/update its release PR."
+    )
+    assert "contents: write" in content, (
+        "Bot needs contents write to tag the release commit on merge."
+    )
+
+
+def test_release_please_config_and_manifest_are_present_and_consistent() -> None:
+    """Config and manifest must agree with pyproject.toml's version."""
+    import json
+
+    # tomllib is stdlib on 3.11+; tomli is the backport for 3.10 (which
+    # the project still supports per pyproject.toml `requires-python`).
+    # Matches the same fallback pattern in headroom/release_version.py.
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python 3.10 only
+        import tomli as tomllib  # type: ignore[no-redef]
+
+    manifest = json.loads((ROOT / ".release-please-manifest.json").read_text(encoding="utf-8"))
+    config = json.loads((ROOT / ".release-please-config.json").read_text(encoding="utf-8"))
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    # Manifest tracks current version per package; the root package must
+    # match pyproject.toml exactly. A drift here means the bot will
+    # propose a version bump from the wrong base.
+    assert manifest["."] == pyproject["project"]["version"], (
+        f"manifest['.'] ({manifest['.']}) must match "
+        f"pyproject.toml version ({pyproject['project']['version']}). "
+        "Update the manifest when you bump pyproject.toml manually, or "
+        "let release-please own both."
+    )
+
+    # Config: the root package must declare python release-type so the
+    # bot updates pyproject.toml.
+    root_pkg = config["packages"]["."]
+    assert root_pkg["release-type"] == "python"
+    assert root_pkg["package-name"] == "headroom-ai"
+
+    # extra-files: TypeScript SDK and openclaw plugin package.json
+    # files must be in lockstep with pyproject.toml.
+    extra_paths = {ef["path"] for ef in root_pkg.get("extra-files", [])}
+    assert "sdk/typescript/package.json" in extra_paths, (
+        "release-please must bump sdk/typescript/package.json so the npm "
+        "publish in release.yml ships the same version as the wheel."
+    )
+    assert "plugins/openclaw/package.json" in extra_paths, (
+        "release-please must bump plugins/openclaw/package.json so the "
+        "openclaw npm publish stays in sync."
+    )

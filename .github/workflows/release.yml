@@ -25,18 +25,15 @@ env:
   GH_PACKAGES_SKIP: "false"
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/publish.yml"
-      - "scripts/**"
-      - ".commitlintrc.json"
-      - ".actrc"
-      - ".actrc.local.example"
-      - ".env.act.example"
-      - ".github/act/**"
+  # Triggered when release-please's release PR is merged: the bot
+  # tags the merge commit `vX.Y.Z` and creates a GitHub Release on
+  # that tag, which fires the `release: published` event. Ordinary
+  # pushes to main no longer trigger publishes — that was the old
+  # behavior that burned PyPI's per-project storage quota by
+  # uploading a fresh wheel matrix (~200 MB) per merged fix/feat PR.
+  # See .github/workflows/release-please.yml for the PR-aggregator.
+  release:
+    types: [published]
   # X2: PR-time release dry-run. Trigger on PRs that touch release-
   # critical paths so the wheel matrix + smoke-import gate run BEFORE
   # merge — not after the tag is pushed and main is broken. Path
@@ -91,12 +88,35 @@ jobs:
         with:
           fetch-depth: 0
 
+      # When fired by release-please's release event, the tag the
+      # bot just published IS the canonical version for this run —
+      # release_version.py's git-log derivation would re-bump it.
+      # workflow_dispatch still honors `inputs.version`; PR dry-runs
+      # leave MANUAL_VER empty and the script computes normally.
+      - name: Resolve MANUAL_VER from trigger
+        id: manualver
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          MANUAL_INPUT: ${{ github.event.inputs.version }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            # github.event.release.tag_name is "vX.Y.Z" — strip the
+            # leading "v" so release_version.py's SemVer parser
+            # accepts it.
+            echo "value=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          elif [ -n "$MANUAL_INPUT" ]; then
+            echo "value=$MANUAL_INPUT" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Compute semantic version from canonical + release history
         id: ver
         run: |
           python headroom/release_version.py
         env:
-          MANUAL_VER: ${{ github.event.inputs.version }}
+          MANUAL_VER: ${{ steps.manualver.outputs.value }}
 
   # Single source of truth for changelog + npm packaging. Wheels are
   # built per-platform in `build-wheels` below. publish-pypi merges them.
@@ -888,7 +908,13 @@ jobs:
           TAG="v${{ needs.detect-version.outputs.version }}"
           TITLE="Release v${{ needs.detect-version.outputs.version }}"
           if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release edit "$TAG" --title "$TITLE" --notes-file .changelog.md
+            # Release already exists — typically created by
+            # release-please on release-PR merge with an auto-
+            # generated changelog body. Don't overwrite its notes
+            # (--notes-file would clobber them); only sync the
+            # title in case detect-version's canonical form differs
+            # from what the bot set.
+            gh release edit "$TAG" --title "$TITLE"
           else
             gh release create "$TAG" --title "$TITLE" --notes-file .changelog.md
           fi
