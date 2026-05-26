@@ -252,3 +252,67 @@ def test_user_mode_partitions_by_user_id(tmp_path: Path) -> None:
         assert backend_alice is not backend_bob
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Unresolved-project fail-closed (incident 2026-05-26).
+#
+# When `mode=PROJECT` and `unresolved_project_fallback="empty"` (the new
+# default), an inbound request with no project-resolution signal
+# (x-headroom-project-id / x-headroom-cwd / system-prompt cwd:) must
+# return None from search_and_format_context — NOT silently pool the
+# request's memory into the GLOBAL bucket. The old GLOBAL fallback was
+# what surfaced a memory from a prior unrelated TAM-550 session into
+# a live PR-review thread, where the agent misread it as a new command.
+# ---------------------------------------------------------------------------
+
+
+def test_unresolved_project_returns_no_context(tmp_path: Path) -> None:
+    """No project signals + PROJECT mode + empty fallback → no memory injection."""
+    cfg = MemoryConfig(
+        enabled=True,
+        backend="local",
+        db_path=str(tmp_path / "memory.db"),
+        inject_context=True,
+        mode=MemoryMode.AUTO_TAIL,
+        storage_mode=sr_mod.MemoryStorageMode.PROJECT,  # PROJECT mode triggers resolution.
+        # unresolved_project_fallback="empty" — the new default applied
+        # by MemoryHandler when building the BackendRouterConfig.
+    )
+    handler = MemoryHandler(cfg, agent_type="test")
+
+    async def run() -> None:
+        await handler._ensure_initialized()
+
+        # Request with NO project-resolution signal: no header, no cwd,
+        # no parseable system-prompt cwd: line.
+        ctx_unresolved = sr_mod.RequestContext(
+            headers={},  # No x-headroom-* headers.
+            system_prompt="You are helpful.",  # No env block.
+            base_user_id="alice",
+        )
+
+        # Seed a backend so search WOULD return something — to prove the
+        # gate is at the scope-resolution layer, not just an empty store.
+        for backend in _FakeBackend.instances:
+            backend.search_results = [
+                SimpleNamespace(
+                    memory=SimpleNamespace(
+                        id="should-not-leak", content="Stale prior content", metadata={}
+                    ),
+                    score=0.99,
+                    related_entities=[],
+                )
+            ]
+
+        msgs = [{"role": "user", "content": "Just a friendly hello"}]
+        context = await handler.search_and_format_context("alice", msgs, ctx_unresolved)
+
+        # Fail-closed: no memory injected even though backends have data.
+        assert context is None, (
+            "Unresolved project in PROJECT mode must skip injection — "
+            "incident on 2026-05-26 (TAM-550) was caused by the GLOBAL "
+            "fallback pooling prior-session content into a fresh thread."
+        )
+
+    asyncio.run(run())

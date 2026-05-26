@@ -207,14 +207,74 @@ def test_router_project_mode_two_cwds_two_paths(
     assert scope_b.display_name == "b"
 
 
-def test_router_project_mode_unresolved_falls_back_to_global(
+def test_router_project_mode_unresolved_fails_closed_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Default `unresolved_project_fallback='empty'` → fail-closed signal, NOT GLOBAL pool.
+
+    Updated 2026-05-26 from the prior GLOBAL-fallback assertion. The
+    silent GLOBAL pooling was the root cause of the TAM-550
+    "implémente X" cross-thread instruction misread (a memory from a
+    prior unrelated session ended up in the live user turn and got
+    treated as a new command). The new default is fail-closed: the
+    router still returns a ResolvedScope (so callers don't need to
+    handle None), but signals "no project" via
+    ``mode=PROJECT & project_key=None``. The memory handler reads
+    that sentinel and skips injection entirely.
+    """
     router = _make_router(tmp_path, MemoryStorageMode.PROJECT, monkeypatch)
+
+    _, scope = router.backend_for(_ctx(system_prompt="no env block"))
+    # Fail-closed signal: PROJECT mode preserved, project_key is None.
+    assert scope.mode is MemoryStorageMode.PROJECT
+    assert scope.project_key is None
+    assert scope.display_name == "unresolved (no memory)"
+
+
+def test_router_project_mode_unresolved_global_fallback_when_opted_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy GLOBAL pooling is reachable via opt-in config."""
+    monkeypatch.setattr(
+        "headroom.memory.storage_router.LocalBackend",
+        _FakeBackend,
+    )
+    cfg = BackendRouterConfig(
+        mode=MemoryStorageMode.PROJECT,
+        root_dir=tmp_path / "memories",
+        global_db_path=tmp_path / "memory.db",
+        max_open_backends=4,
+        backend_config_template=LocalBackendConfig(db_path=str(tmp_path / "memory.db")),
+        unresolved_project_fallback="global",
+    )
+    router = BackendRouter(cfg)
 
     _, scope = router.backend_for(_ctx(system_prompt="no env block"))
     assert scope.mode is MemoryStorageMode.GLOBAL
     assert scope.db_path == tmp_path / "memory.db"
+    assert scope.display_name == "global (unresolved)"
+
+
+def test_router_invalid_unresolved_fallback_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unknown values of `unresolved_project_fallback` fail loud, not silently."""
+    monkeypatch.setattr(
+        "headroom.memory.storage_router.LocalBackend",
+        _FakeBackend,
+    )
+    cfg = BackendRouterConfig(
+        mode=MemoryStorageMode.PROJECT,
+        root_dir=tmp_path / "memories",
+        global_db_path=tmp_path / "memory.db",
+        max_open_backends=4,
+        backend_config_template=LocalBackendConfig(db_path=str(tmp_path / "memory.db")),
+        unresolved_project_fallback="nonsense_value",
+    )
+    router = BackendRouter(cfg)
+
+    with pytest.raises(ValueError, match="not a recognised value"):
+        router.backend_for(_ctx(system_prompt="no env block"))
 
 
 def test_router_user_mode_partitions_by_user(
