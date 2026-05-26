@@ -1061,6 +1061,19 @@ def test_release_please_config_and_manifest_are_present_and_consistent() -> None
     assert root_pkg["release-type"] == "python"
     assert root_pkg["package-name"] == "headroom-ai"
 
+    # Tag format: existing tags in this repo are `vX.Y.Z`, NOT
+    # `headroom-ai-vX.Y.Z`. release-please's default for manifest
+    # configs prepends the component name; that would produce
+    # `headroom-ai-v0.22.4` and the bot would never find the existing
+    # `v0.22.3` baseline tag. include-component-in-tag MUST be false
+    # to keep tag format consistent with the project's pre-bot tags.
+    assert config.get("include-component-in-tag") is False, (
+        "include-component-in-tag must be false — existing tags are "
+        "`vX.Y.Z`, not `headroom-ai-vX.Y.Z`. Reverting this setting "
+        "would orphan every prior tag and produce a months-long "
+        "changelog because the bot can't find its baseline."
+    )
+
     # extra-files: TypeScript SDK and openclaw plugin package.json
     # files must be in lockstep with pyproject.toml.
     extra_paths = {ef["path"] for ef in root_pkg.get("extra-files", [])}
