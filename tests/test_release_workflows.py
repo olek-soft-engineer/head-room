@@ -1033,7 +1033,13 @@ def test_release_please_config_and_manifest_are_present_and_consistent() -> None
     """Config and manifest must agree with pyproject.toml's version."""
     import json
 
-    import tomllib
+    # tomllib is stdlib on 3.11+; tomli is the backport for 3.10 (which
+    # the project still supports per pyproject.toml `requires-python`).
+    # Matches the same fallback pattern in headroom/release_version.py.
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python 3.10 only
+        import tomli as tomllib  # type: ignore[no-redef]
 
     manifest = json.loads((ROOT / ".release-please-manifest.json").read_text(encoding="utf-8"))
     config = json.loads((ROOT / ".release-please-config.json").read_text(encoding="utf-8"))
