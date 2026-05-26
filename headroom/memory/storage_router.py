@@ -111,6 +111,22 @@ class BackendRouterConfig:
         backend_config_template: Template ``LocalBackendConfig`` to clone
             for each backend; only ``db_path`` / ``graph_db_path`` differ
             per project.
+        unresolved_project_fallback: Behavior when ``mode`` is PROJECT but
+            ``ProjectResolver.resolve()`` returns ``None`` (no header, no
+            CLI override, no ``cwd:`` in system prompt).
+
+            - ``"empty"`` (default, fail-closed): refuse to load any
+              memory for this request — return a sentinel scope whose
+              ``project_key`` is ``None`` and whose mode stays PROJECT.
+              The memory handler treats this as "no memory available"
+              and skips injection. Prevents the silent cross-project
+              pooling that surfaced on 2026-05-26 (an entry from a
+              prior TAM-550 session was misread as a live instruction
+              inside an unrelated thread).
+            - ``"global"`` (legacy opt-in): fall back to GLOBAL. ALL
+              unresolved-project traffic across ALL clients/projects
+              pools into one DB. Cross-project leak vector; opt in
+              only if you understand the trade-off.
     """
 
     mode: MemoryStorageMode
@@ -118,6 +134,7 @@ class BackendRouterConfig:
     global_db_path: Path
     max_open_backends: int = 16
     backend_config_template: LocalBackendConfig = field(default_factory=LocalBackendConfig)
+    unresolved_project_fallback: str = "empty"
 
 
 class ProjectResolver:
@@ -288,15 +305,44 @@ class BackendRouter:
         # PROJECT mode.
         ident = self._resolver.resolve(ctx)
         if ident is None:
-            logger.warning(
-                "event=memory_project_unresolved fallback=global user_id=%s",
-                ctx.base_user_id,
-            )
-            return ResolvedScope(
-                mode=MemoryStorageMode.GLOBAL,
-                db_path=self._config.global_db_path,
-                display_name="global (unresolved)",
-                project_key=None,
+            fallback = self._config.unresolved_project_fallback
+            if fallback == "empty":
+                # Fail-closed: refuse to load any memory for this
+                # request. The memory handler checks `scope.project_key
+                # is None` and skips injection rather than pooling this
+                # request into the GLOBAL bucket (which is what surfaced
+                # the TAM-550 cross-thread instruction misread on
+                # 2026-05-26 — a memory from a prior unrelated session
+                # got dropped into the live user turn and read as a
+                # command).
+                logger.warning(
+                    "event=memory_project_unresolved behavior=empty user_id=%s "
+                    "hint='set x-headroom-project-id or x-headroom-cwd header, "
+                    "or set memory.unresolved_project_fallback=global to opt-in "
+                    "to legacy cross-project GLOBAL pooling (cross-project leak risk).'",
+                    ctx.base_user_id,
+                )
+                return ResolvedScope(
+                    mode=MemoryStorageMode.PROJECT,
+                    db_path=self._config.global_db_path,  # Unused — caller checks project_key.
+                    display_name="unresolved (no memory)",
+                    project_key=None,
+                )
+            if fallback == "global":
+                logger.warning(
+                    "event=memory_project_unresolved behavior=global user_id=%s",
+                    ctx.base_user_id,
+                )
+                return ResolvedScope(
+                    mode=MemoryStorageMode.GLOBAL,
+                    db_path=self._config.global_db_path,
+                    display_name="global (unresolved)",
+                    project_key=None,
+                )
+            # Unknown config value — fail-loud per no-silent-fallbacks.
+            raise ValueError(
+                f"unresolved_project_fallback={fallback!r} is not a recognised value; "
+                "expected 'empty' or 'global'."
             )
 
         project_key, display_name = ident
