@@ -1,9 +1,9 @@
-ARG PYTHON_VERSION=3.11
-ARG UV_VERSION=0.6.17
-# Pinned 2026-04-15. Update via Dependabot or: docker pull python:3.11-slim
-ARG PYTHON_DIGEST=sha256:233de06753d30d120b1a3ce359d8d3be8bda78524cd8f520c99883bfe33964cf
-# Pinned 2026-04-15. Update via Dependabot or: docker pull gcr.io/distroless/python3-debian13
-ARG DISTROLESS_DIGEST=sha256:ed3a4beb46f8f8baac068743ba1b1f95ea3f793422129cf6dd23967f779b6018
+ARG PYTHON_VERSION=3.13
+ARG UV_VERSION=0.11.16
+# Pinned 2026-05-28. Update via Dependabot or: docker pull python:3.13-slim
+ARG PYTHON_DIGEST=sha256:b04b5d7233d2ad9c379e22ea8927cd1378cd15c60d4ef876c065b25ea8fb3bf3
+# Pinned 2026-05-28. Update via Dependabot or: docker pull gcr.io/distroless/python3-debian13
+ARG DISTROLESS_DIGEST=sha256:a156791331382d183a569c1714a6c5364d5402e622da5618005308c2adcb4a9c
 ARG DISTROLESS_IMAGE=gcr.io/distroless/python3-debian13
 ARG PYTHON_SITE_PACKAGES=/usr/local/lib/python${PYTHON_VERSION}/site-packages
 
