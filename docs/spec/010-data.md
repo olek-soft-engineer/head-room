@@ -93,9 +93,8 @@ CREATE TABLE compression_store (
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HEADROOM_DB_PATH` | `~/.headroom/` | Base path for databases |
-| `HEADROOM_DB_URL` | - | External database URL (overrides default) |
-| `HEADROOM_CACHE_PATH` | `~/.headroom/cache/` | Compression cache location |
+| `HEADROOM_WORKSPACE_DIR` | `~/.headroom` | Workspace root; all DBs live under this directory |
+| `HEADROOM_CONFIG_DIR` | `~/.headroom/config` | Config root (read-mostly: models.json, per-plugin config) |
 
 ### Cache
 
@@ -158,12 +157,12 @@ curl http://localhost:8787/stats
 tar -czf headroom-backup.tar.gz ~/.headroom/
 ```
 
-### External Database
+### Storage Location
 
-Set `HEADROOM_DB_URL` for external storage:
+Relocate all storage by setting the workspace root:
 
 ```bash
-export HEADROOM_DB_URL=postgresql://user:pass@host:5432/headroom
+export HEADROOM_WORKSPACE_DIR=/mnt/state
 ```
 
 ---
