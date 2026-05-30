@@ -345,36 +345,46 @@ class TestDecodeProjectPath:
         assert projects[0].name == "work"
         assert str(projects[0].project_path).startswith("C:")
 
-    def test_unix_username_with_dot_stays_single_component(
-        self, users_tmp: Path
-    ) -> None:
-        """Unix home dirs like /Users/first.last must not decode as /Users/first/last.
+    def test_home_dir_username_stays_single_component(self) -> None:
+        """A home-directory name must survive decoding as one component.
 
-        Claude Code flattens '.', '-' and '_' to '-' when escaping, so
-        /Users/first.last is stored as ``-Users-first-last-…``. The decoder used
-        to consume only the first token after ``Users`` as the home directory and
-        walk from ``/Users/first`` (which does not exist), so it bailed out and
-        callers fell back to the literal ``/Users/first/last`` — causing writes to
-        fail with ``PermissionError: '/Users/first'``. This is the Unix
-        counterpart of ``test_windows_username_with_dot_stays_single_component``.
+        Claude Code flattens ``/``, ``.``, ``-`` and ``_`` all to ``-`` when
+        escaping, so a project under ``/Users/first.last`` (or
+        ``/home/first.last``) is stored as ``-Users-first-last-…``. The decoder
+        used to consume only the first token after ``Users``/``home`` as the
+        home directory and walk from ``/Users/first`` (which does not exist), so
+        it bailed out and callers fell back to the literal
+        ``/Users/first/last`` — causing ``headroom learn --apply`` to fail with
+        ``PermissionError: '/Users/first'`` for usernames such as
+        ``first.last``. This is the Unix counterpart of
+        ``test_windows_username_with_dot_stays_single_component``.
 
-        Reproduces only when the test runner's home is itself a dotted/hyphenated
-        name under ``/Users`` (the decoder is rooted at the real ``/Users`` tree);
-        skipped otherwise.
+        Rooted at the real home so it exercises the ``Users``/``home`` branch on
+        both macOS (``/Users/…``) and Linux (``/home/…``); skipped when the home
+        directory is neither rooted there nor writable.
         """
-        import re
+        import shutil
 
         home = Path.home()
-        if not (str(home).startswith("/Users/") and ("." in home.name or "-" in home.name)):
-            pytest.skip("requires a dotted or hyphenated username under /Users")
+        if len(home.parts) < 3 or home.parts[1] not in ("Users", "home"):
+            pytest.skip("decoder branch only activates under /Users or /home")
 
-        project = users_tmp / "proj"
-        project.mkdir(parents=True)
+        base = home / f"pytest_headroom_{uuid4().hex}"
+        try:
+            base.mkdir()
+        except (PermissionError, OSError):
+            pytest.skip("home directory is not writable")
 
-        # Flatten separators exactly as Claude Code does when escaping a path.
-        encoded = "-" + re.sub(r"[-._/]", "-", str(project)[1:])
-        result = _decode_project_path(encoded)
+        try:
+            project = base / "my.project"
+            project.mkdir()
+
+            # Flatten separators exactly as Claude Code does when escaping.
+            encoded = "-" + str(project)[1:].replace("/", "-").replace(".", "-").replace("_", "-")
+            result = _decode_project_path(encoded)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
 
         assert result == project
-        assert f"/{home.name}/" in str(result)
-        assert f"/{home.name.split('.')[0]}/" not in str(result)
+        # The home component is reconstructed whole, never split on a separator.
+        assert home.name in result.parts
