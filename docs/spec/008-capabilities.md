@@ -58,9 +58,8 @@ class CCRConfig:
 
 **Configuration:**
 ```bash
-HEADROOM_SUMMARY_ENABLED=true
-HEADROOM_SUMMARY_THRESHOLD=5000  # tokens
-HEADROOM_SUMMARY_RATIO=0.3  # compress to 30%
+# Note: HEADROOM_SUMMARY_* env vars are not yet implemented.
+# Summary compression is currently configured programmatically only.
 ```
 
 **Behavior:**

@@ -66,16 +66,13 @@ curl http://localhost:8787/readyz
 
 ### Log Levels
 
-Set via environment:
+Set via CLI flag or `RUST_LOG` env var for the Rust proxy:
 ```bash
-HEADROOM_LOG_LEVEL=INFO
-```
+# Python proxy
+headroom proxy --log-level debug
 
-Or in config:
-```yaml
-logging:
-  level: INFO
-  format: json
+# Rust proxy
+RUST_LOG=debug headroom-proxy --upstream http://...
 ```
 
 ---
