@@ -199,12 +199,27 @@ def _ensure_copilot_hooks(path: Path, profile: str) -> None:
     _write_json(path, payload)
 
 
-def _replace_marker_block(content: str, marker_start: str, marker_end: str, block: str) -> str:
+def _replace_marker_block(
+    content: str, marker_start: str, marker_end: str, block: str, *, at_root: bool = False
+) -> str:
     if marker_start in content and marker_end in content:
         start = content.index(marker_start)
         end = content.index(marker_end) + len(marker_end)
         content = content[:start].rstrip() + "\n\n" + content[end:].lstrip()
-    return (content.rstrip() + "\n\n" + block.strip() + "\n").lstrip()
+    block = block.strip()
+    if at_root:
+        # The block carries top-level keys, so it must sit above the first table
+        # header; appended after a table (e.g. [features]) TOML scopes those keys
+        # into that table and Codex rejects the config (#260).
+        lines = content.splitlines()
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                head = "\n".join(lines[:index]).rstrip()
+                tail = "\n".join(lines[index:]).lstrip("\n")
+                prefix = f"{head}\n\n" if head else ""
+                return (f"{prefix}{block}\n\n{tail}").rstrip() + "\n"
+    return (content.rstrip() + "\n\n" + block + "\n").lstrip()
 
 
 def _strip_codex_init_block(content: str) -> str:
@@ -245,6 +260,8 @@ def _strip_codex_init_block(content: str) -> str:
 
 
 def _ensure_codex_provider(path: Path, port: int) -> None:
+    import re
+
     logger.debug("ensure codex provider block: %s (port=%s)", path, port)
     block = (
         f"{_CODEX_PROVIDER_MARKER_START}\n"
@@ -257,8 +274,15 @@ def _ensure_codex_provider(path: Path, port: int) -> None:
         f"{_CODEX_PROVIDER_MARKER_END}"
     )
     content = path.read_text(encoding="utf-8") if path.exists() else ""
+    # init owns model_provider/openai_base_url: drop any prior assignment (any
+    # value, including one an older version mis-scoped under a table) so we
+    # replace it instead of emitting a duplicate top-level key (#260).
+    content = re.sub(r"(?m)^[ \t]*model_provider[ \t]*=.*\r?\n", "", content)
+    content = re.sub(r"(?m)^[ \t]*openai_base_url[ \t]*=.*\r?\n", "", content)
+    # The provider block carries top-level keys (model_provider, openai_base_url),
+    # so it must land at the document root rather than after a trailing table (#260).
     content = _replace_marker_block(
-        content, _CODEX_PROVIDER_MARKER_START, _CODEX_PROVIDER_MARKER_END, block
+        content, _CODEX_PROVIDER_MARKER_START, _CODEX_PROVIDER_MARKER_END, block, at_root=True
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")

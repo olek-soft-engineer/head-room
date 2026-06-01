@@ -7,6 +7,11 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    import tomli as tomllib  # type: ignore[no-redef]
+
 import click
 import pytest
 from click.testing import CliRunner
@@ -438,6 +443,49 @@ def test_ensure_codex_provider_replaces_existing_marker(monkeypatch, tmp_path: P
     assert 'base_url = "http://127.0.0.1:9100/v1"' in content
     assert "old = true" not in content
     assert 'env_key = "OPENAI_API_KEY"' not in content
+
+
+def test_ensure_codex_provider_keeps_root_keys_above_existing_table(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#260: a config ending in a table must not capture the provider root keys.
+
+    Appending the block after a trailing [features] table scoped model_provider
+    under it, so Codex refused to start with
+    'invalid type: string "headroom", expected a boolean in features'.
+    """
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text("[features]\ncodex_hooks = true\n", encoding="utf-8")
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+    # model_provider belongs at the document root, not under [features].
+    assert parsed["model_provider"] == "headroom"
+    assert "model_provider" not in parsed["features"]
+    assert "openai_base_url" not in parsed["features"]
+    # The user's existing table is preserved.
+    assert parsed["features"]["codex_hooks"] is True
+    assert parsed["model_providers"]["headroom"]["base_url"] == "http://127.0.0.1:8787/v1"
+
+
+def test_ensure_codex_provider_replaces_existing_model_provider(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A pre-existing root model_provider is replaced, never duplicated (#260).
+
+    A second top-level model_provider key would be invalid TOML; init owns it.
+    """
+    init_cli, _ = _load_init_module(monkeypatch)
+    path = tmp_path / "config.toml"
+    path.write_text('model_provider = "openai"\n[features]\ncodex_hooks = true\n', encoding="utf-8")
+
+    init_cli._ensure_codex_provider(path, 8787)
+
+    parsed = tomllib.loads(path.read_text(encoding="utf-8"))  # raises on a duplicate key
+    assert parsed["model_provider"] == "headroom"
+    assert parsed["features"]["codex_hooks"] is True
 
 
 def test_ensure_codex_feature_flag_replaces_existing_marker(monkeypatch, tmp_path: Path) -> None:
