@@ -6,7 +6,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
 from typing import Any, TypedDict, cast
 from urllib.parse import quote
 
@@ -16,8 +15,6 @@ from fastapi.responses import Response
 from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
 
 logger = logging.getLogger("headroom.proxy.routes")
-
-_CODEX_MODELS_CACHE: dict[tuple[str, str], tuple[float, tuple[str, ...]]] = {}
 
 
 class OpenAIModelItem(TypedDict):
@@ -86,18 +83,6 @@ def _codex_client_version(requested_client_version: str | None = None) -> str:
     if requested_client_version:
         return requested_client_version
     return os.getenv("HEADROOM_CODEX_CLIENT_VERSION", "0.130.0")
-
-
-def _codex_models_cache_ttl_seconds() -> float:
-    raw_value = os.getenv("HEADROOM_CODEX_MODELS_CACHE_TTL_SECONDS", "300")
-    try:
-        return max(0.0, float(raw_value))
-    except ValueError:
-        logger.warning(
-            "Invalid HEADROOM_CODEX_MODELS_CACHE_TTL_SECONDS=%r; disabling Codex models cache",
-            raw_value,
-        )
-        return 0.0
 
 
 def _openai_model_item(model_id: str) -> OpenAIModelItem:
@@ -171,21 +156,7 @@ async def _fetch_chatgpt_codex_model_ids(
     requested_client_version: str | None,
 ) -> tuple[str, ...] | None:
     client_version = _codex_client_version(requested_client_version)
-    upstream_headers, account_id = _normalize_codex_registry_headers(headers)
-    cache_key = (account_id, client_version)
-    cache_ttl = _codex_models_cache_ttl_seconds()
-    now = time.monotonic()
-    cached = _CODEX_MODELS_CACHE.get(cache_key)
-    if cached is not None:
-        cached_at, cached_model_ids = cached
-        if cache_ttl > 0 and now - cached_at < cache_ttl:
-            logger.debug(
-                "Using cached Codex model IDs from upstream model registry: %s",
-                list(cached_model_ids),
-            )
-            return cached_model_ids
-        _CODEX_MODELS_CACHE.pop(cache_key, None)
-
+    upstream_headers, _account_id = _normalize_codex_registry_headers(headers)
     url = (
         "https://chatgpt.com/backend-api/codex/models"
         f"?client_version={quote(client_version, safe='')}"
@@ -222,8 +193,6 @@ async def _fetch_chatgpt_codex_model_ids(
             logger.warning("Codex model registry returned no model slugs")
             return None
 
-        if cache_ttl > 0:
-            _CODEX_MODELS_CACHE[cache_key] = (now, model_ids)
         logger.info("Fetched %d Codex models from upstream model registry", len(model_ids))
         logger.debug("Fetched Codex model IDs from upstream model registry: %s", list(model_ids))
         return model_ids

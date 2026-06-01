@@ -341,7 +341,6 @@ def test_gemini_batch_embed_contents_passthrough_uses_gemini_target(monkeypatch)
 
 def test_v1_models_fetches_codex_registry_under_chatgpt_auth(monkeypatch) -> None:
     monkeypatch.setenv("HEADROOM_CODEX_CLIENT_VERSION", "0.130.0")
-    monkeypatch.setenv("HEADROOM_CODEX_MODELS_CACHE_TTL_SECONDS", "0")
     proxy_routes = importlib.import_module("headroom.providers.proxy_routes")
     debug_messages: list[tuple[str, tuple[object, ...]]] = []
     monkeypatch.setattr(
@@ -424,8 +423,6 @@ def test_v1_models_falls_back_to_synthetic_list_under_chatgpt_auth(monkeypatch) 
     synthesize an OpenAI-compatible response with the known-supported
     Codex/ChatGPT model set instead, so Codex's model-picker refresh succeeds.
     """
-    monkeypatch.setenv("HEADROOM_CODEX_MODELS_CACHE_TTL_SECONDS", "0")
-
     class FakeAsyncClient:
         async def get(self, url, **kwargs):  # type: ignore[no-untyped-def]
             return httpx.Response(403, json={"error": "forbidden"})
@@ -458,13 +455,10 @@ def test_v1_models_falls_back_to_synthetic_list_under_chatgpt_auth(monkeypatch) 
         assert entry["owned_by"] == "openai"
 
 
-def test_v1_models_get_single_dynamic_under_chatgpt_auth(monkeypatch) -> None:
+def test_v1_models_get_single_dynamic_under_chatgpt_auth() -> None:
     """The single-model variant (`/v1/models/{id}`) is also called by
     Codex for some flows. It should use the Codex registry first so
     dynamically exposed model slugs validate consistently."""
-    monkeypatch.setenv("HEADROOM_CODEX_MODELS_CACHE_TTL_SECONDS", "300")
-    importlib.import_module("headroom.providers.proxy_routes")._CODEX_MODELS_CACHE.clear()
-
     class FakeAsyncClient:
         def __init__(self) -> None:
             self.calls = 0
@@ -504,7 +498,7 @@ def test_v1_models_get_single_dynamic_under_chatgpt_auth(monkeypatch) -> None:
         "owned_by": "openai",
     }
     assert unknown.status_code == 404
-    assert fake_http_client.calls == 1
+    assert fake_http_client.calls == 2
 
 
 def test_v1_models_still_forwards_under_non_chatgpt_auth() -> None:

@@ -167,7 +167,6 @@ def test_codex_model_metadata_fetches_codex_registry_for_chatgpt_auth(monkeypatc
     OpenAI-compatible payload from its slugs.
     """
     monkeypatch.setenv("HEADROOM_CODEX_CLIENT_VERSION", "0.130.0")
-    monkeypatch.setenv("HEADROOM_CODEX_MODELS_CACHE_TTL_SECONDS", "0")
 
     class FakeAsyncClient:
         def __init__(self):
