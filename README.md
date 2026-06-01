@@ -62,13 +62,13 @@
         ▼
     ┌────────────────────────────────────────────────────┐
     │  Headroom   (runs locally — your data stays here)  │
-    │  ───────────────────────────────────────────────   │
-    │  CacheAligner  →  ContentRouter  →  CCR             │
-    │                    ├─ SmartCrusher   (JSON)         │
-    │                    ├─ CodeCompressor (AST)          │
-    │                    └─ Kompress-base  (text, HF)     │
-    │                                                     │
-    │  Cross-agent memory  ·  headroom learn  ·  MCP      │
+    │  ────────────────────────────────────────────────  │
+    │  CacheAligner  →  ContentRouter  →  CCR            │
+    │                    ├─ SmartCrusher   (JSON)        │
+    │                    ├─ CodeCompressor (AST)         │
+    │                    └─ Kompress-base  (text, HF)    │
+    │                                                    │
+    │  Cross-agent memory  ·  headroom learn  ·  MCP     │
     └────────────────────────────────────────────────────┘
         │   compressed prompt  +  retrieval tool
         ▼
