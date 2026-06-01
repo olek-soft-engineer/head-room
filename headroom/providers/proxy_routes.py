@@ -5,8 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-from typing import Any, TypedDict, cast
+from typing import Any, cast
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request, WebSocket
@@ -15,13 +14,6 @@ from fastapi.responses import Response
 from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
 
 logger = logging.getLogger("headroom.proxy.routes")
-
-
-class OpenAIModelItem(TypedDict):
-    id: str
-    object: str
-    created: int
-    owned_by: str
 
 
 def _api_target(proxy: Any, provider_name: str) -> str:
@@ -82,22 +74,21 @@ _CHATGPT_AUTH_CODEX_MODELS: tuple[str, ...] = (
 def _codex_client_version(requested_client_version: str | None = None) -> str:
     if requested_client_version:
         return requested_client_version
-    return os.getenv("HEADROOM_CODEX_CLIENT_VERSION", "0.130.0")
+    return "0.130.0"
 
 
-def _openai_model_item(model_id: str) -> OpenAIModelItem:
-    return {
-        "id": model_id,
-        "object": "model",
-        "created": 0,
-        "owned_by": "openai",
-    }
-
-
-def _models_list_response(model_ids: tuple[str, ...], *, source: str) -> Response:
+def _models_list_response(model_ids: tuple[str, ...]) -> Response:
     payload = {
         "object": "list",
-        "data": [_openai_model_item(model_id) for model_id in model_ids],
+        "data": [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "openai",
+            }
+            for model_id in model_ids
+        ],
     }
     return Response(
         content=json.dumps(payload),
@@ -108,7 +99,7 @@ def _models_list_response(model_ids: tuple[str, ...], *, source: str) -> Respons
 
 def _synthetic_models_list_response() -> Response:
     """OpenAI-compatible `/v1/models` payload for Codex ChatGPT auth."""
-    return _models_list_response(_CHATGPT_AUTH_CODEX_MODELS, source="static_fallback")
+    return _models_list_response(_CHATGPT_AUTH_CODEX_MODELS)
 
 
 def _synthetic_model_get_response(model_id: str) -> Response:
@@ -128,13 +119,20 @@ def _synthetic_model_get_response(model_id: str) -> Response:
             headers={"content-type": "application/json"},
         )
     return Response(
-        content=json.dumps(_openai_model_item(model_id)),
+        content=json.dumps(
+            {
+                "id": model_id,
+                "object": "model",
+                "created": 0,
+                "owned_by": "openai",
+            }
+        ),
         status_code=200,
         headers={"content-type": "application/json"},
     )
 
 
-def _normalize_codex_registry_headers(headers: dict[str, str]) -> tuple[dict[str, str], str]:
+def _normalize_codex_registry_headers(headers: dict[str, str]) -> dict[str, str]:
     upstream_headers = dict(headers)
     upstream_headers.pop("host", None)
     account_id = (
@@ -147,7 +145,7 @@ def _normalize_codex_registry_headers(headers: dict[str, str]) -> tuple[dict[str
         upstream_headers.pop("ChatGPT-Account-ID", None)
     upstream_headers["accept"] = "application/json"
     upstream_headers.pop("Accept", None)
-    return upstream_headers, account_id
+    return upstream_headers
 
 
 async def _fetch_chatgpt_codex_model_ids(
@@ -156,7 +154,7 @@ async def _fetch_chatgpt_codex_model_ids(
     requested_client_version: str | None,
 ) -> tuple[str, ...] | None:
     client_version = _codex_client_version(requested_client_version)
-    upstream_headers, _account_id = _normalize_codex_registry_headers(headers)
+    upstream_headers = _normalize_codex_registry_headers(headers)
     url = (
         "https://chatgpt.com/backend-api/codex/models"
         f"?client_version={quote(client_version, safe='')}"
@@ -209,7 +207,7 @@ async def _fetch_chatgpt_codex_models_response(
     model_ids = await _fetch_chatgpt_codex_model_ids(proxy, headers, requested_client_version)
     if model_ids is None:
         return None
-    return _models_list_response(model_ids, source="upstream_registry")
+    return _models_list_response(model_ids)
 
 
 async def _fetch_chatgpt_codex_model_get_response(
@@ -223,7 +221,14 @@ async def _fetch_chatgpt_codex_model_get_response(
         return None
     if model_id in model_ids:
         return Response(
-            content=json.dumps(_openai_model_item(model_id)),
+            content=json.dumps(
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "openai",
+                }
+            ),
             status_code=200,
             headers={"content-type": "application/json"},
         )

@@ -340,7 +340,6 @@ def test_gemini_batch_embed_contents_passthrough_uses_gemini_target(monkeypatch)
 
 
 def test_v1_models_fetches_codex_registry_under_chatgpt_auth(monkeypatch) -> None:
-    monkeypatch.setenv("HEADROOM_CODEX_CLIENT_VERSION", "0.130.0")
     proxy_routes = importlib.import_module("headroom.providers.proxy_routes")
     debug_messages: list[tuple[str, tuple[object, ...]]] = []
     monkeypatch.setattr(
