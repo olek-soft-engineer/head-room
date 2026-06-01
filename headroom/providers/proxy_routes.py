@@ -3,8 +3,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any, cast
+import os
+import time
+from typing import Any, TypedDict, cast
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import Response
@@ -12,6 +16,15 @@ from fastapi.responses import Response
 from headroom.proxy.handlers.openai import _resolve_codex_routing_headers
 
 logger = logging.getLogger("headroom.proxy.routes")
+
+_CODEX_MODELS_CACHE: dict[tuple[str, str], tuple[float, tuple[str, ...]]] = {}
+
+
+class OpenAIModelItem(TypedDict):
+    id: str
+    object: str
+    created: int
+    owned_by: str
 
 
 def _api_target(proxy: Any, provider_name: str) -> str:
@@ -51,8 +64,9 @@ def _select_passthrough_base_url(proxy: Any, headers: dict[str, str]) -> str:
 # bearer tokens (issue #478). Codex polls `/v1/models` every few seconds
 # to populate its model-picker UI, so the 403 storm is noisy and breaks
 # refresh. The fix: when Codex hits `/v1/models` under ChatGPT auth,
-# synthesize an OpenAI-compatible response from the known-supported
-# Codex/ChatGPT model set instead of forwarding to a 403.
+# fetch the Codex-specific registry first and synthesize an
+# OpenAI-compatible response from its slugs. If that registry is
+# unavailable, fall back to the known-supported static set.
 #
 # The list mirrors what Codex itself ships in its built-in model
 # registry (the same models its provider config exposes); it's the
@@ -68,22 +82,44 @@ _CHATGPT_AUTH_CODEX_MODELS: tuple[str, ...] = (
 )
 
 
-def _synthetic_models_list_response() -> Response:
-    """OpenAI-compatible `/v1/models` payload for Codex ChatGPT auth."""
-    import json
+def _codex_client_version(requested_client_version: str | None = None) -> str:
+    if requested_client_version:
+        return requested_client_version
+    return os.getenv("HEADROOM_CODEX_CLIENT_VERSION", "0.130.0")
 
+
+def _codex_models_cache_ttl_seconds() -> float:
+    raw_value = os.getenv("HEADROOM_CODEX_MODELS_CACHE_TTL_SECONDS", "300")
+    try:
+        return max(0.0, float(raw_value))
+    except ValueError:
+        logger.warning(
+            "Invalid HEADROOM_CODEX_MODELS_CACHE_TTL_SECONDS=%r; disabling Codex models cache",
+            raw_value,
+        )
+        return 0.0
+
+
+def _openai_model_item(model_id: str) -> OpenAIModelItem:
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": 0,
+        "owned_by": "openai",
+    }
+
+
+def _models_list_response(model_ids: tuple[str, ...], *, source: str) -> Response:
     payload = {
         "object": "list",
-        "data": [
-            {
-                "id": model_id,
-                "object": "model",
-                "created": 0,
-                "owned_by": "openai",
-            }
-            for model_id in _CHATGPT_AUTH_CODEX_MODELS
-        ],
+        "data": [_openai_model_item(model_id) for model_id in model_ids],
     }
+    logger.debug(
+        "Returning Codex model metadata response source=%s model_ids=%s payload=%s",
+        source,
+        list(model_ids),
+        payload,
+    )
     return Response(
         content=json.dumps(payload),
         status_code=200,
@@ -91,10 +127,13 @@ def _synthetic_models_list_response() -> Response:
     )
 
 
+def _synthetic_models_list_response() -> Response:
+    """OpenAI-compatible `/v1/models` payload for Codex ChatGPT auth."""
+    return _models_list_response(_CHATGPT_AUTH_CODEX_MODELS, source="static_fallback")
+
+
 def _synthetic_model_get_response(model_id: str) -> Response:
     """OpenAI-compatible `/v1/models/{id}` payload."""
-    import json
-
     if model_id not in _CHATGPT_AUTH_CODEX_MODELS:
         return Response(
             content=json.dumps(
@@ -110,15 +149,132 @@ def _synthetic_model_get_response(model_id: str) -> Response:
             headers={"content-type": "application/json"},
         )
     return Response(
+        content=json.dumps(_openai_model_item(model_id)),
+        status_code=200,
+        headers={"content-type": "application/json"},
+    )
+
+
+def _normalize_codex_registry_headers(headers: dict[str, str]) -> tuple[dict[str, str], str]:
+    upstream_headers = dict(headers)
+    upstream_headers.pop("host", None)
+    account_id = (
+        upstream_headers.get("chatgpt-account-id")
+        or upstream_headers.get("ChatGPT-Account-ID")
+        or ""
+    )
+    if account_id:
+        upstream_headers["chatgpt-account-id"] = account_id
+        upstream_headers.pop("ChatGPT-Account-ID", None)
+    upstream_headers["accept"] = "application/json"
+    upstream_headers.pop("Accept", None)
+    return upstream_headers, account_id
+
+
+async def _fetch_chatgpt_codex_model_ids(
+    proxy: Any,
+    headers: dict[str, str],
+    requested_client_version: str | None,
+) -> tuple[str, ...] | None:
+    client_version = _codex_client_version(requested_client_version)
+    upstream_headers, account_id = _normalize_codex_registry_headers(headers)
+    cache_key = (account_id, client_version)
+    cache_ttl = _codex_models_cache_ttl_seconds()
+    now = time.monotonic()
+    cached = _CODEX_MODELS_CACHE.get(cache_key)
+    if cached is not None:
+        cached_at, cached_model_ids = cached
+        if cache_ttl > 0 and now - cached_at < cache_ttl:
+            logger.debug(
+                "Using cached Codex model IDs from upstream model registry: %s",
+                list(cached_model_ids),
+            )
+            return cached_model_ids
+        _CODEX_MODELS_CACHE.pop(cache_key, None)
+
+    url = (
+        "https://chatgpt.com/backend-api/codex/models"
+        f"?client_version={quote(client_version, safe='')}"
+    )
+    try:
+        assert proxy.http_client is not None
+        resp = await proxy.http_client.get(
+            url,
+            headers=upstream_headers,
+            timeout=15.0,
+        )
+        if resp.status_code >= 400:
+            logger.warning(
+                "Codex model registry fetch failed: HTTP %s: %s",
+                resp.status_code,
+                resp.text[:300],
+            )
+            return None
+
+        data = resp.json()
+        models_raw = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(models_raw, list):
+            logger.warning("Codex model registry response did not contain models[]")
+            return None
+
+        model_ids = tuple(
+            slug
+            for entry in models_raw
+            if isinstance(entry, dict)
+            for slug in (entry.get("slug"),)
+            if isinstance(slug, str) and slug
+        )
+        if not model_ids:
+            logger.warning("Codex model registry returned no model slugs")
+            return None
+
+        if cache_ttl > 0:
+            _CODEX_MODELS_CACHE[cache_key] = (now, model_ids)
+        logger.info("Fetched %d Codex models from upstream model registry", len(model_ids))
+        logger.debug("Fetched Codex model IDs from upstream model registry: %s", list(model_ids))
+        return model_ids
+    except Exception:
+        logger.exception("Codex model registry fetch failed")
+        return None
+
+
+async def _fetch_chatgpt_codex_models_response(
+    proxy: Any,
+    headers: dict[str, str],
+    requested_client_version: str | None,
+) -> Response | None:
+    model_ids = await _fetch_chatgpt_codex_model_ids(proxy, headers, requested_client_version)
+    if model_ids is None:
+        return None
+    return _models_list_response(model_ids, source="upstream_registry")
+
+
+async def _fetch_chatgpt_codex_model_get_response(
+    proxy: Any,
+    headers: dict[str, str],
+    model_id: str,
+    requested_client_version: str | None,
+) -> Response | None:
+    model_ids = await _fetch_chatgpt_codex_model_ids(proxy, headers, requested_client_version)
+    if model_ids is None:
+        return None
+    if model_id in model_ids:
+        return Response(
+            content=json.dumps(_openai_model_item(model_id)),
+            status_code=200,
+            headers={"content-type": "application/json"},
+        )
+    return Response(
         content=json.dumps(
             {
-                "id": model_id,
-                "object": "model",
-                "created": 0,
-                "owned_by": "openai",
+                "error": {
+                    "message": f"Model {model_id!r} not available under ChatGPT auth",
+                    "type": "invalid_request_error",
+                    "code": "model_not_found",
+                }
             }
         ),
-        status_code=200,
+        status_code=404,
         headers={"content-type": "application/json"},
     )
 
@@ -134,13 +290,28 @@ async def _handle_chatgpt_model_metadata(
     if not is_chatgpt_auth:
         return None
 
-    # Short-circuit `/backend-api/models[/{id}]` — chatgpt.com returns
-    # 403 here for OAuth tokens; synthesize a Codex-compatible response
-    # locally so the model-picker refresh succeeds (issue #478).
+    # Avoid generic `/backend-api/models[/{id}]`, which returns 403 for
+    # OAuth tokens, but prefer the Codex-specific registry when available.
+    requested_client_version = request.query_params.get("client_version")
     if upstream_path == "/backend-api/models":
+        upstream_response = await _fetch_chatgpt_codex_models_response(
+            proxy,
+            headers,
+            requested_client_version,
+        )
+        if upstream_response is not None:
+            return upstream_response
         return _synthetic_models_list_response()
     if upstream_path.startswith("/backend-api/models/"):
         model_id = upstream_path[len("/backend-api/models/") :]
+        upstream_response = await _fetch_chatgpt_codex_model_get_response(
+            proxy,
+            headers,
+            model_id,
+            requested_client_version,
+        )
+        if upstream_response is not None:
+            return upstream_response
         return _synthetic_model_get_response(model_id)
 
     url = f"https://chatgpt.com{upstream_path}"
