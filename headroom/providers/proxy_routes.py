@@ -72,12 +72,14 @@ _CHATGPT_AUTH_CODEX_MODELS: tuple[str, ...] = (
 
 
 def _codex_client_version(requested_client_version: str | None = None) -> str:
+    """Return the Codex client version to use for model-registry requests."""
     if requested_client_version:
         return requested_client_version
     return "0.130.0"
 
 
 def _models_list_response(model_ids: tuple[str, ...]) -> Response:
+    """Build an OpenAI-compatible model-list response for Codex metadata callers."""
     payload = {
         "object": "list",
         "data": [
@@ -133,6 +135,7 @@ def _synthetic_model_get_response(model_id: str) -> Response:
 
 
 def _normalize_codex_registry_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Prepare inbound ChatGPT auth headers for the Codex model registry."""
     upstream_headers = dict(headers)
     upstream_headers.pop("host", None)
     account_id = (
@@ -153,6 +156,7 @@ async def _fetch_chatgpt_codex_model_ids(
     headers: dict[str, str],
     requested_client_version: str | None,
 ) -> tuple[str, ...] | None:
+    """Fetch Codex model slugs from ChatGPT, returning None when fallback should apply."""
     client_version = _codex_client_version(requested_client_version)
     upstream_headers = _normalize_codex_registry_headers(headers)
     url = (
@@ -204,6 +208,7 @@ async def _fetch_chatgpt_codex_models_response(
     headers: dict[str, str],
     requested_client_version: str | None,
 ) -> Response | None:
+    """Build a dynamic `/v1/models` response from the Codex registry when available."""
     model_ids = await _fetch_chatgpt_codex_model_ids(proxy, headers, requested_client_version)
     if model_ids is None:
         return None
@@ -216,6 +221,7 @@ async def _fetch_chatgpt_codex_model_get_response(
     model_id: str,
     requested_client_version: str | None,
 ) -> Response | None:
+    """Build a dynamic `/v1/models/{id}` response from the Codex registry when available."""
     model_ids = await _fetch_chatgpt_codex_model_ids(proxy, headers, requested_client_version)
     if model_ids is None:
         return None
