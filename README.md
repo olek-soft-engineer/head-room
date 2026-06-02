@@ -16,7 +16,6 @@
   <a href="https://pypi.org/project/headroom-ai/"><img src="https://img.shields.io/pypi/v/headroom-ai.svg" alt="PyPI"></a>
   <a href="https://www.npmjs.com/package/headroom-ai"><img src="https://img.shields.io/npm/v/headroom-ai.svg" alt="npm"></a>
   <a href="https://huggingface.co/chopratejas/kompress-base"><img src="https://img.shields.io/badge/model-Kompress--base-yellow.svg" alt="Model: Kompress-base"></a>
-  <a href="https://headroomlabs.ai/dashboard"><img src="https://img.shields.io/badge/tokens%20saved-60B%2B-2ea44f" alt="Tokens saved: 60B+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a>
   <a href="https://headroom-docs.vercel.app/docs"><img src="https://img.shields.io/badge/docs-online-blue.svg" alt="Docs"></a>
 </p>
@@ -121,13 +120,6 @@ Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[agno]`, `[langchain]`, `[evals]`.
 | BFCL       | Tools    | 100 |        — |  **97%** | 32% compression |
 
 Reproduce: `python -m headroom.evals suite --tier 1` · [Full benchmarks & methodology](https://headroom-docs.vercel.app/docs/benchmarks)
-
-<p align="center">
-  <a href="https://headroomlabs.ai/dashboard">
-    <img src="headroom-savings.png" alt="60B+ tokens saved — community leaderboard" width="820">
-  </a>
-  <br/><b><a href="https://headroomlabs.ai/dashboard">60B+ tokens saved by the community — live leaderboard →</a></b>
-</p>
 
 ## Agent compatibility matrix
 
