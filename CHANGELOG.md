@@ -5,6 +5,30 @@ All notable changes to Headroom will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Documentation
+
+- Fix stale API references: removed `IntelligentContextConfig`, `ScoringWeights`, and `RollingWindowConfig` from all docs (these classes no longer exist); context management is now automatic.
+- Fix `SmartCrusherConfig` field names: removed fabricated fields (`keep_first`, `keep_last`, `relevance_threshold`, `anomaly_std_threshold`, `preserve_errors`, `relevance_tier`); replaced with real fields from source (`variance_threshold`, `uniqueness_threshold`, `similarity_threshold`, `preserve_change_points`, `first_fraction`, `last_fraction`, `dedup_identical_items`, `use_feedback_hints`).
+- Fix `EmbeddingScorer` constructor: `model=` -> `model_name=`, default model updated to `BAAI/bge-small-en-v1.5`.
+- Fix `memory.add()` examples: remove non-existent `category=` parameter.
+- Fix `headroom learn` CLI reference: remove non-existent `--claude-dir PATH`; add actual `--agent`, `--model`, `--workers` flags.
+- Fix import path: `from headroom.compression import compress` -> `from headroom import compress`; mark `UniversalCompressor` examples as Advanced/Internal API.
+- Mark "Message-level CCR via IntelligentContext" section as retired in `ccr.mdx`.
+- Fix CHANGELOG footer links: `headroom-sdk/headroom` -> `chopratejas/headroom`.
+- Note `pip install "headroom-ai[llmlingua]"` extra was removed in 0.9.x.
+- Fix proxy command: `python -m headroom.proxy.server --port 8787` -> `headroom proxy --port 8787`.
+- Add "opt-in; disabled by default" caveat to source code 40-70% savings claims.
+- Add missing extras to installation docs: `memory`, `relevance`, `image`, `reports`, `otel`, `voice`.
+- Update `README.md` extras mention to include `[code]`, `[memory]`, `[relevance]`, `[image]`.
+- Fix telemetry description in `llms.txt`: "No telemetry by default" -> "Anonymous telemetry enabled by default; set `HEADROOM_TELEMETRY=off` to disable".
+- Update `EmbedderBackend.LOCAL` recommendation to `EmbedderBackend.ONNX` with note that LOCAL requires PyTorch (~2 GB).
+- Fix CCR acronym: "Cross-Conversation Retrieval" -> "Compress-Cache-Retrieve" in `api-reference.mdx` (including `ccrHashes` field description).
+- Remove `IntelligentContext` from pipeline diagram in `how-compression-works.mdx`; update to 2-stage pipeline: `CacheAligner` -> `ContentRouter`.
+- Remove retired `rolling_window_config` field from `HeadroomClient` Python constructor table in `api-reference.mdx`; add note that `rolling_window` was removed in 0.9.x.
+- docs: fix stale API references, retired class imports, wrong field names, and incomplete extras table
+
 ## [0.22.4](https://github.com/chopratejas/headroom/compare/v0.22.3...v0.22.4) (2026-05-26)
 
 
@@ -280,7 +304,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Device selection: `--llmlingua-device` (auto/cuda/cpu/mps)
   - Custom compression rate: `--llmlingua-rate`
   - Helpful startup hints when llmlingua is available but not enabled
-  - Install with: `pip install headroom-ai[llmlingua]`
+  - ~~Install with: `pip install headroom-ai[llmlingua]`~~ (the `[llmlingua]` extra was removed in 0.9.x)
 - **Code-Aware Compression** (AST-based, syntax-preserving)
   - `CodeAwareCompressor` transform using tree-sitter for AST parsing
   - Supports Python, JavaScript, TypeScript, Go, Rust, Java, C, C++
@@ -418,12 +442,12 @@ New in 0.2.0 - run Headroom as a proxy server:
 
 ```bash
 # Start the proxy
-python -m headroom.proxy.server --port 8787
+headroom proxy --port 8787
 
 # Use with Claude Code
 ANTHROPIC_BASE_URL=http://localhost:8787 claude
 ```
 
-[Unreleased]: https://github.com/headroom-sdk/headroom/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/headroom-sdk/headroom/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/headroom-sdk/headroom/releases/tag/v0.1.0
+[Unreleased]: https://github.com/chopratejas/headroom/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/chopratejas/headroom/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/chopratejas/headroom/releases/tag/v0.1.0
