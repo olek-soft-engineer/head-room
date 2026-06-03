@@ -44,6 +44,8 @@ _MODEL_ALIASES: dict[str, str] = {
 }
 
 _resolved_model_cache: dict[str, str] = {}
+
+
 def resolve_litellm_model(model: str) -> str:
     """Resolve model name to one LiteLLM recognizes, adding provider prefix if needed.
     Results are cached per model name to avoid blocking the event loop
@@ -54,6 +56,8 @@ def resolve_litellm_model(model: str) -> str:
     resolved = _resolve_litellm_model_uncached(model)
     _resolved_model_cache[model] = resolved
     return resolved
+
+
 def _resolve_litellm_model_uncached(model: str) -> str:
     """Uncached resolution — called once per unique model name."""
     if not LITELLM_AVAILABLE:
@@ -82,7 +86,7 @@ def _resolve_litellm_model_uncached(model: str) -> str:
             except Exception:
                 break
     return model
-    
+
 
 @dataclass
 class LiteLLMModelPricing:

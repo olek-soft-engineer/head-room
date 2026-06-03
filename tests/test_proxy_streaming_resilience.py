@@ -33,7 +33,8 @@ class TestModelResolutionCaching:
         import headroom.pricing.litellm_pricing as lp
 
         with patch(
-            "headroom.pricing.litellm_pricing._resolve_litellm_model_uncached", return_value="anthropic/claude-opus-4-6"
+            "headroom.pricing.litellm_pricing._resolve_litellm_model_uncached",
+            return_value="anthropic/claude-opus-4-6",
         ) as mock_uncached:
             # First call — should invoke uncached resolution
             result1 = lp.resolve_litellm_model("claude-opus-4-6")
@@ -165,7 +166,8 @@ class TestModelResolutionCaching:
         import headroom.pricing.litellm_pricing as lp
 
         with patch(
-            "headroom.pricing.litellm_pricing._resolve_litellm_model_uncached", return_value="resolved/model-a"
+            "headroom.pricing.litellm_pricing._resolve_litellm_model_uncached",
+            return_value="resolved/model-a",
         ) as mock_uncached:
             # Resolve
             result1 = lp.resolve_litellm_model("model-a")
@@ -417,12 +419,12 @@ class TestConcurrentSessionSafety:
             return f"resolved/{model}"
 
         with patch(
-            "headroom.pricing.litellm_pricing._resolve_litellm_model_uncached", side_effect=slow_uncached
+            "headroom.pricing.litellm_pricing._resolve_litellm_model_uncached",
+            side_effect=slow_uncached,
         ):
             # Launch 50 concurrent resolution tasks for the same model
             tasks = [
-                asyncio.to_thread(lp.resolve_litellm_model, "claude-opus-4-6")
-                for _ in range(50)
+                asyncio.to_thread(lp.resolve_litellm_model, "claude-opus-4-6") for _ in range(50)
             ]
             results = await asyncio.gather(*tasks)
 
@@ -503,8 +505,8 @@ class TestConcurrentSessionSafety:
     @pytest.mark.asyncio
     async def test_estimate_cost_concurrent_with_caching(self):
         """Multiple concurrent estimate_cost calls should not block each other."""
-        from headroom.proxy.server import CostTracker
         import headroom.pricing.litellm_pricing as lp
+        from headroom.proxy.server import CostTracker
 
         tracker = CostTracker()
 

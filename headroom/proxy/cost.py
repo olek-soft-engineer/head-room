@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Any
 
 from headroom.proxy.modes import PROXY_MODE_CACHE
 
-
 if TYPE_CHECKING:
     from headroom.proxy.prometheus_metrics import PrometheusMetrics
 
@@ -567,7 +566,6 @@ class CostTracker:
         self._api_cache_write_1h_by_model.clear()
         self._api_uncached_by_model.clear()
 
-    
     def estimate_cost(
         self,
         model: str,
@@ -595,6 +593,7 @@ class CostTracker:
 
         try:
             from headroom.pricing.litellm_pricing import resolve_litellm_model
+
             resolved_model = resolve_litellm_model(model)
 
             # litellm.cost_per_token handles all token types natively:
@@ -704,6 +703,7 @@ class CostTracker:
             return None
         try:
             from headroom.pricing.litellm_pricing import resolve_litellm_model
+
             resolved = resolve_litellm_model(model)
             info = litellm.model_cost.get(resolved, {})
             cost_per_token = info.get("input_cost_per_token")
@@ -722,6 +722,7 @@ class CostTracker:
             return None
         try:
             from headroom.pricing.litellm_pricing import resolve_litellm_model
+
             resolved = resolve_litellm_model(model)
             info = litellm.model_cost.get(resolved, {})
             uncached = info.get("input_cost_per_token")

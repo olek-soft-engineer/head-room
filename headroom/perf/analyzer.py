@@ -18,7 +18,6 @@ from datetime import datetime, timedelta
 from headroom import paths as _paths
 from headroom.pricing.litellm_pricing import resolve_litellm_model
 
-
 log = logging.getLogger(__name__)
 
 LOG_DIR = _paths.log_dir()
