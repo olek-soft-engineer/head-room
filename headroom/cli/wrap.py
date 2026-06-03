@@ -38,7 +38,12 @@ import click
 
 from headroom._version import __version__ as _HEADROOM_VERSION
 from headroom.copilot_auth import DEFAULT_API_URL as COPILOT_API_URL
-from headroom.copilot_auth import has_oauth_auth, resolve_client_bearer_token
+from headroom.copilot_auth import (
+    has_oauth_auth,
+    resolve_client_bearer_token,
+    resolve_copilot_api_url,
+    resolve_subscription_bearer_token,
+)
 from headroom.providers.aider import build_launch_env as _build_aider_launch_env
 from headroom.providers.claude import proxy_base_url as _claude_proxy_base_url
 from headroom.providers.codex import build_launch_env as _build_codex_launch_env
@@ -210,6 +215,8 @@ def _start_proxy(
     if agent_type != "unknown":
         proxy_env["HEADROOM_AGENT_TYPE"] = agent_type
         proxy_env.setdefault("HEADROOM_STACK", f"wrap_{agent_type}")
+    if openai_api_url:
+        proxy_env["OPENAI_TARGET_API_URL"] = openai_api_url
 
     proc = subprocess.Popen(
         cmd,
@@ -1343,6 +1350,16 @@ def _proxy_active_session_count(payload: dict[str, Any] | None) -> int:
     return max(counts, default=0)
 
 
+def _normalize_proxy_api_url(url: object) -> str | None:
+    """Normalize configured upstream URLs for running-proxy comparisons."""
+    if not isinstance(url, str):
+        return None
+    normalized = url.strip().rstrip("/")
+    if normalized.endswith("/v1"):
+        normalized = normalized[:-3]
+    return normalized or None
+
+
 def _proxy_version(payload: dict[str, Any] | None) -> str | None:
     """Return the running proxy version when it exposes one."""
     if payload is None:
@@ -1554,8 +1571,11 @@ def _should_use_copilot_oauth(
     backend: str | None,
     provider_type: str,
     env: dict[str, str],
+    force_subscription: bool = False,
 ) -> bool:
     """Prefer a reusable Copilot OAuth session when the requested routing supports it."""
+    if force_subscription:
+        return True
     if env.get("COPILOT_PROVIDER_API_KEY") or env.get("COPILOT_PROVIDER_BEARER_TOKEN"):
         return False
     if provider_type == "anthropic":
@@ -1669,10 +1689,20 @@ def _ensure_proxy(
                     missing.append("learn")
                 if code_graph and not running_config.get("code_graph"):
                     missing.append("code_graph")
+                if openai_api_url:
+                    running_openai_url = _normalize_proxy_api_url(
+                        running_config.get("openai_api_url")
+                    )
+                    requested_openai_url = _normalize_proxy_api_url(openai_api_url)
+                    if running_openai_url != requested_openai_url:
+                        missing.append("openai-api-url")
 
                 if missing:
                     needs_restart = True
-                    flags_str = ", ".join(f"--{f.replace('_', '-')}" for f in missing)
+                    flags_str = ", ".join(
+                        f if f.startswith("--") else f"--{f.replace('_', '-')}"
+                        for f in missing
+                    )
                     click.echo(f"  Proxy on port {port} is missing: {flags_str}")
                     click.echo("  Restarting proxy with upgraded configuration...")
 
@@ -2360,6 +2390,14 @@ def unwrap_claude(
     default=None,
     help="OpenAI-compatible Copilot wire API. Defaults to 'completions' when provider-type resolves to openai.",
 )
+@click.option(
+    "--subscription",
+    is_flag=True,
+    help=(
+        "Experimental: route GitHub-authenticated Copilot CLI traffic through Headroom "
+        "without requiring a provider API key."
+    ),
+)
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.argument("copilot_args", nargs=-1, type=click.UNPROCESSED)
@@ -2372,6 +2410,7 @@ def copilot(
     region: str | None,
     provider_type: str,
     wire_api: str | None,
+    subscription: bool,
     memory: bool,
     verbose: bool,
     copilot_args: tuple[str, ...],
@@ -2389,6 +2428,7 @@ def copilot(
         headroom wrap copilot -- --model claude-sonnet-4-20250514
         headroom wrap copilot --backend anyllm --anyllm-provider groq -- --model gpt-4o
         headroom wrap copilot --provider-type openai --wire-api responses -- --model gpt-5.4
+        headroom wrap copilot --subscription -- --model gpt-4.1
         headroom wrap copilot --no-context-tool -- --prompt "explain this file"
     """
     copilot_bin = shutil.which("copilot")
@@ -2416,6 +2456,17 @@ def copilot(
         wire_api=wire_api,
         backend=effective_backend,
     )
+    if subscription:
+        if effective_backend not in (None, "", "anthropic"):
+            raise click.ClickException(
+                "--subscription routes to GitHub Copilot's hosted API and cannot be combined "
+                "with translated backends such as anyllm or litellm-*."
+            )
+        if provider_type == "anthropic":
+            raise click.ClickException(
+                "--subscription uses Copilot's OpenAI-compatible hosted API path; "
+                "do not combine it with --provider-type anthropic."
+            )
 
     if not no_rtk:
         if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
@@ -2434,11 +2485,16 @@ def copilot(
         backend=effective_backend,
         provider_type=provider_type,
         env=env,
+        force_subscription=subscription,
     ):
-        client_bearer = resolve_client_bearer_token()
+        client_bearer = (
+            resolve_subscription_bearer_token() if subscription else resolve_client_bearer_token()
+        )
         if not client_bearer:
             raise click.ClickException(
-                "GitHub Copilot auth was detected but no reusable bearer token could be resolved."
+                "GitHub Copilot subscription mode requires a reusable GitHub/Copilot bearer "
+                "token, but none could be resolved. Run `copilot auth login` first, or set "
+                "GITHUB_COPILOT_TOKEN / GITHUB_COPILOT_GITHUB_TOKEN."
             )
 
         effective_wire_api = wire_api or "completions"
@@ -2446,14 +2502,25 @@ def copilot(
         env["COPILOT_PROVIDER_BASE_URL"] = f"http://127.0.0.1:{port}/v1"
         env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
         env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
+        env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
         env.pop("COPILOT_PROVIDER_API_KEY", None)
         env_vars_display = [
             "COPILOT_PROVIDER_TYPE=openai",
             f"COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:{port}/v1",
             f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
-            "COPILOT_AUTH_MODE=github-oauth",
+            (
+                "COPILOT_AUTH_MODE=github-subscription-experimental"
+                if subscription
+                else "COPILOT_AUTH_MODE=github-oauth"
+            ),
         ]
-        openai_api_url = COPILOT_API_URL
+        openai_api_url = resolve_copilot_api_url(client_bearer)
+        env["GITHUB_COPILOT_API_URL"] = openai_api_url
+        env["OPENAI_TARGET_API_URL"] = openai_api_url
+        env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
+        os.environ["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
+        os.environ["GITHUB_COPILOT_API_URL"] = openai_api_url
+        os.environ["OPENAI_TARGET_API_URL"] = openai_api_url
     else:
         env, env_vars_display = _build_copilot_launch_env(
             port=port,
@@ -2475,7 +2542,7 @@ def copilot(
             )
             raise SystemExit(1)
 
-    if not _copilot_model_configured(copilot_args, env):
+    if not subscription and not _copilot_model_configured(copilot_args, env):
         click.echo(
             "  Note: Copilot BYOK requires a model. Pass `--model <name>` "
             "or set `COPILOT_MODEL` / `COPILOT_PROVIDER_MODEL_ID`."

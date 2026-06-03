@@ -212,8 +212,92 @@ def test_wrap_copilot_prefers_existing_oauth_session(
     assert env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8787/v1"
     assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
     assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-existing"
+    assert env["GITHUB_COPILOT_API_URL"] == DEFAULT_API_URL
+    assert env["OPENAI_TARGET_API_URL"] == DEFAULT_API_URL
     assert "COPILOT_PROVIDER_API_KEY" not in env
     assert captured["openai_api_url"] == DEFAULT_API_URL
+    assert f"COPILOT_PROVIDER_API_URL={DEFAULT_API_URL}" in captured["env_vars_display"]
+
+
+def test_wrap_copilot_subscription_uses_github_auth_without_provider_key(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wrap_cli, main = wrap_modules
+    for var in ("COPILOT_PROVIDER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    captured: dict[str, object] = {}
+
+    def fake_launch_tool(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value="gho-existing"),
+        patch("headroom.cli.wrap.has_oauth_auth", return_value=False),
+        patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool),
+    ):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--subscription", "--no-rtk"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Copilot BYOK requires a model" not in result.output
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["COPILOT_PROVIDER_TYPE"] == "openai"
+    assert env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8787/v1"
+    assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
+    assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-existing"
+    assert "COPILOT_PROVIDER_API_KEY" not in env
+    assert captured["openai_api_url"] == DEFAULT_API_URL
+
+
+def test_wrap_copilot_subscription_requires_reusable_auth(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    _wrap_cli, main = wrap_modules
+    with (
+        patch("headroom.cli.wrap.shutil.which", return_value="copilot"),
+        patch("headroom.cli.wrap.resolve_subscription_bearer_token", return_value=None),
+    ):
+        result = runner.invoke(main, ["wrap", "copilot", "--subscription", "--no-rtk"])
+
+    assert result.exit_code != 0
+    assert "subscription mode requires a reusable GitHub/Copilot bearer token" in result.output
+
+
+def test_wrap_copilot_subscription_rejects_translated_backend(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    _wrap_cli, main = wrap_modules
+    with patch("headroom.cli.wrap.shutil.which", return_value="copilot"):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--subscription", "--backend", "anyllm", "--no-rtk"],
+        )
+
+    assert result.exit_code != 0
+    assert "cannot be combined with translated backends" in result.output
+
+
+def test_wrap_copilot_subscription_rejects_anthropic_provider_type(
+    runner: CliRunner,
+    wrap_modules: tuple[types.ModuleType, click.Group],
+) -> None:
+    _wrap_cli, main = wrap_modules
+    with patch("headroom.cli.wrap.shutil.which", return_value="copilot"):
+        result = runner.invoke(
+            main,
+            ["wrap", "copilot", "--subscription", "--provider-type", "anthropic", "--no-rtk"],
+        )
+
+    assert result.exit_code != 0
+    assert "do not combine it with --provider-type anthropic" in result.output
 
 
 def test_wrap_copilot_translated_backend_still_requires_byok(
