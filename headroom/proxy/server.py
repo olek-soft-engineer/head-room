@@ -3073,12 +3073,13 @@ def run_server(
         # sticky-session workaround.
         logger.warning(
             "Headroom is running with workers=%d. The in-memory CCR store, "
-            "compression cache, prefix tracker, and TOIN state are all "
+            "compression cache, prefix tracker, TOIN state, and CostTracker are all "
             "per-process; multi-worker deployments produce silent retrieval "
-            "failures and avoidable cache busts when sessions land on different "
-            "workers. Run --workers 1 (or place a sticky-session load balancer "
-            "in front of multiple --workers 1 processes). See RUST_DEV.md → "
-            "'Multi-worker deployment — CCR fragmentation'.",
+            "failures, avoidable cache busts, and an unstable dashboard 'Proxy $ Saved' "
+            "hero tile (each /stats poll hits a different worker's partial total) when "
+            "sessions land on different workers. Run --workers 1 (or place a "
+            "sticky-session load balancer in front of multiple --workers 1 processes). "
+            "See RUST_DEV.md → 'Multi-worker deployment — CCR fragmentation'.",
             workers,
         )
         os.environ[_MULTI_WORKER_CONFIG_ENV] = json.dumps(_proxy_config_payload(config))
