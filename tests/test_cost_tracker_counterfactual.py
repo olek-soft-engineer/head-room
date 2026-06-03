@@ -37,8 +37,9 @@ def test_savings_at_list_price():
 
     # Savings should be 100k tokens * list input price (NOT affected by cache mix)
     import litellm
+    from headroom.pricing.litellm_pricing import resolve_litellm_model
 
-    resolved = ct._resolve_litellm_model(model)
+    resolved = resolve_litellm_model(model)
     info = litellm.model_cost.get(resolved, {})
     list_price = info.get("input_cost_per_token", 0)
 
