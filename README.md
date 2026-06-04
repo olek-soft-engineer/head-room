@@ -281,3 +281,59 @@ Devcontainers in `.devcontainer/` (default + `memory-stack` with Qdrant & Neo4j)
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
+---
+
+## Troubleshooting
+
+These are common issues faced during initial setup and how to resolve them.
+
+### Python version error
+
+This project requires **Python 3.10+**.
+
+Check your version:
+
+```bash
+python3 --version
+```
+
+If needed (Mac with Homebrew):
+
+```bash
+brew install python@3.11
+```
+
+---
+
+### Editable install fails (`pip install -e`)
+
+Upgrade pip to the latest version:
+
+```bash
+python3 -m pip install --upgrade pip
+```
+
+---
+
+### Missing `cargo` (Rust error)
+
+Some tests require Rust tooling.
+
+Install it using:
+
+```bash
+brew install rust
+```
+
+---
+
+### npm vs Python confusion
+
+* This repository is primarily a **Python project**
+* `npm install headroom-ai` is only for using it in JavaScript/TypeScript apps, not for development
+
+To contribute to this repository, use:
+
+```bash
+pip install ".[dev]"
+```
