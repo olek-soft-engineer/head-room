@@ -1,0 +1,155 @@
+name: CI Fast (experimental)
+
+# Intelligent + parallel CI, running ALONGSIDE the existing ci.yml so it can be
+# validated/measured without touching required status checks. Once it's proven
+# green + faster, fold it into ci.yml and update branch protection.
+#
+# Design:
+#   * changes      — paths-filter: skip the heavy work for docs-only PRs.
+#   * build-wheel  — compile the Rust extension ONCE (maturin), share via artifact.
+#   * lint         — ruff + mypy, once (3.12).
+#   * test         — 4 parallel shards (pytest-split), each a fresh runner VM so
+#                    the suite's shared-state tests (repo-root db, port 8787) don't
+#                    collide. CPU-only torch + cached HF model keep installs fast.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-fast-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PY_VERSION: "3.12"
+  # CPU-only torch index — CI runners have no GPU; the default CUDA wheels pull
+  # ~2.5 GB of nvidia libs we never use.
+  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cpu
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'headroom/**'
+              - 'crates/**'
+              - '**/*.rs'
+              - 'pyproject.toml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'tests/**'
+              - 'scripts/tests/**'
+              - '.github/workflows/ci-fast.yml'
+
+  build-wheel:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Build wheel once (maturin)
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --release --out dist --interpreter "python${PY_VERSION}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: headroom-wheel
+          path: dist/*.whl
+          retention-days: 1
+
+  lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+      - name: Install ruff + mypy
+        run: python -m pip install --upgrade pip ruff mypy
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+      - name: mypy
+        run: mypy headroom --ignore-missing-imports
+
+  test:
+    needs: [changes, build-wheel]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      FASTEMBED_CACHE_PATH: ${{ github.workspace }}/.fastembed-cache
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pipfast-${{ env.PY_VERSION }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-pipfast-${{ env.PY_VERSION }}-
+
+      - name: Cache HuggingFace + fastembed models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ${{ github.workspace }}/.fastembed-cache
+          key: ${{ runner.os }}-models-allMiniLM-v1
+
+      - name: Download prebuilt wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: headroom-wheel
+          path: dist
+
+      - name: Install (CPU torch + prebuilt wheel + dev deps, no cargo rebuild)
+        run: |
+          python -m pip install --upgrade pip
+          # Install torch CPU explicitly first so the editable/extra resolve reuses it.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          WHEEL="$(ls dist/*.whl)"
+          pip install "${WHEEL}[dev]"
+          pip install pytest-split
+          python -c "from headroom._core import DiffCompressor; print('headroom._core OK')"
+
+      - name: Pre-fetch embedding model (resilient to HF rate limits)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DISABLE_TELEMETRY: "1"
+        run: |
+          for i in 1 2 3 4 5; do
+            if python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"; then exit 0; fi
+            echo "::warning::model fetch attempt $i failed; backing off"; sleep $((i * 20))
+          done
+          echo "::error::could not fetch all-MiniLM-L6-v2 from HuggingFace"; exit 1
+
+      - name: Run test shard ${{ matrix.shard }}/4
+        run: |
+          pytest tests scripts/tests \
+            --splits 4 --group ${{ matrix.shard }} \
+            --tb=short -q
