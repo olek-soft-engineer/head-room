@@ -28,16 +28,16 @@ def _handler_with_router(router: ContentRouter) -> OpenAIHandlerMixin:
 
 
 def test_openai_responses_unit_parallelism_env_defaults_and_clamps(monkeypatch):
-    monkeypatch.delenv("HEADROOM_OPENAI_RESPONSES_UNIT_PARALLELISM", raising=False)
+    monkeypatch.delenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", raising=False)
     assert openai_handler._openai_responses_unit_parallelism() == 4
 
-    monkeypatch.setenv("HEADROOM_OPENAI_RESPONSES_UNIT_PARALLELISM", "bad")
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "bad")
     assert openai_handler._openai_responses_unit_parallelism() == 4
 
-    monkeypatch.setenv("HEADROOM_OPENAI_RESPONSES_UNIT_PARALLELISM", "0")
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "0")
     assert openai_handler._openai_responses_unit_parallelism() == 1
 
-    monkeypatch.setenv("HEADROOM_OPENAI_RESPONSES_UNIT_PARALLELISM", "999")
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "999")
     assert openai_handler._openai_responses_unit_parallelism() == 16
 
 
@@ -271,7 +271,7 @@ def test_openai_responses_adapter_reuses_identical_tool_output_in_same_request()
 
 
 def test_openai_responses_adapter_parallelizes_cache_misses_preserving_order(monkeypatch):
-    monkeypatch.setenv("HEADROOM_OPENAI_RESPONSES_UNIT_PARALLELISM", "4")
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "4")
     router = ContentRouter()
     lock = threading.Lock()
     release = threading.Event()

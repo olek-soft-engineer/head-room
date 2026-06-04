@@ -96,7 +96,7 @@ def _json_bytes(value: object) -> int:
 
 
 def test_t3_failed_size_responses_payload_parallelizes_uncached_tool_outputs(monkeypatch):
-    monkeypatch.setenv("HEADROOM_OPENAI_RESPONSES_UNIT_PARALLELISM", "4")
+    monkeypatch.setenv("HEADROOM_TOOL_OUTPUT_COMPRESSION_PARALLELISM", "4")
     case = T3_FAILED_CASES[0]
     router = ContentRouter()
     lock = threading.Lock()
