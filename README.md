@@ -98,7 +98,7 @@ headroom proxy --port 8787              # drop-in proxy, zero code changes
 headroom perf
 ```
 
-Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[agno]`, `[langchain]`, `[evals]`. Requires **Python 3.10+**.
+Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`. Requires **Python 3.10+**.
 
 ## Proof
 
@@ -221,7 +221,7 @@ npm install headroom-ai                 # TypeScript / Node
 docker pull ghcr.io/chopratejas/headroom:latest
 ```
 
-Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-base), `[agno]`, `[langchain]`, `[evals]`. Requires **Python 3.10+**.
+Granular extras: `[proxy]`, `[mcp]`, `[ml]` (Kompress-base), `[code]`, `[memory]`, `[relevance]`, `[image]`, `[agno]`, `[langchain]`, `[evals]`. Requires **Python 3.10+**.
 
 Using `pipx`? Choose a supported interpreter explicitly:
 

@@ -5,8 +5,8 @@ All notable changes to Headroom will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.23.0](https://github.com/chopratejas/headroom/compare/v0.22.4...v0.23.0) (2026-06-04)
 
+## [0.23.0](https://github.com/chopratejas/headroom/compare/v0.22.4...v0.23.0) (2026-06-04)
 
 ### Features
 
@@ -323,7 +323,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Device selection: `--llmlingua-device` (auto/cuda/cpu/mps)
   - Custom compression rate: `--llmlingua-rate`
   - Helpful startup hints when llmlingua is available but not enabled
-  - Install with: `pip install headroom-ai[llmlingua]`
+  - ~~Install with: `pip install headroom-ai[llmlingua]`~~ (the `[llmlingua]` extra was removed in 0.9.x)
 - **Code-Aware Compression** (AST-based, syntax-preserving)
   - `CodeAwareCompressor` transform using tree-sitter for AST parsing
   - Supports Python, JavaScript, TypeScript, Go, Rust, Java, C, C++
@@ -461,12 +461,12 @@ New in 0.2.0 - run Headroom as a proxy server:
 
 ```bash
 # Start the proxy
-python -m headroom.proxy.server --port 8787
+headroom proxy --port 8787
 
 # Use with Claude Code
 ANTHROPIC_BASE_URL=http://localhost:8787 claude
 ```
 
-[Unreleased]: https://github.com/headroom-sdk/headroom/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/headroom-sdk/headroom/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/headroom-sdk/headroom/releases/tag/v0.1.0
+[Unreleased]: https://github.com/chopratejas/headroom/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/chopratejas/headroom/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/chopratejas/headroom/releases/tag/v0.1.0
