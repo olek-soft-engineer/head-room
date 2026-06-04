@@ -17,6 +17,13 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Least-privilege GITHUB_TOKEN: every job here only reads the repo (checkout,
+# paths-filter, build, test). No job writes contents/PRs/releases, so read-only
+# is sufficient and satisfies the CodeQL "workflow does not contain permissions"
+# advisory.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-fast-${{ github.ref }}
   cancel-in-progress: true
