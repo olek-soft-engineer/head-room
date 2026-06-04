@@ -75,9 +75,11 @@ def test_resolve_subscription_bearer_token_skips_invalid_generic_token(
     monkeypatch.setattr(
         copilot_auth,
         "_fetch_copilot_user_info",
-        lambda token: {"endpoints": {"api": "https://api.individual.githubcopilot.com"}}
-        if token == "gho-copilot"
-        else None,
+        lambda token: (
+            {"endpoints": {"api": "https://api.individual.githubcopilot.com"}}
+            if token == "gho-copilot"
+            else None
+        ),
     )
 
     assert copilot_auth.resolve_subscription_bearer_token() == "gho-copilot"
