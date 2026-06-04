@@ -21,19 +21,6 @@ from typing import Any
 
 from headroom import paths as _paths
 
-# fcntl is Unix-only; on Windows file locking is skipped (best-effort).
-# Typed Any so attribute access on flock/LOCK_EX/LOCK_UN doesn't fail on
-# platforms where the type stub is absent.
-_fcntl: Any = None
-_HAS_FCNTL = False
-try:
-    import fcntl as _fcntl_impl  # noqa: E402
-
-    _fcntl = _fcntl_impl
-    _HAS_FCNTL = True
-except ImportError:
-    pass
-
 logger = logging.getLogger(__name__)
 
 HEADROOM_SAVINGS_PATH_ENV_VAR = _paths.HEADROOM_SAVINGS_PATH_ENV
@@ -825,18 +812,7 @@ class SavingsTracker:
                     f.write(json_data)
                     f.flush()
                     os.fsync(f.fileno())
-                # Acquire an exclusive cross-process lock on the target file
-                # before the atomic rename so concurrent workers don't clobber
-                # each other's increments. Unix only; Windows skips gracefully.
-                if _HAS_FCNTL and self._path.exists():
-                    with open(self._path, "r+b") as lock_fh:
-                        _fcntl.flock(lock_fh, _fcntl.LOCK_EX)
-                        try:
-                            Path(tmp_path).replace(self._path)
-                        finally:
-                            _fcntl.flock(lock_fh, _fcntl.LOCK_UN)
-                else:
-                    Path(tmp_path).replace(self._path)
+                Path(tmp_path).replace(self._path)
             except Exception:
                 try:
                     Path(tmp_path).unlink()
