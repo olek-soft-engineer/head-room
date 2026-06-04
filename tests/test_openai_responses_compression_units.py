@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from types import MethodType, SimpleNamespace
 
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin
@@ -108,6 +109,122 @@ def test_openai_responses_adapter_compresses_custom_tool_call_output():
     assert "router:openai:responses:custom_tool_call_output:kompress" in transforms
     assert units_by_category == {"applied": 1}
     assert strategy_chain == []
+
+
+def test_openai_responses_adapter_reuses_exact_tool_output_cache():
+    router = ContentRouter()
+    calls = {"count": 0}
+
+    def compress(self, content: str, **_kwargs):
+        calls["count"] += 1
+        return RouterCompressionResult(
+            compressed="cached output summary",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    long_text = " ".join(f"word{i}" for i in range(180))
+
+    payload_one = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "local_shell_call_output", "call_id": "c1", "output": long_text},
+        ],
+    }
+    payload_two = {
+        "model": "gpt-5",
+        "input": [
+            {"type": "message", "role": "user", "content": "changed envelope"},
+            {"type": "local_shell_call_output", "call_id": "c2", "output": long_text},
+        ],
+    }
+
+    new_payload_one, modified_one, saved_one, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload_one,
+            model="gpt-5",
+            request_id="req_cache_one",
+        )
+    )
+    new_payload_two, modified_two, saved_two, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload_two,
+            model="gpt-5",
+            request_id="req_cache_two",
+        )
+    )
+
+    assert calls["count"] == 1
+    assert modified_one is True
+    assert modified_two is True
+    assert saved_one > 0
+    assert saved_two == saved_one
+    assert new_payload_one["input"][0]["output"] == "cached output summary"
+    assert new_payload_two["input"][1]["output"] == "cached output summary"
+
+
+def test_openai_responses_adapter_parallelizes_cache_misses_preserving_order(monkeypatch):
+    monkeypatch.setenv("HEADROOM_OPENAI_RESPONSES_UNIT_PARALLELISM", "4")
+    router = ContentRouter()
+    lock = threading.Lock()
+    release = threading.Event()
+    active = {"count": 0, "max": 0}
+
+    def compress(self, content: str, **_kwargs):
+        with lock:
+            active["count"] += 1
+            active["max"] = max(active["max"], active["count"])
+            if active["count"] >= 2:
+                release.set()
+        release.wait(0.05)
+        try:
+            marker = content.rsplit(" marker", 1)[1]
+            return RouterCompressionResult(
+                compressed=f"summary marker{marker}",
+                original=content,
+                strategy_used=CompressionStrategy.KOMPRESS,
+            )
+        finally:
+            with lock:
+                active["count"] -= 1
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+
+    def long_text(index: int) -> str:
+        return " ".join(f"word{index}_{j}" for j in range(180)) + f" marker{index}"
+
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "local_shell_call_output",
+                "call_id": f"c{i}",
+                "output": long_text(i),
+            }
+            for i in range(4)
+        ],
+    }
+
+    new_payload, modified, saved, *_ = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload,
+            model="gpt-5",
+            request_id="req_parallel",
+        )
+    )
+
+    assert active["max"] >= 2
+    assert modified is True
+    assert saved > 0
+    assert [item["output"] for item in new_payload["input"]] == [
+        "summary marker0",
+        "summary marker1",
+        "summary marker2",
+        "summary marker3",
+    ]
 
 
 def test_openai_responses_adapter_accepts_empty_input_list():
