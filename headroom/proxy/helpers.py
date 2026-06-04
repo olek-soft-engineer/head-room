@@ -841,9 +841,7 @@ def decide_compression_failure_action(
             frame_bytes=frame_bytes,
         )
 
-    if (client or "").strip().lower() == "codex" and isinstance(
-        exception, asyncio.TimeoutError
-    ):
+    if (client or "").strip().lower() == "codex" and isinstance(exception, asyncio.TimeoutError):
         return CompressionFailureAction(
             refuse=False,
             reason="client_override:codex",

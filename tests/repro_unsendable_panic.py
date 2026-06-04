@@ -12,8 +12,8 @@ Usage:
     python repro_unsendable_panic.py
 """
 
-import threading
 import concurrent.futures
+import threading
 
 CODE = b"def hello():\n    return 42\n"
 
