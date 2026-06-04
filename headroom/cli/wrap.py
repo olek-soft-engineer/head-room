@@ -37,7 +37,6 @@ if sys.platform == "win32" and hasattr(sys.stdout, "buffer"):
 import click
 
 from headroom._version import __version__ as _HEADROOM_VERSION
-from headroom.copilot_auth import DEFAULT_API_URL as COPILOT_API_URL
 from headroom.copilot_auth import (
     has_oauth_auth,
     resolve_client_bearer_token,
@@ -162,6 +161,7 @@ def _start_proxy(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    copilot_api_token: str | None = None,
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
 
@@ -217,6 +217,12 @@ def _start_proxy(
         proxy_env.setdefault("HEADROOM_STACK", f"wrap_{agent_type}")
     if openai_api_url:
         proxy_env["OPENAI_TARGET_API_URL"] = openai_api_url
+    # Pin the wrapper-validated Copilot token for this proxy instance only.
+    # Injected into the subprocess env here (not the parent's os.environ) so it
+    # never leaks into shared state. The proxy's CopilotTokenProvider honours
+    # GITHUB_COPILOT_API_TOKEN directly, making upstream auth deterministic.
+    if copilot_api_token:
+        proxy_env["GITHUB_COPILOT_API_TOKEN"] = copilot_api_token
 
     proc = subprocess.Popen(
         cmd,
@@ -1600,6 +1606,7 @@ def _ensure_proxy(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    copilot_api_token: str | None = None,
 ) -> subprocess.Popen | None:
     """Start or verify proxy. Returns process handle if we started it."""
     helpers = _live_wrap_module()
@@ -1700,8 +1707,7 @@ def _ensure_proxy(
                 if missing:
                     needs_restart = True
                     flags_str = ", ".join(
-                        f if f.startswith("--") else f"--{f.replace('_', '-')}"
-                        for f in missing
+                        f if f.startswith("--") else f"--{f.replace('_', '-')}" for f in missing
                     )
                     click.echo(f"  Proxy on port {port} is missing: {flags_str}")
                     click.echo("  Restarting proxy with upgraded configuration...")
@@ -1748,6 +1754,7 @@ def _ensure_proxy(
                     anyllm_provider=anyllm_provider,
                     region=region,
                     openai_api_url=openai_api_url,
+                    copilot_api_token=copilot_api_token,
                 ),
             )
             click.echo(f"  Proxy ready on http://127.0.0.1:{port}")
@@ -1823,6 +1830,7 @@ def _launch_tool(
     anyllm_provider: str | None = None,
     region: str | None = None,
     openai_api_url: str | None = None,
+    copilot_api_token: str | None = None,
 ) -> None:
     """Common logic: start proxy, launch tool, clean up."""
     proxy_holder: list[subprocess.Popen | None] = [None]
@@ -1849,6 +1857,7 @@ def _launch_tool(
             anyllm_provider=anyllm_provider,
             region=region,
             openai_api_url=openai_api_url,
+            copilot_api_token=copilot_api_token,
         )
 
         if code_graph:
@@ -2481,6 +2490,7 @@ def copilot(
 
     env = os.environ.copy()
     openai_api_url: str | None = None
+    copilot_proxy_token: str | None = None
     if _should_use_copilot_oauth(
         backend=effective_backend,
         provider_type=provider_type,
@@ -2504,6 +2514,16 @@ def copilot(
         env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
         env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
         env.pop("COPILOT_PROVIDER_API_KEY", None)
+        # Hand the exact token we resolved (and, for --subscription, validated
+        # against GitHub) to the proxy explicitly via copilot_proxy_token below.
+        # The proxy pins it as GITHUB_COPILOT_API_TOKEN, so upstream auth is
+        # deterministic instead of the proxy re-running unvalidated discovery
+        # (read_cached_oauth_token returns the *first* candidate, which may not
+        # be the one the wrapper approved → environment-dependent 401s). Passing
+        # it as a launch argument — rather than mutating this process's global
+        # os.environ — keeps the token off shared state and out of unrelated
+        # code paths.
+        copilot_proxy_token = client_bearer
         env_vars_display = [
             "COPILOT_PROVIDER_TYPE=openai",
             f"COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:{port}/v1",
@@ -2518,9 +2538,6 @@ def copilot(
         env["GITHUB_COPILOT_API_URL"] = openai_api_url
         env["OPENAI_TARGET_API_URL"] = openai_api_url
         env_vars_display.append(f"COPILOT_PROVIDER_API_URL={openai_api_url}")
-        os.environ["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
-        os.environ["GITHUB_COPILOT_API_URL"] = openai_api_url
-        os.environ["OPENAI_TARGET_API_URL"] = openai_api_url
     else:
         env, env_vars_display = _build_copilot_launch_env(
             port=port,
@@ -2563,6 +2580,7 @@ def copilot(
         anyllm_provider=anyllm_provider,
         region=region,
         openai_api_url=openai_api_url,
+        copilot_api_token=copilot_proxy_token,
     )
 
 
