@@ -312,18 +312,20 @@ Upgrade pip to the latest version:
 ```bash
 python3 -m pip install --upgrade pip
 ```
-
 ---
 
 ### Missing `cargo` (Rust error)
 
 Some tests require Rust tooling.
 
-Install it using:
+Install Rust using the official installer:
 
 ```bash
-brew install rust
+curl https://sh.rustup.rs -sSf | sh
 ```
+
+Or visit the official site:
+https://rust-lang.org/tools/install/
 
 ---
 
