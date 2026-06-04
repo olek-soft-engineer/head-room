@@ -233,6 +233,11 @@ jobs:
           done
           echo "::error::could not fetch fastembed model from HuggingFace"; exit 1
       - name: Run relevance tests
+        # Offline so fastembed reads the cache the prefetch step just warmed,
+        # without an unauthenticated cache-validation HEAD that could 429.
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
         run: pytest tests/test_relevance.py -v
 
   test-agno:
