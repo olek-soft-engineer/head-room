@@ -76,6 +76,7 @@ When configured, Headroom emits OTLP traces for the shared compression pipeline 
 | `--budget` | None | Daily budget limit in USD |
 | `--code-aware` | true | Enable AST-based code compression (env: HEADROOM_CODE_AWARE_ENABLED) |
 | `--no-code-aware` | false | Disable code-aware compression |
+| `--anthropic-api-url` | `https://api.anthropic.com` | Custom Anthropic API URL endpoint |
 | `--openai-api-url` | `https://api.openai.com` | Custom OpenAI API URL endpoint |
 
 ### Run Modes
