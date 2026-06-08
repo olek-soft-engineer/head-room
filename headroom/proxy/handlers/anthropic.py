@@ -1239,6 +1239,37 @@ class AnthropicHandlerMixin:
             # `frozen_message_count > 0` guard below).
             tools = body.get("tools")
             _original_tools = tools  # Preserve for diagnostic / future retry
+
+            # Issue #746: when Claude Code talks to a custom ANTHROPIC_BASE_URL
+            # with ENABLE_TOOL_SEARCH unset, it stops deferring tool schemas and
+            # loads them all into local context. That is a client-side decision
+            # we cannot reverse from here, so emit a single actionable hint for
+            # users who launch `claude` manually (the wrap path sets the env var).
+            # Gate on the cheap one-time flag first so the detection scan stops
+            # running once the hint has fired; never let it break a request.
+            from headroom.proxy.helpers import tool_search_hint_pending
+
+            if tool_search_hint_pending():
+                try:
+                    from headroom.proxy.helpers import (
+                        claude_code_tool_search_inactive,
+                        format_tool_search_disabled_hint,
+                        take_tool_search_hint_slot,
+                    )
+
+                    if (
+                        claude_code_tool_search_inactive(
+                            client=client,
+                            tools=tools,
+                            anthropic_beta=request.headers.get("anthropic-beta"),
+                        )
+                        and take_tool_search_hint_slot()
+                    ):
+                        logger.warning(
+                            "[%s] %s", request_id, format_tool_search_disabled_hint(tools)
+                        )
+                except Exception:  # advisory hint only — must never fail a request
+                    pass
             if (
                 self.config.ccr_inject_tool or self.config.ccr_inject_system_instructions
             ) and not _bypass:
