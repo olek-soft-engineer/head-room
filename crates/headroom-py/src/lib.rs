@@ -30,6 +30,7 @@ use headroom_core::transforms::tag_protector::{
 use headroom_core::transforms::{
     compress_openai_responses_live_zone as rust_compress_openai_responses_live_zone,
     detect as rust_detect_chain, is_json_array_of_dicts as rust_is_json_array_of_dicts,
+    summarize_openai_responses_no_change_reason as rust_summarize_openai_responses_no_change_reason,
     AuthMode as RustLiveZoneAuthMode, ContentType as RustContentType,
     DetectionResult as RustDetectionResult, DiffCompressionResult, DiffCompressor,
     DiffCompressorConfig, DiffCompressorStats, LiveZoneOutcome,
@@ -1498,7 +1499,7 @@ fn compress_openai_responses_live_zone(
     body: &[u8],
     auth_mode: &str,
     model: &str,
-) -> (Py<PyBytes>, bool) {
+) -> (Py<PyBytes>, bool, u64, Vec<String>, Option<String>) {
     let mode = match auth_mode.to_ascii_lowercase().as_str() {
         "payg" => RustLiveZoneAuthMode::Payg,
         "oauth" => RustLiveZoneAuthMode::OAuth,
@@ -1512,17 +1513,50 @@ fn compress_openai_responses_live_zone(
     };
 
     match rust_compress_openai_responses_live_zone(body, mode, model_str) {
-        Ok(LiveZoneOutcome::NoChange { .. }) => (PyBytes::new_bound(py, body).unbind(), false),
-        Ok(LiveZoneOutcome::Modified { new_body, .. }) => {
+        Ok(LiveZoneOutcome::NoChange { manifest }) => {
+            let saved = manifest.tokens_saved() as u64;
+            let transforms: Vec<String> = manifest
+                .transforms_applied()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            let reason = rust_summarize_openai_responses_no_change_reason(&manifest).to_string();
+            (
+                PyBytes::new_bound(py, body).unbind(),
+                false,
+                saved,
+                transforms,
+                Some(reason),
+            )
+        }
+        Ok(LiveZoneOutcome::Modified { new_body, manifest }) => {
             // `RawValue::get` returns the underlying serialized JSON
             // as `&str`; bytes are valid UTF-8 by construction.
             let bytes = new_body.get().as_bytes();
-            (PyBytes::new_bound(py, bytes).unbind(), true)
+            let saved = manifest.tokens_saved() as u64;
+            let transforms: Vec<String> = manifest
+                .transforms_applied()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            (
+                PyBytes::new_bound(py, bytes).unbind(),
+                true,
+                saved,
+                transforms,
+                None,
+            )
         }
         Err(_) => {
             // BodyNotJson / NoMessagesArray are non-fatal: nothing to
             // compress, fall through to passthrough byte-for-byte.
-            (PyBytes::new_bound(py, body).unbind(), false)
+            (
+                PyBytes::new_bound(py, body).unbind(),
+                false,
+                0,
+                Vec::new(),
+                Some("dispatch_error".to_string()),
+            )
         }
     }
 }

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import builtins
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
+
+import httpx
 
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin, _decode_openai_bearer_payload
+from headroom.proxy.helpers import _headroom_bypass_enabled
+from headroom.proxy.server import HeadroomProxy
 
 
 def _jwt(payload: object) -> str:
@@ -33,6 +39,32 @@ class _FreshCompressor:
 
     def __init__(self):
         type(self).instances += 1
+
+
+class _TimeoutHttpClient:
+    async def request(self, **kwargs):  # noqa: ANN001, ANN201
+        raise httpx.ConnectTimeout("connect timed out")
+
+
+class _PassthroughRequest:
+    method = "GET"
+    headers = {}
+    url = SimpleNamespace(path="/favicon.ico", query="")
+
+    async def body(self) -> bytes:
+        return b""
+
+
+class _RetryThenSuccessClient:
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    async def post(self, url, content, headers):  # noqa: ANN001, ANN201
+        self.attempts += 1
+        if self.attempts == 1:
+            raise httpx.ConnectTimeout("connect timed out")
+        request = httpx.Request("POST", url, headers=headers, content=content)
+        return httpx.Response(200, request=request, content=b"{}")
 
 
 def test_decode_openai_bearer_payload_handles_missing_and_non_mapping_payloads() -> None:
@@ -77,6 +109,58 @@ def test_openai_handler_prefix_helpers_cover_edge_cases() -> None:
     )
     assert restored == original
     assert changed == 1
+
+
+def test_headroom_bypass_helper_is_transport_neutral() -> None:
+    assert _headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
+    assert _headroom_bypass_enabled({"x-headroom-bypass": " TRUE "}) is True
+    assert _headroom_bypass_enabled({"x-headroom-mode": "passthrough"}) is True
+    assert _headroom_bypass_enabled({"x-headroom-mode": " PASSTHROUGH "}) is True
+    assert _headroom_bypass_enabled({"x-headroom-bypass": "false"}) is False
+    assert _headroom_bypass_enabled({}) is False
+    assert _headroom_bypass_enabled(None) is False
+    assert OpenAIHandlerMixin._headroom_bypass_enabled({"x-headroom-bypass": "true"}) is True
+
+
+def test_openai_passthrough_connect_timeout_returns_502() -> None:
+    handler = object.__new__(OpenAIHandlerMixin)
+    handler.http_client = _TimeoutHttpClient()
+
+    async def run():
+        return await handler.handle_passthrough(
+            _PassthroughRequest(),
+            "https://api.openai.com",
+        )
+
+    response = asyncio.run(run())
+
+    assert response.status_code == 502
+    payload = json.loads(response.body)
+    assert payload["error"]["type"] == "connection_error"
+    assert "Failed to connect to upstream API" in payload["error"]["message"]
+
+
+def test_retry_request_retries_connect_timeout() -> None:
+    proxy = object.__new__(HeadroomProxy)
+    proxy.http_client = _RetryThenSuccessClient()
+    proxy.config = SimpleNamespace(
+        retry_enabled=True,
+        retry_max_attempts=2,
+        retry_base_delay_ms=0,
+        retry_max_delay_ms=0,
+    )
+
+    response = asyncio.run(
+        proxy._retry_request(
+            "POST",
+            "https://api.openai.com/v1/responses",
+            {},
+            {"model": "gpt-5"},
+        )
+    )
+
+    assert response.status_code == 200
+    assert proxy.http_client.attempts == 2
 
 
 def test_anthropic_tool_sort_and_context_append_helpers() -> None:
@@ -261,3 +345,89 @@ def test_anthropic_assistant_message_helper_requires_assistant_role() -> None:
     assert AnthropicHandlerMixin._assistant_message_from_response_json(
         {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
     ) == {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+
+
+# ============================================================================
+# CCR workspace resolution (cross-project leak fix, 2026-05-26).
+#
+# These tests pin the `_resolve_ccr_workspace` static helper that the
+# anthropic handler uses to scope the proactive-expansion cache by
+# project identity. The resolver shares its tier order with the memory
+# subsystem's ProjectResolver: x-headroom-project-id → x-headroom-cwd →
+# system-prompt `cwd:` line. Returns `("", None)` on no signal — the
+# fail-closed signal that callers gate on.
+# ============================================================================
+
+
+def _fake_request(headers: dict[str, str]) -> SimpleNamespace:
+    """Minimal Starlette/FastAPI-shaped request object for resolver tests."""
+    return SimpleNamespace(headers=headers)
+
+
+def test_resolve_ccr_workspace_explicit_project_id_wins() -> None:
+    """x-headroom-project-id is the highest-priority signal."""
+    request = _fake_request({"x-headroom-project-id": "my-cool-project"})
+    body = {}
+    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    assert key == "my-cool-project"
+    assert label == "my-cool-project"
+
+
+def test_resolve_ccr_workspace_cwd_header() -> None:
+    """x-headroom-cwd produces a stable per-cwd key + basename label."""
+    request = _fake_request({"x-headroom-cwd": "/home/user/code/daphni-rails"})
+    body = {}
+    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    # Key format: "{basename}-{sha256[:16]}" — stable per absolute cwd.
+    assert key.startswith("daphni-rails-")
+    assert len(key) >= len("daphni-rails-") + 16
+    assert label == "daphni-rails"
+
+
+def test_resolve_ccr_workspace_two_cwds_get_distinct_keys() -> None:
+    """Two different cwds produce different workspace keys (cross-leak prevention)."""
+    key_a, _ = AnthropicHandlerMixin._resolve_ccr_workspace(
+        _fake_request({"x-headroom-cwd": "/home/user/code/daphni-rails"}), {}
+    )
+    key_b, _ = AnthropicHandlerMixin._resolve_ccr_workspace(
+        _fake_request({"x-headroom-cwd": "/home/user/code/tamag0"}), {}
+    )
+    assert key_a != key_b, "different cwds must yield different workspace keys"
+
+
+def test_resolve_ccr_workspace_no_signal_returns_empty() -> None:
+    """No project-id, no cwd header, no system prompt → fail-closed signal."""
+    request = _fake_request({})
+    body = {}
+    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    assert key == ""
+    assert label is None
+
+
+def test_resolve_ccr_workspace_system_prompt_cwd_fallback() -> None:
+    """System prompt with `cwd:` line is the lowest-tier fallback."""
+    request = _fake_request({})
+    body = {
+        "system": [{"type": "text", "text": "You are helpful.\ncwd: /home/u/code/my-project\nGo."}]
+    }
+    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    # The label is the basename of the cwd extracted from the prompt.
+    assert label == "my-project"
+    assert key.startswith("my-project-")
+
+
+def test_resolve_ccr_workspace_malformed_request_returns_empty() -> None:
+    """A request whose headers attribute can't be dict()-ed fails closed, not crashes."""
+
+    class _BrokenHeaders:
+        def __iter__(self):
+            raise RuntimeError("boom")
+
+    request = SimpleNamespace(headers=_BrokenHeaders())
+    body = {}
+    # The helper catches the exception, logs it, and returns the fail-
+    # closed sentinel ("", None). Critically, it does NOT raise — the
+    # proxy must continue serving the request even if CCR scoping fails.
+    key, label = AnthropicHandlerMixin._resolve_ccr_workspace(request, body)
+    assert key == ""
+    assert label is None

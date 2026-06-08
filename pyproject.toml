@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "headroom-ai"
-version = "0.9.1"
+version = "0.23.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
@@ -75,16 +75,17 @@ proxy = [
 code = [
     "tree-sitter-language-pack>=0.10.0",
 ]
-# ML-based compression with Kompress (ModernBERT)
+# ML-based compression with Kompress (ModernBERT).
+# (The legacy [llmlingua] extra was removed in 0.9.x — no live code path used it.
+# Use [ml] for the supported ML compression dependencies.)
 ml = [
     "torch>=2.0.0",
     "transformers>=4.30.0",
-]
-# Legacy ML compression (LLMLingua-2 — use [ml] instead for Kompress)
-llmlingua = [
-    "llmlingua>=0.2.0",
-    "torch>=2.0.0",
-    "transformers>=4.30.0",
+    # transformers >= 5.x requires huggingface-hub >= 1.5.0,<2.0; pinning
+    # the floor here prevents Kompress from silently falling back to
+    # "unavailable" when a sibling install (e.g. `pip install
+    # strands-agents`) drags huggingface-hub backwards.
+    "huggingface-hub>=1.5.0,<2.0",
 ]
 # Memory system (hierarchical memory with vector search)
 memory = [
@@ -197,7 +198,7 @@ html = [
 ]
 # Comprehensive LLM benchmarks
 benchmark = [
-    "lm-eval>=0.4.0",
+    "lm-eval[api]>=0.4.0",
     "openai>=1.0.0",
     "anthropic>=0.18.0",
 ]
@@ -234,11 +235,15 @@ all = [
 headroom = "headroom.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/chopratejas/headroom"
-Documentation = "https://github.com/chopratejas/headroom#readme"
+Homepage = "https://headroom-docs.vercel.app"
+Documentation = "https://headroom-docs.vercel.app/docs"
 Repository = "https://github.com/chopratejas/headroom"
 Issues = "https://github.com/chopratejas/headroom/issues"
 Changelog = "https://github.com/chopratejas/headroom/blob/main/CHANGELOG.md"
+# llms.txt convention (llmstxt.org) — point AI agents / LLM crawlers
+# at the auto-generated docs index so they can resolve install paths
+# and entry points without a follow-up fetch.
+"AI / LLM Index" = "https://headroom-docs.vercel.app/llms.txt"
 
 # Maturin builds a single wheel containing both the Python source under
 # `headroom/` AND the compiled Rust extension `headroom/_core.so` (cdylib
@@ -263,9 +268,16 @@ default = true
 # Where the Python package lives. With `python-source = "."` and the
 # package directory `headroom/` at repo root, maturin includes every file
 # under `headroom/` in the wheel — that picks up the dashboard HTML
-# templates and bundled YAML configs. `LICENSE` is listed explicitly because
-# maturin sdists do not get the package-directory treatment wheels do.
-include = [{ path = "LICENSE", format = "sdist" }]
+# templates and bundled YAML configs. `LICENSE` and `NOTICE` are listed
+# explicitly because maturin sdists do not get the package-directory
+# treatment wheels do, and PEP 639 auto-discovery emits both files into
+# `License-File:` metadata — PyPI rejects sdists whose declared license
+# files are missing from the tarball with `400 License-File X does not
+# exist in distribution file`.
+include = [
+    { path = "LICENSE", format = "sdist" },
+    { path = "NOTICE", format = "sdist" },
+]
 python-source = "."
 module-name = "headroom._core"
 # The cdylib source lives under `crates/headroom-py`. Maturin invokes

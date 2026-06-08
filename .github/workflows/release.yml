@@ -25,18 +25,15 @@ env:
   GH_PACKAGES_SKIP: "false"
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - ".github/workflows/ci.yml"
-      - ".github/workflows/publish.yml"
-      - "scripts/**"
-      - ".commitlintrc.json"
-      - ".actrc"
-      - ".actrc.local.example"
-      - ".env.act.example"
-      - ".github/act/**"
+  # Triggered when release-please's release PR is merged: the bot
+  # tags the merge commit `vX.Y.Z` and creates a GitHub Release on
+  # that tag, which fires the `release: published` event. Ordinary
+  # pushes to main no longer trigger publishes — that was the old
+  # behavior that burned PyPI's per-project storage quota by
+  # uploading a fresh wheel matrix (~200 MB) per merged fix/feat PR.
+  # See .github/workflows/release-please.yml for the PR-aggregator.
+  release:
+    types: [published]
   # X2: PR-time release dry-run. Trigger on PRs that touch release-
   # critical paths so the wheel matrix + smoke-import gate run BEFORE
   # merge — not after the tag is pushed and main is broken. Path
@@ -87,16 +84,39 @@ jobs:
       bump: ${{ steps.ver.outputs.bump }}
       previous_tag: ${{ steps.ver.outputs.previous_tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
+      # When fired by release-please's release event, the tag the
+      # bot just published IS the canonical version for this run —
+      # release_version.py's git-log derivation would re-bump it.
+      # workflow_dispatch still honors `inputs.version`; PR dry-runs
+      # leave MANUAL_VER empty and the script computes normally.
+      - name: Resolve MANUAL_VER from trigger
+        id: manualver
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          MANUAL_INPUT: ${{ github.event.inputs.version }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            # github.event.release.tag_name is "vX.Y.Z" — strip the
+            # leading "v" so release_version.py's SemVer parser
+            # accepts it.
+            echo "value=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+          elif [ -n "$MANUAL_INPUT" ]; then
+            echo "value=$MANUAL_INPUT" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Compute semantic version from canonical + release history
         id: ver
         run: |
           python headroom/release_version.py
         env:
-          MANUAL_VER: ${{ github.event.inputs.version }}
+          MANUAL_VER: ${{ steps.manualver.outputs.value }}
 
   # Single source of truth for changelog + npm packaging. Wheels are
   # built per-platform in `build-wheels` below. publish-pypi merges them.
@@ -106,17 +126,17 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
 
@@ -159,7 +179,7 @@ jobs:
         shell: bash
 
       - name: Upload changelog via action
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: changelog
           path: /tmp/changelog-backup.md
@@ -183,7 +203,7 @@ jobs:
           npm pack --pack-destination ../../release-assets
 
       - name: Upload release assets artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-assets
           path: release-assets/
@@ -241,12 +261,12 @@ jobs:
             manylinux: ""
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -295,10 +315,23 @@ jobs:
           command: sdist
           args: --out dist
 
-      - name: Verify sdist includes top-level LICENSE
+      - name: Verify sdist license-file metadata matches tarball contents
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
           python - <<'PY'
+          # PyPI rejects sdists whose `License-File:` metadata entries
+          # (PEP 639) reference files that aren't physically present
+          # in the tarball: `400 License-File X does not exist in
+          # distribution file ... at <root>/X`. This check catches
+          # that divergence before upload by parsing PKG-INFO's
+          # License-File lines and asserting each one resolves to a
+          # real tarball member. Issue trail: sdist publish broke at
+          # v0.20.16 when the hatch -> maturin migration in 2a91cbb
+          # dropped NOTICE from the sdist `include` list while PEP 639
+          # still emitted it as a License-File. Was masked for ~22
+          # releases by an earlier twine "File already exists" failure
+          # on duplicate wheels; surfaced once PR #412 added
+          # skip-existing.
           from pathlib import Path
           import tarfile
 
@@ -307,18 +340,37 @@ jobs:
               raise SystemExit(f"expected exactly one sdist in dist/, found {len(sdists)}")
 
           with tarfile.open(sdists[0], "r:gz") as archive:
-              names = archive.getnames()
+              names = set(archive.getnames())
+              roots = {name.split("/", 1)[0] for name in names if "/" in name}
+              if len(roots) != 1:
+                  raise SystemExit(f"expected one sdist root directory, found {sorted(roots)}")
+              root = roots.pop()
 
-          roots = {name.split("/", 1)[0] for name in names if "/" in name}
-          if len(roots) != 1:
-              raise SystemExit(f"expected one sdist root directory, found {sorted(roots)}")
+              pkg_info_path = f"{root}/PKG-INFO"
+              member = archive.getmember(pkg_info_path)
+              fh = archive.extractfile(member)
+              if fh is None:
+                  raise SystemExit(f"could not read {pkg_info_path} from {sdists[0].name}")
+              pkg_info = fh.read().decode("utf-8")
 
-          root = roots.pop()
-          license_path = f"{root}/LICENSE"
-          if license_path not in names:
-              raise SystemExit(f"{sdists[0].name} is missing {license_path}")
+          declared = []
+          for line in pkg_info.splitlines():
+              if not line.strip():
+                  break  # headers ended (blank line separator); rest is README body
+              if line.startswith("License-File:"):
+                  declared.append(line.split(":", 1)[1].strip())
 
-          print(f"sdist LICENSE OK: {license_path}")
+          if not declared:
+              raise SystemExit(f"{sdists[0].name} PKG-INFO declares no License-File entries - expected at least LICENSE")
+
+          missing = [name for name in declared if f"{root}/{name}" not in names]
+          if missing:
+              raise SystemExit(
+                  f"{sdists[0].name} declares License-File entries that are missing from the tarball: {missing}. "
+                  f"Add them to `[tool.maturin].include` with `format = \"sdist\"`."
+              )
+
+          print(f"sdist License-File metadata OK ({len(declared)} files, all present): {declared}")
           PY
 
       # Audit each Linux wheel's dynamic symbol references against its
@@ -341,7 +393,7 @@ jobs:
           done
 
       - name: Upload wheels artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*
@@ -355,14 +407,14 @@ jobs:
       contents: read
     steps:
       - name: Download all wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           path: wheels-tmp/
           merge-multiple: true
 
       - name: Download release assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-assets
           path: release-assets/
@@ -377,13 +429,13 @@ jobs:
           ls -la release-assets/
 
       - name: Upload merged dist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
 
       - name: Upload merged release-assets artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-assets-merged
           path: release-assets/
@@ -450,7 +502,7 @@ jobs:
 
     steps:
       - name: Download wheels artifact for this target
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ matrix.wheel_artifact }}
           path: dist/
@@ -608,7 +660,7 @@ jobs:
       id-token: write  # Required for OIDC trusted publishing
     steps:
       - name: Download merged dist artifact (sdist + cross-platform wheels)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
@@ -635,12 +687,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
           registry-url: ${{ env.NPM_REGISTRY_URL }}
@@ -691,7 +743,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -702,7 +754,7 @@ jobs:
           printf 'scope=%s\n' "$scope" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js for GitHub Package Registry
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "20"
           registry-url: ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}
@@ -823,18 +875,18 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Download changelog artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: changelog
           path: /tmp
 
       - name: Download merged release assets (npm tarballs + wheels + sdist)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-assets-merged
           path: release-assets
@@ -856,7 +908,13 @@ jobs:
           TAG="v${{ needs.detect-version.outputs.version }}"
           TITLE="Release v${{ needs.detect-version.outputs.version }}"
           if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release edit "$TAG" --title "$TITLE" --notes-file .changelog.md
+            # Release already exists — typically created by
+            # release-please on release-PR merge with an auto-
+            # generated changelog body. Don't overwrite its notes
+            # (--notes-file would clobber them); only sync the
+            # title in case detect-version's canonical form differs
+            # from what the bot set.
+            gh release edit "$TAG" --title "$TITLE"
           else
             gh release create "$TAG" --title "$TITLE" --notes-file .changelog.md
           fi

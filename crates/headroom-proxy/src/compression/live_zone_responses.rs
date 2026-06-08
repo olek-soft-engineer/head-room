@@ -35,14 +35,15 @@ use bytes::Bytes;
 use headroom_core::auth_mode::AuthMode as RequestAuthMode;
 use headroom_core::transforms::live_zone::DEFAULT_MODEL;
 use headroom_core::transforms::{
-    compress_openai_responses_live_zone, BlockAction, LiveZoneError, LiveZoneOutcome,
+    compress_openai_responses_live_zone, summarize_openai_responses_no_change_reason, BlockAction,
+    LiveZoneError, LiveZoneOutcome,
 };
 use serde_json::Value;
 
 use crate::cache_stabilization::tool_def_normalize::{
     any_tool_has_cache_control, sort_schema_keys_recursive, sort_tools_deterministically,
 };
-use crate::compression::{Outcome, PassthroughReason};
+use crate::compression::{Outcome, PassthroughReason, PerStrategyTokens};
 use crate::config::CompressionMode;
 
 /// OpenAI Responses live-zone compression entry point.
@@ -146,6 +147,7 @@ pub fn compress_openai_responses_request(
     // the rationale — same wiring on the OpenAI Responses path.
     match compress_openai_responses_live_zone(&dispatch_body, auth_mode.into(), model) {
         Ok(LiveZoneOutcome::NoChange { manifest }) => {
+            let reason = summarize_openai_responses_no_change_reason(&manifest);
             tracing::info!(
                 event = "compression_decision",
                 request_id = %request_id,
@@ -153,7 +155,7 @@ pub fn compress_openai_responses_request(
                 method = "POST",
                 compression_mode = mode.as_str(),
                 decision = "no_change",
-                reason = "no_block_compressed",
+                reason = reason,
                 body_bytes = body.len(),
                 items_total = manifest.messages_total,
                 latest_user_message_index = ?manifest.latest_user_message_index,
@@ -168,6 +170,7 @@ pub fn compress_openai_responses_request(
                     tokens_after: 0,
                     strategies_applied: normalization_applied.strategies(),
                     markers_inserted: Vec::new(),
+                    per_strategy_tokens: Vec::new(),
                 };
             }
             Outcome::NoCompression
@@ -175,12 +178,15 @@ pub fn compress_openai_responses_request(
         Ok(LiveZoneOutcome::Modified { new_body, manifest }) => {
             // Aggregate per-block savings for the structured log.
             // Mirrors the Chat Completions sibling so dashboards
-            // don't need provider-specific shapes.
+            // don't need provider-specific shapes. H1 + C5: per-
+            // strategy token accumulation + rejected-token-check
+            // counter.
             let mut original_bytes_total: usize = 0;
             let mut compressed_bytes_total: usize = 0;
             let mut original_tokens_total: usize = 0;
             let mut compressed_tokens_total: usize = 0;
             let mut strategies: Vec<&'static str> = Vec::new();
+            let mut per_strategy_tokens: Vec<PerStrategyTokens> = Vec::new();
             let mut had_compressor_error = false;
             for entry in &manifest.block_outcomes {
                 match entry.action {
@@ -198,6 +204,22 @@ pub fn compress_openai_responses_request(
                         if !strategies.contains(&strategy) {
                             strategies.push(strategy);
                         }
+                        if let Some(slot) = per_strategy_tokens
+                            .iter_mut()
+                            .find(|s| s.strategy == strategy)
+                        {
+                            slot.original_tokens += original_tokens;
+                            slot.compressed_tokens += compressed_tokens;
+                        } else {
+                            per_strategy_tokens.push(PerStrategyTokens {
+                                strategy,
+                                original_tokens,
+                                compressed_tokens,
+                            });
+                        }
+                    }
+                    BlockAction::RejectedNotSmaller { strategy, .. } => {
+                        crate::observability::record_compression_rejected_by_token_check(strategy);
                     }
                     BlockAction::CompressorError {
                         strategy,
@@ -255,6 +277,7 @@ pub fn compress_openai_responses_request(
                 tokens_after: compressed_tokens_total,
                 strategies_applied: strategies,
                 markers_inserted: Vec::new(),
+                per_strategy_tokens,
             }
         }
         Err(LiveZoneError::BodyNotJson(_)) => {

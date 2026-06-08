@@ -24,6 +24,7 @@ scripts/*
 !scripts/smoke_issue_327.py
 !scripts/refresh_model_limits.sh
 !scripts/audit_wheel_glibc_symbols.py
+!scripts/replay_codex_ws_load.py
 
 # Rust / Cargo build artifacts
 /target/
@@ -101,6 +102,7 @@ pytest_cache/
 .env
 .env.*
 !.env.act.example
+!.env.example
 .venv
 env/
 venv/
@@ -187,6 +189,7 @@ benchmark_results/
 .deepeval/
 
 # Headroom specific
+.headroom/
 headroom.db
 headroom_*.db
 *.jsonl

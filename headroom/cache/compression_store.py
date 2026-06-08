@@ -53,6 +53,32 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_RETRIEVAL_LOG_PREVIEW_CHARS = 4096
+_SECRET_KEY_VALUE_RE = re.compile(
+    r"(?i)\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_-]*)"
+    r"(\s*[:=]\s*)([\"']?)([^\"'\s,}]+)"
+)
+_AUTH_VALUE_RE = re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{12,}")
+_API_KEY_VALUE_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+
+
+def _redact_retrieval_log_payload(payload: str) -> str:
+    redacted = _SECRET_KEY_VALUE_RE.sub(r"\1\2\3[REDACTED]", payload)
+    redacted = _AUTH_VALUE_RE.sub(r"\1 [REDACTED]", redacted)
+    return _API_KEY_VALUE_RE.sub("sk-[REDACTED]", redacted)
+
+
+def _payload_for_retrieval_log(payload: str) -> dict[str, Any]:
+    redacted = _redact_retrieval_log_payload(payload)
+    preview = redacted[:_RETRIEVAL_LOG_PREVIEW_CHARS]
+    truncated = len(redacted) > len(preview)
+    return {
+        "payload_chars": len(payload),
+        "payload_preview_chars": len(preview),
+        "payload_truncated": truncated,
+        "payload_preview": preview,
+    }
+
 
 @dataclass
 class CompressionEntry:
@@ -337,6 +363,15 @@ class CompressionStore:
                     retrieval_type="full",
                     tool_signature_hash=entry.tool_signature_hash,
                 )
+            self._log_retrieval_payload(
+                hash_key=hash_key,
+                query=query,
+                retrieval_type="full",
+                payload=entry.original_content,
+                items_retrieved=entry.original_item_count,
+                total_items=entry.original_item_count,
+                entry=entry,
+            )
 
             # CRITICAL: Make a deep copy to return
             # (entry could be modified/evicted after lock release)
@@ -409,12 +444,7 @@ class CompressionStore:
         if entry is None:
             return []
 
-        try:
-            items = json.loads(entry.original_content)
-            if not isinstance(items, list):
-                return []
-        except json.JSONDecodeError:
-            return []
+        items = self._search_items_from_original(entry.original_content)
 
         if not items:
             return []
@@ -447,8 +477,193 @@ class CompressionStore:
                 )
             # Process feedback immediately to ensure TOIN learns in real-time
             self.process_pending_feedback()
+        self._log_retrieval_payload(
+            hash_key=hash_key,
+            query=query,
+            retrieval_type="search",
+            payload=json.dumps(results, ensure_ascii=False),
+            items_retrieved=len(results),
+            total_items=len(items),
+            entry=entry,
+        )
 
         return results
+
+    def _log_retrieval_payload(
+        self,
+        *,
+        hash_key: str,
+        query: str | None,
+        retrieval_type: str,
+        payload: str,
+        items_retrieved: int,
+        total_items: int,
+        entry: CompressionEntry,
+    ) -> None:
+        event = {
+            "event": "headroom_retrieve",
+            "hash": hash_key,
+            "retrieval_type": retrieval_type,
+            "query": query,
+            "items_retrieved": items_retrieved,
+            "total_items": total_items,
+            "tool_name": entry.tool_name,
+            "tool_call_id": entry.tool_call_id,
+            "compression_strategy": entry.compression_strategy,
+            "tool_signature_hash": entry.tool_signature_hash,
+            "original_tokens": entry.original_tokens,
+            "compressed_tokens": entry.compressed_tokens,
+            "original_item_count": entry.original_item_count,
+            "compressed_item_count": entry.compressed_item_count,
+            **_payload_for_retrieval_log(payload),
+        }
+        logger.info(
+            "event=headroom_retrieve %s",
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+        )
+
+    def _search_items_from_original(self, original_content: str) -> list[Any]:
+        """Normalize cached originals into searchable items.
+
+        CCR producers store different shapes:
+        - SmartCrusher/search-style paths usually store JSON arrays.
+        - Kompress stores the original plain text.
+        - Some callers store JSON objects or scalar JSON values.
+
+        Search should work for all of them. Preserve the legacy JSON-array
+        result shape, but fall back to structured text chunks for everything
+        else so `headroom_retrieve(hash, query=...)` can find plain-text
+        originals.
+        """
+
+        try:
+            parsed = json.loads(original_content)
+        except json.JSONDecodeError:
+            return self._plain_text_search_items(original_content)
+
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            return self._json_object_search_items(parsed)
+        if isinstance(parsed, str):
+            return self._plain_text_search_items(parsed)
+        if parsed is None:
+            return []
+        return [{"type": "json_scalar", "value": parsed}]
+
+    def _json_object_search_items(self, value: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return searchable leaf records for a JSON object."""
+
+        items: list[dict[str, Any]] = []
+
+        def walk(node: Any, path: str) -> None:
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    child_path = f"{path}.{key}" if path else str(key)
+                    walk(child, child_path)
+                return
+            if isinstance(node, list):
+                for idx, child in enumerate(node):
+                    walk(child, f"{path}[{idx}]")
+                return
+            if node is None:
+                return
+            items.append({"type": "json_leaf", "path": path, "value": node})
+
+        walk(value, "")
+        if items:
+            return items
+        return [{"type": "json_object", "value": value}]
+
+    def _plain_text_search_items(self, text: str) -> list[dict[str, Any]]:
+        """Chunk arbitrary text into searchable records.
+
+        Line-aware chunks work well for logs/source. Word-window chunks handle
+        Kompress originals, which are often long single-line text blobs.
+        """
+
+        if not text or not text.strip():
+            return []
+
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        lines = normalized.split("\n")
+        if len(lines) > 1:
+            return self._line_text_search_items(lines)
+
+        words = normalized.split()
+        if not words:
+            return []
+        max_words = 350
+        overlap_words = 50
+        if len(words) <= max_words:
+            return [
+                {
+                    "type": "text",
+                    "text": normalized,
+                    "chunk_index": 0,
+                    "word_start": 1,
+                    "word_end": len(words),
+                }
+            ]
+
+        items: list[dict[str, Any]] = []
+        start = 0
+        chunk_index = 0
+        step = max_words - overlap_words
+        while start < len(words):
+            end = min(len(words), start + max_words)
+            items.append(
+                {
+                    "type": "text",
+                    "text": " ".join(words[start:end]),
+                    "chunk_index": chunk_index,
+                    "word_start": start + 1,
+                    "word_end": end,
+                }
+            )
+            if end == len(words):
+                break
+            start += step
+            chunk_index += 1
+        return items
+
+    @staticmethod
+    def _line_text_search_items(lines: list[str]) -> list[dict[str, Any]]:
+        max_chars = 2000
+        items: list[dict[str, Any]] = []
+        current: list[str] = []
+        line_start = 1
+        char_count = 0
+
+        for idx, line in enumerate(lines, start=1):
+            line_len = len(line) + 1
+            if current and char_count + line_len > max_chars:
+                items.append(
+                    {
+                        "type": "text",
+                        "text": "\n".join(current),
+                        "chunk_index": len(items),
+                        "line_start": line_start,
+                        "line_end": idx - 1,
+                    }
+                )
+                current = []
+                line_start = idx
+                char_count = 0
+            current.append(line)
+            char_count += line_len
+
+        if current:
+            items.append(
+                {
+                    "type": "text",
+                    "text": "\n".join(current),
+                    "chunk_index": len(items),
+                    "line_start": line_start,
+                    "line_end": len(lines),
+                }
+            )
+        return items
 
     def _get_entry_for_search(
         self,
