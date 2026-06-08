@@ -25,8 +25,8 @@ import httpx
 
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy.auth_mode import classify_auth_mode, classify_client
-from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.compression_decision import CompressionDecision
+from headroom.proxy.forwarded_headers import resolve_client_ip
 from headroom.proxy.helpers import extract_tags
 from headroom.proxy.memory_decision import MemoryDecision
 from headroom.proxy.memory_query import MemoryQuery
