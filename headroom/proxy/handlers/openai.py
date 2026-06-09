@@ -1898,7 +1898,7 @@ class OpenAIHandlerMixin:
                 tools = remembered_event.tools
 
         body["messages"] = optimized_messages
-        if tools is not None:
+        if tools or _original_tools is not None:
             body["tools"] = tools
 
         presend_event = self.pipeline_extensions.emit(

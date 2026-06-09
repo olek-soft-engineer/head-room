@@ -1646,7 +1646,7 @@ class AnthropicHandlerMixin:
 
             # Update body
             body["messages"] = optimized_messages
-            if tools is not None:
+            if tools or _original_tools is not None:
                 tools = self._sort_tools_deterministically(tools)
                 body["tools"] = tools
 
