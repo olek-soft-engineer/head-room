@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,6 +55,12 @@ from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_mes
 from .base import Transform
 
 logger = logging.getLogger(__name__)
+
+
+# Lossless-compaction renderers known to the Rust core — mirrors
+# `CompactionStage::SUPPORTED_FORMAT_NAMES` in
+# `crates/headroom-core/.../compaction/mod.rs`.
+_SUPPORTED_COMPACTION_FORMATS = ("csv-schema", "json", "markdown-kv")
 
 
 # ─── CCR sentinel ─────────────────────────────────────────────────────────
@@ -172,6 +179,11 @@ class SmartCrusherConfig:
     dedup_identical_items: bool = True
     first_fraction: float = 0.3
     last_fraction: float = 0.15
+    # Lossless compaction only replaces the original when it saves at
+    # least this byte fraction vs the (minified) input. Mirrors the Rust
+    # default; mainly lowered in tests and KV experiments — KV repeats
+    # field names per row, so it clears the gate less often than CSV.
+    lossless_min_savings_ratio: float = 0.30
 
 
 # ─── Rust-backed SmartCrusher ─────────────────────────────────────────────
@@ -198,6 +210,7 @@ class SmartCrusher(Transform):
         ccr_config: CCRConfig | None = None,
         with_compaction: bool = True,
         observer: Any = None,
+        compaction_format: str | None = None,
     ):
         # Hard import — no Python fallback. If the wheel is missing the
         # caller must build it (scripts/build_rust_extension.sh) or
@@ -303,6 +316,7 @@ class SmartCrusher(Transform):
             dedup_identical_items=cfg.dedup_identical_items,
             first_fraction=cfg.first_fraction,
             last_fraction=cfg.last_fraction,
+            lossless_min_savings_ratio=cfg.lossless_min_savings_ratio,
             relevance_threshold=0.3,
             enable_ccr_marker=(
                 self._ccr_config.enabled and self._ccr_config.inject_retrieval_marker
@@ -314,10 +328,34 @@ class SmartCrusher(Transform):
         # markers. Pass `with_compaction=False` to opt into the
         # pre-PR4 lossy-only path (used by retention-property tests
         # that depend on row-level item preservation).
-        if with_compaction:
+        #
+        # `compaction_format` picks the lossless renderer:
+        # "csv-schema" (default), "json", or "markdown-kv" (opt-in
+        # trade of tokens for model read accuracy). Falls back to the
+        # HEADROOM_COMPACTION_FORMAT env var when the kwarg is None.
+        # Ignored when with_compaction=False.
+        resolved_format = compaction_format or os.environ.get(
+            "HEADROOM_COMPACTION_FORMAT", "csv-schema"
+        )
+        # Validate even when with_compaction=False: an explicit bogus
+        # format (kwarg or env var) is a misconfiguration that should be
+        # visible, not silently accepted because the knob happens to be
+        # ignored on this path.
+        if resolved_format not in _SUPPORTED_COMPACTION_FORMATS:
+            raise ValueError(
+                f"unknown compaction format {resolved_format!r}; "
+                f"expected one of: {', '.join(_SUPPORTED_COMPACTION_FORMATS)}"
+            )
+        self._compaction_format = resolved_format if with_compaction else None
+        if not with_compaction:
+            self._rust = _RustSmartCrusher.without_compaction(rust_cfg)
+        elif resolved_format == "csv-schema":
+            # Keep the `new()` constructor for the default path so its
+            # byte-parity coverage stays on the exact production
+            # codepath.
             self._rust = _RustSmartCrusher(rust_cfg)
         else:
-            self._rust = _RustSmartCrusher.without_compaction(rust_cfg)
+            self._rust = _RustSmartCrusher.with_compaction_format(rust_cfg, resolved_format)
 
     def crush(self, content: str, query: str = "", bias: float = 1.0) -> CrushResult:
         """Crush a single JSON content string.
