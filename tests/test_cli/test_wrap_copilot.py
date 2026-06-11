@@ -8,12 +8,18 @@ import sys
 import types
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import quote
 
 import click
 import pytest
 from click.testing import CliRunner
 
 from headroom.copilot_auth import DEFAULT_API_URL
+
+
+def _expected_project_prefix() -> str:
+    """The /p/<name> prefix the wrap now embeds (launch-directory basename)."""
+    return f"/p/{quote(Path.cwd().name, safe='')}"
 
 
 @pytest.fixture
@@ -98,7 +104,7 @@ def test_wrap_copilot_auto_anthropic_injects_instructions(
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["COPILOT_PROVIDER_TYPE"] == "anthropic"
-    assert env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8787"
+    assert env["COPILOT_PROVIDER_BASE_URL"] == f"http://127.0.0.1:8787{_expected_project_prefix()}"
     assert "COPILOT_PROVIDER_WIRE_API" not in env
     assert captured["agent_type"] == "copilot"
     assert captured["tool_label"] == "COPILOT"
@@ -145,7 +151,9 @@ def test_wrap_copilot_openai_backend_sets_completions_env(
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["COPILOT_PROVIDER_TYPE"] == "openai"
-    assert env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8787/v1"
+    assert env["COPILOT_PROVIDER_BASE_URL"] == (
+        f"http://127.0.0.1:8787{_expected_project_prefix()}/v1"
+    )
     assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
     assert captured["backend"] == "anyllm"
     assert captured["anyllm_provider"] == "groq"
@@ -181,7 +189,9 @@ def test_wrap_copilot_auto_detects_running_proxy_backend(
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["COPILOT_PROVIDER_TYPE"] == "openai"
-    assert env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8787/v1"
+    assert env["COPILOT_PROVIDER_BASE_URL"] == (
+        f"http://127.0.0.1:8787{_expected_project_prefix()}/v1"
+    )
     assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
 
 
@@ -210,7 +220,9 @@ def test_wrap_copilot_prefers_existing_oauth_session(
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["COPILOT_PROVIDER_TYPE"] == "openai"
-    assert env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8787/v1"
+    assert env["COPILOT_PROVIDER_BASE_URL"] == (
+        f"http://127.0.0.1:8787{_expected_project_prefix()}/v1"
+    )
     assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
     assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-existing"
     assert env["GITHUB_COPILOT_API_URL"] == DEFAULT_API_URL
@@ -249,7 +261,9 @@ def test_wrap_copilot_subscription_uses_github_auth_without_provider_key(
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["COPILOT_PROVIDER_TYPE"] == "openai"
-    assert env["COPILOT_PROVIDER_BASE_URL"] == "http://127.0.0.1:8787/v1"
+    assert env["COPILOT_PROVIDER_BASE_URL"] == (
+        f"http://127.0.0.1:8787{_expected_project_prefix()}/v1"
+    )
     assert env["COPILOT_PROVIDER_WIRE_API"] == "completions"
     assert env["COPILOT_PROVIDER_BEARER_TOKEN"] == "gho-existing"
     assert "COPILOT_PROVIDER_API_KEY" not in env

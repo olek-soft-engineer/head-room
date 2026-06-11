@@ -87,6 +87,7 @@ from headroom.providers.openclaw import (
 from headroom.providers.openclaw import (
     normalize_gateway_provider_ids as _normalize_openclaw_gateway_provider_ids_impl,
 )
+from headroom.proxy.project_context import with_project_prefix as _with_project_prefix
 
 from .main import main
 
@@ -944,6 +945,47 @@ def _prepare_wrap_rtk(verbose: bool = False, *, label: str | None = None) -> Pat
     return _ensure_rtk_binary(verbose=verbose)
 
 
+# Canonical casing for the proxy's per-project savings header (matched
+# case-insensitively by headroom.proxy.project_context.PROJECT_HEADER).
+_PROJECT_HEADER_NAME = "X-Headroom-Project"
+
+
+def _project_name_from_cwd() -> str | None:
+    """Project label for X-Headroom-Project: basename of the launch directory.
+
+    The proxy sanitizes and caps the value server-side
+    (headroom.proxy.savings_tracker.sanitize_project_name), so the raw
+    directory name is safe to send as-is.
+    """
+    name = Path.cwd().name.strip()
+    return name or None
+
+
+def _apply_project_header_env(env: dict[str, str]) -> None:
+    """Inject X-Headroom-Project into ``ANTHROPIC_CUSTOM_HEADERS``.
+
+    Claude Code reads ``ANTHROPIC_CUSTOM_HEADERS`` as newline-separated
+    ``Name: value`` lines and attaches them to every API request; the
+    Headroom proxy uses the X-Headroom-Project header for per-project
+    savings attribution.  An existing user-supplied x-headroom-project
+    header (any casing) always wins — we never duplicate or overwrite it,
+    and any other user headers are preserved by appending.
+    """
+    project = _project_name_from_cwd()
+    if not project:
+        return
+    header_line = f"{_PROJECT_HEADER_NAME}: {project}"
+    existing = env.get("ANTHROPIC_CUSTOM_HEADERS")
+    if existing:
+        for line in existing.splitlines():
+            name = line.split(":", 1)[0].strip()
+            if name.lower() == _PROJECT_HEADER_NAME.lower():
+                return  # user override wins
+        env["ANTHROPIC_CUSTOM_HEADERS"] = f"{existing}\n{header_line}"
+    else:
+        env["ANTHROPIC_CUSTOM_HEADERS"] = header_line
+
+
 def _inject_codex_provider_config(port: int) -> None:
     """Inject a Headroom model provider into Codex's config.toml.
 
@@ -985,6 +1027,11 @@ def _inject_codex_provider_config(port: int) -> None:
         'name = "OpenAI via Headroom proxy"\n'
         f'base_url = "http://127.0.0.1:{port}/v1"\n'
         f"supports_websockets = true\n"
+        # Per-project savings: Codex sends the header only when the mapped
+        # env var (HEADROOM_PROJECT, set by `headroom wrap codex`) exists at
+        # Codex runtime.  Inline table keeps the key inside this section so
+        # _strip_codex_headroom_blocks removes it with the rest of the block.
+        f'env_http_headers = {{ "{_PROJECT_HEADER_NAME}" = "HEADROOM_PROJECT" }}\n'
         f"{_CODEX_END_MARKER}\n"
     )
 
@@ -2494,6 +2541,10 @@ def claude(
         else:
             env["ANTHROPIC_BASE_URL"] = proxy_url
 
+        # Per-project savings attribution: tag every request with the launch
+        # directory's name via X-Headroom-Project (user override wins).
+        _apply_project_header_env(env)
+
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
         _tool_search_value = _configure_tool_search_env(env, tool_search)
@@ -2743,7 +2794,11 @@ def copilot(
             _copilot_default_wire_api_for_model(selected_model) if subscription else "completions"
         )
         env["COPILOT_PROVIDER_TYPE"] = "openai"
-        env["COPILOT_PROVIDER_BASE_URL"] = f"http://127.0.0.1:{port}/v1"
+        # Per-project savings: the Copilot CLI cannot send custom headers, so
+        # the project rides as a /p/<name> base-URL prefix the proxy strips.
+        env["COPILOT_PROVIDER_BASE_URL"] = _with_project_prefix(
+            f"http://127.0.0.1:{port}/v1", _project_name_from_cwd()
+        )
         env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
         env["COPILOT_PROVIDER_BEARER_TOKEN"] = client_bearer
         env["GITHUB_COPILOT_USE_TOKEN_EXCHANGE"] = "false"
@@ -2760,7 +2815,7 @@ def copilot(
         copilot_proxy_token = client_bearer
         env_vars_display = [
             "COPILOT_PROVIDER_TYPE=openai",
-            f"COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:{port}/v1",
+            f"COPILOT_PROVIDER_BASE_URL={env['COPILOT_PROVIDER_BASE_URL']}",
             f"COPILOT_PROVIDER_WIRE_API={effective_wire_api}",
             (
                 "COPILOT_AUTH_MODE=github-subscription-experimental"
@@ -2787,6 +2842,7 @@ def copilot(
             provider_type=effective_provider_type,
             wire_api=wire_api,
             environ=env,
+            project=_project_name_from_cwd(),
         )
 
         if not env.get("COPILOT_PROVIDER_API_KEY"):
@@ -3008,6 +3064,13 @@ def codex(
 
     env, env_vars_display = _build_codex_launch_env(port, os.environ)
 
+    # Per-project savings attribution: the injected provider config maps the
+    # X-Headroom-Project header to HEADROOM_PROJECT via env_http_headers, so
+    # Codex sends it only when this var is set.  A user-set value wins.
+    _codex_project = _project_name_from_cwd()
+    if _codex_project and "HEADROOM_PROJECT" not in env:
+        env["HEADROOM_PROJECT"] = _codex_project
+
     # Inject Headroom provider into Codex config so WebSocket traffic also
     # routes through the proxy.  Codex ignores OPENAI_BASE_URL for its WS
     # transport unless a custom provider declares supports_websockets = true.
@@ -3119,7 +3182,9 @@ def aider(
         click.echo("Install aider: pip install aider-chat")
         raise SystemExit(1)
 
-    env, env_vars_display = _build_aider_launch_env(port, os.environ)
+    env, env_vars_display = _build_aider_launch_env(
+        port, os.environ, project=_project_name_from_cwd()
+    )
 
     _launch_tool(
         binary=aider_bin,
@@ -3202,7 +3267,7 @@ def cursor(
         return
 
     def _print_cursor_setup() -> None:
-        for line in _render_cursor_setup_lines(port):
+        for line in _render_cursor_setup_lines(port, project=_project_name_from_cwd()):
             click.echo(line)
         if not no_rtk:
             click.echo()

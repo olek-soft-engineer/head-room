@@ -11,6 +11,8 @@ from typing import Any
 
 import click
 
+from headroom.proxy.project_context import with_project_prefix
+
 
 def resolve_provider_type(
     backend: str | None, provider_type: str, environ: Mapping[str, str] | None = None
@@ -113,8 +115,14 @@ def build_launch_env(
     provider_type: str,
     wire_api: str | None,
     environ: Mapping[str, str] | None = None,
+    project: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
-    """Build the Copilot BYOK environment for the selected provider type."""
+    """Build the Copilot BYOK environment for the selected provider type.
+
+    ``project`` (the wrap launch directory) is encoded as a ``/p/<name>``
+    base-URL prefix because the Copilot CLI cannot send custom headers; the
+    proxy strips it and attributes savings per project.
+    """
     # Distinguish "caller passed nothing" (use os.environ) from "caller
     # explicitly passed an empty dict" (start fresh — the test/CLI is in
     # charge of which keys to seed). The previous `environ or os.environ`
@@ -129,7 +137,7 @@ def build_launch_env(
             env["COPILOT_PROVIDER_API_KEY"] = key
 
     if provider_type == "anthropic":
-        base_url = f"http://127.0.0.1:{port}"
+        base_url = with_project_prefix(f"http://127.0.0.1:{port}", project)
         env["COPILOT_PROVIDER_BASE_URL"] = base_url
         return env, [
             "COPILOT_PROVIDER_TYPE=anthropic",
@@ -137,7 +145,7 @@ def build_launch_env(
         ]
 
     effective_wire_api = wire_api or "completions"
-    base_url = f"http://127.0.0.1:{port}/v1"
+    base_url = with_project_prefix(f"http://127.0.0.1:{port}/v1", project)
     env["COPILOT_PROVIDER_BASE_URL"] = base_url
     env["COPILOT_PROVIDER_WIRE_API"] = effective_wire_api
     return env, [
