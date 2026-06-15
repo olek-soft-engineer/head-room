@@ -20,7 +20,6 @@ import logging
 import re
 import threading
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any
 
 from headroom.compression.handlers.base import BaseStructureHandler, HandlerResult
@@ -105,19 +104,6 @@ def _ts_children(node: Any) -> list[Any]:
     if children is not None and not callable(children):
         return list(children)
     return [node.child(i) for i in range(node.child_count())]
-
-
-class CodeLanguage(Enum):
-    """Supported programming languages."""
-
-    PYTHON = "python"
-    JAVASCRIPT = "javascript"
-    TYPESCRIPT = "typescript"
-    GO = "go"
-    RUST = "rust"
-    JAVA = "java"
-    C = "c"
-    CPP = "cpp"
 
 
 @dataclass
@@ -235,6 +221,16 @@ _CONTAINER_BODY_TYPES: frozenset[str] = frozenset(
         "enum_body",  # java enum body
     }
 )
+
+# Language-detection markers for _detect_language
+_LANGUAGE_MARKERS: dict[str, list[str]] = {
+    "python": ["def ", "import ", "from ", "class ", "async def"],
+    "javascript": ["function ", "const ", "let ", "var ", "=>"],
+    "typescript": ["interface ", "type ", ": string", ": number"],
+    "go": ["func ", "package ", "import (", "type "],
+    "rust": ["fn ", "let mut", "impl ", "pub fn", "use "],
+    "java": ["public class", "private ", "protected ", "void "],
+}
 
 # Import patterns for fallback
 _IMPORT_PATTERNS: dict[str, re.Pattern[str]] = {
@@ -608,8 +604,10 @@ class CodeStructureHandler(BaseStructureHandler):
 
         for span in spans:
             if span.is_structural:
-                for i in range(span.start, min(span.end, length)):
-                    mask[i] = True
+                start = min(span.start, length)
+                end = min(span.end, length)
+                if start < end:
+                    mask[start:end] = [True] * (end - start)
 
         return mask
 
@@ -622,18 +620,8 @@ class CodeStructureHandler(BaseStructureHandler):
         Returns:
             Language name (lowercase).
         """
-        # Check for language-specific markers
-        markers = {
-            "python": ["def ", "import ", "from ", "class ", "async def"],
-            "javascript": ["function ", "const ", "let ", "var ", "=>"],
-            "typescript": ["interface ", "type ", ": string", ": number"],
-            "go": ["func ", "package ", "import (", "type "],
-            "rust": ["fn ", "let mut", "impl ", "pub fn", "use "],
-            "java": ["public class", "private ", "protected ", "void "],
-        }
-
         scores: dict[str, int] = {}
-        for lang, patterns in markers.items():
+        for lang, patterns in _LANGUAGE_MARKERS.items():
             scores[lang] = sum(1 for p in patterns if p in content)
 
         if not scores or max(scores.values()) == 0:

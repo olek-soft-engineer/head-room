@@ -183,11 +183,8 @@ class JSONStructureHandler(BaseStructureHandler):
                 for i in range(token.start, min(token.end, len(mask))):
                     mask[i] = True
 
-        # Convert to character tokens if needed
-        char_tokens = list(content) if tokens == list(content) else tokens
-
         return HandlerResult(
-            mask=StructureMask(tokens=char_tokens, mask=mask),
+            mask=StructureMask(tokens=tokens, mask=mask),
             handler_name=self.name,
             confidence=1.0,
             metadata={
@@ -326,7 +323,9 @@ class JSONStructureHandler(BaseStructureHandler):
                 i += 1
                 while i < n and content[i] != '"':
                     if content[i] == "\\":
-                        i += 2  # Skip escaped character
+                        # Clamp: a trailing backslash at EOF must not
+                        # step past the buffer.
+                        i = min(i + 2, n)
                     else:
                         i += 1
                 i += 1  # Include closing quote
