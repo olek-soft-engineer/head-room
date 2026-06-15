@@ -231,14 +231,17 @@ class JSONStructureHandler(BaseStructureHandler):
                 # In deep array, be more aggressive
                 return False
 
+            # Strip quotes once: thresholds apply to the payload, not
+            # the token. Counting the quote characters made a "20-char
+            # threshold" effectively 18 chars of value.
+            value = token.text.strip('"')
+
             # Preserve short values
-            if self.preserve_short_values and len(token.text) <= self.short_value_threshold:
+            if self.preserve_short_values and len(value) <= self.short_value_threshold:
                 return True
 
             # Preserve high-entropy values (UUIDs, hashes)
             if self.preserve_high_entropy:
-                # Strip quotes for entropy calculation
-                value = token.text.strip('"')
                 # Entropy targets identifiers (UUIDs, hashes, API keys).
                 # Self-normalized entropy also scores English prose >0.85,
                 # so gate on the cheapest identifier signal: no spaces.
