@@ -98,6 +98,13 @@ Use 'auto' (default) to scan all detected agents."""
     help="Parallel workers for session scanning. "
     "Default: auto (min of CPU count, 8). Use 1 for serial.",
 )
+@click.option(
+    "--main-only",
+    is_flag=True,
+    default=False,
+    help="Only scan top-level main sessions, skipping nested subagent/workflow "
+    "transcripts (Claude Code). Default scans everything.",
+)
 def learn(
     project: Path | None,
     analyze_all: bool,
@@ -105,6 +112,7 @@ def learn(
     agent: str,
     model: str | None,
     workers: int | None,
+    main_only: bool,
 ) -> None:
     """Learn from past tool call failures to prevent future ones.
 
@@ -198,7 +206,9 @@ def learn(
             click.echo(f"Path: {proj.project_path}")
             click.echo(f"{'=' * 60}")
 
-            sessions = plugin.scan_project(proj, max_workers=max_workers)
+            sessions = plugin.scan_project(
+                proj, max_workers=max_workers, include_subagents=not main_only
+            )
             if not sessions:
                 click.echo("  No conversation data found.")
                 continue
