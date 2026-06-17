@@ -628,9 +628,12 @@ class HeadroomProxy(
         # ContentRouter, so merge rather than assign.
         if config.exclude_tools:
             router_config.exclude_tools = set(DEFAULT_EXCLUDE_TOOLS) | config.exclude_tools
-        # Token mode: allow compression of older excluded-tool results.
+        # Token mode: allow compression of older excluded-tool results,
+        # and emit search results grouped by file (path once per file
+        # instead of repeated on every match line).
         if is_token_mode(config.mode):
             router_config.protect_recent_reads_fraction = 0.3
+            router_config.search_group_by_file = True
         # `--compress-user-messages` flips the router's default skip rule.
         # Off by default for prefix-cache safety; enabled for workloads where
         # user-message content dominates input (OpenAI/Azure chat with pasted
@@ -2737,7 +2740,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         profile_kwargs = proxy_pipeline_kwargs(config)
         target_ratio = profile_kwargs.get("target_ratio", config.target_ratio)
         target_savings_percent = None
-        if isinstance(target_ratio, (int, float)):
+        if isinstance(target_ratio, int | float):
             target_savings_percent = round(max(0.0, min(1.0, 1.0 - float(target_ratio))) * 100, 1)
         return {
             "savings_profile": config.savings_profile,
@@ -2976,7 +2979,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             )
 
         if query:
-            # Search within cached content
+            # Search within cached content. The get_entry_status check above
+            # (clean_expired=True) already guaranteed availability or raised
+            # 404, so no second exists()/status backend read is needed here.
             results = store.search(hash_key, query)
             return {
                 "hash": hash_key,
