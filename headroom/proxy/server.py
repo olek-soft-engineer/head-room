@@ -1672,6 +1672,32 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     config = config or ProxyConfig()
     proxy = HeadroomProxy(config)
 
+    # cc-switch reconciler (opt-in: HEADROOM_CC_SWITCH_RECONCILE=1).
+    # Keeps Headroom in the request path while cc-switch overwrites
+    # ~/.claude/settings.json on every provider switch. See
+    # headroom/proxy/cc_switch_reconciler.py for the full rationale.
+    from headroom.proxy.cc_switch_reconciler import (
+        CCSwitchReconciler,
+        reconciler_enabled,
+    )
+
+    _cc_reconciler: CCSwitchReconciler | None = None
+    if reconciler_enabled():
+        _cc_proxy_port = config.port if hasattr(config, "port") else 8787
+
+        def _set_anthropic_upstream(url: str) -> None:
+            from headroom.providers.registry import _normalize_api_url
+
+            HeadroomProxy.ANTHROPIC_API_URL = _normalize_api_url(
+                url, default=DEFAULT_ANTHROPIC_API_URL
+            )
+
+        _cc_reconciler = CCSwitchReconciler(
+            proxy_url=f"http://127.0.0.1:{_cc_proxy_port}",
+            default_upstream=DEFAULT_ANTHROPIC_API_URL,
+            set_upstream=_set_anthropic_upstream,
+        )
+
     # Telemetry beacon (anonymous aggregate stats).
     # With uvicorn workers > 1, each worker runs the lifespan independently.
     # We must ensure only ONE beacon runs across all workers — otherwise each
@@ -1771,6 +1797,15 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 else:
                     logger.debug("Beacon: skipping (another worker owns the lock)")
 
+                # Only the beacon-lock owner runs the reconciler. With
+                # uvicorn workers > 1 each worker runs this lifespan; without
+                # this guard every worker would watch + rewrite settings.json
+                # concurrently and each process would hold its own
+                # HeadroomProxy.ANTHROPIC_API_URL, so workers could disagree on
+                # the upstream. Single-owner mirrors the beacon's reasoning.
+                if _cc_reconciler is not None and _beacon_is_owner[0]:
+                    await _cc_reconciler.start()
+
                 app.state.ready = True
                 yield
             except Exception as exc:
@@ -1779,6 +1814,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         finally:
             app.state.ready = False
             # Shutdown
+            if _cc_reconciler is not None:
+                await _cc_reconciler.stop()
             if _beacon_is_owner[0]:
                 await _beacon.stop()
                 _release_beacon_lock()
@@ -2238,6 +2275,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         collect_tasks as _collect_tasks,
     )
     from headroom.proxy.loopback_guard import require_loopback as _require_loopback
+
+    @app.get("/admin/upstream", dependencies=[Depends(_require_loopback)])
+    async def get_upstream():
+        """Current Anthropic upstream + cc-switch reconciler state (loopback-only).
+
+        Read-only. The upstream is mutated only via the in-process cc-switch
+        reconciler (driven by ~/.claude/settings.json) — there is deliberately
+        no HTTP write route, so a local process cannot redirect credential-
+        bearing traffic to an arbitrary URL through this surface.
+        """
+        return {
+            "anthropic": HeadroomProxy.ANTHROPIC_API_URL,
+            "cc_switch_reconcile": _cc_reconciler is not None,
+            "captured_upstream": getattr(_cc_reconciler, "current_upstream", None),
+        }
 
     @app.get("/debug/tasks", dependencies=[Depends(_require_loopback)])
     async def debug_tasks(stack: bool = False):
