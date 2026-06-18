@@ -146,6 +146,15 @@ export HEADROOM_OUTPUT_SHAPER=1     # off by default
 headroom proxy --port 8787
 ```
 
+> **Already running a proxy?** These switches are read *live* on every request,
+> so a proxy that `headroom wrap` **reused** (rather than started) would not see
+> a value you export afterwards — its environment was snapshotted at launch.
+> `headroom wrap` now hot-syncs your current settings to the running proxy via a
+> loopback `POST /admin/runtime-env`, so they take effect immediately with **no
+> restart** (no cold start, no dropped requests, no lost caches). Set them before
+> you `wrap`. On a shared proxy these overrides are global — the last explicit
+> setting wins.
+
 **Learn the right terseness for you.** People don't *say* how terse they want
 answers — they *show* it (they interrupt long replies, or move on before they
 could have read them). `headroom learn --verbosity` reads your past sessions and

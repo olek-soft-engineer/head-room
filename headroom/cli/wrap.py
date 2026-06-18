@@ -1535,6 +1535,7 @@ def _run_proxy_only_watcher(
         proxy_holder[0] = _ensure_proxy(
             port, no_proxy, learn=learn, memory=memory, agent_type=agent_type
         )
+        _push_runtime_env(port, no_proxy)
         click.echo()
         print_setup_lines()
         click.echo()
@@ -2175,6 +2176,44 @@ def _should_use_copilot_oauth(
     return has_oauth_auth()
 
 
+def _push_runtime_env(port: int, no_proxy: bool) -> None:
+    """Hot-sync this session's live env knobs to the proxy on ``port``.
+
+    Live knobs (the output-shaper family, the ast-grep read threshold) are read
+    from the *proxy's* process environment. A proxy we reused — rather than
+    started — would otherwise ignore values exported in this shell, since its
+    environment was snapshotted when it first launched. Pushing them to
+    ``/admin/runtime-env`` applies them in memory with no disruptive restart.
+
+    Best-effort: a silent no-op when nothing is explicitly set, when there is no
+    proxy (``--no-proxy``), when the proxy is unreachable, or when it predates
+    the endpoint (older build returns 404).
+    """
+    if no_proxy:
+        return
+    from headroom.proxy import runtime_env as _rt
+
+    payload = _rt.explicit_env(os.environ)
+    if not payload:
+        return
+
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/admin/runtime-env",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            response.read()
+    except (OSError, urllib.error.URLError, ValueError):
+        return
+    click.echo(f"  Synced output settings to proxy: {', '.join(sorted(payload))}")
+
+
 def _ensure_proxy(
     port: int,
     no_proxy: bool,
@@ -2600,6 +2639,7 @@ def _launch_tool(
             openai_api_url=openai_api_url,
             copilot_api_token=copilot_api_token,
         )
+        _push_runtime_env(port, no_proxy)
 
         if code_graph:
             _setup_code_graph(verbose=False)
@@ -3047,6 +3087,7 @@ def claude(
             region=region,
             anthropic_api_url=foundry_upstream,
         )
+        _push_runtime_env(port, no_proxy)
 
         if not no_rtk:
             if _selected_context_tool() == _CONTEXT_TOOL_LEAN_CTX:
