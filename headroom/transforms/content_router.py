@@ -2486,7 +2486,9 @@ class ContentRouter(Transform):
             # Two-tier compression cache.
             # Tier 1 (skip): known won't-compress → instant skip.
             # Tier 2 (result): known compresses → reuse compressed text.
-            content_key = hash(content)
+            # Key on the runtime target_ratio too: the same content compressed at
+            # a different ratio is a different result, so it must not alias.
+            content_key = hash((content, getattr(self, "_runtime_target_ratio", None)))
 
             # Tier 1: skip set — instant rejection
             if self._cache.is_skipped(content_key):
@@ -2861,7 +2863,9 @@ class ContentRouter(Transform):
                     # Two-tier compression cache → shared helper
                     compressed_content, was_compressed = self._compress_block_content(
                         content=tool_content,
-                        content_key=hash(tool_content),
+                        content_key=hash(
+                            (tool_content, getattr(self, "_runtime_target_ratio", None))
+                        ),
                         context=context,
                         bias=bias,
                         min_ratio=min_ratio,
@@ -2904,7 +2908,9 @@ class ContentRouter(Transform):
                     # Two-tier compression cache → shared helper
                     compressed_content, _was_compressed = self._compress_block_content(
                         content=text_content,
-                        content_key=hash(text_content),
+                        content_key=hash(
+                            (text_content, getattr(self, "_runtime_target_ratio", None))
+                        ),
                         context=context,
                         bias=1.0,
                         min_ratio=min_ratio,
