@@ -2814,6 +2814,18 @@ def unwrap() -> None:
         "ENABLE_TOOL_SEARCH env var is respected."
     ),
 )
+@click.option(
+    "--backend",
+    default=None,
+    help="API backend for the proxy: 'anthropic' (default), 'litellm-vertex_ai', etc. "
+    "(env: HEADROOM_BACKEND). For Vertex, prefer CLAUDE_CODE_USE_VERTEX=1 (native, "
+    "keeps your GCP auth) over a litellm backend.",
+)
+@click.option(
+    "--region",
+    default=None,
+    help="Cloud region for Vertex/Bedrock backends (env: HEADROOM_REGION).",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
@@ -2827,6 +2839,8 @@ def claude(
     learn: bool,
     memory: bool,
     tool_search: str | None,
+    backend: str | None,
+    region: str | None,
     verbose: bool,
     prepare_only: bool,
     claude_args: tuple,
@@ -2928,6 +2942,16 @@ def claude(
         if os.environ.get("CLAUDE_CODE_USE_FOUNDRY"):
             foundry_upstream = os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL")
 
+        # Detect Vertex mode: with CLAUDE_CODE_USE_VERTEX=1, Claude Code IGNORES
+        # ANTHROPIC_BASE_URL and authenticates to Google Vertex with GCP ADC. The
+        # documented way to route its Vertex :rawPredict / :streamRawPredict
+        # traffic through a gateway is ANTHROPIC_VERTEX_BASE_URL. Point it at
+        # Headroom and the proxy compresses the request, then forwards to the
+        # real regional Vertex host (derived per-request from the path's
+        # location) using Claude Code's own ADC token — no API key, no creds held
+        # by Headroom. This is the turnkey Vertex compression path.
+        use_vertex = bool(os.environ.get("CLAUDE_CODE_USE_VERTEX"))
+
         proxy_holder[0] = _ensure_proxy(
             port,
             no_proxy,
@@ -2935,6 +2959,8 @@ def claude(
             memory=memory,
             agent_type="claude",
             code_graph=code_graph,
+            backend=backend,
+            region=region,
             anthropic_api_url=foundry_upstream,
         )
 
@@ -2970,7 +2996,12 @@ def claude(
         proxy_url = _claude_proxy_base_url(port)
         click.echo()
         click.echo("  Launching Claude Code (API routed through Headroom)...")
-        if foundry_upstream:
+        if use_vertex:
+            click.echo(
+                f"  Vertex mode: ANTHROPIC_VERTEX_BASE_URL={proxy_url} "
+                "→ compress, then forward to Vertex with your GCP ADC token"
+            )
+        elif foundry_upstream:
             click.echo(
                 f"  Foundry mode: ANTHROPIC_FOUNDRY_BASE_URL={proxy_url} → upstream {foundry_upstream}"
             )
@@ -2982,7 +3013,12 @@ def claude(
         click.echo()
 
         env = os.environ.copy()
-        if foundry_upstream:
+        if use_vertex:
+            # Claude Code stays in Vertex mode (keeps CLAUDE_CODE_USE_VERTEX,
+            # ANTHROPIC_VERTEX_PROJECT_ID, CLOUD_ML_REGION, ADC — all inherited);
+            # we only redirect its Vertex endpoint to Headroom.
+            env["ANTHROPIC_VERTEX_BASE_URL"] = proxy_url
+        elif foundry_upstream:
             env["ANTHROPIC_FOUNDRY_BASE_URL"] = proxy_url
         else:
             env["ANTHROPIC_BASE_URL"] = proxy_url
