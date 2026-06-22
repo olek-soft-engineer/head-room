@@ -625,6 +625,34 @@ def _remove_claude_rtk_hooks(settings_path: Path | None = None) -> bool:
     return True
 
 
+def _foundry_upstream_url(resource: str) -> str:
+    """Derive the Azure AI Foundry endpoint URL from a resource name.
+
+    When CLAUDE_CODE_USE_FOUNDRY=1 is set, Claude Code routes requests to the
+    Azure AI Services endpoint it constructs from ANTHROPIC_FOUNDRY_RESOURCE.
+    If ANTHROPIC_FOUNDRY_BASE_URL is not already set in the environment,
+    we derive it here so the proxy knows where to forward compressed requests.
+
+    Azure AI Foundry (AI Services) hosts the Anthropic-format Claude API at:
+      https://{resource}.services.ai.azure.com/anthropic
+    This matches the URL Claude Code constructs internally from ANTHROPIC_FOUNDRY_RESOURCE,
+    and what ANTHROPIC_FOUNDRY_BASE_URL must point to for the Anthropic SDK to reach Claude.
+    """
+    return f"https://{resource.strip()}.services.ai.azure.com/anthropic"
+
+
+def _foundry_proxy_url(proxy_url: str) -> str:
+    """Return the local proxy URL that Claude Code should use in Foundry mode.
+
+    ANTHROPIC_FOUNDRY_BASE_URL is the full base URL the Anthropic SDK appends
+    /v1/messages to, so it must include the /anthropic path component to match
+    the Azure AI Foundry endpoint structure.  _claude_proxy_base_url() returns
+    the bare http://127.0.0.1:<port> — this helper appends /anthropic so the
+    proxy URL Claude Code receives mirrors the real Foundry URL shape.
+    """
+    return proxy_url.rstrip("/") + "/anthropic"
+
+
 def _write_claude_wrap_base_url(
     proxy_url: str,
     *,
@@ -3110,9 +3138,16 @@ def claude(
 
         # Detect Foundry mode: Claude Code uses ANTHROPIC_FOUNDRY_BASE_URL instead of
         # ANTHROPIC_BASE_URL when CLAUDE_CODE_USE_FOUNDRY=1 is set.
+        # Users typically set ANTHROPIC_FOUNDRY_RESOURCE (the resource name) rather
+        # than the full ANTHROPIC_FOUNDRY_BASE_URL.  When the URL is absent we derive
+        # it from the resource name so the proxy has an upstream to forward to.
         foundry_upstream = None
         if os.environ.get("CLAUDE_CODE_USE_FOUNDRY"):
             foundry_upstream = os.environ.get("ANTHROPIC_FOUNDRY_BASE_URL")
+            if not foundry_upstream:
+                resource = os.environ.get("ANTHROPIC_FOUNDRY_RESOURCE", "").strip()
+                if resource:
+                    foundry_upstream = _foundry_upstream_url(resource)
 
         # Detect Vertex mode: with CLAUDE_CODE_USE_VERTEX=1, Claude Code IGNORES
         # ANTHROPIC_BASE_URL and authenticates to Google Vertex with GCP ADC. The
@@ -3176,7 +3211,7 @@ def claude(
             )
         elif foundry_upstream:
             click.echo(
-                f"  Foundry mode: ANTHROPIC_FOUNDRY_BASE_URL={proxy_url} → upstream {foundry_upstream}"
+                f"  Foundry mode: ANTHROPIC_FOUNDRY_BASE_URL={_foundry_proxy_url(proxy_url)} → upstream {foundry_upstream}"
             )
         else:
             click.echo(f"  ANTHROPIC_BASE_URL={proxy_url}")
@@ -3192,7 +3227,10 @@ def claude(
             # we only redirect its Vertex endpoint to Headroom.
             env["ANTHROPIC_VERTEX_BASE_URL"] = proxy_url
         elif foundry_upstream:
-            env["ANTHROPIC_FOUNDRY_BASE_URL"] = proxy_url
+            # ANTHROPIC_FOUNDRY_BASE_URL is the base URL the Anthropic SDK
+            # appends /v1/messages to.  The real Foundry URL includes /anthropic,
+            # so the proxy URL must mirror that structure.
+            env["ANTHROPIC_FOUNDRY_BASE_URL"] = _foundry_proxy_url(proxy_url)
         else:
             env["ANTHROPIC_BASE_URL"] = proxy_url
 
@@ -3201,7 +3239,8 @@ def claude(
         # daemon's environment) also route through Headroom.
         _settings_foundry[0] = bool(foundry_upstream)
         _saved_base_url[0] = _write_claude_wrap_base_url(
-            proxy_url, foundry_mode=_settings_foundry[0]
+            _foundry_proxy_url(proxy_url) if _settings_foundry[0] else proxy_url,
+            foundry_mode=_settings_foundry[0],
         )
 
         # Per-project savings attribution: tag every request with the launch
