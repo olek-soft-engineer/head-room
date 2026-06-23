@@ -427,6 +427,16 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--disable-kompress-fallback",
+    is_flag=True,
+    envvar="HEADROOM_DISABLE_KOMPRESS_FALLBACK",
+    help=(
+        "With --disable-kompress, route fall-through content to PASSTHROUGH instead of "
+        "the default KOMPRESS fallback (restores legacy --disable-kompress behaviour). "
+        "Env: HEADROOM_DISABLE_KOMPRESS_FALLBACK=1."
+    ),
+)
+@click.option(
     "--disable-kompress-anthropic/--enable-kompress-anthropic",
     "disable_kompress_anthropic",
     default=None,
@@ -731,6 +741,7 @@ def proxy(
     budget_period: str,
     code_aware_flag: bool | None,
     disable_kompress: bool,
+    disable_kompress_fallback: bool,
     disable_kompress_anthropic: bool | None,
     disable_kompress_openai: bool | None,
     code_graph: bool,
@@ -959,6 +970,7 @@ def proxy(
             in ("true", "1", "yes", "on")
         ),
         disable_kompress=disable_kompress,
+        disable_kompress_fallback=disable_kompress_fallback,
         disable_kompress_anthropic=disable_kompress_anthropic,
         disable_kompress_openai=disable_kompress_openai,
         # Code graph: live file watcher for incremental reindexing
