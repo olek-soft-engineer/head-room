@@ -2406,6 +2406,7 @@ def _ensure_proxy(
                         f"is running stale Headroom {running_version} and could not be restarted."
                     )
                 click.echo(f"  Proxy already running on port {port}")
+                click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                 return None
             if helpers._recover_persistent_proxy(port):
                 return None
@@ -2536,6 +2537,7 @@ def _ensure_proxy(
 
             if not needs_restart:
                 click.echo(f"  Proxy already running on port {port}")
+                click.echo(f"  Dashboard:    http://127.0.0.1:{port}/dashboard")
                 return None
 
         # Start (or restart) the proxy with the requested flags
