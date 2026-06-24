@@ -1581,6 +1581,7 @@ class HeadroomProxy(
         request_id: str | None = None,
         forwarder_name: str = "server",
         path_for_log: str | None = None,
+        timeout: httpx.Timeout | float | None = None,
     ) -> httpx.Response:
         """Make request with retry and exponential backoff.
 
@@ -1624,16 +1625,20 @@ class HeadroomProxy(
             source=source,
         )
 
+        post_kwargs: dict = {"content": outbound_bytes, "headers": outbound_headers}
+        if timeout is not None:
+            post_kwargs["timeout"] = timeout
+
         for attempt in range(self.config.retry_max_attempts):
             try:
                 if stream:
                     # For streaming, we return early - retry happens at higher level
                     return await self.http_client.post(  # type: ignore[union-attr]
-                        url, content=outbound_bytes, headers=outbound_headers
+                        url, **post_kwargs
                     )
                 else:
                     response = await self.http_client.post(  # type: ignore[union-attr]
-                        url, content=outbound_bytes, headers=outbound_headers
+                        url, **post_kwargs
                     )
 
                     # Don't retry client errors (4xx)
@@ -3818,6 +3823,11 @@ def _proxy_config_from_env() -> ProxyConfig:
         port=_get_env_int("HEADROOM_PORT", 8787),
         openai_api_url=os.environ.get("OPENAI_TARGET_API_URL"),
         anthropic_api_url=os.environ.get("ANTHROPIC_TARGET_API_URL"),
+        anthropic_buffered_request_timeout_seconds=_get_env_int(
+            "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
+            600,
+            min_value=1,
+        ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
@@ -4023,15 +4033,25 @@ def _get_env_optional_bool(name: str) -> bool | None:
     return val.lower() in ("true", "1", "yes", "on")
 
 
-def _get_env_int(name: str, default: int) -> int:
+def _get_env_int(name: str, default: int, *, min_value: int | None = None) -> int:
     """Get integer from environment variable."""
     val = os.environ.get(name)
     if val is None:
         return default
     try:
-        return int(val)
+        parsed = int(val)
     except ValueError:
         return default
+    if min_value is not None and parsed < min_value:
+        return default
+    return parsed
+
+
+def _positive_int_arg(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
 
 
 def _get_env_float(name: str, default: float) -> float:
@@ -4121,6 +4141,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--anthropic-api-url",
         help=f"Custom Anthropic API URL (default: {DEFAULT_ANTHROPIC_API_URL})",
+    )
+    parser.add_argument(
+        "--anthropic-buffered-request-timeout-seconds",
+        type=_positive_int_arg,
+        default=600,
+        help=(
+            "Anthropic buffered read timeout in seconds for non-streaming "
+            "message and batch paths (default: 600)"
+        ),
     )
     parser.add_argument(
         "--vertex-api-url",
@@ -4359,6 +4388,11 @@ if __name__ == "__main__":
         port=_get_env_int("HEADROOM_PORT", args.port),
         openai_api_url=_get_env_str("OPENAI_TARGET_API_URL", args.openai_api_url),
         anthropic_api_url=_get_env_str("ANTHROPIC_TARGET_API_URL", args.anthropic_api_url),
+        anthropic_buffered_request_timeout_seconds=_get_env_int(
+            "HEADROOM_ANTHROPIC_BUFFERED_REQUEST_TIMEOUT_SECONDS",
+            args.anthropic_buffered_request_timeout_seconds,
+            min_value=1,
+        ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
