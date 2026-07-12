@@ -39,6 +39,14 @@ from headroom.proxy.body_forwarding import (
 )
 from headroom.proxy.body_forwarding import serialize_body_canonical
 from headroom.proxy.ccr_session_tracker import SessionCcrTracker as _SessionCcrTracker
+from headroom.proxy.internal_header_policy import (
+    INTERNAL_HEADER_PREFIX,
+    STRIP_INTERNAL_HEADERS_DEFAULT,
+    STRIP_INTERNAL_HEADERS_ENV,
+    StripInternalHeadersMode,
+    resolve_strip_internal_headers_mode,
+    strip_internal_headers,
+)
 from headroom.proxy.tool_injection_config import (
     ToolInjectionStickyMode,
 )
@@ -1474,16 +1482,9 @@ def is_anthropic_auth(headers: dict[str, str]) -> bool:
 # tell its client about its own work. This helper only filters
 # request-side headers.
 
-_INTERNAL_HEADER_PREFIX = "x-headroom-"
-
-# Operator opt-in env var. ``enabled`` (default) strips internal
-# ``x-headroom-*`` headers from every upstream-bound forwarder.
-# ``disabled`` is an explicit operator opt-in for diagnostic shadow
-# tracing — NOT a fallback. Per realignment build constraint #4 the
-# behaviour is loud, configurable, and never silent.
-_STRIP_INTERNAL_HEADERS_ENV = "HEADROOM_STRIP_INTERNAL_HEADERS"
-StripInternalHeadersMode = Literal["enabled", "disabled"]
-_STRIP_INTERNAL_HEADERS_DEFAULT: StripInternalHeadersMode = "enabled"
+_INTERNAL_HEADER_PREFIX = INTERNAL_HEADER_PREFIX
+_STRIP_INTERNAL_HEADERS_ENV = STRIP_INTERNAL_HEADERS_ENV
+_STRIP_INTERNAL_HEADERS_DEFAULT = STRIP_INTERNAL_HEADERS_DEFAULT
 
 
 def get_strip_internal_headers_mode() -> StripInternalHeadersMode:
@@ -1493,14 +1494,7 @@ def get_strip_internal_headers_mode() -> StripInternalHeadersMode:
     restart. Unknown values raise loudly per the no-silent-fallback
     build constraint.
     """
-    raw = os.environ.get(_STRIP_INTERNAL_HEADERS_ENV, "").strip().lower()
-    if not raw:
-        return _STRIP_INTERNAL_HEADERS_DEFAULT
-    if raw in ("enabled", "disabled"):
-        return cast(StripInternalHeadersMode, raw)
-    raise ValueError(
-        f"Invalid {_STRIP_INTERNAL_HEADERS_ENV}={raw!r}; expected 'enabled' or 'disabled'"
-    )
+    return resolve_strip_internal_headers_mode(os.environ.get(_STRIP_INTERNAL_HEADERS_ENV))
 
 
 def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
@@ -1516,11 +1510,7 @@ def _strip_internal_headers(headers: dict[str, str]) -> dict[str, str]:
     is set, returns a shallow copy unchanged. That mode is for diagnostic
     shadow tracing only and is documented as a per-deploy choice.
     """
-    mode = get_strip_internal_headers_mode()
-    if mode == "disabled":
-        # Always return a copy so callers can mutate without surprise.
-        return dict(headers)
-    return {k: v for k, v in headers.items() if not k.lower().startswith(_INTERNAL_HEADER_PREFIX)}
+    return strip_internal_headers(headers, mode=get_strip_internal_headers_mode())
 
 
 def log_outbound_headers(
