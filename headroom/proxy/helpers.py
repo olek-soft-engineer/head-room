@@ -74,6 +74,10 @@ from headroom.proxy.internal_header_policy import (
     resolve_strip_internal_headers_mode,
     strip_internal_headers,
 )
+from headroom.proxy.memory_golden_policy import (
+    replay_golden_memory_tool_definition,
+    serialize_memory_tool_definition_canonical,
+)
 from headroom.proxy.tool_injection_config import (
     ToolInjectionStickyMode,
 )
@@ -2017,7 +2021,7 @@ def apply_session_sticky_memory_tools(
                 continue
             tools_out.append(tool_def)
             existing_names.add(tn)
-            added_bytes += len(serialize_tool_definition_canonical(tool_def))
+            added_bytes += len(serialize_memory_tool_definition_canonical(tool_def))
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
@@ -2047,7 +2051,7 @@ def apply_session_sticky_memory_tools(
                 continue
             tools_out.append(tool_def)
             existing_names.add(tn)
-            added_bytes += len(serialize_tool_definition_canonical(tool_def))
+            added_bytes += len(serialize_memory_tool_definition_canonical(tool_def))
         log_tool_injection_decision(
             provider=provider,
             session_id=None,
@@ -2072,7 +2076,10 @@ def apply_session_sticky_memory_tools(
                 # Their bytes win (the client's choice, not ours to gate).
                 continue
             try:
-                tool_def = json.loads(golden_bytes.decode("utf-8"))
+                replay = replay_golden_memory_tool_definition(
+                    tool_name=tool_name,
+                    golden_tool_bytes=golden_bytes,
+                )
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 logger.error(
                     "corrupt golden tool bytes for session %s tool %s: %s — skipping tool injection",
@@ -2082,9 +2089,9 @@ def apply_session_sticky_memory_tools(
                     exc_info=True,
                 )
                 continue
-            tools_out.append(tool_def)
-            existing_names.add(tool_name)
-            replay_bytes += len(golden_bytes)
+            tools_out.append(replay.tool_definition)
+            existing_names.add(replay.tool_name)
+            replay_bytes += len(replay.canonical_bytes)
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
@@ -2111,7 +2118,7 @@ def apply_session_sticky_memory_tools(
         tn = _extract_tool_name(tool_def)
         if tn is None or tn in existing_names:
             continue
-        golden_bytes = serialize_tool_definition_canonical(tool_def)
+        golden_bytes = serialize_memory_tool_definition_canonical(tool_def)
         tracker.record_injection(
             provider=provider,
             session_id=session_id,
