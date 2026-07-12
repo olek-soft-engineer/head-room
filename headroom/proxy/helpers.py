@@ -42,6 +42,12 @@ from headroom.proxy.ccr_golden_policy import (
     create_fresh_ccr_tool_definition,
     replay_golden_ccr_tool_definition,
 )
+from headroom.proxy.ccr_marker_policy import (
+    has_new_ccr_markers as _has_new_ccr_markers,
+)
+from headroom.proxy.ccr_marker_policy import (
+    should_inject_ccr_tool as _should_inject_ccr_tool,
+)
 from headroom.proxy.ccr_session_tracker import SessionCcrTracker as _SessionCcrTracker
 from headroom.proxy.internal_header_policy import (
     INTERNAL_HEADER_PREFIX,
@@ -2218,21 +2224,11 @@ def has_new_ccr_markers(
     Returns True iff ``current_detected_hashes`` contains a hash that is not present
     in ``previous_forwarded_messages``.
     """
-    current = set(current_detected_hashes)
-    if not current:
-        return False
-    if not previous_forwarded_messages:
-        # No prior forward → every marker is new (genuine first CCR turn).
-        return True
-    from headroom.ccr.tool_injection import CCRToolInjector
-
-    prev = CCRToolInjector(
+    return _has_new_ccr_markers(
+        current_detected_hashes=current_detected_hashes,
+        previous_forwarded_messages=previous_forwarded_messages,
         provider=provider,
-        inject_tool=False,
-        inject_system_instructions=False,
     )
-    prev.scan_for_markers(previous_forwarded_messages)
-    return bool(current - set(prev.detected_hashes))
 
 
 def should_inject_ccr_tool(
@@ -2257,11 +2253,11 @@ def should_inject_ccr_tool(
     True only when injection happens *because* of new markers despite a deferral,
     so the caller can log the override distinctly.
     """
-    inject_tool = configured_inject_tool
-    if inject_tool and frozen_message_count > 0:
-        inject_tool = False  # defer to preserve cache
-    is_marker_override = not inject_tool and has_compressed_content
-    return (inject_tool or is_marker_override), is_marker_override
+    return _should_inject_ccr_tool(
+        configured_inject_tool=configured_inject_tool,
+        frozen_message_count=frozen_message_count,
+        has_compressed_content=has_compressed_content,
+    )
 
 
 def apply_session_sticky_ccr_tool(
