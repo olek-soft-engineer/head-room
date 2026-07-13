@@ -5903,6 +5903,11 @@ def openclaw(
     is_flag=True,
     help="Skip CLI context-tool setup",
 )
+@click.option(
+    "--no-project-rtk",
+    is_flag=True,
+    help="Skip rtk instruction injection into the project AGENTS.md",
+)
 @click.option("--no-mcp", is_flag=True, help="Skip headroom MCP server registration")
 @click.option("--no-serena", is_flag=True, help="Skip Serena MCP server registration")
 @click.option(
@@ -5924,6 +5929,7 @@ def openclaw(
 def opencode(
     port: int,
     no_rtk: bool,
+    no_project_rtk: bool,
     no_mcp: bool,
     no_serena: bool,
     code_graph: bool,
@@ -5949,6 +5955,7 @@ def opencode(
         headroom wrap opencode                         # Start proxy + context tool + opencode
         headroom wrap opencode -- "fix the bug"        # Pass prompt to opencode
         headroom wrap opencode --no-context-tool       # Skip CLI context-tool setup
+        headroom wrap opencode --no-project-rtk        # Keep project AGENTS.md unchanged
         headroom wrap opencode --no-mcp                # Skip MCP retrieve tool registration
         headroom wrap opencode --no-serena             # Skip Serena MCP registration
         headroom wrap opencode --port 9999             # Custom proxy port
@@ -5968,9 +5975,9 @@ def opencode(
             click.echo("  Setting up rtk for OpenCode...")
             rtk_path = _ensure_rtk_binary(verbose=verbose)
             if rtk_path:
-                # Inject into project AGENTS.md
-                project_agents = Path.cwd() / "AGENTS.md"
-                _inject_rtk_instructions(project_agents, verbose=verbose)
+                if not no_project_rtk:
+                    project_agents = Path.cwd() / "AGENTS.md"
+                    _inject_rtk_instructions(project_agents, verbose=verbose)
                 # Inject into global OpenCode AGENTS.md
                 global_agents = _opencode_home_dir() / "AGENTS.md"
                 _inject_rtk_instructions(global_agents, verbose=verbose)
