@@ -139,10 +139,17 @@ def build_prefix_cache_stats(
         read_mult: float = econ["read_multiplier"]  # type: ignore[assignment]
         write_mult: float = econ["write_multiplier"]  # type: ignore[assignment]
 
-        # Get the base input price per token for the most-used model on this provider
+        # Get the base input price per token for the most-used model on this
+        # provider. Pick the provider-matching, priced model with the highest
+        # token volume — not the first one recorded. A Claude Code session sends
+        # both Sonnet (main loop) and Haiku (titles/subagents); breaking on the
+        # first-inserted model would price all cache savings at whichever happened
+        # to be seen first (e.g. Haiku's $0.80/M vs Sonnet's $3/M), skewing the
+        # dashboard's savings figure ~3.75x.
         input_price_per_token = None
         if cost_tracker:
-            for model_name in cost_tracker._tokens_sent_by_model:
+            best_tokens = -1
+            for model_name, tokens_sent in cost_tracker._tokens_sent_by_model.items():
                 # Match model to provider
                 _openai_prefixes = ("gpt", "o1", "o3", "o4")
                 is_match = (
@@ -151,11 +158,11 @@ def build_prefix_cache_stats(
                     or (provider == "gemini" and "gemini" in model_name)
                     or (provider == "bedrock" and "claude" in model_name)
                 )
-                if is_match:
+                if is_match and tokens_sent > best_tokens:
                     price_per_1m = cost_tracker._get_list_price(model_name)
                     if price_per_1m:
                         input_price_per_token = price_per_1m / 1_000_000
-                        break
+                        best_tokens = tokens_sent
 
         # Calculate savings:
         # Cache reads save (1.0 - read_mult) per token vs uncached input price.
