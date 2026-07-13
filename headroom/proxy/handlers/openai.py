@@ -1506,6 +1506,24 @@ class OpenAIHandlerMixin:
 
         unit_build_started = time.perf_counter()
         unit_debug: list[dict[str, Any]] = []
+        # Aggregate-then-floor: the Responses payload splits each tool output
+        # into its own unit, so a per-item size floor would reject every unit
+        # in a session made of many small tool outputs (e.g. Codex), yielding
+        # 0% savings even when the combined compressible text is large. The
+        # Anthropic path compresses the whole message list as one batch and is
+        # not subject to a per-item floor. Match that: evaluate the floor once
+        # against the *aggregate* compressible bytes of the extracted group. If
+        # the group as a whole clears the threshold, disable the per-unit floor
+        # so small units still reach the router; if the whole group is below
+        # the threshold, keep the floor so trivially small payloads are skipped.
+        aggregate_compressible_bytes = sum(
+            len(text.encode("utf-8", errors="replace")) for _, _, text in candidates
+        )
+        effective_unit_min_bytes = (
+            0
+            if aggregate_compressible_bytes >= self.OPENAI_RESPONSES_ROUTER_MIN_BYTES
+            else self.OPENAI_RESPONSES_ROUTER_MIN_BYTES
+        )
         for item_idx, slot_ref, original_text in candidates:
             item = items[item_idx] if item_idx < len(items) else {}
             item_type = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
@@ -1518,7 +1536,7 @@ class OpenAIHandlerMixin:
                 item_type=str(item_type),
                 cache_zone="live",
                 mutable=True,
-                min_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+                min_bytes=effective_unit_min_bytes,
             )
             routed_units.append(RoutedCompressionUnit(unit=unit, slot=(item_idx, slot_ref)))
             if debug_enabled:
