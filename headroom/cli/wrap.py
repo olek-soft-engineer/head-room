@@ -6180,6 +6180,17 @@ def unwrap_opencode(port: int, no_stop_proxy: bool) -> None:
         elif serena_status == "failed":
             click.echo("  Serena MCP server matched Headroom ledger but could not be removed.")
 
+    # `wrap opencode` injects the marker-fenced rtk guidance into both the project
+    # `AGENTS.md` and the global `_opencode_home_dir() / "AGENTS.md"`; that block is
+    # durable state the config restore above does not touch. Without removing it, a
+    # plain `opencode` launch keeps following Headroom's "prefix shell commands with
+    # rtk" instruction and fails when the managed rtk binary is off PATH. Mirror what
+    # unwrap_codex / unwrap_copilot already do. Best-effort and unconditional, like
+    # the MCP cleanup above.
+    for _agents_md in (Path.cwd() / "AGENTS.md", _opencode_home_dir() / "AGENTS.md"):
+        if _remove_rtk_instructions(_agents_md):
+            click.echo(f"  Removed Headroom rtk instructions from {_agents_md}.")
+
     click.echo()
     click.echo("✓ OpenCode is no longer routed through the Headroom proxy.")
     if not no_stop_proxy and status != "noop":
