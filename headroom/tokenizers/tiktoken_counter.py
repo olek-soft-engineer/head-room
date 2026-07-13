@@ -282,7 +282,15 @@ class TiktokenCounter(BaseTokenizer):
                                     else:
                                         total += 170  # Base for high detail
                                 else:
-                                    total += self.count_text(str(part))
+                                    # Any other block shape (Anthropic
+                                    # image/tool_result/tool_use, Strands blocks)
+                                    # is priced by the base handler, which uses a
+                                    # bounded per-image/document estimate. Stringifying
+                                    # it here would json-serialize a base64 blob and
+                                    # count it as text — a 1MB image becomes ~330K
+                                    # phantom tokens (the exact overcount base.py
+                                    # _count_content_parts exists to prevent).
+                                    total += self._count_content_parts([part])
                             elif isinstance(part, str):
                                 total += self.count_text(part)
                 elif key == "role":
