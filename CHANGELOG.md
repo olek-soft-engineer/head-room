@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- **shared_context:** `SharedContext.put` no longer evicts an unrelated entry when it merely updates a key that is already cached at capacity — same defect class fixed for `SemanticCache` in [#2094](https://github.com/headroomlabs-ai/headroom/pull/2094).
 - **compress:** stop mutating the caller's `CompressConfig`. `compress(config=my_cfg, protect_recent=0, target_ratio=0.2)` used to write those kwargs onto `my_cfg`, so a shared per-agent config was silently rewritten by every request that overrode a single option.
 - **paths:** reject `.`, `..`, and NUL as plugin names so `plugin_config_dir` / `plugin_workspace_dir` cannot resolve outside the `plugins/` sandbox. Previously `plugin_config_dir("..")` returned the entire config root and `plugin_workspace_dir("..")` returned the workspace root (savings ledger, memory DB, license cache, logs).
 - **backends/litellm:** drop tool names over 64 chars before calling Bedrock Converse (`send_message` and `stream_message`), instead of letting the whole request 401. The Bedrock Converse API hard-rejects any tool name past that length, and Claude Code includes every globally-added claude.ai MCP connector tool in every request, even ones the user hasn't enabled locally, so a single oversized connector name broke every call through this backend. Only the `bedrock` provider filters; other providers forward tool names unfiltered.
