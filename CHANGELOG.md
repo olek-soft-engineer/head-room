@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- **install:** include `orjson` in the `[proxy]` extra so `uv tool install "headroom-ai[all]"` satisfies LiteLLM OpenRouter/provider backends that import it at runtime ([#2056](https://github.com/headroomlabs-ai/headroom/issues/2056)).
 - The dashboard's per-request metadata (the `recent_requests` / `request_logs`
   tail and the `config` block with upstream URLs) is gated to loopback callers
   via `_request_is_loopback`. When Headroom runs in a bridge-network container
