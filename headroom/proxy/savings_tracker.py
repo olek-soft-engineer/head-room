@@ -209,7 +209,11 @@ def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
         resolved = _resolve_litellm_model(model)
         info = litellm.model_cost.get(resolved, {})
         input_cost_per_token = info.get("input_cost_per_token")
-        if not input_cost_per_token:
+        # Distinguish "price unknown" (missing key → fall back) from a model that
+        # is legitimately free (input_cost_per_token == 0.0). `if not ...` treated
+        # a real 0.0 as unavailable and billed the $3/M fallback — phantom savings
+        # for a model that costs nothing.
+        if input_cost_per_token is None:
             raise RuntimeError("input cost unavailable")
         return float(tokens_saved) * float(input_cost_per_token)
     except Exception:
@@ -290,7 +294,9 @@ def _estimate_input_cost_usd(
         resolved = _resolve_litellm_model(model)
         info = litellm.model_cost.get(resolved, {})
         input_cost_per_token = info.get("input_cost_per_token")
-        if not input_cost_per_token:
+        # A missing key means the model is unknown → fall back to a blended rate.
+        # A present 0.0 means the model is free and must cost $0, not the fallback.
+        if input_cost_per_token is None:
             raise RuntimeError("input cost unavailable")
 
         if use_breakdown:
