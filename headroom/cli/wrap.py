@@ -2683,7 +2683,9 @@ def _proxy_needs_version_restart(payload: dict[str, Any] | None) -> bool:
     """Return True when a running Headroom proxy uses a different package version."""
     running_version = _proxy_version(payload)
     running_release = _normalize_release_version(running_version)
-    current_release = _normalize_release_version(_HEADROOM_VERSION)
+    # -dev is a display marker for source builds; compare the base release so a
+    # dev CLI still restarts a stale proxy on a real version difference.
+    current_release = _normalize_release_version(_HEADROOM_VERSION.removesuffix("-dev"))
     return (
         running_release is not None
         and current_release is not None
