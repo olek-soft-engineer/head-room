@@ -44,7 +44,7 @@ def test_build_runtime_command_for_docker_includes_deployment_env(
         port=8787,
         host="127.0.0.1",
         backend="anthropic",
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
         base_env={"HEADROOM_PORT": "8787"},
         proxy_args=["--host", "127.0.0.1", "--port", "8787"],
     )
@@ -56,7 +56,7 @@ def test_build_runtime_command_for_docker_includes_deployment_env(
     assert "HEADROOM_DEPLOYMENT_PROFILE=default" in joined
     assert "HEADROOM_DEPLOYMENT_PRESET=persistent-docker" in joined
     assert "127.0.0.1:8787:8787" in joined
-    assert "ghcr.io/chopratejas/headroom:latest" in command
+    assert "ghcr.io/headroomlabs-ai/headroom:latest" in command
     # Canonical Headroom filesystem contract (issue #175) forwarded into
     # the container.
     assert "HEADROOM_WORKSPACE_DIR=/tmp/headroom-home/.headroom" in command
@@ -121,7 +121,7 @@ def test_build_runtime_command_for_docker_matches_wrapper_parity(
         port=8787,
         host="127.0.0.1",
         backend="anthropic",
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
         base_env={"HEADROOM_PORT": "8787"},
         proxy_args=["--host", "127.0.0.1", "--port", "8787"],
     )
@@ -157,7 +157,7 @@ def test_build_runtime_command_for_docker_does_not_duplicate_entrypoint(
         port=8787,
         host="127.0.0.1",
         backend="anthropic",
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
         base_env={"HEADROOM_PORT": "8787"},
         proxy_args=["--host", "127.0.0.1", "--port", "8787", "--backend", "anthropic"],
     )
@@ -266,7 +266,7 @@ def test_build_runtime_command_python_and_docker_user(monkeypatch, tmp_path: Pat
         port=8787,
         host="127.0.0.1",
         backend="anthropic",
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
         base_env={"HEADROOM_PORT": "8787"},
         proxy_args=["--host", "127.0.0.1", "--port", "8787"],
     )
