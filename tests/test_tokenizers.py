@@ -613,6 +613,38 @@ class TestLargeToolBlobEstimation:
         exact = tok.count_text(json.dumps(big))
         assert abs(tok._count_serialized(big) - exact) / exact < 0.10
 
+    def test_tool_result_list_recurses_into_image_block(self):
+        """A tool that returns an image nests a base64 block inside a
+        `tool_result` list. Serializing it prices the base64 as text (a 50-200x
+        overcount); recursing into the block prices the image at ~1600 tokens."""
+        tok = EstimatingTokenCounter()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "A" * 280_000,  # ~280KB base64
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+
+        count = tok.count_messages(messages)
+
+        # The image is priced structurally (~1600), not as a huge text blob.
+        assert count < 5_000
+
     def test_oversized_estimate_never_overcounts(self):
         """R4 (prefer false negatives): a token-dense head + sparse tail must not
         over-count. Counting per leaf cannot extrapolate a dense front slice to the
