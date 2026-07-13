@@ -761,6 +761,11 @@ class HeadroomProxy(
         if is_token_mode(config.mode):
             router_config.protect_recent_reads_fraction = 0.3
             router_config.search_group_by_file = True
+        # Note: protect_tool_results runs AFTER token mode (ordering matters).
+        # It resets protect_recent_reads_fraction from 0.3→0.0, restoring
+        # full protection for ALL excluded-tool results regardless of age.
+        # This means naming any tool with --protect-tool-results also
+        # protects Read/Glob/Grep/Write/Edit results indefinitely.
         if config.protect_tool_results:
             router_config.protect_recent_reads_fraction = 0.0
         # `--compress-user-messages` flips the router's default skip rule.

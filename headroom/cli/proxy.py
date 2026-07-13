@@ -285,6 +285,10 @@ def dashboard(port: int, no_open: bool) -> None:
     help=(
         "Comma-separated tool names whose results are never lossy-compressed, "
         "merged with the built-in defaults (e.g. Bash,WebFetch). "
+        "In token mode, this also resets protect_recent_reads_fraction "
+        "from 0.3 (only recent ~30% of results protected) to 0.0 (all "
+        "results protected indefinitely), which prevents older Read/Glob/"
+        "Grep/Write/Edit tool results from being silently compressed. "
         "Env: HEADROOM_PROTECT_TOOL_RESULTS."
     ),
 )
