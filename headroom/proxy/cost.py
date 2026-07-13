@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import math
 from collections import deque
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -472,23 +473,50 @@ def build_session_summary(
         "too_small": 0,
         "passthrough": 0,
         "no_compressible_content": 0,
+        "unknown_token_accounting": 0,
     }
+
+    def _entry_has_number(entry: Any, attr: str) -> bool:
+        value = getattr(entry, attr, None)
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+
+    def _entry_number(entry: Any, attr: str) -> int | float:
+        value = getattr(entry, attr, 0)
+        return value if _entry_has_number(entry, attr) else 0
 
     if proxy.logger:
         for entry in proxy.logger._logs:
             if entry.model and "count_tokens" in entry.model:
                 uncompressed_reasons["passthrough"] += 1
                 continue
-            if entry.tokens_saved > 0:
+            tokens_saved = _entry_number(entry, "tokens_saved")
+            input_tokens_original = _entry_number(entry, "input_tokens_original")
+            input_tokens_optimized = _entry_number(entry, "input_tokens_optimized")
+            has_complete_token_accounting = all(
+                _entry_has_number(entry, attr)
+                for attr in (
+                    "input_tokens_original",
+                    "input_tokens_optimized",
+                    "tokens_saved",
+                    "savings_percent",
+                )
+            )
+            if tokens_saved > 0 and has_complete_token_accounting:
                 compressed_requests.append(
                     {
-                        "savings_pct": round(entry.savings_percent, 1),
-                        "tokens_saved": entry.tokens_saved,
-                        "original": entry.input_tokens_original,
-                        "optimized": entry.input_tokens_optimized,
+                        "savings_pct": round(_entry_number(entry, "savings_percent"), 1),
+                        "tokens_saved": tokens_saved,
+                        "original": input_tokens_original,
+                        "optimized": input_tokens_optimized,
                     }
                 )
-            elif entry.input_tokens_original > 0:
+            elif not has_complete_token_accounting:
+                uncompressed_reasons["unknown_token_accounting"] += 1
+            elif input_tokens_original > 0:
                 # Categorize why it wasn't compressed
                 transforms = entry.transforms_applied or []
                 if not transforms:
@@ -496,7 +524,7 @@ def build_session_summary(
                     uncompressed_reasons["prefix_frozen"] += 1
                 elif all("excluded" in t or "protected" in t for t in transforms):
                     uncompressed_reasons["no_compressible_content"] += 1
-                elif entry.input_tokens_original < 500:
+                elif input_tokens_original < 500:
                     uncompressed_reasons["too_small"] += 1
                 else:
                     uncompressed_reasons["prefix_frozen"] += 1
