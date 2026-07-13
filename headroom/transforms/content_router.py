@@ -3297,7 +3297,16 @@ class ContentRouter(Transform):
         else:
             read_protection_window = num_messages  # 0.0 = protect all (old behavior)
         runtime_read_protection_window = kwargs.get("read_protection_window")
-        if runtime_read_protection_window is not None:
+        if (
+            runtime_read_protection_window is not None
+            and self.config.protect_recent_reads_fraction > 0
+        ):
+            # A profile-derived window may only narrow protection when the
+            # deployment hasn't explicitly opted into "protect everything"
+            # (protect_recent_reads_fraction == 0.0, set by --protect-tool-results).
+            # See #1374's documented contract: protected tool output must never
+            # lossy-compress "regardless of conversation depth" -- a per-request
+            # savings-profile kwarg must not silently weaken that.
             read_protection_window = max(0, int(runtime_read_protection_window))
 
         # Adaptive compression ratio: scale with context pressure
