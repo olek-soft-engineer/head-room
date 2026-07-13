@@ -603,27 +603,17 @@ def _compact_openai_responses_tools(
     return updated, True, before, after
 
 
-def _ensure_responses_store_for_memory_tools(
-    payload: dict[str, Any],
-    *,
-    memory_tools_injected: bool,
-) -> bool:
-    """Keep Responses API memory-tool continuations addressable.
+def _responses_request_allows_memory_tool_continuation(payload: dict[str, Any]) -> bool:
+    """Return whether Responses memory tools may rely on stored continuations.
 
-    Memory tools are transparent to clients: Headroom executes the emitted
-    function_call, then sends function_call_output in a continuation request
-    using previous_response_id. OpenAI only allows that continuation when the
-    previous response was stored. Clients such as pi/Codex can set store=false
-    to avoid retaining ordinary responses, but that makes memory-tool
-    continuations fail with previous_response_not_found.
-
-    Return True when this function changes the payload.
+    Headroom memory tools use ``previous_response_id`` continuations after a
+    tool call. Those continuations require the originating response to be
+    stored. When a client explicitly sends ``store=false``, preserve that
+    contract and skip the Responses memory-tool injection path instead of
+    mutating the request.
     """
 
-    if memory_tools_injected and payload.get("store") is False:
-        payload["store"] = True
-        return True
-    return False
+    return payload.get("store") is not False
 
 
 def _responses_input_item_text_bytes(item: Any) -> int:
@@ -4066,28 +4056,27 @@ class OpenAIHandlerMixin:
                     else:
                         memory_tool_defs_responses.append(t)
 
-                resp_tools = body.get("tools") or []
-                resp_tools, mem_tools_injected = _apply_sticky_mem_tools_resp(
-                    provider="openai",
-                    session_id=_responses_session_id,
-                    request_id=request_id,
-                    existing_tools=resp_tools,
-                    memory_tools_to_inject=memory_tool_defs_responses,
-                    inject_this_turn=bool(self.memory_handler.config.inject_tools),
-                )
-                if mem_tools_injected:
-                    body["tools"] = resp_tools
-                    body_mutation_tracker.mark_mutated("responses_memory_tools")
-                    logger.info(f"[{request_id}] Memory: Injected memory tools (openai/responses)")
-
-                    if _ensure_responses_store_for_memory_tools(
-                        body,
-                        memory_tools_injected=True,
-                    ):
-                        body_mutation_tracker.mark_mutated("responses_memory_store")
+                if _responses_request_allows_memory_tool_continuation(body):
+                    resp_tools = body.get("tools") or []
+                    resp_tools, mem_tools_injected = _apply_sticky_mem_tools_resp(
+                        provider="openai",
+                        session_id=_responses_session_id,
+                        request_id=request_id,
+                        existing_tools=resp_tools,
+                        memory_tools_to_inject=memory_tool_defs_responses,
+                        inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                    )
+                    if mem_tools_injected:
+                        body["tools"] = resp_tools
+                        body_mutation_tracker.mark_mutated("responses_memory_tools")
                         logger.info(
-                            f"[{request_id}] Memory: forced store=true for Responses memory tool continuation"
+                            f"[{request_id}] Memory: Injected memory tools (openai/responses)"
                         )
+                elif self.memory_handler.config.inject_tools:
+                    logger.info(
+                        "[%s] Memory: skipped Responses memory tools because client set store=false",
+                        request_id,
+                    )
             except Exception as e:
                 logger.warning(f"[{request_id}] Memory injection failed (responses): {e}")
         elif self.memory_handler and memory_user_id and _bypass:
