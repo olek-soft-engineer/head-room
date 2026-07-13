@@ -7494,6 +7494,21 @@ class OpenAIHandlerMixin:
             logger.debug("Client disconnected during body read for passthrough")
             return Response(status_code=204)
 
+        # Hermes owns its scoped coding-agent protocols; keep that adapter out of
+        # the generic OpenAI passthrough handler.
+        from headroom.providers.hermes import compress_scoped_passthrough_body
+
+        optimize_enabled = bool(getattr(getattr(self, "config", None), "optimize", False))
+        original_body = body
+        body = compress_scoped_passthrough_body(
+            path,
+            body,
+            optimize=optimize_enabled,
+            bypass=_headroom_bypass_enabled(request.headers),
+        )
+        if body is not original_body:
+            headers["content-length"] = str(len(body))
+
         headers = await apply_copilot_api_auth(headers, url=url)
         # Cloudflare bot-management challenges our HTTP/2 fingerprint on
         # ChatGPT's sensitive account endpoints (/backend-api/me,
