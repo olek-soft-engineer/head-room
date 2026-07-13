@@ -175,6 +175,26 @@ class TestEstimatingTokenCounter:
         count = counter.count_text(text)
         assert count == 10  # 50 / 5 = 10
 
+    def test_count_text_fixed_ratio_prices_cjk(self):
+        """The fixed-ratio path must price dense scripts (CJK) like the auto path.
+
+        The registry builds provider counters (Anthropic 3.5, Google 4.0, ...)
+        with a fixed ratio; before the fix CJK was priced at the Latin ratio, so
+        a large CJK context read as ~40-55% of its true size and could skip
+        compression."""
+        counter = EstimatingTokenCounter(chars_per_token=3.5)
+        cjk = "これはテストです" * 100  # 800 dense-script chars, no ASCII
+
+        count = counter.count_text(cjk)
+
+        # ~1 token per 1.5 chars (CHARS_PER_TOKEN_CJK), not 1 per 3.5.
+        assert count == pytest.approx(len(cjk) / 1.5, rel=0.05)
+        # Far higher than the old Latin-ratio estimate.
+        assert count > len(cjk) / 3.5 * 2
+
+        # ASCII is unaffected by the fixed ratio.
+        assert counter.count_text("x" * 35) == 10
+
     def test_count_text_minimum_one(self):
         """Test minimum of 1 token."""
         counter = EstimatingTokenCounter()
