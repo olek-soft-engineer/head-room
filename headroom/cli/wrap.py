@@ -1505,7 +1505,14 @@ def _codex_session_home_overlay() -> Any:
     with tempfile.TemporaryDirectory(prefix="headroom-codex-home-") as tmp_dir:
         session_home = Path(tmp_dir)
         if source_home.exists():
-            shutil.copytree(source_home, session_home, dirs_exist_ok=True)
+            shutil.copytree(
+                source_home,
+                session_home,
+                dirs_exist_ok=True,
+                ignore=lambda directory, names: [
+                    name for name in names if (Path(directory) / name).is_socket()
+                ],
+            )
 
         os.environ["CODEX_HOME"] = str(session_home)
         try:
