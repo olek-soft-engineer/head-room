@@ -633,6 +633,15 @@ def _responses_input_item_text_bytes(item: Any) -> int:
     output = item.get("output")
     if isinstance(output, str):
         return len(output.encode("utf-8", errors="replace"))
+    if isinstance(output, list):
+        total = 0
+        for part in output:
+            if isinstance(part, str):
+                total += len(part.encode("utf-8", errors="replace"))
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                total += len(part["text"].encode("utf-8", errors="replace"))
+        if total > 0:
+            return total
 
     content = item.get("content")
     if isinstance(content, str):
@@ -1296,9 +1305,9 @@ class OpenAIHandlerMixin:
             # remain as defense-in-depth.
             type_tag = item.get("type")
             if type_tag in self.OPENAI_RESPONSES_OUTPUT_TYPES:
-                output = item.get("output")
-                if isinstance(output, str):
-                    return output, ("output", None)
+                output_text = _responses_part_text(item.get("output"))
+                if output_text:
+                    return output_text, ("output", None)
             return None
 
         def _set_slot_text(
@@ -1396,12 +1405,8 @@ class OpenAIHandlerMixin:
                     # Protected from lossy compression — but grep/log/json output
                     # can still be losslessly compacted. Reuse the router helper
                     # so the Responses path matches the chat/Anthropic behavior.
-                    excl_out = item.get("output")
-                    fold = (
-                        router._lossless_compact_excluded(excl_out)
-                        if isinstance(excl_out, str)
-                        else None
-                    )
+                    excl_out = _responses_part_text(item.get("output"))
+                    fold = router._lossless_compact_excluded(excl_out) if excl_out else None
                     if fold is not None:
                         lossless_excluded.append((idx, ("output", None), fold[0], excl_out))
                     if debug_enabled:
