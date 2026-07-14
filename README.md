@@ -425,6 +425,28 @@ Two runtime assets are fetched over TLS; if they are blocked, trust your corpora
 
 Running with compression disabled (pure gateway) requires neither asset.
 
+#### Intel macOS (x86_64-apple-darwin): no prebuilt ONNX Runtime binary (#941)
+
+`ort-sys` ships no prebuilt ONNX Runtime binary for Intel macOS, so a source
+build fails by default even outside a corporate-proxy environment. The same
+`ORT_STRATEGY=system` mechanism above fixes it — point it at a system ONNX
+Runtime instead:
+
+```bash
+brew install onnxruntime
+ORT_STRATEGY=system \
+ORT_LIB_LOCATION="$(brew --prefix onnxruntime)/lib" \
+ORT_PREFER_DYNAMIC_LINK=1 \
+  pip install "headroom-ai[all]"
+
+# ORT is dlopen'd at runtime too:
+export ORT_DYLIB_PATH="$(brew --prefix onnxruntime)/lib/libonnxruntime.dylib"
+```
+
+`ORT_LIB_LOCATION` must point at `lib/` (not the bare prefix) and
+`ORT_PREFER_DYNAMIC_LINK=1` is required, or `ORT_STRATEGY=system` still
+attempts static linking, which the Homebrew keg doesn't provide.
+
 #### "Basic Constraints of CA cert not marked critical" (Python 3.13+ strict mode)
 
 A **different** failure from the one above. If TLS fails with:
