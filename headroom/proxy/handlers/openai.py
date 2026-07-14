@@ -69,6 +69,7 @@ from headroom.proxy.auth_mode import (
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.cost import _summarize_transforms, header_safe_transforms
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
+from headroom.proxy.image_isolation import run_image_compression_isolated
 from headroom.proxy.outcome import RequestOutcome
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
@@ -2309,18 +2310,17 @@ class OpenAIHandlerMixin:
             try:
                 compressor = _get_image_compressor()
                 if compressor and compressor.has_images(messages):
-                    # Offload CPU-bound image compression onto the bounded
-                    # executor (same as text compression); inline blocked the loop.
-                    messages = await self._run_compression_in_executor(
-                        lambda: compressor.compress(messages, provider="openai"),
+                    messages, image_result = await run_image_compression_isolated(
+                        messages,
+                        provider="openai",
                         timeout=COMPRESSION_TIMEOUT_SECONDS,
                     )
-                    if compressor.last_result:
+                    if image_result is not None:
                         logger.info(
-                            f"[{request_id}] Image: {compressor.last_result.technique.value} "
-                            f"({compressor.last_result.savings_percent:.0f}% saved, "
-                            f"{compressor.last_result.original_tokens} → "
-                            f"{compressor.last_result.compressed_tokens} tokens)"
+                            f"[{request_id}] Image: {image_result['technique']} "
+                            f"({image_result['savings_percent']:.0f}% saved, "
+                            f"{image_result['original_tokens']} → "
+                            f"{image_result['compressed_tokens']} tokens)"
                         )
             except Exception as e:
                 # Image compression is best-effort — fail open on timeout/error and
