@@ -78,6 +78,16 @@ _detect_panic_warned = False
 _detect_native_unhealthy = False  # circuit breaker: native detect hung once (#575)
 
 
+def _compression_deadline_seconds() -> float:
+    try:
+        return max(
+            0.0,
+            float(os.environ.get("HEADROOM_COMPRESSION_DEADLINE_MS", "20000")) / 1000.0,
+        )
+    except ValueError:
+        return 20.0
+
+
 def _router_debug_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
@@ -3723,8 +3733,48 @@ class ContentRouter(Transform):
                 task_results = []
                 for _, task_content, task_ctx, task_bias, _, _ in pending_tasks:
                     t0 = time.perf_counter()
-                    r = self.compress(task_content, context=task_ctx, bias=task_bias)
-                    task_results.append((r, (time.perf_counter() - t0) * 1000))
+                    deadline_s = _compression_deadline_seconds() if len(pending_tasks) == 1 else 0.0
+                    if deadline_s:
+                        box: dict[str, Any] = {}
+
+                        def _run(
+                            _box: dict[str, Any] = box,
+                            _content: str = task_content,
+                            _context: str = task_ctx,
+                            _bias: float = task_bias,
+                        ) -> None:
+                            try:
+                                _box["result"] = self.compress(
+                                    _content, context=_context, bias=_bias
+                                )
+                            except BaseException as exc:  # noqa: BLE001
+                                _box["error"] = exc
+
+                        # ponytail: daemon watchdog cannot stop native GIL holds; native layer owns that fix.
+                        worker = threading.Thread(
+                            target=_run, name="headroom-single-compress-watchdog", daemon=True
+                        )
+                        worker.start()
+                        worker.join(deadline_s)
+                        if worker.is_alive():
+                            logger.warning(
+                                "ContentRouter single-cache-miss compression exceeded %.1fs; "
+                                "failing open via PASSTHROUGH",
+                                deadline_s,
+                            )
+                            r = RouterCompressionResult(
+                                compressed=task_content,
+                                original=task_content,
+                                strategy_used=CompressionStrategy.PASSTHROUGH,
+                            )
+                        elif "error" in box:
+                            raise box["error"]
+                        else:
+                            r = box["result"]
+                    else:
+                        r = self.compress(task_content, context=task_ctx, bias=task_bias)
+                    compress_ms = (time.perf_counter() - t0) * 1000
+                    task_results.append((r, compress_ms))
             else:
                 # Parallel compression via thread pool
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
