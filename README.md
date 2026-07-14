@@ -164,6 +164,12 @@ Headroom can trim that too, from the proxy, without you changing any code:
   (a file read, a passing test), it dials the model's thinking effort down. New
   questions and errors keep full effort.
 
+Applies to Anthropic `/v1/messages` **and** OpenAI-compatible endpoints
+(`/v1/chat/completions`, `/v1/responses`). Effort routing uses
+`reasoning_effort` on OpenAI, `thinking.budget_tokens` /
+`output_config.effort` on Anthropic — same clamp-only invariant on both
+paths, same `output_shaper:*` label vocabulary.
+
 Turn it on:
 
 ```bash
