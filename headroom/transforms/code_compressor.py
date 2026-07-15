@@ -45,6 +45,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -1196,6 +1197,20 @@ class CodeAwareCompressor(Transform):
 
             # Verify syntax validity (checks both ERROR and MISSING nodes)
             syntax_valid = self._verify_syntax(compressed, detected_lang)
+            original_syntax_valid = True
+
+            if not syntax_valid and detected_lang == CodeLanguage.PYTHON:
+                original_syntax_valid = self._verify_syntax(code, detected_lang)
+                if original_syntax_valid:
+                    compressed, structure, symbol_scores = self._compress_with_ast(
+                        code,
+                        detected_lang,
+                        context,
+                        tokenizer,
+                        recover_invalid_python_nodes=True,
+                    )
+                    compressed_tokens = self._estimate_tokens(compressed, tokenizer)
+                    syntax_valid = self._verify_syntax(compressed, detected_lang)
 
             # If syntax invalid, return original (never serve broken code)
             if not syntax_valid:
@@ -1294,6 +1309,7 @@ class CodeAwareCompressor(Transform):
         language: CodeLanguage,
         context: str,
         tokenizer: Tokenizer | None = None,
+        recover_invalid_python_nodes: bool = False,
     ) -> tuple[str, CodeStructure, dict[str, float]]:
         """Compress code using AST parsing with symbol importance analysis.
 
@@ -1312,6 +1328,23 @@ class CodeAwareCompressor(Transform):
         parser = _get_parser(language.value)
         tree = parser.parse(bytes(code, "utf-8"))
         root = tree.root_node
+        candidate_validator: Callable[[Any, str], str] | None = None
+
+        if recover_invalid_python_nodes and language == CodeLanguage.PYTHON:
+            code_bytes = code.encode("utf-8")
+
+            def candidate_validator(node: Any, candidate_text: str) -> str:
+                original_text = _slice_code_bytes(code, node.start_byte, node.end_byte)
+                if candidate_text == original_text:
+                    return candidate_text
+                candidate_module = (
+                    code_bytes[: node.start_byte]
+                    + candidate_text.encode("utf-8")
+                    + code_bytes[node.end_byte :]
+                ).decode("utf-8")
+                if self._verify_syntax(candidate_module, CodeLanguage.PYTHON):
+                    return candidate_text
+                return original_text
 
         # Analyze symbol importance and allocate compression budget
         analysis = self._analyze_symbol_importance(root, code, language, context)
@@ -1321,7 +1354,13 @@ class CodeAwareCompressor(Transform):
         lang_config = _LANG_CONFIGS.get(language)
         if lang_config:
             structure = self._extract_structure(
-                root, code, language, lang_config, body_limits, analysis
+                root,
+                code,
+                language,
+                lang_config,
+                body_limits,
+                analysis,
+                candidate_validator=candidate_validator,
             )
         else:
             structure = self._extract_generic_structure(root, code)
@@ -1351,6 +1390,7 @@ class CodeAwareCompressor(Transform):
         lang_config: LangConfig,
         body_limits: dict[str, int],
         analysis: _SymbolAnalysis,
+        candidate_validator: Callable[[Any, str], str] | None = None,
     ) -> CodeStructure:
         """Extract structure from AST using data-driven language config.
 
@@ -1359,6 +1399,11 @@ class CodeAwareCompressor(Transform):
         """
         structure = CodeStructure()
         captured_byte_ranges: list[tuple[int, int]] = []
+
+        def _validated_candidate(node: Any, compressed: str) -> str:
+            if candidate_validator is None:
+                return compressed
+            return candidate_validator(node, compressed)
 
         def visit(node: Any) -> None:
             node_type = node.type
@@ -1396,7 +1441,11 @@ class CodeAwareCompressor(Transform):
                         export_prefix = _slice_code_bytes(code, node.start_byte, child.start_byte)
                         export_suffix = _slice_code_bytes(code, child.end_byte, node.end_byte)
                         structure.function_signatures.append(
-                            leading + export_prefix + compressed + export_suffix
+                            leading
+                            + _validated_candidate(
+                                node,
+                                export_prefix + compressed + export_suffix,
+                            )
                         )
                         break
                 if not has_func_or_class:
@@ -1421,16 +1470,21 @@ class CodeAwareCompressor(Transform):
                             child, code, language, lang_config, body_limits, analysis
                         )
                 if decorator_text and definition_compressed:
-                    full_def = leading + "\n".join(decorator_text) + "\n" + definition_compressed
+                    full_def = _validated_candidate(
+                        node,
+                        "\n".join(decorator_text) + "\n" + definition_compressed,
+                    )
                     # Route to correct list based on inner definition type
                     for child in node.children:
                         if child.type in lang_config.class_nodes:
-                            structure.class_definitions.append(full_def)
+                            structure.class_definitions.append(leading + full_def)
                             break
                     else:
-                        structure.function_signatures.append(full_def)
+                        structure.function_signatures.append(leading + full_def)
                 elif definition_compressed:
-                    structure.function_signatures.append(leading + definition_compressed)
+                    structure.function_signatures.append(
+                        leading + _validated_candidate(node, definition_compressed)
+                    )
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
@@ -1440,7 +1494,9 @@ class CodeAwareCompressor(Transform):
                 compressed = self._compress_function_ast(
                     node, code, language, lang_config, body_limits, analysis
                 )
-                structure.function_signatures.append(leading + compressed)
+                structure.function_signatures.append(
+                    leading + _validated_candidate(node, compressed)
+                )
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
@@ -1448,7 +1504,7 @@ class CodeAwareCompressor(Transform):
                 compressed = self._compress_class_ast(
                     node, code, language, lang_config, body_limits, analysis
                 )
-                structure.class_definitions.append(compressed)
+                structure.class_definitions.append(_validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 return
 
@@ -1458,7 +1514,7 @@ class CodeAwareCompressor(Transform):
                 compressed = self._compress_class_ast(
                     node, code, language, lang_config, body_limits, analysis
                 )
-                structure.class_definitions.append(leading + compressed)
+                structure.class_definitions.append(leading + _validated_candidate(node, compressed))
                 captured_byte_ranges.append((node.start_byte, node.end_byte))
                 trailing_semicolon = _get_same_line_trailing_semicolon(node)
                 if trailing_semicolon is not None:
