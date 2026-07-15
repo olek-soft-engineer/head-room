@@ -7829,6 +7829,11 @@ class OpenAIHandlerMixin:
                 }
             )
 
+        start_time = time.time()
+        headers = dict(request.headers)
+        tags = extract_tags(headers)
+        client = classify_client(headers)
+
         try:
             # Use OpenAI pipeline (messages are in OpenAI format from TS SDK)
             # Allow optional token_budget to override model's context limit
@@ -7873,6 +7878,33 @@ class OpenAIHandlerMixin:
                 timeout=COMPRESSION_TIMEOUT_SECONDS,
             )
 
+            tokens_before = result.tokens_before
+            tokens_after = result.tokens_after
+            tokens_saved = max(0, tokens_before - tokens_after)
+            latency_ms = (time.time() - start_time) * 1000
+            await self._record_request_outcome(
+                RequestOutcome(
+                    request_id=(
+                        await self._next_request_id()
+                        if hasattr(self, "_next_request_id")
+                        else f"compress_{int(time.time())}"
+                    ),
+                    provider="compress",
+                    model=model if isinstance(model, str) else str(model),
+                    original_tokens=tokens_before,
+                    optimized_tokens=tokens_after,
+                    output_tokens=0,
+                    tokens_saved=tokens_saved,
+                    attempted_input_tokens=tokens_before,
+                    total_latency_ms=latency_ms,
+                    overhead_ms=latency_ms,
+                    num_messages=len(messages) if isinstance(messages, list) else 0,
+                    transforms_applied=tuple(result.transforms_applied or ()),
+                    tags=tags,
+                    client=client,
+                )
+            )
+
             return JSONResponse(
                 {
                     "messages": result.messages,
@@ -7894,6 +7926,29 @@ class OpenAIHandlerMixin:
                 "Compression timed out after %.0fs; failing open with original messages",
                 COMPRESSION_TIMEOUT_SECONDS,
             )
+            self.metrics.record_compression_failed("timeout")
+            latency_ms = (time.time() - start_time) * 1000
+            await self._record_request_outcome(
+                RequestOutcome(
+                    request_id=(
+                        await self._next_request_id()
+                        if hasattr(self, "_next_request_id")
+                        else f"compress_{int(time.time())}"
+                    ),
+                    provider="compress",
+                    model=model if isinstance(model, str) else str(model),
+                    original_tokens=0,
+                    optimized_tokens=0,
+                    output_tokens=0,
+                    tokens_saved=0,
+                    attempted_input_tokens=0,
+                    total_latency_ms=latency_ms,
+                    overhead_ms=latency_ms,
+                    num_messages=len(messages) if isinstance(messages, list) else 0,
+                    tags=tags,
+                    client=client,
+                )
+            )
             return JSONResponse(
                 content={
                     "messages": messages,
@@ -7910,6 +7965,7 @@ class OpenAIHandlerMixin:
             )
         except Exception as e:
             logger.exception("Compression failed: %s", e)
+            await self.metrics.record_failed(provider="compress")
             return JSONResponse(
                 status_code=503,
                 content={
