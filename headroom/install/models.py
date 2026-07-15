@@ -55,6 +55,7 @@ class ToolTarget(str, Enum):
     CODEX = "codex"
     AIDER = "aider"
     CURSOR = "cursor"
+    GROK_BUILD = "grok_build"
     GROK = "grok"
     OPENCLAW = "openclaw"
     OPENCODE = "opencode"

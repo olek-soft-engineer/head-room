@@ -7,7 +7,7 @@ name = "headroom-ai"
 version = "0.32.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
-license = "Apache-2.0"  
+license = "Apache-2.0"
 requires-python = ">=3.10"
 authors = [
     { name = "Headroom Contributors" }
