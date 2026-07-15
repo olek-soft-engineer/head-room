@@ -1069,16 +1069,32 @@ class AnthropicHandlerMixin:
             # session id (and its sticky CCR/memory tools, beta headers, and
             # frozen-prefix state). This synthetic message only derives the id; it
             # is never forwarded.
+            # Both the session id and the conversation lineage derive from the
+            # SAME original client bytes (pre security-scan/hook mutation,
+            # which may rewrite messages differently turn-to-turn — a
+            # turn-dependent rewrite of the leading system text would rotate
+            # the id mid-conversation, orphaning all session-sticky state).
+            # The synthetic system message folds the top-level system prompt
+            # into both derivations, so conversations sharing an explicit
+            # header id but differing in system prompt keep separate lineages.
             system_prompt = body.get("system")
             session_messages = (
-                [{"role": "system", "content": system_prompt}, *messages]
+                [{"role": "system", "content": system_prompt}, *original_client_messages]
                 if system_prompt is not None
-                else messages
+                else original_client_messages
             )
             session_id = self.session_tracker_store.compute_session_id(
                 request, model, session_messages
             )
-            prefix_tracker = self.session_tracker_store.get_or_create(session_id, "anthropic")
+            # Resolve the tracker by conversation lineage within the session id
+            # (#2085): one model + system prompt spans a Claude Code session and
+            # all its parallel subagents, so concurrent conversations share this
+            # fallback id — on one shared tracker their interleaved histories
+            # thrash the frozen-prefix state and the provider prompt cache is
+            # re-written on nearly every call.
+            prefix_tracker = self.session_tracker_store.resolve_tracker(
+                session_id, "anthropic", messages=session_messages
+            )
             frozen_message_count = prefix_tracker.get_frozen_message_count()
             # Idle gap since the previous turn's response, snapshotted at fetch
             # (before get_or_create bumped the access clock). Forwarded to the
