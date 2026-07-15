@@ -1067,8 +1067,10 @@ async def test_ws_connect_failure_falls_back_to_http():
     # Fallback ran with the first frame.
     assert len(fallback_calls) == 1
     _body, _first_raw = fallback_calls[0]
-    assert _first_raw == first
-    assert _body == json.loads(first)
+    expected = json.loads(first)
+    expected["response"]["store"] = False
+    assert json.loads(_first_raw) == expected
+    assert _body == expected
     # Clean teardown.
     assert handler.ws_sessions.active_count() == 0
 
