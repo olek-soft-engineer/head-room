@@ -102,6 +102,9 @@ def _tree_sitter_importable() -> bool:
         return False
 
 
+_UNSAFE_TREE_SITTER_LANGUAGES: frozenset[str] = frozenset({"perl"})
+
+
 def _get_parser(language: str) -> Any:
     """Get a tree-sitter parser for the given language.
 
@@ -129,6 +132,8 @@ def _get_parser(language: str) -> Any:
         ImportError: If tree-sitter is not installed.
         ValueError: If language is not supported.
     """
+    if language in _UNSAFE_TREE_SITTER_LANGUAGES:
+        raise ValueError(f"Language '{language}' is quarantined for code-aware compression.")
     # NOTE: guard on importability (not _check_tree_sitter_available), because
     # _check_tree_sitter_available now performs a real end-to-end parse via
     # _get_parser; guarding on it here would recurse.
@@ -161,7 +166,7 @@ def _get_parser(language: str) -> Any:
         except Exception as e:
             raise ValueError(
                 f"Language '{language}' is not supported by tree-sitter. "
-                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, csharp, perl. "
+                f"Supported: python, javascript, typescript, go, rust, java, c, cpp, csharp. "
                 f"Error: {e}"
             ) from e
 
@@ -714,6 +719,16 @@ def detect_language(code: str) -> tuple[CodeLanguage, float]:
         if candidates[CodeLanguage.CPP] >= 2:
             candidates[CodeLanguage.C] = 0
 
+    perl_score = candidates.get(CodeLanguage.PERL, 0)
+    if perl_score > 0:
+        best_non_perl = max(
+            (score for lang, score in candidates.items() if lang != CodeLanguage.PERL),
+            default=0,
+        )
+        if perl_score > best_non_perl:
+            return CodeLanguage.UNKNOWN, 0.0
+        candidates.pop(CodeLanguage.PERL, None)
+
     # Phase 2: If tree-sitter available, parse with candidates and pick fewest errors
     if _check_tree_sitter_available():
         best_lang = CodeLanguage.UNKNOWN
@@ -1142,6 +1157,19 @@ class CodeAwareCompressor(Transform):
                     language_confidence=0.0,
                     syntax_valid=True,
                 )
+        if detected_lang == CodeLanguage.PERL:
+            if self.config.fallback_to_kompress:
+                return self._fallback_compress(code, original_tokens)
+            return CodeCompressionResult(
+                compressed=code,
+                original=code,
+                original_tokens=original_tokens,
+                compressed_tokens=original_tokens,
+                compression_ratio=1.0,
+                language=detected_lang,
+                language_confidence=confidence,
+                syntax_valid=True,
+            )
 
         # Check if tree-sitter is available
         if not _check_tree_sitter_available():
