@@ -1500,9 +1500,6 @@ class KompressCompressor(Transform):
         if n == 0:
             return []
 
-        if self._degraded_reason is not None:
-            return [self._passthrough(c, len(c.split())) for c in contents]
-
         # Normalize target_ratio to a per-text list
         if isinstance(target_ratio, list):
             if len(target_ratio) != n:
@@ -1525,6 +1522,9 @@ class KompressCompressor(Transform):
             ccr_sources: list[str | None] = list(ccr_originals)
         else:
             ccr_sources = [None] * n
+
+        if getattr(self, "_degraded_reason", None) is not None:
+            return [self._passthrough(c, len(c.split())) for c in contents]
 
         # Fast path: on backends where batch-dim parallelism does NOT help
         # (ONNX CPU, PyTorch CPU), fall back to sequential `compress()`
