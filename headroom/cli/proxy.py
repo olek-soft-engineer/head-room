@@ -804,6 +804,15 @@ def dashboard(port: int, no_open: bool) -> None:
     help="Custom OpenAI API URL for passthrough endpoints (env: OPENAI_TARGET_API_URL)",
 )
 @click.option(
+    "--provider-name",
+    default=None,
+    help=(
+        "Display name for the OpenAI-compatible upstream shown on the dashboard "
+        "(e.g. 'OpenRouter'). Overrides hostname detection from --openai-api-url. "
+        "Internal routing and pricing are unaffected."
+    ),
+)
+@click.option(
     "--gemini-api-url",
     default=None,
     help="Custom Gemini API URL for passthrough endpoints (env: GEMINI_TARGET_API_URL)",
@@ -966,6 +975,7 @@ def proxy(
     anthropic_extra_headers: str | None,
     openai_extra_headers: str | None,
     openai_api_url: str | None,
+    provider_name: str | None,
     gemini_api_url: str | None,
     cloudcode_api_url: str | None,
     vertex_api_url: str | None,
@@ -1155,6 +1165,7 @@ def proxy(
         anthropic_extra_headers=resolved_anthropic_extra_headers,
         openai_extra_headers=resolved_openai_extra_headers,
         openai_api_url=provider_api_overrides.openai,
+        provider_name=provider_name,
         gemini_api_url=provider_api_overrides.gemini,
         cloudcode_api_url=provider_api_overrides.cloudcode,
         vertex_api_url=provider_api_overrides.vertex,
