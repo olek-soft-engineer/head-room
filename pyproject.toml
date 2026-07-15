@@ -60,6 +60,7 @@ dependencies = [
     "ast-grep-cli>=0.30.0",       # AST-aware code slicing (CodeCompressor); binary wheel
     "pyyaml>=6.0",                # omp wrap: parse/merge omp's models.yml registry
     "tomli>=2.0.0; python_version < '3.11'",  # tomllib backport for helper scripts
+    "tomlkit>=0.13.0,<1.0",       # Loss-minimizing Codex config recovery
 ]
 
 [project.optional-dependencies]
