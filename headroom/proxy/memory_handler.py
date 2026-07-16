@@ -558,7 +558,7 @@ class MemoryHandler:
         # Check which tools are already present
         existing_names: set[str] = set()
         for tool in tools:
-            name = tool.get("name") or tool.get("function", {}).get("name")
+            name = tool.get("name") or (tool.get("function") or {}).get("name")
             if name:
                 existing_names.add(name)
 
@@ -1039,7 +1039,9 @@ your responses, not to drive new actions."""
         """Check if response contains memory tool calls."""
         tool_calls = self._extract_tool_calls(response, provider)
         for tc in tool_calls:
-            name = tc.get("name") or tc.get("function", {}).get("name")
+            # Coalesce `function` with `or {}` so an explicit {"function": null}
+            # on a malformed/partial upstream tool call doesn't crash detection.
+            name = tc.get("name") or (tc.get("function") or {}).get("name")
             # Check for both custom and native memory tools
             if name in MEMORY_TOOL_NAMES or name == NATIVE_MEMORY_TOOL_NAME:
                 return True
@@ -1106,7 +1108,11 @@ your responses, not to drive new actions."""
         results: list[dict[str, Any]] = []
 
         for tc in tool_calls:
-            tool_name = tc.get("name") or tc.get("function", {}).get("name")
+            # `tc.get("function", {})` returns None for an explicit
+            # {"function": null} (the default only applies to a missing key), so
+            # the following `.get` would raise AttributeError on a malformed /
+            # partial upstream tool call. Coalesce to {}.
+            tool_name = tc.get("name") or (tc.get("function") or {}).get("name")
             tool_id = tc.get("id") or tc.get("call_id", "")
 
             # Parse input data
@@ -1115,7 +1121,9 @@ your responses, not to drive new actions."""
             else:
                 # Chat Completions format: function.arguments
                 # Responses API format: arguments (top-level string)
-                args_str = tc.get("arguments") or tc.get("function", {}).get("arguments") or "{}"
+                args_str = (
+                    tc.get("arguments") or (tc.get("function") or {}).get("arguments") or "{}"
+                )
                 try:
                     input_data = json.loads(args_str)
                 except json.JSONDecodeError:
