@@ -3186,6 +3186,143 @@ def _stop_local_proxy_for_unwrap(port: int) -> str:
     return "stopped" if _kill_proxy_by_pid(pid, port) else "failed"
 
 
+def _manifest_targets_claude(manifest: Any) -> bool:
+    targets = getattr(manifest, "targets", None)
+    if isinstance(targets, list) and any(
+        str(target).strip().lower() == "claude" for target in targets
+    ):
+        return True
+    tool_envs = getattr(manifest, "tool_envs", None)
+    if isinstance(tool_envs, dict) and any(
+        str(name).strip().lower() == "claude" for name in tool_envs
+    ):
+        return True
+    mutations = getattr(manifest, "mutations", None)
+    if isinstance(mutations, list):
+        for mutation in mutations:
+            if str(getattr(mutation, "target", "")).strip().lower() == "claude":
+                return True
+    return False
+
+
+def _can_unwrap_stop_persistent_manifest(manifest: Any) -> bool:
+    if not _manifest_targets_claude(manifest):
+        return False
+    supervisor_kind = str(getattr(manifest, "supervisor_kind", "")).strip().lower()
+    return supervisor_kind in {"", "none", "service"}
+
+
+def _same_port_claude_env_keys(port: int) -> list[str]:
+    matches: list[str] = []
+    for key in (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_FOUNDRY_BASE_URL",
+        "ANTHROPIC_VERTEX_BASE_URL",
+    ):
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = urllib.parse.urlparse(raw)
+        except Exception:
+            continue
+        try:
+            parsed_port = parsed.port
+        except ValueError:
+            continue
+        if parsed_port != port:
+            continue
+        host = (parsed.hostname or "").strip().lower()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            continue
+        matches.append(key)
+    return matches
+
+
+def _stop_persistent_manifest_for_claude_unwrap(manifest: Any) -> str | None:
+    from headroom.cli.install import _deactivate_deployment_mutations, _stop_deployment
+
+    try:
+        _deactivate_deployment_mutations(manifest)
+        _stop_deployment(manifest)
+        return None
+    except Exception as exc:
+        return str(exc)
+
+
+def _unwrap_claude_route_cleanup(port: int) -> dict[str, Any]:
+    manifest = _find_persistent_manifest(port)
+    env_keys = _same_port_claude_env_keys(port)
+    if manifest is not None:
+        if _can_unwrap_stop_persistent_manifest(manifest):
+            error = _stop_persistent_manifest_for_claude_unwrap(manifest)
+            if error is None:
+                return {
+                    "kind": "persistent_stopped",
+                    "manifest": manifest,
+                    "env_keys": env_keys,
+                }
+            return {
+                "kind": "persistent_failed",
+                "manifest": manifest,
+                "env_keys": env_keys,
+                "error": error,
+            }
+        return {
+            "kind": "persistent_residue",
+            "manifest": manifest,
+            "env_keys": env_keys,
+        }
+    return {
+        "kind": "local",
+        "status": _stop_local_proxy_for_unwrap(port),
+        "env_keys": env_keys,
+    }
+
+
+def _echo_claude_unwrap_route_cleanup(result: dict[str, Any], port: int) -> bool:
+    kind = str(result.get("kind") or "")
+    env_keys = [str(key) for key in result.get("env_keys", []) if isinstance(key, str)]
+    clean = True
+    if kind == "local":
+        status = str(result.get("status") or "failed")
+        _echo_unwrap_proxy_stop_status(status, port)
+        clean = status in {"stopped", "not_running"}
+    elif kind == "persistent_stopped":
+        manifest = result["manifest"]
+        click.echo(
+            f"  Stopped Claude-owned persistent deployment '{manifest.profile}' on port {port}."
+        )
+    elif kind == "persistent_residue":
+        manifest = result["manifest"]
+        click.echo(
+            "  Warning: same-port persistent deployment "
+            f"'{manifest.profile}' still owns port {port}; left it running because it is not "
+            "clearly Claude-targeted."
+        )
+        click.echo(f"  To stop it, run `headroom install stop --profile {manifest.profile}`.")
+        click.echo(
+            f"  To remove it completely, run `headroom install remove --profile {manifest.profile}`."
+        )
+        clean = False
+    elif kind == "persistent_failed":
+        manifest = result["manifest"]
+        click.echo(
+            "  Warning: failed to stop Claude-owned persistent deployment "
+            f"'{manifest.profile}' on port {port}: {result.get('error')}"
+        )
+        click.echo(f"  Retry with `headroom install stop --profile {manifest.profile}`.")
+        clean = False
+    if env_keys:
+        click.echo(
+            "  Warning: current shell still exports "
+            + ", ".join(env_keys)
+            + f" for port {port}; restart Claude and your shell or unset those variables."
+        )
+        clean = False
+    return clean
+
+
 def _echo_unwrap_proxy_stop_status(status: str, port: int) -> None:
     """Print a human-readable proxy stop result for unwrap commands."""
 
@@ -4778,9 +4915,18 @@ def unwrap_claude(
         )
 
     click.echo()
-    click.echo("✓ Claude is no longer durably wrapped by Headroom.")
-    if not no_stop_proxy:
-        _echo_unwrap_proxy_stop_status(_stop_local_proxy_for_unwrap(port), port)
+    clean_unwrap = True
+    if no_stop_proxy:
+        click.echo("  Kept proxy stop disabled (--no-stop-proxy).")
+        clean_unwrap = False
+    else:
+        clean_unwrap = _echo_claude_unwrap_route_cleanup(_unwrap_claude_route_cleanup(port), port)
+    if clean_unwrap:
+        click.echo("✓ Claude is no longer durably wrapped by Headroom.")
+    else:
+        click.echo(
+            "  Claude local wrap settings were removed, but effective routing residue remains."
+        )
     click.echo()
 
 
