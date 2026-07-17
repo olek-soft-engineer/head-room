@@ -15,7 +15,8 @@ def _win32_pid_alive(pid: int) -> bool:
         kernel32.CloseHandle(handle)
         return True
     ERROR_ACCESS_DENIED = 5
-    return kernel32.GetLastError() == ERROR_ACCESS_DENIED
+    # ctypes GetLastError() is Any; wrap so mypy sees bool (matches pid_alive below).
+    return bool(kernel32.GetLastError() == ERROR_ACCESS_DENIED)
 
 
 def pid_alive(pid: int) -> bool:
