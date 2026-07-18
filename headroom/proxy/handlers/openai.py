@@ -130,8 +130,13 @@ _OPENAI_BASE_URL_HEADER = "x-headroom-base-url"
 _decode_openai_bearer_payload = decode_openai_bearer_payload
 
 
-def _normalize_openai_max_tokens(body: dict[str, Any]) -> None:
+def _normalize_openai_max_tokens(
+    body: dict[str, Any], *, backend_owns_translation: bool = False
+) -> None:
     """Rename the legacy ``max_tokens`` to ``max_completion_tokens`` in-place.
+
+    This direct-OpenAI compatibility shim leaves provider-specific translation
+    to backend-routed requests.
 
     GPT-5 / o-series chat models reject ``max_tokens`` and require
     ``max_completion_tokens``; gpt-4o/4.1 accept the latter too. So translating
@@ -140,7 +145,7 @@ def _normalize_openai_max_tokens(body: dict[str, Any]) -> None:
     No-op when there is no ``max_tokens``; keeps an already-set
     ``max_completion_tokens`` and just drops the rejected legacy key.
     """
-    if not isinstance(body, dict) or "max_tokens" not in body:
+    if backend_owns_translation or not isinstance(body, dict) or "max_tokens" not in body:
         return
     legacy = body.get("max_tokens")
     if legacy is not None and body.get("max_completion_tokens") is None:
@@ -3406,7 +3411,9 @@ class OpenAIHandlerMixin:
         # translate it here — the proxy already owns the outbound body — and
         # those requests work unchanged. No-op when the caller already set
         # `max_completion_tokens`.
-        _normalize_openai_max_tokens(body)
+        _normalize_openai_max_tokens(
+            body, backend_owns_translation=self.anthropic_backend is not None
+        )
 
         # Output shaping (opt-in via HEADROOM_OUTPUT_SHAPER): verbosity steering
         # on the chat system message. Runs after every other body mutation so the
