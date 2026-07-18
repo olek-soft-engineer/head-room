@@ -2578,7 +2578,47 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             **details,
         }
 
+    def _kompress_health_routers() -> list[ContentRouter]:
+        routers: list[ContentRouter] = []
+        for pipeline in (proxy.anthropic_pipeline, proxy.openai_pipeline):
+            for transform in getattr(pipeline, "transforms", ()):
+                if (
+                    isinstance(transform, ContentRouter)
+                    and transform.config.enable_kompress
+                    and all(transform is not item for item in routers)
+                ):
+                    routers.append(transform)
+        return routers
+
+    def _reconcile_kompress_health() -> bool:
+        routers = _kompress_health_routers()
+        if not routers:
+            return False
+
+        compressors: list[Any] = []
+        for router in routers:
+            for name in ("_kompress", "_kompress_remote"):
+                compressor = getattr(router, name, None)
+                if compressor is not None and all(compressor is not item for item in compressors):
+                    compressors.append(compressor)
+
+        for compressor in compressors:
+            try:
+                if not compressor.is_ready():
+                    continue
+                backend = compressor.ready_backend()
+                if not backend:
+                    continue
+            except Exception:
+                continue
+            if proxy.warmup.kompress.status == "loaded":
+                return True
+            proxy.warmup.kompress.mark_loaded(handle=compressor, backend=backend)
+            return True
+        return True
+
     def _health_checks() -> dict[str, dict[str, Any]]:
+        kompress_enabled = _reconcile_kompress_health()
         memory_status = (
             proxy.memory_handler.health_status()
             if proxy.memory_handler
@@ -2625,7 +2665,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 error=_upstream_check_cache["error"],
             ),
             "kompress": _component_health(
-                enabled=not config.disable_kompress,
+                enabled=kompress_enabled,
                 ready=proxy.warmup.kompress.status == "loaded",
                 backend=proxy.warmup.kompress.info.get("backend", None),
             ),
