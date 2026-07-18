@@ -1319,6 +1319,47 @@ class OpenAIHandlerMixin:
         except Exception as exc:
             logger.debug("[%s] Traffic learner (responses): %s", request_id, exc)
 
+    async def _observe_openai_chat_traffic(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        request_id: str,
+    ) -> None:
+        """Feed one chat/completions request into the live traffic learner.
+
+        The chat counterpart of :meth:`_observe_openai_responses_traffic`.
+        Chat/completions clients (GitHub Copilot CLI, opencode, OpenAI SDKs)
+        route here rather than through ``/v1/responses``, so without this call
+        their tool results and user preferences never reached the learner even
+        with Learn enabled (part of #2060). Chat messages are already
+        ``role``/``content`` shaped, so ``on_messages`` consumes them directly;
+        tool results use the OpenAI-format extractor.
+        """
+        traffic_learner = getattr(self, "traffic_learner", None)
+        if traffic_learner is None:
+            return
+        try:
+            memory_handler = getattr(self, "memory_handler", None)
+            if (
+                traffic_learner._backend is None
+                and memory_handler
+                and memory_handler.initialized
+                and memory_handler.backend
+            ):
+                traffic_learner.set_backend(memory_handler.backend)
+
+            tool_results = traffic_learner.extract_tool_results_from_openai_messages(messages)
+            for tool_result in tool_results[-5:]:
+                await traffic_learner.on_tool_result(
+                    tool_name=tool_result["tool_name"],
+                    tool_input=tool_result["input"],
+                    tool_output=tool_result["output"],
+                    is_error=tool_result["is_error"],
+                )
+            await traffic_learner.on_messages(messages)
+        except Exception as exc:
+            logger.debug("[%s] Traffic learner (chat): %s", request_id, exc)
+
     @staticmethod
     def _headroom_bypass_enabled(headers: Any) -> bool:
         """Return True when inbound headers request full passthrough."""
@@ -2557,6 +2598,12 @@ class OpenAIHandlerMixin:
             )
 
         stream = body.get("stream", False)
+
+        # Learn from the original client payload before memory context or
+        # compression mutates it, mirroring the Responses and Anthropic
+        # ingestion paths. Without this, chat/completions traffic (Copilot CLI,
+        # opencode, OpenAI SDKs) fed nothing to the learner (part of #2060).
+        await self._observe_openai_chat_traffic(original_client_messages, request_id=request_id)
 
         # Bypass: skip ALL compression for explicit opt-out
         _bypass = self._headroom_bypass_enabled(request.headers)
