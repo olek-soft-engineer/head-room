@@ -62,6 +62,12 @@ from ..tokenizer import Tokenizer
 from ..tokenizers.estimator import EstimatingTokenCounter
 from . import mixed_content as _mixed_content
 from .base import Transform
+from .compressor_registry import (
+    CompressInput,
+    CompressorDescriptor,
+    CompressorRegistry,
+    CompressOutput,
+)
 from .content_detector import (
     ContentType,
     DetectionResult,
@@ -118,6 +124,124 @@ def _compression_deadline_seconds() -> float:
 
 def _router_debug_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
+
+
+# ── Built-in compressor inventory (registry metadata only) ────────────────────
+# Declarative capability metadata for each built-in compressor. The registry is
+# an *inventory*: built-ins are still constructed and dispatched by the router's
+# existing if/elif in `_apply_strategy_to_content` — these descriptors change no
+# routing. They give the (opt-in) `headroom.compressor` registry a name-
+# addressable view of what ships in-tree, alongside any third-party compressors
+# discovered from the entry-point group. The content_types / lossless /
+# cost_tier / recoverable fields are declarative (they describe the built-in's
+# typical behavior in the default CCR configuration) and are not read on the
+# request hot path today.
+_BUILTIN_COMPRESSOR_DESCRIPTORS: tuple[CompressorDescriptor, ...] = (
+    CompressorDescriptor(
+        name="smart_crusher",
+        content_types=["application/json"],
+        lossless=False,
+        cost_tier="fast",
+        recoverable=True,
+    ),
+    CompressorDescriptor(
+        name="kompress",
+        content_types=["text/plain"],
+        lossless=False,
+        cost_tier="ml",
+        recoverable=True,
+    ),
+    CompressorDescriptor(
+        name="code_aware",
+        content_types=["text/x-code"],
+        lossless=False,
+        cost_tier="fast",
+        recoverable=True,
+    ),
+    CompressorDescriptor(
+        name="search",
+        content_types=["text/x-search-results"],
+        lossless=True,
+        cost_tier="fast",
+        recoverable=True,
+    ),
+    CompressorDescriptor(
+        name="log",
+        content_types=["text/x-log"],
+        lossless=False,
+        cost_tier="fast",
+        recoverable=True,
+    ),
+    CompressorDescriptor(
+        name="tabular",
+        content_types=["text/csv"],
+        lossless=False,
+        cost_tier="fast",
+        recoverable=True,
+    ),
+    CompressorDescriptor(
+        name="config",
+        content_types=["text/x-config"],
+        lossless=False,
+        cost_tier="fast",
+        recoverable=False,
+    ),
+    CompressorDescriptor(
+        name="html",
+        content_types=["text/html"],
+        lossless=False,
+        cost_tier="fast",
+        recoverable=False,
+    ),
+    CompressorDescriptor(
+        name="image",
+        content_types=["image/*"],
+        lossless=False,
+        cost_tier="ml",
+        recoverable=False,
+    ),
+)
+
+
+class _BuiltinCompressorEntry:
+    """Registry adapter exposing a built-in's metadata under the Compressor protocol.
+
+    The router dispatches built-ins through its own if/elif — never through the
+    registry — so ``compress`` is a guard that must not run. This type exists only
+    so the built-ins are name-addressable in the shared :class:`CompressorRegistry`
+    inventory next to discovered third-party compressors.
+    """
+
+    def __init__(self, descriptor: CompressorDescriptor) -> None:
+        self._descriptor = descriptor
+
+    @property
+    def descriptor(self) -> CompressorDescriptor:
+        return self._descriptor
+
+    def compress(self, inp: CompressInput) -> CompressOutput:  # pragma: no cover - guard
+        raise NotImplementedError(
+            f"built-in compressor {self._descriptor.name!r} is dispatched by the "
+            "content router's built-in path, not through the registry"
+        )
+
+
+def _build_compressor_registry() -> CompressorRegistry:
+    """Build the router's compressor registry: built-in inventory + discovery.
+
+    Registers a metadata-only entry for each built-in, then runs opt-in
+    discovery of ``headroom.compressor`` entry points. Discovery never invokes
+    ``compress`` and is fail-open (a broken third-party package is logged and
+    skipped), so constructing this registry cannot change request handling.
+    """
+    registry = CompressorRegistry()
+    for descriptor in _BUILTIN_COMPRESSOR_DESCRIPTORS:
+        registry.register(_BuiltinCompressorEntry(descriptor))
+    # External compressors register under distinct names; a name collision with
+    # a built-in is skipped fail-open (replace=False) so a third-party package
+    # can never shadow a built-in's inventory entry.
+    registry.discover()
+    return registry
 
 
 def _tool_call_args_text(raw: Any) -> str:
@@ -1359,6 +1483,18 @@ class ContentRouter(Transform):
             self.config.ccr_inject_marker = False
             self.config.smart_crusher_lossless_only = True
         self._observer = observer
+
+        # Name-addressable compressor inventory: built-in metadata + opt-in
+        # discovery of `headroom.compressor` entry points. Inventory only —
+        # built-ins are still constructed and dispatched by the if/elif below,
+        # so this changes no routing. Exposed for selection/routing wiring in a
+        # follow-up. Failure to build it must never break the router, so it is
+        # fail-open to an empty registry.
+        try:
+            self.compressor_registry: CompressorRegistry = _build_compressor_registry()
+        except Exception as exc:  # noqa: BLE001 - inventory is non-critical
+            logger.debug("compressor registry unavailable: %s", exc)
+            self.compressor_registry = CompressorRegistry()
 
         # Lazy-loaded compressors
         self._code_compressor: Any = None
