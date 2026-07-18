@@ -683,9 +683,10 @@ def _apply_compressor_selection(
     keeps its dataclass default, so behavior is byte-identical to today. When a
     selection is given, each recognized built-in in :data:`BUILTIN_COMPRESSOR_FLAGS`
     is enabled iff it (or the wildcard ``"*"``) was selected, and disabled
-    otherwise. Unrecognized names are ignored (reserved for the compressor
-    registry). This maps a selection onto the existing flags without adding any
-    dispatch logic.
+    otherwise. Unrecognized names select no flag (reserved for the compressor
+    registry) but are surfaced with a warning, because a typo'd selection is
+    otherwise indistinguishable from "compress nothing" (#2384). This maps a
+    selection onto the existing flags without adding any dispatch logic.
     """
     if compressors is None:
         return
@@ -693,6 +694,23 @@ def _apply_compressor_selection(
     if not selected:
         return
     select_all = "*" in selected
+    unmatched = sorted(selected - set(BUILTIN_COMPRESSOR_FLAGS) - {"*"})
+    if unmatched:
+        if select_all or selected & set(BUILTIN_COMPRESSOR_FLAGS):
+            logger.warning(
+                "compressor selection: %s match no built-in compressor "
+                "(assumed registry names); built-ins: %s",
+                ", ".join(unmatched),
+                ", ".join(sorted(BUILTIN_COMPRESSOR_FLAGS)),
+            )
+        else:
+            logger.warning(
+                "compressor selection %s matches no built-in compressor — every "
+                "built-in compressor is now disabled. If this is a typo, valid "
+                "names are: %s (or '*' for all).",
+                ", ".join(unmatched),
+                ", ".join(sorted(BUILTIN_COMPRESSOR_FLAGS)),
+            )
     for name, flag in BUILTIN_COMPRESSOR_FLAGS.items():
         setattr(router_config, flag, select_all or name in selected)
 

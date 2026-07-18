@@ -14,6 +14,7 @@ Covers the two behavior-safe halves of the router/registry integration:
 from __future__ import annotations
 
 import dataclasses
+import logging
 
 import pytest
 
@@ -142,6 +143,44 @@ def test_unrecognized_names_are_ignored_but_recognized_still_apply() -> None:
     flags = _enable_flags(config)
     assert flags["enable_kompress"] is True
     # No crash / no spurious flag creation for the unknown name.
+
+
+# ────────────────── unmatched-name warning (#2384, no behavior change) ────────
+
+
+def test_only_unmatched_selection_warns_that_builtins_are_disabled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A typo'd selection must be diagnosable from the startup log."""
+    config = ContentRouterConfig()
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        _apply_compressor_selection(config, {"smart_krusher"})
+    # Behavior is unchanged — the opt-in "exactly these" contract still holds.
+    assert not any(_enable_flags(config).values())
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "smart_krusher" in text
+    assert "disabled" in text.lower()
+    assert "smart_crusher" in text  # valid names listed for the typo case
+
+
+def test_mixed_selection_warns_only_about_unmatched_names(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    config = ContentRouterConfig()
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        _apply_compressor_selection(config, {"kompress", "does_not_exist"})
+    assert _enable_flags(config)["enable_kompress"] is True
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "does_not_exist" in text
+    assert "disabled" not in text.lower()  # built-ins were not all turned off
+
+
+def test_matched_selection_emits_no_warning(caplog: pytest.LogCaptureFixture) -> None:
+    for selection in ({"kompress"}, {"*"}):
+        config = ContentRouterConfig()
+        with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+            _apply_compressor_selection(config, selection)
+    assert not caplog.records
 
 
 # ─────────────────────────── ProxyConfig field ───────────────────────────────
