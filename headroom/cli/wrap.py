@@ -1872,8 +1872,21 @@ def _codex_toml_value(value: Any) -> str:
     raise TypeError(f"unsupported Codex config override: {type(value).__name__}")
 
 
+_CODEX_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 def _codex_dotted_key(*parts: str) -> str:
-    return ".".join(json.dumps(part) for part in parts)
+    """Dotted ``--config`` key with segments bare wherever possible.
+
+    Codex's override parser (observed on 0.144.x) matches dotted segments
+    literally and silently ignores quoted ones, so quoting every segment made
+    the whole override a no-op and traffic bypassed the proxy (#2358). Quote
+    only segments that are not valid TOML bare keys (e.g. a provider name
+    containing a dot), where bare emission would corrupt the path.
+    """
+    return ".".join(
+        part if _CODEX_BARE_KEY_RE.fullmatch(part) else json.dumps(part) for part in parts
+    )
 
 
 def _codex_session_launch_settings(
