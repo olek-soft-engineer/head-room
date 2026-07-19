@@ -2956,12 +2956,26 @@ class ContentRouter(Transform):
                     crusher = self._get_smart_crusher()
                     if crusher:
                         compressor_name = type(crusher).__name__
-                        result = crusher.crush(content, query=context, bias=bias)
-                        compressed, compressed_tokens = (
-                            result.compressed,
-                            _estimate_tokens(result.compressed),
+                        # Registry-resolved dispatch: the built-in "smart_crusher"
+                        # adapter delegates to this same getter + ``.crush(...)``
+                        # with the SAME query (``context``) and bias, so on a real
+                        # compression the content is byte-identical to the historical
+                        # direct call and the token metric (``_estimate_tokens`` of
+                        # the crush output) is unchanged. SmartCrusher's ``.crush``
+                        # always returns a string (``compressed=True``), so — inside
+                        # this ``if crusher`` guard where the adapter's own getter
+                        # returns the same cached crusher — ``compressed`` is always
+                        # set exactly as the direct call did. The ``output`` /
+                        # ``output.compressed`` guard mirrors the CODE_AWARE/HTML
+                        # flip and only leaves ``compressed`` None in the defensive
+                        # not-registered case (never reachable for a built-in).
+                        output = self._registry_compress(
+                            "smart_crusher", strategy, content, context, bias
                         )
-                        decision_reason = "smart_crusher"
+                        if output is not None and output.compressed:
+                            compressed = output.content
+                            compressed_tokens = _estimate_tokens(output.content)
+                            decision_reason = "smart_crusher"
                         # Fallback to Kompress (and possibly Log) is
                         # handled by the unified post-strategy block below
                         # — no inline fallback here to avoid duplicate

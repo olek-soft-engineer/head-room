@@ -10,9 +10,12 @@ direct dispatch: same compressed content, same token count, same single-entry
 
 Each FLIPPED strategy has a differential test comparing the router's dispatch
 output to the built-in's direct output obtained via its ``_get_*`` getter — i.e.
-"registry dispatch == old dispatch". DEFERRED strategies (SMART_CRUSHER, KOMPRESS)
-are asserted unchanged: they still route through their bespoke paths (fallback
-chain / the ``_try_ml_compressor`` ML boundary), not the registry.
+"registry dispatch == old dispatch". SMART_CRUSHER is now also flipped (its
+``.crush`` primary invocation goes through the registry while the shared
+Kompress→Log fallback block stays direct); the KOMPRESS/TEXT ML boundary
+(``_try_ml_compressor``) remains DEFERRED and is asserted unchanged. See
+``test_router_registry_smartcrusher.py`` for the full SMART_CRUSHER fallback-chain
+and KOMPRESS/TEXT differential coverage.
 
 Offline guardrails:
   * No real ML/ONNX/HF inference — the deferred KOMPRESS path is mocked.
@@ -167,10 +170,13 @@ def test_config_router_dispatch_matches_direct(monkeypatch: pytest.MonkeyPatch) 
 # ─────────────────────────── deferred (unchanged) ────────────────────────────
 
 
-def test_smart_crusher_deferred_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
-    # SMART_CRUSHER is DEFERRED (its branch feeds a Kompress→Log fallback chain in
-    # the shared post-strategy block), so it still dispatches via the direct
-    # crusher, not the registry. A JSON array shrinks, so the chain stays single.
+def test_smart_crusher_router_dispatch_matches_direct(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SMART_CRUSHER is now FLIPPED: its primary ``.crush`` invocation routes
+    # through the registry "smart_crusher" adapter (which delegates to the SAME
+    # getter + ``.crush(query=..., bias=...)``), while the shared Kompress→Log
+    # fallback block stays direct. Registry dispatch must be byte-identical to the
+    # historical direct crush. A JSON array shrinks, so no fallback fires and the
+    # chain stays single.
     router = _router()
     _isolate_branch(monkeypatch, router)
     content = json.dumps(
