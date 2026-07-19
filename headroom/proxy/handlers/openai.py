@@ -2793,6 +2793,17 @@ class OpenAIHandlerMixin:
             "verbosity": body.get("verbosity"),
             "modalities": body.get("modalities"),
         }
+        # Snapshot the lookup messages too. `messages` is the primary cache
+        # key component, but the pre_compress hook below reassigns it, so
+        # caching the response under the live `messages` would store it under a
+        # different key than it was looked up by — the cache would never hit
+        # and would fill with unreachable entries. Reuse this raw snapshot
+        # verbatim at cache.set (the same reason cache_key_fields is
+        # snapshotted here, #327). Image compression above also rebinds
+        # `messages`, but it runs before this snapshot, so its output is already
+        # captured — keep this snapshot after image compression, or a reorder
+        # silently reintroduces the drift.
+        cache_lookup_messages = messages
         # Check cache
         if self.cache and not stream:
             cached = await self.cache.get(messages, model, **cache_key_fields)
@@ -4045,10 +4056,12 @@ class OpenAIHandlerMixin:
                     except Exception as e:
                         logger.warning(f"[{request_id}] Memory tool handling failed: {e}")
 
-                # Cache
+                # Cache response under the SAME key it was looked up by:
+                # cache_lookup_messages is the raw pre-mutation snapshot, not
+                # the live (hooked) `messages` (#327).
                 if self.cache and response.status_code == 200:
                     await self.cache.set(
-                        messages,
+                        cache_lookup_messages,
                         model,
                         response.content,
                         dict(response.headers),
