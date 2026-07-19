@@ -37,7 +37,15 @@ def _scrub_developer_headroom_env(monkeypatch):
 # every test so build-time side effects can't leak between tests.
 @pytest.fixture(autouse=True)
 def _reset_copilot_routing_flag():
-    from headroom.copilot_auth import reset_request_routed_to_copilot
+    # The macos/windows-native-wrapper CI jobs run the installer tests with only
+    # pytest installed (no headroom): they drive the installer shell scripts via
+    # subprocess, so headroom isn't importable and there's no routing flag to
+    # reset. Skip the reset there instead of erroring at setup.
+    try:
+        from headroom.copilot_auth import reset_request_routed_to_copilot
+    except ModuleNotFoundError:
+        yield
+        return
 
     reset_request_routed_to_copilot()
     yield
