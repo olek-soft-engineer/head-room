@@ -298,7 +298,15 @@ def _invoke_kompress(router: ContentRouter, inp: CompressInput) -> str | None:
     # The router dispatches KOMPRESS through ``_try_ml_compressor`` (size gate,
     # tag protection, background load, marker policy), so the adapter delegates
     # to the SAME method to stay byte-identical to the router's kompress path.
-    compressed, _tokens = router._try_ml_compressor(inp.content, inp.query, None)
+    # ``question`` (QA-aware compression) rides the pure-data contract via
+    # ``config['question']`` — the router sets it in ``_registry_compress`` — and
+    # is forwarded here so the compressed CONTENT matches the router's direct
+    # ``_try_ml_compressor(content, context, question)`` call. A missing/None
+    # ``question`` forwards None, exactly the no-question path. (Previously this
+    # hardcoded ``None``, silently dropping the QA-aware ``question`` — that bug is
+    # fixed here so the flip preserves content.)
+    question = inp.config.get("question")
+    compressed, _tokens = router._try_ml_compressor(inp.content, inp.query, question)
     return compressed
 
 
@@ -2686,6 +2694,7 @@ class ContentRouter(Transform):
         context: str,
         bias: float,
         config: dict[str, Any] | None = None,
+        question: str | None = None,
     ) -> CompressOutput | None:
         """Compress ``content`` with a built-in via the registry, full output.
 
@@ -2706,7 +2715,18 @@ class ContentRouter(Transform):
         real compression the returned content is byte-identical to the direct
         call. Callers read ``.compressed`` to reproduce the historical
         ``compressed is None`` fallback/passthrough branches exactly.
+
+        ``question`` (QA-aware compression) is carried on the pure-data contract
+        via ``CompressInput.config['question']`` — a free ``dict`` — so the
+        contract shape is unchanged. The ``kompress`` adapter reads it back with
+        ``inp.config.get('question')`` and forwards it into
+        ``_try_ml_compressor(content, context, question)``, matching the router's
+        historical direct call. When ``None`` it is not injected, leaving other
+        built-ins' config untouched.
         """
+        merged_config = dict(config or {})
+        if question is not None:
+            merged_config["question"] = question
         entry = self.compressor_registry.get(name)
         if entry is None:
             return None
@@ -2717,7 +2737,7 @@ class ContentRouter(Transform):
                     self._content_type_from_strategy(strategy), "text/plain"
                 ),
                 query=context,
-                config=config or {},
+                config=merged_config,
                 budget={"bias": bias},
             )
         )
@@ -3076,14 +3096,46 @@ class ContentRouter(Transform):
                         decision_reason = "html_extractor"
 
             elif strategy == CompressionStrategy.KOMPRESS:
-                compressed, compressed_tokens = self._try_ml_compressor(content, context, question)
+                # Registry-resolved dispatch: the built-in "kompress" adapter
+                # delegates to the SAME ``_try_ml_compressor(content, context,
+                # question)`` the router historically called here — with
+                # ``question`` forwarded via the CompressInput config — so the
+                # compressed CONTENT is byte-identical to the direct call.
+                # ``_try_ml_compressor`` always returns a str (passthrough on a
+                # no-op / unavailable model), so the adapter always reports
+                # ``compressed=True``; ``output`` is ``None`` only in the
+                # defensive not-registered case, which falls through to the
+                # bottom passthrough exactly as before. The token count is now
+                # ``_estimate_tokens(output.content)`` — the router's calibrated
+                # estimate — replacing the Kompress model's own tuple
+                # ``compressed_tokens``. This is the ONE approved,
+                # non-byte-identical change (a reported metric only; see the
+                # decision-impact note: no keep/drop, fallback, or lossless-
+                # then-lossy gate reads the KOMPRESS/TEXT ``compressed_tokens``).
+                output = self._registry_compress(
+                    "kompress", strategy, content, context, bias, question=question
+                )
+                if output is not None:
+                    compressed = output.content
+                    compressed_tokens = _estimate_tokens(output.content)
                 compressor_name = "KompressCompressor"
                 decision_reason = "kompress"
 
             elif strategy == CompressionStrategy.TEXT:
-                # Prefer Kompress ML compressor for text
-                # Passes through unchanged if Kompress not available
-                compressed, compressed_tokens = self._try_ml_compressor(content, context, question)
+                # Prefer Kompress ML compressor for text; passes through unchanged
+                # if Kompress is not available. Registry-resolved dispatch via the
+                # SAME built-in "kompress" adapter (TEXT and KOMPRESS share the ML
+                # compressor) with ``question`` forwarded via config, so the
+                # compressed CONTENT is byte-identical to the historical direct
+                # ``_try_ml_compressor(content, context, question)`` call. The
+                # token count is now ``_estimate_tokens(output.content)`` (the same
+                # approved metric change as the KOMPRESS branch above).
+                output = self._registry_compress(
+                    "kompress", strategy, content, context, bias, question=question
+                )
+                if output is not None:
+                    compressed = output.content
+                    compressed_tokens = _estimate_tokens(output.content)
                 compressor_name = "KompressCompressor"
                 decision_reason = "text_uses_kompress"
 

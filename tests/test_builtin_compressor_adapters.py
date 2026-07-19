@@ -191,6 +191,39 @@ def test_kompress_adapter_maps_mocked_result(monkeypatch: pytest.MonkeyPatch) ->
     _assert_output_contract(out, inp, entry)
 
 
+def test_kompress_adapter_forwards_question_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The kompress adapter reads ``question`` from ``CompressInput.config`` and
+    # forwards it into _try_ml_compressor (fixing the latent bug where it hardcoded
+    # None). A question-aware fake model embeds the question, so the adapter output
+    # differs when the config question differs — proving end-to-end forwarding.
+    router = _router()
+    seen: dict[str, object] = {}
+
+    def _compress(text: str, *, question: object = None, **kwargs: object) -> SimpleNamespace:
+        seen["question"] = question
+        return SimpleNamespace(compressed=f"Q[{question}]::{text}", compressed_tokens=5)
+
+    monkeypatch.setattr(
+        router,
+        "_get_kompress",
+        lambda: SimpleNamespace(
+            is_ready=lambda: True, ensure_background_load=lambda: None, compress=_compress
+        ),
+    )
+    content = "plain text conditioned on the question " * 4
+    entry = _entry(router, "kompress")
+    out = entry.compress(
+        CompressInput(content=content, content_type="text/plain", config={"question": "why"})
+    )
+    assert seen["question"] == "why"
+    assert out.content == f"Q[why]::{content}"
+    # No question in config forwards None (the historical no-question path).
+    seen.clear()
+    out_none = entry.compress(CompressInput(content=content, content_type="text/plain"))
+    assert seen["question"] is None
+    assert out_none.content == f"Q[None]::{content}"
+
+
 def test_kompress_adapter_passthrough_when_ml_disabled() -> None:
     # With ML disabled the router's kompress path is a passthrough (no model load
     # / network), so the adapter returns the content unchanged, never raising.

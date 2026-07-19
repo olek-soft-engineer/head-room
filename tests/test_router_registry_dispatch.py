@@ -12,13 +12,15 @@ Each FLIPPED strategy has a differential test comparing the router's dispatch
 output to the built-in's direct output obtained via its ``_get_*`` getter — i.e.
 "registry dispatch == old dispatch". SMART_CRUSHER is now also flipped (its
 ``.crush`` primary invocation goes through the registry while the shared
-Kompress→Log fallback block stays direct); the KOMPRESS/TEXT ML boundary
-(``_try_ml_compressor``) remains DEFERRED and is asserted unchanged. See
+Kompress→Log fallback block stays direct); KOMPRESS/TEXT now dispatch via the
+registry too — the ``kompress`` adapter delegates to the SAME ``_try_ml_compressor``
+call with ``question`` forwarded via ``config['question']``, so CONTENT is
+preserved and only the reported token metric changed. See
 ``test_router_registry_smartcrusher.py`` for the full SMART_CRUSHER fallback-chain
 and KOMPRESS/TEXT differential coverage.
 
 Offline guardrails:
-  * No real ML/ONNX/HF inference — the deferred KOMPRESS path is mocked.
+  * No real ML/ONNX/HF inference — the KOMPRESS ML boundary is mocked.
   * The flipped strategies shrink their representative content, so no zero-savings
     Kompress fallback fires (that would touch the ML boundary and append KOMPRESS
     to the chain).
@@ -327,11 +329,11 @@ def test_diff_deferred_no_registry_entry() -> None:
     assert "diff" not in {d.name for d in _BUILTIN_COMPRESSOR_DESCRIPTORS}
 
 
-def test_kompress_deferred_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
-    # KOMPRESS is DEFERRED (it is the ML boundary — dispatched through
-    # _try_ml_compressor, not a built-in adapter). Mock the underlying model so no
-    # real ONNX/HF inference runs, and assert the router still routes through
-    # _try_ml_compressor rather than the registry.
+def test_kompress_registry_dispatch_matches_direct(monkeypatch: pytest.MonkeyPatch) -> None:
+    # KOMPRESS now dispatches via the registry "kompress" adapter, which still
+    # delegates to _try_ml_compressor (the ML boundary). Mock the underlying model
+    # so no real ONNX/HF inference runs, and assert the compressed CONTENT is
+    # byte-identical to the direct _try_ml_compressor call (question is None here).
     router = _router()
     _isolate_branch(monkeypatch, router)
     fake = SimpleNamespace(
@@ -348,5 +350,7 @@ def test_kompress_deferred_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert out == "KOMPRESSED::" + content
     assert chain == [CompressionStrategy.KOMPRESS.value]
-    # Still the bespoke ML path (unchanged), not a registry round-trip.
+    # CONTENT is byte-identical to the direct ML call (registry round-trip preserves
+    # content); the approved token-metric change is covered in
+    # test_router_registry_smartcrusher.py.
     assert out == router._try_ml_compressor(content, "", None)[0]

@@ -1,19 +1,24 @@
-"""Byte-identical differential tests for the SMART_CRUSHER / KOMPRESS / TEXT flip.
+"""Differential tests for the SMART_CRUSHER / KOMPRESS / TEXT registry flip.
 
-PR-C2 flips the PRIMARY compressor invocation of SMART_CRUSHER to the compressor
-registry (``_registry_compress("smart_crusher", ...)``), while the shared
-post-strategy Kompress -> Log fallback block stays a direct dispatch. KOMPRESS and
-TEXT are DEFERRED: they are the ``_try_ml_compressor`` ML boundary, and the
-``kompress`` built-in adapter (a) hardcodes ``question=None`` (dropping the real
-QA-aware ``question`` argument) and (b) recomputes the token count via
-``_estimate_tokens`` instead of returning ``_try_ml_compressor``'s tuple token
-count (Kompress's own word-count ``compressed_tokens``, computed pre-CCR-marker),
-so a registry round-trip cannot reproduce either the content (when a question is
-supplied) or the token metric byte-for-byte. These tests pin both facts.
+SMART_CRUSHER flips the PRIMARY compressor invocation to the compressor registry
+(``_registry_compress("smart_crusher", ...)``), while the shared post-strategy
+Kompress -> Log fallback block stays a direct dispatch. KOMPRESS and TEXT now ALSO
+dispatch via the registry (``_registry_compress("kompress", ...)``): the
+``kompress`` built-in adapter delegates to the SAME ``_try_ml_compressor(content,
+context, question)`` the router historically called, with ``question`` forwarded
+via ``CompressInput.config['question']`` (previously the adapter dropped it,
+passing ``None`` — that latent bug is fixed here). Content is therefore PRESERVED
+byte-for-byte against the direct ``_try_ml_compressor`` call.
 
-Every path asserts registry-dispatch output == the historical direct-dispatch
-output (content, token metric, ``strategy_chain``, and — via the recorded call
-args — the query/bias/question that flow through).
+The ONE approved, non-byte-identical change is the token metric: KOMPRESS/TEXT now
+report ``_estimate_tokens(output.content)`` (the router's calibrated estimate)
+instead of ``_try_ml_compressor``'s tuple token count (Kompress's own
+``compressed_tokens``). No content/routing/fallback/lossless-then-lossy decision
+reads that metric for these two branches, so only the reported number changes.
+
+Every path asserts registry-dispatch CONTENT == the historical direct-dispatch
+content (and, via recorded call args, that query/bias/question flow through), and
+that the token metric equals ``_estimate_tokens(output.content)``.
 
 Offline guardrails:
   * No real ML/ONNX/HF inference — the ML boundary is mocked at
@@ -187,7 +192,7 @@ def test_smart_crusher_log_fallback_matches_direct(monkeypatch: pytest.MonkeyPat
     ]
 
 
-# ───────────────────── KOMPRESS / TEXT: deferred (ML boundary) ─────────────────
+# ─────────────── KOMPRESS / TEXT: flipped (registry, ML boundary) ──────────────
 
 
 def _fake_kompress(seen: dict[str, object]) -> SimpleNamespace:
@@ -195,10 +200,11 @@ def _fake_kompress(seen: dict[str, object]) -> SimpleNamespace:
 
     def _compress(text: str, **kwargs: object) -> SimpleNamespace:
         seen.update(kwargs)
-        # ``compressed_tokens`` is the model's OWN word-count (7), deliberately
-        # unequal to ``_estimate_tokens`` of the output — this is exactly the
-        # value the registry adapter would discard, which is why the branch is
-        # deferred.
+        # ``compressed_tokens`` is the model's OWN count (7), deliberately unequal
+        # to ``_estimate_tokens`` of the output. After the flip the branch reports
+        # ``_estimate_tokens(output.content)`` and DISCARDS this tuple value — the
+        # single approved metric change — so the tests below assert the metric is
+        # the estimate, not 7.
         return SimpleNamespace(compressed="KOMPRESSED::" + text, compressed_tokens=7)
 
     return SimpleNamespace(
@@ -208,7 +214,9 @@ def _fake_kompress(seen: dict[str, object]) -> SimpleNamespace:
     )
 
 
-def test_kompress_deferred_ml_path_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_kompress_registry_dispatch_matches_direct(monkeypatch: pytest.MonkeyPatch) -> None:
+    # KOMPRESS now dispatches through the registry "kompress" adapter, which
+    # delegates to _try_ml_compressor with ``question`` forwarded via config.
     router = _router()
     _isolate_branch(monkeypatch, router)
     seen: dict[str, object] = {}
@@ -218,21 +226,25 @@ def test_kompress_deferred_ml_path_unchanged(monkeypatch: pytest.MonkeyPatch) ->
     out, tokens, chain = router._apply_strategy_to_content(
         content, CompressionStrategy.KOMPRESS, "ctx", question="my question", bias=1.0
     )
+    # (a) CONTENT preserved — byte-identical to the direct _try_ml_compressor call
+    # with the SAME question (so question is forwarded through the adapter).
     assert out == "KOMPRESSED::" + content
     assert chain == [CompressionStrategy.KOMPRESS.value]
-    # Token count is the model's tuple value (7), NOT _estimate_tokens(out) — the
-    # exact divergence that makes the registry round-trip non-byte-identical.
-    assert tokens == 7
-    assert tokens != _estimate_tokens(out)
-    # The real ``question`` is forwarded (the kompress adapter would pass None).
-    assert seen["question"] == "my question"
-    # Still the bespoke ML path, byte-identical to a direct _try_ml_compressor call.
     direct, direct_tokens = router._try_ml_compressor(content, "ctx", "my question")
     assert out == direct
-    assert tokens == direct_tokens
+    # The real ``question`` reached the model (config['question'] -> adapter ->
+    # _try_ml_compressor -> compressor.compress), fixing the latent adapter bug
+    # that dropped it (passed None).
+    assert seen["question"] == "my question"
+    # (b) APPROVED metric change: the token count is now _estimate_tokens(output),
+    # NOT the model's own tuple value (7) that the direct call returns.
+    assert tokens == _estimate_tokens(out)
+    assert tokens != direct_tokens
+    assert direct_tokens == 7
 
 
-def test_text_deferred_ml_path_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_text_registry_dispatch_matches_direct(monkeypatch: pytest.MonkeyPatch) -> None:
+    # TEXT shares the "kompress" adapter — same guarantees as the KOMPRESS branch.
     router = _router()
     _isolate_branch(monkeypatch, router)
     seen: dict[str, object] = {}
@@ -244,9 +256,45 @@ def test_text_deferred_ml_path_unchanged(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     assert out == "KOMPRESSED::" + content
     assert chain == [CompressionStrategy.TEXT.value]
-    assert tokens == 7
-    assert tokens != _estimate_tokens(out)
-    assert seen["question"] == "q2"
     direct, direct_tokens = router._try_ml_compressor(content, "ctx", "q2")
     assert out == direct
-    assert tokens == direct_tokens
+    assert seen["question"] == "q2"
+    assert tokens == _estimate_tokens(out)
+    assert tokens != direct_tokens
+    assert direct_tokens == 7
+
+
+def test_kompress_question_forwarding_changes_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    # QA-differential: a question-aware fake model embeds the question in its
+    # output, so a DIFFERENT ``question`` yields DIFFERENT content. Proves the
+    # router forwards ``question`` end-to-end via the registry adapter
+    # (config['question'] -> _invoke_kompress -> _try_ml_compressor ->
+    # compressor.compress) — the fix for the adapter that previously dropped it.
+    router = _router()
+    _isolate_branch(monkeypatch, router)
+
+    def _qa_model() -> SimpleNamespace:
+        def _compress(text: str, *, question: object = None, **kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(compressed=f"Q[{question}]::{text}", compressed_tokens=5)
+
+        return SimpleNamespace(
+            is_ready=lambda: True,
+            ensure_background_load=lambda: None,
+            compress=_compress,
+        )
+
+    monkeypatch.setattr(router, "_get_kompress", _qa_model)
+    content = "the body the model compresses conditioned on the question. " * 3
+
+    out_a, _tok_a, _ = router._apply_strategy_to_content(
+        content, CompressionStrategy.KOMPRESS, "ctx", question="alpha", bias=1.0
+    )
+    out_b, _tok_b, _ = router._apply_strategy_to_content(
+        content, CompressionStrategy.KOMPRESS, "ctx", question="beta", bias=1.0
+    )
+    assert out_a != out_b
+    assert out_a.startswith("Q[alpha]::")
+    assert out_b.startswith("Q[beta]::")
+    # Each matches the direct _try_ml_compressor call with the SAME question.
+    assert out_a == router._try_ml_compressor(content, "ctx", "alpha")[0]
+    assert out_b == router._try_ml_compressor(content, "ctx", "beta")[0]
