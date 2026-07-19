@@ -2121,7 +2121,7 @@ class ContentRouter(Transform):
             else:
                 mixed = is_mixed_content(content)
                 detection = _detect_content(content)
-                strategy = self._determine_strategy(content)
+                strategy = self._determine_strategy(content, mixed=mixed, detection=detection)
             if debug_enabled:
                 _log_router_debug(
                     "content_router_input",
@@ -2229,17 +2229,37 @@ class ContentRouter(Transform):
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("CompressionObserver raised (non-fatal): %s", e)
 
-    def _determine_strategy(self, content: str) -> CompressionStrategy:
+    def _determine_strategy(
+        self,
+        content: str,
+        mixed: bool | None = None,
+        detection: DetectionResult | None = None,
+    ) -> CompressionStrategy:
         """Determine the compression strategy from content analysis.
 
         Args:
             content: Content to analyze.
+            mixed: Precomputed ``is_mixed_content(content)`` when the caller
+                already has it. ``compress`` runs it on this exact content one
+                line before calling here; recomputed only when ``None``.
+            detection: Precomputed ``_detect_content(content)`` when the caller
+                already has it. The native Rust/Magika pass is the router's
+                hottest per-message cost — reuse it instead of a second
+                identical detection; recomputed only when ``None``.
 
         Returns:
             Selected compression strategy.
         """
+        # Reuse the caller's analysis when supplied — ``compress`` already ran
+        # both on this exact content, and re-running is_mixed_content/
+        # _detect_content on identical bytes is the router's hottest wasted cost.
+        if mixed is None:
+            mixed = is_mixed_content(content)
+        if detection is None:
+            detection = _detect_content(content)
+
         # 1. Check for mixed content
-        if is_mixed_content(content):
+        if mixed:
             # 2. Verify with the native detector: ``is_mixed_content`` uses
             # cheap regex heuristics that produce false positives on source
             # code.  Python files with dict/list literals (``{``, ``[`` at
@@ -2250,13 +2270,11 @@ class ContentRouter(Transform):
             # wasting latency on splitting without any compression.
             # When the native magika detector confidently says SOURCE_CODE,
             # trust it over the regex heuristics.
-            detection = _detect_content(content)
             if detection.content_type == ContentType.SOURCE_CODE and detection.confidence >= 0.8:
                 return self._strategy_from_detection(detection)
             return CompressionStrategy.MIXED
 
-        # 2. Detect content type from content itself
-        detection = _detect_content(content)
+        # 2. Not mixed — map the detected type straight to a strategy.
         return self._strategy_from_detection(detection)
 
     def _strategy_from_detection(self, detection: Any) -> CompressionStrategy:
