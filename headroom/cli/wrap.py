@@ -679,6 +679,49 @@ _rtk_option = click.option(
 )
 
 
+def _serena_instructions_opt_in() -> bool:
+    """Whether Serena instruction injection into the agent's hint file is enabled.
+
+    Injecting "prefer Serena symbol tools" guidance rewrites the user's
+    ``CLAUDE.md``/``AGENTS.md``, so it is opt-in (off by default): turn it on
+    with ``--serena-instructions`` (which sets ``HEADROOM_SERENA_INSTRUCTIONS=1``)
+    or by exporting ``HEADROOM_SERENA_INSTRUCTIONS=1``. Serena's ``.serena/``-only
+    setup (language scoping, pre-indexing) stays on by default regardless.
+    """
+    return os.environ.get("HEADROOM_SERENA_INSTRUCTIONS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _serena_instructions_flag_callback(ctx: Any, param: Any, value: bool) -> bool:
+    """Click eager callback: ``--serena-instructions`` sets
+    HEADROOM_SERENA_INSTRUCTIONS so the central gate
+    (:func:`_serena_instructions_opt_in`) sees the opt-in without threading a
+    param through every wrap subcommand."""
+    if value:
+        os.environ["HEADROOM_SERENA_INSTRUCTIONS"] = "1"
+    return value
+
+
+# Shared opt-in flag for Serena instruction injection, applied to the wrap
+# subcommands that set up Serena. ``expose_value=False`` so no subcommand
+# signature changes; it works purely through HEADROOM_SERENA_INSTRUCTIONS. Same
+# approach as _rtk_option above — set via the callback with NO ``envvar=`` so the
+# settings_store drift guard doesn't flag it.
+_serena_instructions_option = click.option(
+    "--serena-instructions",
+    is_flag=True,
+    default=False,
+    expose_value=False,
+    is_eager=True,
+    callback=_serena_instructions_flag_callback,
+    help="Inject 'prefer Serena symbol tools' guidance into the agent's hint file (opt-in; off by default).",
+)
+
+
 # --- Code-memory MCP selection ------------------------------------------------
 # The code-memory MCP is on by default (tokensave). Swap it with --code-memory
 # serena, or turn it off with --code-memory none. Selection flows through
@@ -1533,6 +1576,244 @@ def _ensure_serena_dashboard_disabled(*, verbose: bool = False) -> None:
             click.echo(f"  Serena: could not update serena_config.yml ({e})")
 
 
+# Marker-fenced guidance steering the agent toward Serena's symbol tools.
+# Injected only when Serena is the active code-memory engine. Mirrors the RTK
+# instruction block (idempotent, marker-guarded).
+_SERENA_MARKER = "<!-- headroom:serena-instructions -->"
+
+SERENA_INSTRUCTIONS_BLOCK = """\
+<!-- headroom:serena-instructions -->
+# Serena — Symbol-First Code Navigation
+
+Serena's MCP tools expose this project's code as a symbol graph backed by a
+language server. **Prefer these tools over reading whole files** — they return
+only the code you need, cutting context usage sharply. Read a file end-to-end
+only when a symbol view is insufficient (non-code files, or when you need the
+surrounding glue).
+
+## Preferred workflow
+- `get_symbols_overview(<file>)` — list a file's top-level symbols before opening it.
+- `find_symbol(<name>)` — fetch a symbol's definition/body instead of reading the file.
+- `find_referencing_symbols(<name>)` — find call sites / usages instead of grepping.
+- `find_declaration(<name>)` — jump to where a symbol is defined.
+
+## Rule
+Reach for a symbol tool first; fall back to reading a whole file only when the
+symbol view does not answer the question.
+<!-- /headroom:serena-instructions -->
+"""
+
+# Ext → Serena language key. Values match the ``Language`` enum in Serena's
+# solidlsp ``ls_config`` (the same keys accepted by ``.serena/project.yml``'s
+# ``languages`` list). Only real programming languages are mapped — data/markup
+# formats (json/yaml/toml/md/html/css) are intentionally skipped so Serena does
+# not spin up language servers that add no symbol-navigation value.
+_EXT_TO_SERENA_LANGUAGE: dict[str, str] = {
+    ".py": "python",
+    ".pyi": "python",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
+    ".js": "typescript",
+    ".jsx": "typescript",
+    ".mjs": "typescript",
+    ".cjs": "typescript",
+    ".go": "go",
+    ".rs": "rust",
+    ".java": "java",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".rb": "ruby",
+    ".erb": "ruby",
+    ".cs": "csharp",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".c++": "cpp",
+    ".hpp": "cpp",
+    ".hh": "cpp",
+    ".hxx": "cpp",
+    ".c": "cpp",
+    ".h": "cpp",
+    ".php": "php",
+    ".swift": "swift",
+    ".dart": "dart",
+    ".scala": "scala",
+    ".sbt": "scala",
+    ".sh": "bash",
+    ".bash": "bash",
+    ".lua": "lua",
+    ".r": "r",
+    ".pl": "perl",
+    ".pm": "perl",
+    ".ex": "elixir",
+    ".exs": "elixir",
+    ".clj": "clojure",
+    ".cljs": "clojure",
+    ".cljc": "clojure",
+    ".elm": "elm",
+    ".tf": "terraform",
+    ".tfvars": "terraform",
+    ".zig": "zig",
+    ".nix": "nix",
+    ".hs": "haskell",
+    ".jl": "julia",
+    ".sol": "solidity",
+    ".vue": "vue",
+    ".svelte": "svelte",
+}
+
+# Directories never worth scanning for language detection (VCS, dependencies,
+# build output, virtualenvs, caches). Pruned in-place during the walk.
+_LANG_SCAN_IGNORE_DIRS = frozenset(
+    {".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__"}
+)
+
+
+def _serena_instruction_file(registrar: Any) -> Path:
+    """Resolve the project instruction file the agent reads for guidance.
+
+    Claude Code reads ``CLAUDE.md``; Codex, Grok, and OpenCode read
+    ``AGENTS.md``. Both live at the project root, mirroring the RTK instruction
+    targets.
+    """
+    name = getattr(registrar, "name", "") or ""
+    filename = "CLAUDE.md" if name == "claude" else "AGENTS.md"
+    return Path.cwd() / filename
+
+
+def _inject_serena_instructions(file_path: Path, verbose: bool = False) -> bool:
+    """Steer the agent toward Serena's symbol tools over whole-file reads.
+
+    Opt-in (off by default): mirrors :func:`_inject_rtk_instructions` and
+    early-returns unless ``--serena-instructions`` / ``HEADROOM_SERENA_INSTRUCTIONS``
+    is set, so the user's hint file is left untouched by default.
+
+    Idempotent — skips if the marker is already present. Appends to an existing
+    instruction file, or creates one. Returns True once the guidance is in place.
+    """
+    if not _serena_instructions_opt_in():
+        return False
+    if file_path.exists():
+        existing = _read_text(file_path)
+        if _SERENA_MARKER in existing:
+            if verbose:
+                click.echo(f"  Serena instructions already in {file_path.name}")
+            return True
+        _append_text(file_path, "\n\n" + SERENA_INSTRUCTIONS_BLOCK)
+    else:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_text(file_path, SERENA_INSTRUCTIONS_BLOCK)
+
+    click.echo(f"  Serena instructions injected into {file_path}")
+    return True
+
+
+def _detect_repo_languages(root: Path) -> list[str]:
+    """Detect the Serena languages present under *root* by file extension.
+
+    Returns the mapped Serena language keys ordered by file count (most common
+    first — Serena treats the first entry as the default/fallback language
+    server), with ties broken alphabetically for determinism. Dependency,
+    build, VCS, and cache directories are pruned from the walk.
+    """
+    counts: dict[str, int] = {}
+    for _dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _LANG_SCAN_IGNORE_DIRS]
+        for filename in filenames:
+            lang = _EXT_TO_SERENA_LANGUAGE.get(Path(filename).suffix.lower())
+            if lang is not None:
+                counts[lang] = counts.get(lang, 0) + 1
+    return [lang for lang, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
+def _scope_serena_languages(*, verbose: bool = False) -> None:
+    """Pin the repo's languages into ``.serena/project.yml`` (best-effort).
+
+    Scoping the LSP to the languages actually present keeps Serena from
+    starting unnecessary language servers. Runs before indexing so
+    ``serena project index`` respects the scope. Writes the ``languages`` key as
+    a YAML flow list (the format Serena's own project template uses) via a
+    targeted line edit — mirroring :func:`_ensure_serena_dashboard_disabled` —
+    and creates a minimal ``project.yml`` (``project_name`` + ``languages``, the
+    only fields Serena requires) when absent. An existing block-style or
+    otherwise unexpected ``languages`` entry is left untouched rather than risk
+    corrupting the file. Non-fatal on any I/O error.
+    """
+    languages = _detect_repo_languages(Path.cwd())
+    if not languages:
+        if verbose:
+            click.echo("  Serena: no recognized source languages detected — leaving scope unset")
+        return
+
+    cfg = Path.cwd() / ".serena" / "project.yml"
+    value = "[" + ", ".join(f'"{lang}"' for lang in languages) + "]"
+    try:
+        if cfg.exists():
+            text = _read_text(cfg)
+            # Match only a single-line flow list (the format we and Serena write).
+            pattern = re.compile(r"^(\s*)languages:\s*\[[^\]\n]*\]\s*$", re.MULTILINE)
+            if pattern.search(text):
+                new = pattern.sub(rf"\g<1>languages: {value}", text, count=1)
+                if new != text:
+                    _write_text(cfg, new)
+                    if verbose:
+                        click.echo(f"  Serena: scoped languages to {value} (project.yml)")
+            elif verbose:
+                click.echo(
+                    "  Serena: project.yml has a custom languages entry — leaving it untouched"
+                )
+        else:
+            cfg.parent.mkdir(parents=True, exist_ok=True)
+            project_name = Path.cwd().name or "project"
+            _write_text(cfg, f'project_name: "{project_name}"\nlanguages: {value}\n')
+            if verbose:
+                click.echo(f"  Serena: created project.yml scoped to {value}")
+    except OSError as e:
+        if verbose:
+            click.echo(f"  Serena: could not scope languages ({e})")
+
+
+def _index_serena_project(*, verbose: bool = False) -> None:
+    """Warm Serena's symbol cache for the current project (non-fatal).
+
+    Runs ``serena project index`` (the same ``uvx --from git+…`` launch used to
+    start the MCP server) in the project directory so the first symbol query is
+    not paying for a cold index. Timeout-guarded and best-effort: Serena also
+    indexes lazily on demand, so a failure or timeout here never blocks the
+    wrap. Mirrors :func:`_index_tokensave_project`.
+    """
+    if shutil.which("uvx") is None:
+        if verbose:
+            click.echo("  Serena: uvx not found — skipping pre-index")
+        return
+    try:
+        result = run(
+            [
+                "uvx",
+                "--from",
+                "git+https://github.com/oraios/serena",
+                "serena",
+                "project",
+                "index",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            cwd=str(Path.cwd()),
+        )
+        if result.returncode == 0:
+            click.echo("  Serena: project pre-indexed (symbol cache warmed)")
+        elif verbose:
+            click.echo(f"  Serena: pre-index failed ({(result.stderr or '')[:100]})")
+    except subprocess.TimeoutExpired:
+        click.echo("  Serena: pre-index timed out (will index on demand)")
+    except Exception as e:
+        if verbose:
+            click.echo(f"  Serena: pre-index skipped ({e})")
+
+
 def _setup_serena_mcp(
     registrar: Any, *, context: str, verbose: bool = False, force: bool = False
 ) -> None:
@@ -1594,6 +1875,15 @@ def _setup_serena_mcp(
     )
     if line is not None:
         click.echo(line)
+
+    # Serena is the active engine here (we passed the detect/uvx guards): steer
+    # the agent toward symbol-level tools, scope the LSP to the repo's
+    # languages, then warm the symbol cache. Scoping runs before indexing so
+    # ``serena project index`` respects the scope. Each step is best-effort and
+    # non-fatal — none of them block the wrap.
+    _inject_serena_instructions(_serena_instruction_file(registrar), verbose=verbose)
+    _scope_serena_languages(verbose=verbose)
+    _index_serena_project(verbose=verbose)
 
 
 def _remove_headroom_installed_serena_mcp(registrar: Any) -> str:
@@ -4559,6 +4849,7 @@ def wrap_selfheal(marker: str | None) -> None:
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_serena_instructions_option
 @click.option(
     # no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
     "--port",
@@ -5636,6 +5927,7 @@ def _run_codex_wrap(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_serena_instructions_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -6138,6 +6430,7 @@ def kimi(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_serena_instructions_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
@@ -7329,6 +7622,7 @@ def openclaw(
 
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_rtk_option
+@_serena_instructions_option
 @click.option(
     "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
 )
