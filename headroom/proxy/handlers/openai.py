@@ -3665,8 +3665,15 @@ class OpenAIHandlerMixin:
                     # cache stats from the LAST upstream call.
                     total_latency = (time.time() - start_time) * 1000
                     usage = backend_response.body.get("usage", {})
-                    output_tokens = usage.get("completion_tokens", 0)
-                    total_input_tokens = usage.get("prompt_tokens", optimized_tokens)
+                    # `.get(key, default)` only falls back when the key is
+                    # absent; a present-but-null count (some OpenAI-compatible
+                    # backends emit these on a stopped/empty turn) would return
+                    # None and crash the downstream `max(...)` arithmetic and the
+                    # int-typed outcome/metrics. `_usage_int` coerces both cases,
+                    # matching the streaming path and the guarded cache keys below
+                    # (same class as the gemini fix in #2347).
+                    output_tokens = _usage_int(usage.get("completion_tokens"))
+                    total_input_tokens = _usage_int(usage.get("prompt_tokens")) or optimized_tokens
 
                     # Cache stats: prefer the Anthropic/Bedrock top-level
                     # keys when present (authoritative). Fall back to
@@ -3976,12 +3983,17 @@ class OpenAIHandlerMixin:
                 try:
                     resp_json = response.json()
                     usage = resp_json.get("usage", {})
-                    total_input_tokens = usage.get("prompt_tokens", optimized_tokens)
-                    output_tokens = usage.get("completion_tokens", 0)
+                    # Coerce present-but-null counts: the arithmetic below
+                    # (`_infer_openai_cache_write_tokens`, `max(...)`) runs
+                    # outside this try, so a null `prompt_tokens`/`cached_tokens`
+                    # would otherwise raise an uncaught TypeError and 500 the
+                    # request (same class as the gemini fix in #2347).
+                    total_input_tokens = _usage_int(usage.get("prompt_tokens")) or optimized_tokens
+                    output_tokens = _usage_int(usage.get("completion_tokens"))
                     # OpenAI returns cached_tokens in prompt_tokens_details
                     # These are charged at 50% of the input price
                     prompt_details = usage.get("prompt_tokens_details") or {}
-                    cache_read_tokens = prompt_details.get("cached_tokens", 0)
+                    cache_read_tokens = _usage_int(prompt_details.get("cached_tokens"))
                 except (KeyError, TypeError, AttributeError) as e:
                     logger.debug(
                         f"[{request_id}] Failed to extract cached tokens from OpenAI response: {e}"
