@@ -957,31 +957,71 @@ def _dedup_responses_output_items(
 
 
 def _openai_responses_to_sse(response: dict[str, Any]) -> list[bytes]:
-    """Convert a complete Responses API JSON body into a minimal SSE stream.
+    """Convert a complete Responses API JSON body into an SSE stream.
 
-    Used only for the buffered-CCR path: the client asked for
-    ``stream: true`` but we forced a non-streaming upstream call so CCR
-    retrieval could be resolved server-side. This reconstructs just enough
-    of the real event sequence (``response.created`` + ``response.completed``)
-    for Responses API clients that key off the terminal event's full
-    response object — it does not replay incremental output-item/text
-    deltas. Mirrors the equivalent simplification in
-    ``StreamingMixin._response_to_sse`` for the Anthropic buffered path.
+    Used only for the buffered-CCR path: the client asked for ``stream: true``
+    but we forced a non-streaming upstream call so CCR retrieval could be
+    resolved server-side. We then have to replay the response as SSE.
+
+    Some Responses clients read the whole answer off the terminal
+    ``response.completed`` event, but others (OpenCode / the Vercel AI SDK)
+    render output only from the *incremental* item/text events and show nothing
+    when they are absent (#2410). So reconstruct the real event sequence:
+    ``response.created`` -> ``response.in_progress`` -> per output item
+    (``response.output_item.added``, and for message items the
+    ``response.content_part.added`` / ``response.output_text.delta`` /
+    ``response.output_text.done`` / ``response.content_part.done`` sequence) ->
+    ``response.output_item.done`` -> ``response.completed`` -> ``[DONE]``.
     """
-    created_response = {**response, "status": "in_progress", "output": []}
     events: list[bytes] = []
-    for seq, (event_type, event_response) in enumerate(
-        (
-            ("response.created", created_response),
-            ("response.completed", response),
-        )
-    ):
-        payload = {
-            "type": event_type,
-            "sequence_number": seq,
-            "response": event_response,
-        }
+    seq = 0
+
+    def _emit(event_type: str, extra: dict[str, Any]) -> None:
+        nonlocal seq
+        payload = {"type": event_type, "sequence_number": seq, **extra}
         events.append(f"event: {event_type}\ndata: {json.dumps(payload)}\n\n".encode())
+        seq += 1
+
+    output_items = response.get("output") or []
+    created_response = {**response, "status": "in_progress", "output": []}
+    _emit("response.created", {"response": created_response})
+    _emit("response.in_progress", {"response": created_response})
+
+    for out_idx, item in enumerate(output_items):
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id", f"item_{out_idx}")
+
+        # ``output_item.added`` carries the item shell; message content streams
+        # via the content-part events below, so start it empty there.
+        if item.get("type") == "message":
+            added_item = {k: v for k, v in item.items() if k != "content"}
+            added_item["content"] = []
+        else:
+            added_item = item
+        _emit("response.output_item.added", {"output_index": out_idx, "item": added_item})
+
+        content = item.get("content")
+        if item.get("type") == "message" and isinstance(content, list):
+            for c_idx, part in enumerate(content):
+                if not isinstance(part, dict):
+                    continue
+                loc = {"item_id": item_id, "output_index": out_idx, "content_index": c_idx}
+                if part.get("type") in ("output_text", "text"):
+                    text = part.get("text", "") or ""
+                    _emit("response.content_part.added", {**loc, "part": {**part, "text": ""}})
+                    if text:
+                        _emit("response.output_text.delta", {**loc, "delta": text})
+                    _emit("response.output_text.done", {**loc, "text": text})
+                    _emit("response.content_part.done", {**loc, "part": part})
+                else:
+                    # Non-text part (e.g. refusal): add + done with the full part.
+                    _emit("response.content_part.added", {**loc, "part": part})
+                    _emit("response.content_part.done", {**loc, "part": part})
+
+        _emit("response.output_item.done", {"output_index": out_idx, "item": item})
+
+    _emit("response.completed", {"response": response})
     events.append(b"data: [DONE]\n\n")
     return events
 
