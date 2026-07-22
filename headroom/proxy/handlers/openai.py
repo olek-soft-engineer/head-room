@@ -1249,6 +1249,26 @@ def _infer_openai_cache_write_tokens(input_tokens: int, cache_read_tokens: int) 
     return max(input_tokens - cache_read_tokens, 0)
 
 
+def _deferrable_savings_delta(input_delta: int, saved_delta: int) -> int:
+    """Gate a WS Responses turn's compression-savings delta on input accounting.
+
+    ``tokens_saved`` accumulates at compression time (our own token count),
+    while input tokens only arrive with a usage frame on
+    ``response.completed``. A turn that was compressed but never completed
+    (cancelled mid-response, upstream error) therefore shows
+    ``saved_delta > 0`` with ``input_delta == 0`` — and recording that pair
+    writes a savings-with-zero-spend checkpoint into the savings tracker,
+    desyncing every downstream funnel (dashboards flag "savings but no
+    spend"). Return 0 for that case so the caller defers the savings until a
+    usage-carrying turn; non-positive deltas pass through unchanged so the
+    recorded-total bookkeeping keeps its normal resync behaviour.
+    """
+
+    if saved_delta > 0 and input_delta <= 0:
+        return 0
+    return saved_delta
+
+
 def _extract_responses_usage(event: dict[str, Any]) -> tuple[int, int, int, int, int]:
     """Return input/output/cache usage from a Responses event.
 
@@ -6978,7 +6998,16 @@ class OpenAIHandlerMixin:
                                 ws_uncached_input_tokens_total
                                 - ws_recorded_uncached_input_tokens_total
                             )
-                            saved_delta = tokens_saved - ws_recorded_tokens_saved_total
+                            # Usage-less turn (cancelled/failed before
+                            # response.completed): defer its savings — see
+                            # _deferrable_savings_delta. The recorded total
+                            # advances by the recorded delta below, so
+                            # deferred savings stay pending and land with the
+                            # next usage-carrying turn.
+                            saved_delta = _deferrable_savings_delta(
+                                input_delta,
+                                tokens_saved - ws_recorded_tokens_saved_total,
+                            )
                             attempted_delta = (
                                 attempted_input_tokens_total
                                 - ws_recorded_attempted_input_tokens_total
@@ -7091,7 +7120,13 @@ class OpenAIHandlerMixin:
                             ws_recorded_cache_read_tokens_total = ws_cache_read_tokens_total
                             ws_recorded_cache_write_tokens_total = ws_cache_write_tokens_total
                             ws_recorded_uncached_input_tokens_total = ws_uncached_input_tokens_total
-                            ws_recorded_tokens_saved_total = tokens_saved
+                            # Advance by the recorded delta, not to the live
+                            # total: when the usage-less guard above zeroed
+                            # saved_delta, the un-recorded savings must stay
+                            # pending for the next usage-carrying turn.
+                            # Equivalent to `= tokens_saved` whenever the
+                            # delta was recorded as computed.
+                            ws_recorded_tokens_saved_total += saved_delta
                             ws_recorded_attempted_input_tokens_total = attempted_input_tokens_total
                             ws_recorded_overhead_ms_total = _current_ws_overhead_ms()
                             ws_recorded_compression_timing_totals.update(
@@ -7552,7 +7587,15 @@ class OpenAIHandlerMixin:
                 0,
                 ws_uncached_input_tokens_total - ws_recorded_uncached_input_tokens_total,
             )
-            residual_tokens_saved = max(0, tokens_saved - ws_recorded_tokens_saved_total)
+            # Savings deferred from usage-less turns (per-turn guard in
+            # _record_ws_response_metrics) land here when the session closes
+            # before another usage frame arrives. With no residual input there
+            # is no spend to pair them with — drop them rather than write the
+            # savings-with-zero-spend checkpoint the per-turn guard prevents.
+            residual_tokens_saved = _deferrable_savings_delta(
+                residual_input_tokens,
+                max(0, tokens_saved - ws_recorded_tokens_saved_total),
+            )
             residual_attempted_input_tokens = max(
                 0,
                 attempted_input_tokens_total - ws_recorded_attempted_input_tokens_total,
