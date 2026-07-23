@@ -6381,9 +6381,10 @@ def grok(
     """Launch Grok CLI through Headroom proxy.
 
     \b
-    Sets ``GROK_CLI_CHAT_PROXY_BASE_URL`` so Grok routes inference traffic
-    through Headroom. Registers the headroom MCP server in ``~/.grok/config.toml``
-    so Grok can call ``headroom_retrieve`` on compression markers.
+    Sets ``GROK_MODELS_BASE_URL`` so Grok routes inference traffic through
+    Headroom while preserving native settings and authentication routing.
+    Registers the headroom MCP server in ``~/.grok/config.toml`` so Grok can
+    call ``headroom_retrieve`` on compression markers.
 
     \b
     Examples:
@@ -8210,10 +8211,11 @@ def unwrap_omp(port: int, no_stop_proxy: bool) -> None:
 def unwrap_grok(port: int, no_stop_proxy: bool) -> None:
     """Undo durable ``headroom wrap grok`` MCP and guidance edits.
 
-    Grok API routing is session-scoped via ``GROK_CLI_CHAT_PROXY_BASE_URL`` and
-    does not require config restoration. This command removes Headroom MCP
-    servers from ``~/.grok/config.toml`` and strips injected RTK guidance from
-    the project ``AGENTS.md``.
+    Grok inference routing is session-scoped via ``GROK_MODELS_BASE_URL`` and
+    does not require config restoration. Native settings and authentication
+    routing stay unchanged. This command removes Headroom MCP servers from
+    ``~/.grok/config.toml`` and strips injected RTK guidance from the project
+    ``AGENTS.md``.
     """
     click.echo()
     click.echo("  ╔═══════════════════════════════════════════════╗")

@@ -227,7 +227,7 @@ shows an **Output Tokens Saved** card next to input compression, labelled
 |--------------|:---------------:|----------------------------------|
 | Claude Code  | ✅              | `--memory` · `--code-graph` · `--1m` · `--tool-search` |
 | Codex        | ✅              | shares memory with Claude        |
-| Grok CLI     | ✅              | routes via `GROK_CLI_CHAT_PROXY_BASE_URL` |
+| Grok CLI     | ✅              | routes via `GROK_MODELS_BASE_URL` |
 | Cursor       | Manual setup    | starts proxy and prints base URLs for Cursor settings |
 | Aider        | ✅              | starts proxy + launches          |
 | Copilot CLI  | ✅              | starts proxy + launches          |
