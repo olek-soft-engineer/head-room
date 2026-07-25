@@ -3025,6 +3025,28 @@ class OpenAIHandlerMixin:
                 messages,
                 openai_frozen_count,
             )
+        # Cold-prefix cache-miss hook, branch 2 (HEADROOM_COLD_RECOMPACT). When the
+        # prompt cache has lapsed (idle past TTL → dead, nothing to bust), unfreeze the
+        # whole prefix so the router recompacts it (cross-turn dedupe + superseded-read
+        # drop + lossless folds) — the lever for encrypted-reasoning models (Codex)
+        # whose reasoning we can't touch. Composes with branch 1 (plain-text reasoning
+        # drop at PRE_SEND for Kimi/GLM). Token mode only; deterministic → cache-stable.
+        if is_token_mode(self.config.mode) and os.environ.get(
+            "HEADROOM_COLD_RECOMPACT", ""
+        ).strip().lower() in ("1", "true", "yes"):
+            from headroom.cache.ttl_observations import resolve_learned_ttl
+            from headroom.transforms.cold_prefix import is_cold_prefix
+
+            # OpenAI/Kimi don't expose their cache TTL, so use the offline-learned
+            # value if available (else is_cold_prefix falls back to the static guess).
+            _learned_ttl = resolve_learned_ttl("openai", model)
+            if is_cold_prefix(openai_prefix_tracker, ttl_seconds=_learned_ttl):
+                logger.info(
+                    "[%s] cold-prefix recompaction: unfreezing prefix for "
+                    "dedupe/superseded-read compaction",
+                    request_id,
+                )
+                openai_frozen_count = 0
 
         _compression_failed = False
         original_messages = messages  # Preserve for 400-retry fallback
@@ -3434,6 +3456,68 @@ class OpenAIHandlerMixin:
         if tools or _original_tools is not None:
             body["tools"] = tools
 
+        # Reasoning compaction (HEADROOM_THINKING_COMPACT, off by default). Unlike
+        # Anthropic/OpenAI (encrypted reasoning handles, nothing to compress),
+        # Kimi/GLM/DeepSeek-R1 resend reasoning as PLAIN TEXT billed as input (Kimi
+        # K2.7: ~1,558 tok/block, kept every turn) — so Kompress can actually shrink
+        # it. Shape-driven: compacts the `reasoning_content` field (Kimi) and inline
+        # `<think>…</think>` (GLM/DeepSeek); no-ops when neither is present (OpenAI's
+        # own encrypted models). Deterministic → forwarded prefix stays cache-stable;
+        # keep_last_turns protects the active reasoning. Never breaks the request.
+        if os.environ.get("HEADROOM_THINKING_COMPACT", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            try:
+                from headroom.cache.ttl_observations import resolve_learned_ttl
+                from headroom.transforms.cold_prefix import is_cold_prefix
+                from headroom.transforms.compression_units import find_content_router
+                from headroom.transforms.thinking_compactor import (
+                    compact_reasoning_openai_chat,
+                )
+
+                # Cold-prefix cache-miss hook: on a warm turn Kompress the reasoning
+                # (deterministic → cache-stable); on a COLD turn (idle past provider
+                # TTL, cache dead) DROP it outright — the full block, safe because the
+                # cold turn re-caches from scratch. See cold_prefix / thinking_compactor.
+                # Uses the offline-learned TTL (Kimi/OpenAI don't expose it).
+                _rc_cold = is_cold_prefix(
+                    openai_prefix_tracker, ttl_seconds=resolve_learned_ttl("openai", model)
+                )
+                _rc_router = find_content_router(self.openai_pipeline)
+                _rc_kompress = (
+                    (_rc_router._get_remote_kompress() or _rc_router._get_kompress())
+                    if _rc_router is not None
+                    else None
+                )
+                # Drop needs no compressor; Kompress (warm) does.
+                if _rc_kompress is not None or _rc_cold:
+                    _rc_keep = int(os.environ.get("HEADROOM_THINKING_COMPACT_KEEP_LAST", "1"))
+                    optimized_messages, _rc_stats = compact_reasoning_openai_chat(
+                        optimized_messages,
+                        kompress=_rc_kompress,
+                        keep_last_turns=_rc_keep,
+                        drop=_rc_cold,
+                    )
+                    body["messages"] = optimized_messages
+                    if _rc_stats["turns_compacted"]:
+                        transforms_applied.append(
+                            f"openai:reasoning_{'drop' if _rc_cold else 'compact'}:{_rc_stats['turns_compacted']}"
+                        )
+                        logger.info(
+                            "[%s] reasoning %s: %d turns, %d blocks, %d->%d words (cold=%s)",
+                            request_id,
+                            "drop" if _rc_cold else "compact",
+                            _rc_stats["turns_compacted"],
+                            _rc_stats["blocks"],
+                            _rc_stats["words_before"],
+                            _rc_stats["words_after"],
+                            _rc_cold,
+                        )
+            except Exception as _rc_exc:  # never break the request on compaction
+                logger.warning("[%s] reasoning compaction skipped: %s", request_id, _rc_exc)
+
         presend_event = self.pipeline_extensions.emit(
             PipelineStage.PRE_SEND,
             operation="proxy.request",
@@ -3826,6 +3910,27 @@ class OpenAIHandlerMixin:
                         0, total_input_tokens - cache_read_tokens - cache_write_tokens
                     )
 
+                    # Cache-TTL learning seam: attribute this turn's cache outcome
+                    # (hit / ttl_expiry / prefix_change) and record it BEFORE
+                    # update_from_response overwrites the prior-turn state. Feeds the
+                    # offline TTL learner (HEADROOM_CACHE_TTL_LEARN); best-effort.
+                    try:
+                        if hasattr(openai_prefix_tracker, "classify_cache_miss"):
+                            from headroom.cache.ttl_observations import (
+                                record_cache_observation,
+                            )
+
+                            record_cache_observation(
+                                provider="openai",
+                                model=model,
+                                attribution=openai_prefix_tracker.classify_cache_miss(
+                                    cache_read_tokens=cache_read_tokens,
+                                    current_forwarded_messages=optimized_messages,
+                                ),
+                            )
+                    except Exception:
+                        pass
+
                     openai_prefix_tracker.update_from_response(
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
@@ -4128,6 +4233,25 @@ class OpenAIHandlerMixin:
                     total_input_tokens,
                     cache_read_tokens,
                 )
+                # Cache-TTL learning seam (see the /v1/chat path above): record the
+                # cache-outcome attribution before update_from_response. Best-effort.
+                try:
+                    if hasattr(openai_prefix_tracker, "classify_cache_miss"):
+                        from headroom.cache.ttl_observations import (
+                            record_cache_observation,
+                        )
+
+                        record_cache_observation(
+                            provider="openai",
+                            model=model,
+                            attribution=openai_prefix_tracker.classify_cache_miss(
+                                cache_read_tokens=cache_read_tokens,
+                                current_forwarded_messages=optimized_messages,
+                            ),
+                        )
+                except Exception:
+                    pass
+
                 openai_prefix_tracker.update_from_response(
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
