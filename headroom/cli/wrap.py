@@ -1840,6 +1840,27 @@ def _scope_serena_languages(*, verbose: bool = False) -> None:
             click.echo(f"  Serena: could not scope languages ({e})")
 
 
+def _serena_project_skip_reason(root: Path) -> str | None:
+    """Why Serena's per-project setup must not run for *root* (None = proceed).
+
+    ``$HOME`` is never a project: scanning it walks every unrelated tree
+    (Downloads, VM images, network mounts) and would write ``project.yml`` into
+    Serena's own ``~/.serena`` config directory. A linked git worktree (its
+    top-level ``.git`` is a file, not a directory) is an ephemeral checkout that
+    would pay for its own index at a path that soon disappears.
+    """
+    try:
+        resolved = root.resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return None
+    if resolved == home:
+        return "$HOME is not a project"
+    if (resolved / ".git").is_file():
+        return "linked git worktree"
+    return None
+
+
 def _index_serena_project(*, verbose: bool = False) -> None:
     """Warm Serena's symbol cache for the current project (non-fatal).
 
@@ -1947,6 +1968,11 @@ def _setup_serena_mcp(
     # ``serena project index`` respects the scope. Each step is best-effort and
     # non-fatal — none of them block the wrap.
     _inject_serena_instructions(_serena_instruction_file(registrar), verbose=verbose)
+    skip_reason = _serena_project_skip_reason(Path.cwd())
+    if skip_reason is not None:
+        if verbose:
+            click.echo(f"  Serena: skipping language scope + pre-index ({skip_reason})")
+        return
     _scope_serena_languages(verbose=verbose)
     _index_serena_project(verbose=verbose)
 
