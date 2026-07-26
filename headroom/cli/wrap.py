@@ -5269,6 +5269,40 @@ def claude(
 @click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
 @click.option("--keep-mcp", is_flag=True, help="Keep Headroom MCP registrations")
 @click.option("--keep-rtk", is_flag=True, help="Keep rtk Claude hooks")
+def _warn_if_proxy_env_leaked(port: int) -> None:
+    """Issue #2238: surface a proxy URL that survived unwrap in the live shell.
+
+    ``unwrap_claude`` restores settings.local.json, but if ``ANTHROPIC_BASE_URL``
+    (or the Foundry/Vertex equivalents) was exported into the current shell or a
+    persistent profile, it outlives the JSON edit and Claude keeps trying to reach
+    the (now unwrapped) proxy, failing with a connection error. The user previously
+    had to discover ``Remove-Item Env:ANTHROPIC_BASE_URL`` by hand — emit it here.
+    """
+    proxy_host = f"127.0.0.1:{port}"
+    leaked = []
+    for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_FOUNDRY_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL"):
+        value = os.environ.get(name, "").strip()
+        if proxy_host in value:
+            leaked.append((name, value))
+    if not leaked:
+        return
+    click.echo(
+        "  ⚠ Headroom's proxy URL is still exported in this shell's environment:"
+    )
+    for name, value in leaked:
+        click.echo(f"      {name}={value}")
+    click.echo(
+        "    Claude will keep routing through the (now unwrapped) proxy and fail to connect."
+    )
+    click.echo("    Clear it for the current shell, then restart Claude Code:")
+    click.echo("      PowerShell:  Remove-Item Env:ANTHROPIC_BASE_URL")
+    click.echo("      bash/zsh:    unset ANTHROPIC_BASE_URL")
+    click.echo(
+        "    If it reappears after restart, remove it from your shell profile "
+        "(e.g. $PROFILE / ~/.bashrc / ~/.zshrc)."
+    )
+
+
 def unwrap_claude(
     port: int,
     no_stop_proxy: bool,
@@ -5335,6 +5369,13 @@ def unwrap_claude(
             vertex_mode=_vertex,
             settings_path=_unwrap_settings_path,
         )
+
+    # Issue #2238: unwrap restores settings.local.json, but a proxy URL that was
+    # exported into the live shell (or a persistent profile) survives unwrap and
+    # leaves Claude unable to reach the real API ("connection error" until the
+    # user manually runs `Remove-Item Env:ANTHROPIC_BASE_URL`). Warn loudly and
+    # give the exact per-shell fix instead of leaving the user to discover it.
+    _warn_if_proxy_env_leaked(port)
 
     click.echo()
     clean_unwrap = True
