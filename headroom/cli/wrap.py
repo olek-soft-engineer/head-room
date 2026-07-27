@@ -5262,13 +5262,6 @@ def claude(
 # =============================================================================
 
 
-@unwrap.command("claude")
-@click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
-)
-@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
-@click.option("--keep-mcp", is_flag=True, help="Keep Headroom MCP registrations")
-@click.option("--keep-rtk", is_flag=True, help="Keep rtk Claude hooks")
 def _warn_if_proxy_env_leaked(port: int) -> None:
     """Issue #2238: surface a proxy URL that survived unwrap in the live shell.
 
@@ -5286,9 +5279,7 @@ def _warn_if_proxy_env_leaked(port: int) -> None:
             leaked.append((name, value))
     if not leaked:
         return
-    click.echo(
-        "  ⚠ Headroom's proxy URL is still exported in this shell's environment:"
-    )
+    click.echo("  ⚠ Headroom's proxy URL is still exported in this shell's environment:")
     for name, value in leaked:
         click.echo(f"      {name}={value}")
     click.echo(
@@ -5303,6 +5294,13 @@ def _warn_if_proxy_env_leaked(port: int) -> None:
     )
 
 
+@unwrap.command("claude")
+@click.option(
+    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+)
+@click.option("--no-stop-proxy", is_flag=True, help="Do not stop the local Headroom proxy")
+@click.option("--keep-mcp", is_flag=True, help="Keep Headroom MCP registrations")
+@click.option("--keep-rtk", is_flag=True, help="Keep rtk Claude hooks")
 def unwrap_claude(
     port: int,
     no_stop_proxy: bool,
