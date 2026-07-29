@@ -2857,6 +2857,11 @@ _TOOL_SEARCH_CORE_TOOLS = frozenset(
         "webfetch",
         "question",
         "skill",
+        # A client's own tool-search/schema-fetch tool (Claude Code's ``ToolSearch``).
+        # It resolves tools the client keeps in its local registry and never puts in
+        # the request body (TaskCreate, WebFetch, …), so deferring it hides the only
+        # tool that can load them and they become permanently unreachable.
+        "toolsearch",
     }
 )
 _TOOL_SEARCH_DEFAULT_TYPE = "tool_search_tool_regex_20251119"
@@ -2900,8 +2905,18 @@ def inject_tool_search_deferral(
     last_resident_real: dict[str, Any] | None = None
     resident_has_cache_control = False
 
+    # Clients disagree on casing for the same tool: Claude Code sends ``Bash`` /
+    # ``ToolSearch`` where opencode sends ``bash``. Compare case-insensitively so
+    # the exemption applies to both — an exact match silently deferred *every*
+    # tool for PascalCase clients, including their own tool-search tool.
+    core_lower = {name.lower() for name in core_tools}
+
     for tool in tools:
-        if not isinstance(tool, dict) or tool.get("type") or tool.get("name") in core_tools:
+        if (
+            not isinstance(tool, dict)
+            or tool.get("type")
+            or str(tool.get("name") or "").lower() in core_lower
+        ):
             # Non-dict, server/typed tools (web_search, computer, …), and core
             # tools stay resident and unchanged.
             out.append(tool)
@@ -3011,6 +3026,11 @@ def inject_tool_search_deferral_openai(
 
     out: list[Any] = [{"type": _OPENAI_TOOL_SEARCH_TYPE}]
     deferred = 0
+    # Case-insensitive for the same reason as the Anthropic path above: the
+    # resident-name sets are lowercase, clients are not required to be.
+    resident_lower = {name.lower() for name in core_tools} | {
+        name.lower() for name in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
+    }
     for tool in tools:
         if not isinstance(tool, dict):
             out.append(tool)
@@ -3020,9 +3040,7 @@ def inject_tool_search_deferral_openai(
         # trained to search namespaces / MCP servers). Everything else — core
         # coding tools and other hosted tools — stays resident.
         deferrable = (
-            ttype == "function"
-            and tool.get("name") not in core_tools
-            and tool.get("name") not in _OPENAI_TOOL_SEARCH_RESIDENT_NAMES
+            ttype == "function" and str(tool.get("name") or "").lower() not in resident_lower
         ) or ttype == "mcp"
         if deferrable and not tool.get("defer_loading"):
             new_tool = dict(tool)
