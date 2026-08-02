@@ -29,6 +29,7 @@ from ..config import TransformResult
 from ..onnx_runtime import (
     ONNX_CPU_ARENA_ENV,
     create_cpu_session_options,
+    hf_entry_known_absent,
     hf_hub_download_local_first,
     trim_process_heap,
 )
@@ -721,6 +722,104 @@ def _load_modernbert_tokenizer(auto_tokenizer: Any, *, allow_download: bool) -> 
         raise
 
 
+# Sub-state-dict keys inside a merged v2-style checkpoint (see
+# scripts/export_kompress_v2_onnx.py, which this mirrors).
+_MERGED_CHECKPOINT_KEYS = ("encoder_state_dict", "token_head_state_dict", "span_conv_state_dict")
+
+
+def _load_merged_state_dict(model: Any, ckpt_path: str, model_id: str) -> None:
+    """Load a merged v2-style checkpoint (LoRA already folded into the encoder).
+
+    The checkpoint is a dict of per-submodule state-dicts
+    (``encoder_state_dict`` / ``token_head_state_dict`` / ``span_conv_state_dict``)
+    rather than a single flat state-dict, so each piece is loaded into its
+    matching submodule directly instead of via a single ``load_state_dict``
+    call on the whole model.
+    """
+    import torch
+
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    missing_sections = [k for k in _MERGED_CHECKPOINT_KEYS if k not in ckpt]
+    if missing_sections:
+        raise RuntimeError(
+            f"merged.pt for {model_id} is missing {missing_sections}; found keys: "
+            f"{sorted(ckpt)}. This checkpoint format is not what the loader expects."
+        )
+
+    for section, submodule in (
+        ("encoder_state_dict", model.encoder),
+        ("token_head_state_dict", model.token_head),
+        ("span_conv_state_dict", model.span_conv),
+    ):
+        missing, unexpected = submodule.load_state_dict(ckpt[section], strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"{model_id} {section}: state_dict mismatch against {type(submodule).__name__} "
+                f"(missing={list(missing)[:5]}, unexpected={list(unexpected)[:5]}). "
+                "The checkpoint no longer matches HeadroomCompressorModel's architecture."
+            )
+
+
+def _load_plain_state_dict(model: Any, weights_path: str, model_id: str) -> None:
+    """Load a plain, already-merged full state-dict (the pre-v2 / non-PEFT format)."""
+    from safetensors.torch import load_file
+
+    state_dict = load_file(weights_path)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"{model_id} model.safetensors: state_dict mismatch against "
+            f"HeadroomCompressorModel (missing={list(missing)[:5]}, "
+            f"unexpected={list(unexpected)[:5]}). Refusing to run with unloaded weights."
+        )
+
+
+def _load_pytorch_weights(model: Any, model_id: str, *, allow_download: bool) -> None:
+    """Load PyTorch weights into ``model``, preferring the merged v2 checkpoint.
+
+    ``merged.pt`` (when the repo ships one) holds LoRA-merged sub-state-dicts
+    keyed by submodule name. In a PEFT-trained repo, ``model.safetensors`` is
+    the *unmerged* adapter checkpoint (encoder keys prefixed
+    ``encoder.base_model.model...``) and does not map onto this module tree at
+    all, so it is only used as a fallback for repos that never shipped a
+    merged checkpoint (e.g. the original non-LoRA kompress-base).
+
+    In cache-only mode (``allow_download=False``) a ``merged.pt`` cache miss is
+    ambiguous: it could mean the repo has no merged checkpoint (safe to use the
+    plain fallback), or it could mean the repo has one but it just is not
+    downloaded yet (in which case a *stale* cached ``model.safetensors`` from a
+    prior run must not be used, since for a PEFT repo it is the wrong format).
+    ``hf_entry_known_absent`` disambiguates without a network call, using
+    HuggingFace Hub's own cache of confirmed-404 lookups.
+    """
+    try:
+        ckpt_path = hf_hub_download_local_first(model_id, "merged.pt", allow_network=allow_download)
+    except _NOT_CACHED_ERRORS as exc:
+        if not allow_download:
+            if not hf_entry_known_absent(model_id, "merged.pt"):
+                raise KompressModelNotCached(model_id) from exc
+            try:
+                weights_path = hf_hub_download_local_first(
+                    model_id, "model.safetensors", allow_network=False
+                )
+            except _NOT_CACHED_ERRORS:
+                raise KompressModelNotCached(model_id) from exc
+            _load_plain_state_dict(model, weights_path, model_id)
+            return
+        if isinstance(exc, EntryNotFoundError):
+            # merged.pt genuinely does not exist in this repo (confirmed by a
+            # real network lookup, not just a cache miss) - fall back to the
+            # plain format instead of treating it as a download failure.
+            weights_path = hf_hub_download_local_first(
+                model_id, "model.safetensors", allow_network=allow_download
+            )
+            _load_plain_state_dict(model, weights_path, model_id)
+            return
+        raise
+    else:
+        _load_merged_state_dict(model, ckpt_path, model_id)
+
+
 def _load_kompress_pytorch(
     model_id: str, device: str = "auto", *, allow_download: bool = True
 ) -> tuple[Any, Any, str]:
@@ -738,22 +837,10 @@ def _load_kompress_pytorch(
 
         logger.info("Downloading Kompress PyTorch model from %s ...", model_id)
 
-        try:
-            weights_path = hf_hub_download_local_first(
-                model_id, "model.safetensors", allow_network=allow_download
-            )
-        except _NOT_CACHED_ERRORS as exc:
-            if not allow_download:
-                raise KompressModelNotCached(model_id) from exc
-            raise
-
         HeadroomCompressorModel = _get_model_class()
         model = HeadroomCompressorModel()
 
-        from safetensors.torch import load_file
-
-        state_dict = load_file(weights_path)
-        model.load_state_dict(state_dict, strict=False)
+        _load_pytorch_weights(model, model_id, allow_download=allow_download)
 
         if device == "auto":
             if torch.cuda.is_available():
