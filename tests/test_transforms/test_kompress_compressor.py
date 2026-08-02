@@ -753,3 +753,62 @@ class TestPytorchWeightLoading:
 
         for name, param in model.state_dict().items():
             assert torch.equal(param, fresh_model.state_dict()[name])
+
+    def test_cache_only_raises_when_confirmed_absent_but_plain_also_missing(
+        self, monkeypatch
+    ) -> None:
+        """merged.pt confirmed absent, but the plain fallback isn't cached either:
+        still nothing to load from, so this must defer rather than raise a
+        confusing lower-level error.
+        """
+        import pytest
+
+        pytest.importorskip("torch")
+        import headroom.transforms.kompress_compressor as kmod
+
+        def fake_download(model_id, filename, *, allow_network=True, **kwargs):  # noqa: ANN001
+            raise kmod.LocalEntryNotFoundError(f"{filename} not cached")
+
+        monkeypatch.setattr(kmod, "hf_hub_download_local_first", fake_download)
+        monkeypatch.setattr(kmod, "hf_entry_known_absent", lambda *a, **k: True)
+
+        with pytest.raises(kmod.KompressModelNotCached):
+            kmod._load_pytorch_weights(
+                SimpleNamespace(), "chopratejas/kompress-base", allow_download=False
+            )
+
+    def test_genuine_download_failure_propagates_instead_of_falling_back(self, monkeypatch) -> None:
+        """A real network/download failure (not a 404, not a cache miss under
+        allow_download=False) must propagate as-is, not be swallowed into a
+        silent fallback to the plain format.
+        """
+        import pytest
+
+        pytest.importorskip("torch")
+        import headroom.transforms.kompress_compressor as kmod
+
+        def fake_download(model_id, filename, *, allow_network=True, **kwargs):  # noqa: ANN001
+            raise OSError("connection reset")
+
+        monkeypatch.setattr(kmod, "hf_hub_download_local_first", fake_download)
+
+        with pytest.raises(OSError, match="connection reset"):
+            kmod._load_pytorch_weights(SimpleNamespace(), "some/repo", allow_download=True)
+
+
+class TestLoadKompressPytorchCaching:
+    def test_returns_cached_entry_without_reloading(self, monkeypatch) -> None:
+        import pytest
+
+        pytest.importorskip("torch")
+        import headroom.transforms.kompress_compressor as kmod
+
+        sentinel = ("cached-model", "cached-tokenizer", "pytorch")
+        monkeypatch.setattr(kmod, "_kompress_cache", {"some/repo": sentinel})
+
+        def boom(*a, **k):  # noqa: ANN001, ANN202
+            raise AssertionError("should not attempt to reload an already-cached model")
+
+        monkeypatch.setattr(kmod, "_load_pytorch_weights", boom)
+
+        assert kmod._load_kompress_pytorch("some/repo") == sentinel
