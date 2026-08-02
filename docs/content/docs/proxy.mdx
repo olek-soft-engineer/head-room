@@ -385,6 +385,22 @@ For Codex-compatible clients, the proxy also accepts these alias paths and route
 
 Matching WebSocket and subpath aliases are also supported for Codex flows.
 
+### Codex Live voice WebSocket
+
+The proxy relays Codex Live voice frames without parsing or transforming them.
+These paths use the same transparent transport:
+
+- `ws://localhost:8787/v1/live`
+- `ws://localhost:8787/v1/codex/live`
+- `ws://localhost:8787/backend-api/live`
+- `ws://localhost:8787/backend-api/codex/live`
+
+Subscription authentication uses the derived ChatGPT backend path. API-key
+authentication preserves the selected OpenAI-compatible base URL and inbound
+path. The backend Live suffix defaults to `/live` and can be corrected with
+`HEADROOM_CODEX_LIVE_WS_PATH` if the upstream contract changes. The exact
+ChatGPT backend path is not confirmed by this proxy documentation.
+
 ### `POST /v1internal:streamGenerateContent`
 
 Google Cloud Code Assist / Antigravity compatibility endpoint used by Pi-style `google-gemini-cli` and `google-antigravity` providers.
