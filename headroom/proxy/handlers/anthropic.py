@@ -1845,11 +1845,6 @@ class AnthropicHandlerMixin:
                     )
                     inject_system_instructions = False
                 configured_inject_tool = self.config.ccr_inject_tool
-                if configured_inject_tool and frozen_message_count > 0:
-                    logger.info(
-                        f"[{request_id}] CCR: deferring tool injection "
-                        f"(frozen_message_count={frozen_message_count}) to preserve cache"
-                    )
                 # Scan for compression markers + maybe inject system instructions.
                 # Tool-list injection is handled separately via the sticky helper.
                 injector = CCRToolInjector(
@@ -1865,47 +1860,34 @@ class AnthropicHandlerMixin:
                 # retrieval tool once a session has done CCR, regardless
                 # of whether THIS turn produced compressed content.
                 #
-                # #1006: if tool injection was deferred (frozen prefix) but
-                # compression just emitted NEW markers this turn, override the
-                # deferral — the agent has no other way to redeem those markers.
-                # The cache miss on this one request is preferable to silent
-                # data loss.  If the session has already done CCR the tool is
-                # already in the client's tool list, so sticky replay is a
-                # no-op and the cache is unaffected.
-                # ponytail: ceiling is one extra cache miss on the first CCR
-                # turn in a frozen-prefix session.
-                from headroom.proxy.helpers import (
-                    has_new_ccr_markers,
-                    should_inject_ccr_tool,
-                )
+                # Injection is deliberately NOT gated on
+                # ``frozen_message_count``. That counter answers "is the
+                # prefix warm?", but the decision needs "does the established
+                # prefix already contain the tool?" — which only
+                # ``SessionCcrTracker`` knows. Gating on the counter dropped a
+                # tool that was already inside the provider-cached prefix, and
+                # ``tools`` is the head of Anthropic's cache key, so every
+                # toggle invalidated the entire prefix in both directions.
+                # ``apply_session_sticky_ccr_tool`` carries the correct rule:
+                # a session that has never compressed still gets no tool, so
+                # dropping the gate cannot start injecting into non-CCR
+                # conversations.
+                if configured_inject_tool:
+                    from headroom.proxy.helpers import (
+                        apply_session_sticky_ccr_tool,
+                        has_new_ccr_markers,
+                    )
 
-                # #1850: only markers NEW this turn justify overriding the
-                # injection deferral (#1006). Markers replayed from the
-                # previously-forwarded prefix (overlay_cached_prefix) are
-                # historical — counting them would re-inject the tool on every
-                # frozen turn and bust the *tools* cache segment, undoing the
-                # overlay's messages-prefix cache-safety.
-                has_new_compressed_content = has_new_ccr_markers(
-                    current_detected_hashes=injector.detected_hashes,
-                    previous_forwarded_messages=prefix_tracker.get_last_forwarded_messages(),
-                    provider="anthropic",
-                )
-
-                should_inject, is_marker_override = should_inject_ccr_tool(
-                    configured_inject_tool=configured_inject_tool,
-                    frozen_message_count=frozen_message_count,
-                    has_compressed_content=has_new_compressed_content,
-                )
-                if should_inject:
-                    if is_marker_override:
-                        logger.info(
-                            f"[{request_id}] CCR: overriding injection deferral — "
-                            f"new markers emitted but headroom_retrieve unavailable "
-                            f"(frozen_message_count={frozen_message_count}); injecting to "
-                            "prevent unredeemable markers (#1006)"
-                        )
-                    from headroom.proxy.helpers import apply_session_sticky_ccr_tool
-
+                    # #1850: markers replayed from the previously-forwarded
+                    # prefix (overlay_cached_prefix) are historical; only
+                    # markers NEW this turn may drive a first-time injection,
+                    # else a replayed marker injects the tool into a session
+                    # that never actually compressed.
+                    has_new_compressed_content = has_new_ccr_markers(
+                        current_detected_hashes=injector.detected_hashes,
+                        previous_forwarded_messages=prefix_tracker.get_last_forwarded_messages(),
+                        provider="anthropic",
+                    )
                     tools, ccr_tool_injected = apply_session_sticky_ccr_tool(
                         provider="anthropic",
                         session_id=session_id,

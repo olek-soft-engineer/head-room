@@ -73,9 +73,6 @@ from headroom.proxy.ccr_golden_policy import (
 from headroom.proxy.ccr_marker_policy import (
     has_new_ccr_markers as _has_new_ccr_markers,
 )
-from headroom.proxy.ccr_marker_policy import (
-    should_inject_ccr_tool as _should_inject_ccr_tool,
-)
 from headroom.proxy.ccr_session_tracker import SessionCcrTracker as _SessionCcrTracker
 from headroom.proxy.internal_header_policy import (
     INTERNAL_HEADER_PREFIX,
@@ -1712,35 +1709,6 @@ def has_new_ccr_markers(
         current_detected_hashes=current_detected_hashes,
         previous_forwarded_messages=previous_forwarded_messages,
         provider=provider,
-    )
-
-
-def should_inject_ccr_tool(
-    *,
-    configured_inject_tool: bool,
-    frozen_message_count: int,
-    has_compressed_content: bool,
-) -> tuple[bool, bool]:
-    """Decide whether the ``headroom_retrieve`` tool must be injected this turn.
-
-    This is the decision the Anthropic handler used to inline. It is extracted
-    so the #1006 regression can be pinned at the decision point itself.
-
-    Tool injection is normally deferred when there is a frozen message prefix
-    (``frozen_message_count > 0``) to preserve the prompt cache. But if
-    compression emitted fresh markers this turn, deferring would hand the agent
-    a ``<<ccr:hash>>`` marker with no tool to redeem it — silent data loss. In
-    that case we override the deferral and inject anyway (one cache miss is
-    cheaper than dropped content).
-
-    Returns ``(should_inject, is_marker_override)``. ``is_marker_override`` is
-    True only when injection happens *because* of new markers despite a deferral,
-    so the caller can log the override distinctly.
-    """
-    return _should_inject_ccr_tool(
-        configured_inject_tool=configured_inject_tool,
-        frozen_message_count=frozen_message_count,
-        has_compressed_content=has_compressed_content,
     )
 
 
