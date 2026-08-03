@@ -629,10 +629,15 @@ class TrafficLearner:
         if not patterns:
             return
 
-        # Bucket patterns by project.
+        # Bucket patterns by project. discover_projects() walks the filesystem
+        # to decode escaped project directory names, which on a large home tree
+        # takes minutes; running it inline blocked the event loop, so uvicorn
+        # could not answer /readyz and supervisors killed a proxy that was
+        # merely busy. It is called once per learner (cached below), so the
+        # thread hop costs nothing on the steady-state path.
         if self._project_roots_cache is None:
             try:
-                self._project_roots_cache = plugin.discover_projects()
+                self._project_roots_cache = await asyncio.to_thread(plugin.discover_projects)
             except Exception as e:
                 logger.warning("discover_projects failed: %s", e)
                 self._project_roots_cache = []

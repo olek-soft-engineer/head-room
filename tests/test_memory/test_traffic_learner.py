@@ -6,6 +6,8 @@ a real memory backend.
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -1213,6 +1215,46 @@ class TestFlushToFile:
         )
         await learner.flush_to_file()
         assert writer.calls == []  # no roots → short-circuits before writer
+
+    @pytest.mark.asyncio
+    async def test_discover_projects_does_not_block_the_event_loop(self, tmp_path, monkeypatch):
+        """A slow discover_projects must not stall other loop work.
+
+        discover_projects walks the filesystem; on a large home tree it takes
+        minutes. Called inline it froze the loop, so uvicorn stopped answering
+        /readyz and supervisors killed a proxy that was only busy.
+        """
+        writer = _FakeWriter()
+        project_path = tmp_path.resolve()
+        plugin = _FakePlugin(roots=[_make_project(str(project_path))], writer=writer)
+
+        release = threading.Event()
+
+        def slow_discover():
+            release.wait(timeout=5)
+            return [_make_project(str(project_path))]
+
+        plugin.discover_projects = slow_discover  # type: ignore[method-assign]
+        _install_plugin_registry(monkeypatch, plugin)
+
+        learner = TrafficLearner(backend=None, agent_type="claude", min_evidence=1)
+        learner._pattern_counts["h"] = (
+            ExtractedPattern(
+                category=PatternCategory.ENVIRONMENT,
+                content=f"Working test command: cd {project_path} && pytest",
+                importance=0.5,
+                evidence_count=2,
+            ),
+            2,
+        )
+
+        flush = asyncio.create_task(learner.flush_to_file())
+        # The loop stays responsive while discover_projects is stuck.
+        await asyncio.wait_for(asyncio.sleep(0), timeout=1)
+        assert not flush.done()
+        release.set()
+        await asyncio.wait_for(flush, timeout=5)
+        assert writer.calls, "flush should still complete once discovery returns"
 
     @pytest.mark.asyncio
     async def test_unanchored_patterns_dropped(self, tmp_path, monkeypatch):
