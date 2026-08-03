@@ -15,8 +15,7 @@ from __future__ import annotations
 import errno
 import json
 import os
-import subprocess
-import sys
+import signal
 from pathlib import Path
 from typing import Any
 
@@ -209,6 +208,53 @@ def test_run_proxy_only_watcher_keyboardinterrupt_shuts_down_cleanly(
     inv = runner.invoke(_cmd)
     assert inv.exit_code == 0, inv.output
     assert "Shutting down..." in inv.output
+
+
+def test_run_proxy_only_watcher_signal_handler_uses_clean_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The installed SIGINT handler must not misreport its own proxy stop as a crash."""
+
+    handlers: dict[int, Any] = {}
+    cleanup_calls = {"n": 0}
+
+    class _FakeProc:
+        def poll(self) -> None:
+            return None
+
+    def capture_handler(sig: int, handler: Any) -> None:
+        handlers[sig] = handler
+
+    def trigger_sigint(_seconds: float) -> None:
+        handlers[signal.SIGINT](signal.SIGINT, None)
+
+    def cleanup(*_args: Any) -> None:
+        cleanup_calls["n"] += 1
+
+    monkeypatch.setattr(wrap_mod, "_ensure_proxy", lambda *a, **kw: (_FakeProc(), 8787))
+    monkeypatch.setattr(wrap_mod.time, "sleep", trigger_sigint)
+    monkeypatch.setattr(wrap_mod, "_make_cleanup", lambda holder, port: cleanup)
+    monkeypatch.setattr(wrap_mod.signal, "signal", capture_handler)
+
+    runner = CliRunner()
+
+    @click.command()
+    def _cmd() -> None:
+        wrap_mod._run_proxy_only_watcher(
+            agent_label="vscode copilot",
+            port=8787,
+            no_proxy=False,
+            learn=False,
+            memory=False,
+            agent_type="copilot",
+            print_setup_lines=lambda _port: None,
+        )
+
+    inv = runner.invoke(_cmd)
+    assert inv.exit_code == 0, inv.output
+    assert "Shutting down..." in inv.output
+    assert "Proxy process exited unexpectedly" not in inv.output
+    assert cleanup_calls["n"] >= 2  # signal handler plus finally (idempotent)
 
 
 def test_run_proxy_only_watcher_unexpected_exception_returns_exit_1(
@@ -505,13 +551,13 @@ class TestProxyClientRefCounting:
 
         assert proc.terminated is False
 
-    def test_dead_client_marker_is_pruned_and_not_counted(self, clients_dir: Path) -> None:
+    def test_dead_client_marker_is_pruned_and_not_counted(
+        self, clients_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A marker for a dead PID is pruned from disk and never counted."""
-        # Spawn and reap a child so its PID is reliably dead (not a zombie).
-        child = subprocess.Popen([sys.executable, "-c", "pass"])
-        child.wait()
-        dead_pid = child.pid
+        dead_pid = 358784
         marker = self._write_marker(clients_dir, dead_pid)
+        monkeypatch.setattr(wrap_mod, "_pid_alive", lambda pid: pid != dead_pid)
 
         live = wrap_mod._live_proxy_clients(self.PORT, exclude_self=True)
 
