@@ -834,7 +834,7 @@ def _responses_input_to_learner_messages(
         if text:
             role = item.get("role")
             messages.append(
-                {"role": role if isinstance(role, str) and role else "user", "content": text}
+                {"role": role if isinstance(role, str) and role else "unknown", "content": text}
             )
     return messages
 
