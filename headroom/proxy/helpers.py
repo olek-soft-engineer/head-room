@@ -2421,6 +2421,7 @@ def inject_tool_search_deferral(
 _OPENAI_TOOL_SEARCH_TYPE = "tool_search"
 _OPENAI_TOOL_SEARCH_MIN_TOOLS = 12
 _OPENAI_TOOL_SEARCH_RESIDENT_NAMES = frozenset({"terminal"})
+_OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS = frozenset({"codex"})
 # gpt-5.4 is the first model with Responses tool_search (OpenAI docs). Version-
 # gated by default; overridable per deployment via a regex in
 # HEADROOM_OPENAI_TOOL_SEARCH_MODELS (matched against the model name) so new
@@ -2451,24 +2452,34 @@ def _model_supports_openai_tool_search(model: str | None) -> bool:
     return (major, minor) >= _OPENAI_TOOL_SEARCH_MIN_VERSION
 
 
+def openai_tool_search_client_supported(client: str | None) -> bool:
+    """Return whether OpenAI tool search deferral is safe for this client."""
+    normalized = client.strip().lower() if client else ""
+    return normalized not in _OPENAI_TOOL_SEARCH_UNSUPPORTED_CLIENTS
+
+
 def inject_tool_search_deferral_openai(
     tools: Any,
     model: str | None,
     *,
+    client: str | None = None,
     core_tools: frozenset[str] = _TOOL_SEARCH_CORE_TOOLS,
 ) -> Any:
     """Return a new Responses ``tools`` list with non-core function/MCP tools
     deferred + a ``{"type": "tool_search"}`` tool injected, or the original list
     unchanged when injection doesn't apply.
 
-    No-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
+    No-op for Codex, whose round-trip structs drop deferred-call namespaces. Also
+    no-op when: the model doesn't support tool search (gpt-5.4+ only), ``tools``
     is not a list, there are fewer than ``_OPENAI_TOOL_SEARCH_MIN_TOOLS``, a
     tool_search tool is already present (client already defers), or nothing would
     be deferred. Core coding tools and hosted/typed tools (web_search,
-    file_search, code_interpreter, computer, …) stay resident and unchanged, so
-    routine edit/read/run loops never pay a search round-trip and the request
+    file_search, code_interpreter, computer, ...) stay resident and unchanged,
+    so routine edit/read/run loops never pay a search round-trip and the request
     stays valid; the injected search tool is itself resident.
     """
+    if not openai_tool_search_client_supported(client):
+        return tools
     if not _model_supports_openai_tool_search(model):
         return tools
     if not isinstance(tools, list) or len(tools) < _OPENAI_TOOL_SEARCH_MIN_TOOLS:

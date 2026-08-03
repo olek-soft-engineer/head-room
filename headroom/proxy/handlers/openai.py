@@ -2209,6 +2209,7 @@ class OpenAIHandlerMixin:
         model: str,
         request_id: str,
         timing: dict[str, float] | None = None,
+        client: str | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int]:
         """Compress an OpenAI Responses payload through the shared router.
 
@@ -2346,7 +2347,9 @@ class OpenAIHandlerMixin:
         # one — hence a transform tag but no tokens_saved claim.
         from headroom.proxy.helpers import inject_tool_search_deferral_openai
 
-        _deferred_tools = inject_tool_search_deferral_openai(working.get("tools"), model)
+        _deferred_tools = inject_tool_search_deferral_openai(
+            working.get("tools"), model, client=client
+        )
         if _deferred_tools is not working.get("tools"):
             if working is payload:
                 working = copy.deepcopy(payload)
@@ -2548,6 +2551,7 @@ class OpenAIHandlerMixin:
         model: str,
         request_id: str,
         timeout: float = COMPRESSION_TIMEOUT_SECONDS,
+        client: str | None = None,
     ) -> tuple[dict[str, Any], bool, int, list[str], str | None, int, int, int, dict[str, float]]:
         timing: dict[str, float] = {}
 
@@ -2562,21 +2566,32 @@ class OpenAIHandlerMixin:
             shape_labels, shape_mutated = _shape_openai_responses_payload(
                 payload, model=model, request_id=request_id
             )
-            try:
-                result = self._compress_openai_responses_payload(
-                    payload,
-                    model=model,
-                    request_id=request_id,
-                    timing=timing,
-                )
-            except TypeError as exc:
-                if "unexpected keyword argument 'timing'" not in str(exc):
-                    raise
-                result = self._compress_openai_responses_payload(
-                    payload,
-                    model=model,
-                    request_id=request_id,
-                )
+            compression_kwargs: dict[str, Any] = {
+                "model": model,
+                "request_id": request_id,
+                "timing": timing,
+                "client": client,
+            }
+            while True:
+                try:
+                    result = self._compress_openai_responses_payload(
+                        payload,
+                        **compression_kwargs,
+                    )
+                    break
+                except TypeError as exc:
+                    unsupported_kwarg = next(
+                        (
+                            name
+                            for name in ("client", "timing")
+                            if f"unexpected keyword argument '{name}'" in str(exc)
+                            and name in compression_kwargs
+                        ),
+                        None,
+                    )
+                    if unsupported_kwarg is None:
+                        raise
+                    compression_kwargs.pop(unsupported_kwarg)
             if shape_labels:
                 # Carry the shaper labels on the transforms channel so the
                 # outcome funnel feeds the output-savings ledger
@@ -4917,6 +4932,7 @@ class OpenAIHandlerMixin:
                     body,
                     model=model,
                     request_id=request_id,
+                    client=client,
                 )
                 attempted_input_tokens = int(_attempted_tokens)
                 if _transforms:
@@ -6559,6 +6575,7 @@ class OpenAIHandlerMixin:
                                 timeout=_codex_ws_compression_timeout_seconds()
                                 if client == "codex"
                                 else COMPRESSION_TIMEOUT_SECONDS,
+                                client=client,
                             )
                             for _timing_name, _timing_ms in _ws_compression_timing.items():
                                 _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -6904,6 +6921,7 @@ class OpenAIHandlerMixin:
                                     timeout=_codex_ws_compression_timeout_seconds()
                                     if client == "codex"
                                     else COMPRESSION_TIMEOUT_SECONDS,
+                                    client=client,
                                 )
                                 for _timing_name, _timing_ms in frame_compression_timing.items():
                                     _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -8650,7 +8668,9 @@ class OpenAIHandlerMixin:
                 },
             )
 
-    async def _maybe_compress_passthrough_responses(self, body: bytes) -> bytes:
+    async def _maybe_compress_passthrough_responses(
+        self, body: bytes, *, client: str | None = None
+    ) -> bytes:
         """Compress an OpenAI Responses-shaped passthrough body, fail-open.
 
         Reuses the native `/v1/responses` compression path so custom
@@ -8669,15 +8689,22 @@ class OpenAIHandlerMixin:
         model = str(payload.get("model") or "passthrough")
         request_id = await self._next_request_id()
         try:
-            (
-                compressed_payload,
-                modified,
-                *_rest,
-            ) = await self._compress_openai_responses_payload_in_executor(
-                payload,
-                model=model,
-                request_id=request_id,
-            )
+            try:
+                result = await self._compress_openai_responses_payload_in_executor(
+                    payload,
+                    model=model,
+                    request_id=request_id,
+                    client=client,
+                )
+            except TypeError as exc:
+                if "unexpected keyword argument 'client'" not in str(exc):
+                    raise
+                result = await self._compress_openai_responses_payload_in_executor(
+                    payload,
+                    model=model,
+                    request_id=request_id,
+                )
+            compressed_payload, modified, *_rest = result
         except Exception as exc:  # noqa: BLE001 — fail-open on any compressor error
             logger.warning(
                 "[%s] passthrough Responses compression failed, forwarding verbatim: %s",
@@ -8792,7 +8819,7 @@ class OpenAIHandlerMixin:
             and path.rstrip("/").endswith("/responses")
             and body
         ):
-            compressed = await self._maybe_compress_passthrough_responses(body)
+            compressed = await self._maybe_compress_passthrough_responses(body, client=client)
             if compressed != body:
                 body = compressed
                 # Body size changed — let httpx recompute Content-Length.
