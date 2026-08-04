@@ -191,6 +191,28 @@ class RequestOutcome:
             return 0.0
         return self.tokens_saved / self.original_tokens * 100.0
 
+    @property
+    def tokens_inflated(self) -> int:
+        """Tokens the forwarded request grew by, if it ended up larger.
+
+        ``tokens_saved`` is clamped at zero, so a request that leaves the
+        proxy *bigger* than it arrived is indistinguishable from one the
+        proxy simply could not compress: both report ``tok_saved=0``. That
+        ambiguity hides real regressions — anything that adds to the body
+        after compression (proactive context expansion, memory injection)
+        can outweigh the compression it sits on top of and still look like
+        a neutral turn.
+
+        Report the swallowed amount alongside it so the two cases are
+        distinguishable. This is diagnostic only: it deliberately does not
+        feed ``tokens_saved`` or ``attempted_input_tokens``, because
+        ``attempted_input_tokens = optimized_tokens + tokens_saved`` is a
+        size, not a signed delta, and because injection paths already book
+        their own cost through the retrieval-drawback channel — letting a
+        negative land here too would count it twice.
+        """
+        return max(0, self.optimized_tokens - self.original_tokens)
+
     @classmethod
     def from_stream(
         cls,
@@ -512,6 +534,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
         f"model={outcome.model} msgs={outcome.num_messages} "
         f"tok_before={outcome.original_tokens} tok_after={outcome.optimized_tokens} "
         f"tok_saved={outcome.tokens_saved} "
+        f"tok_inflated={outcome.tokens_inflated} "
         f"tool_saved={tool_saved} "
         f"total_saved={total_saved} "
         f"cache_read={outcome.cache_read_tokens} cache_write={outcome.cache_write_tokens} "
