@@ -60,6 +60,7 @@ from ..config import (
 )
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
+from ..tokenizers.base import count_content_blocks
 from ..tokenizers.estimator import EstimatingTokenCounter
 from . import mixed_content as _mixed_content
 from .base import Transform
@@ -1176,42 +1177,29 @@ def _gain_bucket(gain: float) -> str:
 def _netcost_message_tokens(message: dict[str, Any], tokenizer: Tokenizer) -> int:
     """Token count of a message for net-cost suffix (S) estimation.
 
-    String content is counted directly. Anthropic block-list content is
-    counted by summing the text-bearing fields (``text`` blocks and
-    ``tool_result`` content) rather than stringifying the whole list, which
-    would count Python ``repr`` punctuation and type names and badly
-    miscount S — the value that drives the break-even gate decision.
+    String content is counted directly. Block-list content is delegated to the
+    canonical block counter, which knows how to price non-text blocks.
+
+    This function used to walk the list itself and fall back to
+    ``str(block)`` for anything that was not ``text`` or ``tool_result``, on the
+    stated assumption that such blocks "rarely dominate a suffix". An ``image``
+    block is the exception that breaks it: ``str()`` embeds the whole base64
+    payload, so one screenshot counted ~100,000 tokens instead of ~1,600
+    (57x-146x over, growing with image size).
+
+    That mattered because S is the cache-bust cost — the tokens re-written if
+    message *j* is mutated — so an image inflated S for **every message before
+    it**, and the break-even gate then refused to compress any of them.
+    ``BaseTokenizer._count_content_parts`` already solves this (see its "1MB
+    image = ~330K fake tokens without this" guard); this walk simply predated
+    it. Delegating also means new block types are priced in one place.
     """
     content = message.get("content", "")
     if isinstance(content, str):
         return tokenizer.count_text(content)
     if not isinstance(content, list):
         return tokenizer.count_text(str(content))
-    total = 0
-    for block in content:
-        if not isinstance(block, dict):
-            total += tokenizer.count_text(str(block))
-            continue
-        block_type = block.get("type")
-        if block_type == "text":
-            total += tokenizer.count_text(str(block.get("text", "")))
-        elif block_type == "tool_result":
-            tc = block.get("content", "")
-            if isinstance(tc, str):
-                total += tokenizer.count_text(tc)
-            elif isinstance(tc, list):
-                for sub in tc:
-                    if isinstance(sub, dict) and sub.get("type") == "text":
-                        total += tokenizer.count_text(str(sub.get("text", "")))
-                    else:
-                        total += tokenizer.count_text(str(sub))
-            else:
-                total += tokenizer.count_text(str(tc))
-        else:
-            # Other blocks (image, tool_use input, …) — repr is a rough proxy
-            # but bounded; these rarely dominate a suffix.
-            total += tokenizer.count_text(str(block))
-    return total
+    return count_content_blocks(content, tokenizer.count_text)
 
 
 class CompressionCache:
