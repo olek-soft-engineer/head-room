@@ -296,6 +296,11 @@ async def test_funnel_passes_canonical_record_tokens_shape() -> None:
         "cache_write_1h_tokens": 20,
         "uncached_tokens": 0,
         "output_tokens": 50,
+        # Tells cost whether cache_write_tokens was REPORTED by the provider or
+        # derived from the uncached portion. An inferred value is the same tokens
+        # as uncached_tokens, so counting it in the billed prompt total would
+        # double it. Defaults False for providers with disjoint buckets.
+        "cache_inferred": False,
     }
 
 
