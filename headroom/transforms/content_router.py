@@ -1639,7 +1639,11 @@ class ContentRouterConfig:
     compress_tagged_content: bool = False
 
     # Tools to exclude from compression (output passed through unmodified)
-    # Set to None to use DEFAULT_EXCLUDE_TOOLS, or provide custom set
+    # Set to None to use DEFAULT_EXCLUDE_TOOLS, or provide custom set.
+    # NOTE: headroom_retrieve is excluded unconditionally regardless of this
+    # setting, even if this is explicitly set to an empty set -- recompressing
+    # its output would write a new <<ccr:hash>> marker the agent can never
+    # redeem (see the ccr_retrieve_tool_ids guards in apply()).
     exclude_tools: set[str] | None = None
 
     # Excluded tools are protected only from *lossy* compression. Their output
@@ -4661,6 +4665,29 @@ class ContentRouter(Transform):
             if is_tool_excluded(name, exclude_tools)
         }
 
+        # CCR-retrieve tool IDs, precomputed once (mirrors excluded_tool_ids
+        # above, rather than calling is_tool_excluded() per message/block). A
+        # headroom_retrieve result IS already-retrieved, original CCR content --
+        # recompressing it writes a new <<ccr:hash>> marker the agent can never
+        # redeem (unresolvable retrieval loop). is_tool_excluded() (not a bare
+        # comparison) because MCP-served tools appear here under their qualified
+        # name, e.g. mcp__headroom__headroom_retrieve. Consulted unconditionally,
+        # ahead of the age-decay/read-protection-window logic below: a decayed
+        # CCR marker is exactly as unredeemable as a fresh one, so this must
+        # never fall through to compression the way excluded_tool_ids does.
+        # Known, accepted tradeoff: is_tool_excluded()'s alias matching strips
+        # ANY mcp__<server>__ prefix before comparing, so a third-party server
+        # exposing a tool literally named headroom_retrieve would also match
+        # here. Narrowing this to headroom's own server specifically would need
+        # a bespoke check inconsistent with how every other excluded-tool entry
+        # is matched; given the name is this specific, the collision risk is
+        # accepted rather than special-cased.
+        ccr_retrieve_tool_ids = {
+            tool_id
+            for tool_id, name in tool_name_map.items()
+            if is_tool_excluded(name, ("headroom_retrieve",))
+        }
+
         # Read protection (HEADROOM_PROTECT_READS=1): for bash-family agents the
         # exclude-by-tool-NAME set above never catches file reads (they are `bash`
         # tool calls whose COMMAND is a cat/sed/head/...). Mark those tool_use_ids so
@@ -4800,6 +4827,7 @@ class ContentRouter(Transform):
         # Routing reason counters for summary logging
         route_counts: dict[str, int] = {
             "excluded_tool": 0,
+            "ccr_retrieve": 0,
             "user_msg": 0,
             "small": 0,
             "recent_code": 0,
@@ -4913,6 +4941,7 @@ class ContentRouter(Transform):
                     context,
                     transforms_applied,
                     excluded_tool_ids,
+                    ccr_retrieve_tool_ids,
                     tool_name_map=tool_name_map,
                     route_counts=route_counts,
                     compressed_details=compressed_details,
@@ -4935,11 +4964,29 @@ class ContentRouter(Transform):
                 route_counts["non_string"] += 1
                 continue
 
+            # A headroom_retrieve result IS already-retrieved, original CCR content --
+            # recompressing it writes a new <<ccr:hash>> marker the agent can never
+            # redeem (unresolvable retrieval loop). Covers role:"tool" (id-keyed via
+            # tool_call_id -> ccr_retrieve_tool_ids, precomputed above) and legacy
+            # role:"function" (that shape carries no call id -- the tool name is on
+            # the message itself via "name", per OpenAI's pre-parallel-tool-calls API).
+            tool_call_id = message.get("tool_call_id", "") if role in ("tool", "function") else ""
+            if role in ("tool", "function") and (
+                tool_call_id in ccr_retrieve_tool_ids
+                or (
+                    role == "function"
+                    and is_tool_excluded(message.get("name", ""), ("headroom_retrieve",))
+                )
+            ):
+                result_slots[i] = message
+                transforms_applied.append("router:excluded:ccr_retrieve")
+                route_counts["ccr_retrieve"] += 1
+                continue
+
             # Skip OpenAI-style tool messages for excluded tools
             # BUT: allow compression of old excluded-tool outputs beyond the
             # adaptive protection window (age-based decay).
             if role == "tool":
-                tool_call_id = message.get("tool_call_id", "")
                 if tool_call_id in excluded_tool_ids:
                     tool_name = tool_name_map.get(tool_call_id, "")
                     if tool_name and is_tool_excluded(tool_name, DEFAULT_VERBATIM_EXCLUDE_TOOLS):
@@ -5729,6 +5776,7 @@ class ContentRouter(Transform):
         context: str,
         transforms_applied: list[str],
         excluded_tool_ids: set[str],
+        ccr_retrieve_tool_ids: set[str],
         tool_name_map: dict[str, str] | None = None,
         route_counts: dict[str, int] | None = None,
         compressed_details: list[str] | None = None,
@@ -5768,6 +5816,9 @@ class ContentRouter(Transform):
             context: Context for compression.
             transforms_applied: List to append transform names to.
             excluded_tool_ids: Tool IDs to skip compression for.
+            ccr_retrieve_tool_ids: Tool IDs whose output is a headroom_retrieve result --
+                always passed through verbatim (see module-level comment at the
+                precompute site for why this can never fall through to compression).
             tool_name_map: Mapping from tool_call_id to tool_name for profile lookup.
             route_counts: Optional routing reason counters to update.
             compressed_details: Optional list to append compression details to.
@@ -5859,6 +5910,16 @@ class ContentRouter(Transform):
                     if route_counts is not None:
                         route_counts.setdefault("read_protected", 0)
                         route_counts["read_protected"] += 1
+                    continue
+                # Mirrors the OpenAI-shape guard above (issue #1077): a headroom_retrieve
+                # result IS already-retrieved, original CCR content and must never be
+                # recompressed. Precomputed set (mirrors excluded_tool_ids immediately
+                # below) rather than a per-iteration is_tool_excluded() call.
+                if tool_use_id in ccr_retrieve_tool_ids:
+                    new_blocks.append(block)
+                    transforms_applied.append("router:excluded:ccr_retrieve")
+                    if route_counts is not None:
+                        route_counts["ccr_retrieve"] = route_counts.get("ccr_retrieve", 0) + 1
                     continue
                 if tool_use_id in excluded_tool_ids:
                     tool_name = tool_name_map.get(tool_use_id, "") if tool_name_map else ""
@@ -6026,6 +6087,24 @@ class ContentRouter(Transform):
             # skipped; assistant default-skipped, opt-in via
             # `compress_assistant_text_blocks`).
             elif block_type == "text" and not protect_text_blocks:
+                # Same CCR-retrieve exemption as the tool_result branch above, for the
+                # top-level-text-block wire shape: a role:"tool"/"function" harness that
+                # normalizes content to a block list without a tool_result wrapper (see
+                # test_tool_role_text_blocks_compressed_by_default for why this shape is
+                # real). role:"tool" resolves via the message's own tool_call_id/
+                # tool_use_id through ccr_retrieve_tool_ids; legacy role:"function" has no
+                # call id in that shape, so the tool name is read off the message directly.
+                if role in ("tool", "function"):
+                    _msg_tool_id = message.get("tool_call_id") or message.get("tool_use_id") or ""
+                    if _msg_tool_id in ccr_retrieve_tool_ids or (
+                        role == "function"
+                        and is_tool_excluded(message.get("name", ""), ("headroom_retrieve",))
+                    ):
+                        new_blocks.append(block)
+                        transforms_applied.append("router:excluded:ccr_retrieve")
+                        if route_counts is not None:
+                            route_counts["ccr_retrieve"] = route_counts.get("ccr_retrieve", 0) + 1
+                        continue
                 text_content = block.get("text", "")
                 if isinstance(text_content, str) and (
                     len(text_content) > min_chars or self._has_lossless_fold(text_content)
