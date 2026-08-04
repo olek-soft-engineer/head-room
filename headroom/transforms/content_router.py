@@ -3328,11 +3328,21 @@ class ContentRouter(Transform):
                         # Registry-resolved dispatch: the built-in "config" adapter
                         # delegates to this same getter+method, so the content is
                         # byte-identical to the historical direct call. Keep the
-                        # branch's own whitespace-split token metric.
+                        # Measured with _estimate_tokens, matching the
+                        # denominator (`original_tokens`, set from
+                        # _estimate_tokens(content)) and every sibling branch. It
+                        # used to be len(compressed.split()) — a WORD count in the
+                        # numerator of a token ratio. Words run ~2.8x fewer than
+                        # estimator tokens on config text, so a compressor that
+                        # returned its input byte-identically reported a ratio of
+                        # ~0.36 and, because min_ratio is 1.0, the router ACCEPTED
+                        # the no-op: cached it, froze the verdict, emitted a
+                        # router:config_compressor label and wrote a fabricated
+                        # ~64% saving to TOIN. Measured on mkdocs.yml.
                         compressed = self._registry_compress_content(
                             "config", strategy, content, context, bias
                         )
-                        compressed_tokens = len(compressed.split())
+                        compressed_tokens = _estimate_tokens(compressed)
                         decision_reason = "config_compressor"
 
             elif strategy == CompressionStrategy.DIFF:
@@ -3648,7 +3658,17 @@ class ContentRouter(Transform):
         # exceeds the 30s budget and leaks a non-preemptible worker (#1171).
         # Above the ceiling, route to the fast LogCompressor (or pass through)
         # rather than ModernBERT, keeping the request path bounded.
-        if self._kompress_max_tokens > 0 and len(text_to_compress) > self._kompress_max_tokens * 4:
+        # Compared with _estimate_tokens, not len()/4. The cap is expressed in
+        # TOKENS, and chars/4 under-counts dense payloads — compact JSON runs
+        # ~3.2 chars/token — so a band existed where an oversized payload passed
+        # the gate. Measured: 177,781 chars of compact JSON is 44,445 by chars/4
+        # (under the 50,000 cap, gate silent) but 55,557 estimator tokens, 11%
+        # over. That is exactly the >30s non-preemptible ONNX inference this gate
+        # exists to prevent (#1171).
+        if (
+            self._kompress_max_tokens > 0
+            and _estimate_tokens(text_to_compress) > self._kompress_max_tokens
+        ):
             self._kompress_gate_fires += 1
             self._observe_kompress_size_gate("exceeded")
             logger.info(
