@@ -260,8 +260,13 @@ def _get_encoding(encoding_name: str) -> Any:
     return tiktoken.get_encoding(encoding_name)
 
 
-def _get_encoding_name_for_model(model: str, custom_encodings: dict[str, str] | None = None) -> str:
-    """Get the encoding name for a model with fallback support."""
+def _lookup_encoding_name(model: str, custom_encodings: dict[str, str] | None = None) -> str | None:
+    """Resolve the tiktoken encoding for ``model``, or ``None`` if none claims it.
+
+    ``None`` is the "not an OpenAI model" signal: it means no explicit mapping,
+    no known prefix, and no OpenAI family pattern matched. Callers that can
+    reach a better tokenizer should use it rather than guess an encoding.
+    """
     # Check custom encodings first
     if custom_encodings and model in custom_encodings:
         return custom_encodings[model]
@@ -280,8 +285,14 @@ def _get_encoding_name_for_model(model: str, custom_encodings: dict[str, str] | 
     if family and family in _PATTERN_DEFAULTS:
         return cast(str, _PATTERN_DEFAULTS[family]["encoding"])
 
-    # Default for unknown models
-    return cast(str, _UNKNOWN_OPENAI_DEFAULT["encoding"])
+    return None
+
+
+def _get_encoding_name_for_model(model: str, custom_encodings: dict[str, str] | None = None) -> str:
+    """Get the encoding name for a model with fallback support."""
+    return _lookup_encoding_name(model, custom_encodings) or cast(
+        str, _UNKNOWN_OPENAI_DEFAULT["encoding"]
+    )
 
 
 class OpenAITokenCounter:
@@ -321,8 +332,13 @@ class OpenAITokenCounter:
 
         Accounts for ChatML format overhead.
         """
-        # Base overhead per message (role + delimiters)
-        tokens = 4
+        # Base overhead per message (role + delimiters). OpenAI's counting
+        # guide uses 3 for every model since gpt-3.5-turbo-0613; only the
+        # retired gpt-3.5-turbo-0301 used 4. Staying on 4 over-counted every
+        # message by one token and disagreed with the tokenizer registry, which
+        # already uses 3 — so the same request measured differently depending on
+        # whether the pipeline or the handler counted it.
+        tokens = 3
 
         role = message.get("role", "")
         tokens += self.count_text(role)
@@ -419,7 +435,9 @@ class OpenAIProvider(Provider):
         if context_limits:
             self._context_limits.update(context_limits)
 
-        self._token_counters: dict[str, OpenAITokenCounter] = {}
+        # Holds OpenAITokenCounter for models with a real tiktoken encoding and
+        # registry tokenizers for everything else (see get_token_counter).
+        self._token_counters: dict[str, TokenCounter] = {}
 
     @property
     def name(self) -> str:
@@ -442,11 +460,25 @@ class OpenAIProvider(Provider):
         )
 
     def get_token_counter(self, model: str) -> TokenCounter:
-        """Get token counter for an OpenAI model."""
+        """Get token counter for ``model``, deferring non-OpenAI models.
+
+        ``/v1/chat/completions`` is a multi-provider passthrough, so Kimi,
+        Gemini, Mistral and Cohere models all reach this provider. Handing them
+        a guessed tiktoken encoding mis-counts by up to ~19% (Kimi), and since
+        the proxy pipeline resolves its tokenizer through this provider while
+        handlers resolve through the tokenizer registry, the two disagree about
+        the same request — savings become a difference of two rulers. Defer to
+        the registry so each model has exactly one tokenizer.
+        """
         if model not in self._token_counters:
-            self._token_counters[model] = OpenAITokenCounter(
-                model=model, custom_encodings=self._encodings
-            )
+            if _lookup_encoding_name(model, self._encodings) is None:
+                from headroom.tokenizers import get_tokenizer
+
+                self._token_counters[model] = cast(Any, get_tokenizer(model))
+            else:
+                self._token_counters[model] = OpenAITokenCounter(
+                    model=model, custom_encodings=self._encodings
+                )
         return self._token_counters[model]
 
     def get_context_limit(self, model: str) -> int:
