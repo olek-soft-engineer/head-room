@@ -64,6 +64,10 @@ _MODEL_ENCODINGS: dict[str, str] = {
     "o1-mini": "o200k_base",
     "o3": "o200k_base",
     "o3-mini": "o200k_base",
+    "o4": "o200k_base",
+    "o4-mini": "o200k_base",
+    "gpt-4.1": "o200k_base",
+    "gpt-5": "o200k_base",
     # GPT-4 and GPT-3.5 use cl100k_base
     "gpt-4": "cl100k_base",
     "gpt-4-turbo": "cl100k_base",
@@ -78,6 +82,18 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "gpt-4o-2024-11-20": 128000,
     "gpt-4o-2024-08-06": 128000,
     "gpt-4o-2024-05-13": 128000,
+    # GPT-4.1 series (~1M input). LiteLLM is still consulted first in
+    # get_context_limit; these are the manual fallback for installs without it
+    # (the litellm dep is gated python_version < '3.14').
+    "gpt-4.1": 1_047_576,
+    "gpt-4.1-mini": 1_047_576,
+    "gpt-4.1-nano": 1_047_576,
+    # GPT-5 series. This table is an INPUT budget (get_context_limit returns
+    # litellm's max_input_tokens when available), so these are 272K input --
+    # not the 400K total window, which is 272K in + 128K out.
+    "gpt-5": 272000,
+    "gpt-5-mini": 272000,
+    "gpt-5-nano": 272000,
     # GPT-4 Turbo
     "gpt-4-turbo": 128000,
     "gpt-4-turbo-preview": 128000,
@@ -94,6 +110,7 @@ _CONTEXT_LIMITS: dict[str, int] = {
     "o1-mini": 128000,
     "o3": 200000,
     "o3-mini": 200000,
+    "o4-mini": 200000,
     # DeepSeek (often accessed via OpenAI-compatible API). Values verified
     # against api-docs.deepseek.com (V4) and LiteLLM model_cost (deprecated
     # aliases). LiteLLM lookup is still attempted first in get_context_limit;
@@ -275,10 +292,12 @@ def _lookup_encoding_name(model: str, custom_encodings: dict[str, str] | None = 
     if model in _MODEL_ENCODINGS:
         return _MODEL_ENCODINGS[model]
 
-    # Prefix match for versioned models
-    for prefix, encoding in _MODEL_ENCODINGS.items():
+    # Prefix match for versioned models, longest prefix first. Plain dict order
+    # let a shorter family shadow a longer one: "gpt-4.1" hit the "gpt-4" entry
+    # and got cl100k_base instead of o200k_base, which over-counts CJK by ~33%.
+    for prefix in sorted(_MODEL_ENCODINGS, key=len, reverse=True):
         if model.startswith(prefix):
-            return encoding
+            return _MODEL_ENCODINGS[prefix]
 
     # Pattern-based inference
     family = _infer_model_family(model)
@@ -525,10 +544,12 @@ class OpenAIProvider(Provider):
         if model in self._context_limits:
             return self._context_limits[model]
 
-        # Prefix match
-        for prefix, limit in self._context_limits.items():
+        # Prefix match, longest prefix first. Plain dict order let a shorter
+        # family shadow a longer one: "gpt-4.1" hit the "gpt-4" entry and got
+        # 8192 instead of ~1M, and "gpt-4-32k-0613" got 8192 instead of 32768.
+        for prefix in sorted(self._context_limits, key=len, reverse=True):
             if model.startswith(prefix):
-                return limit
+                return self._context_limits[prefix]
 
         # Pattern-based inference
         family = _infer_model_family(model)
