@@ -325,6 +325,24 @@ class _Session:
                 # Of what we touched, how much did we remove? THIS is the
                 # compressor quality number, and the one Kompress moves.
                 "yield_pct": _pct(self.tokens_saved, self.attempted_tokens),
+                # The two above are context-compression only, because
+                # `tool_saved` never lands in original/attempted. On a
+                # tool-heavy fleet that understates the product several-fold —
+                # observed 2.80% vs 12.82% across the first 516 sessions.
+                # These two are what the dashboard headline shows
+                # (`tokens.savings_percent` / `active_savings_percent` in
+                # server.py): tool-schema savings added to BOTH sides, since
+                # deferred schemas were attempted work that succeeded whole.
+                # Kept alongside rather than folded into `saved_pct`, which
+                # already means context-only in every row of the corpus.
+                "all_layers_saved_pct": _pct(
+                    self.tokens_saved + self.tool_saved_tokens,
+                    self.original_tokens + self.tool_saved_tokens,
+                ),
+                "all_layers_yield_pct": _pct(
+                    self.tokens_saved + self.tool_saved_tokens,
+                    self.attempted_tokens + self.tool_saved_tokens,
+                ),
                 # Provider prompt cache participation. Headroom freezes prefixes
                 # to protect this, so it is the other side of eligible_pct.
                 "cache_read_pct": _pct(self.cache_read_tokens, self.original_tokens),
@@ -811,6 +829,10 @@ def demo() -> None:
     assert r["rates"]["overhead_pct"] == 5.0, r["rates"]
     # Tool savings are invisible in `saved` by design; they must not be lost.
     assert r["tokens"]["tool_saved"] == 1000, r["tokens"]
+    # ...and the all-layers rates are the ones that do count them: 1300 saved
+    # of 2000 sent, 1300 of 1400 attempted. Both denominators grow too.
+    assert r["rates"]["all_layers_saved_pct"] == 65.0, r["rates"]
+    assert r["rates"]["all_layers_yield_pct"] == 92.86, r["rates"]
     assert r["compression"]["response_cache_hits"] == 1
     assert r["tokens"]["cache_write"] == 100 and r["tokens"]["uncached"] == 400
 
